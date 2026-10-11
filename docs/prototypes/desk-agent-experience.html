@@ -1,0 +1,337 @@
+<div id="desk-agent-experience" class="viz-dotted-background" aria-label="Desk Agent R1 交互设计示意">
+  <style>
+    #desk-agent-experience {
+      --da-ink: light-dark(#202a38, #e8edf4);
+      --da-muted: light-dark(#667487, #a5b1c1);
+      --da-paper: light-dark(#f4f6f8, #151a22);
+      --da-surface: light-dark(#ffffff, #202733);
+      --da-soft: light-dark(#e9eef4, #293342);
+      --da-line: light-dark(#d9e0e8, #354152);
+      --da-accent: light-dark(#507a70, #9bc9b3);
+      --da-accent-ink: light-dark(#f7fffb, #15251e);
+      --da-warn: light-dark(#a66b30, #f0bd7d);
+      --da-danger: light-dark(#a34c4c, #f0a5a5);
+      color: var(--da-ink);
+      font-family: Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+      padding: 16px 12px 24px;
+    }
+    #desk-agent-experience *, #desk-agent-experience *::before, #desk-agent-experience *::after { box-sizing: border-box; }
+    #desk-agent-experience .da-product {
+      --da-radius: 20px;
+      --da-info: 1;
+      width: min(100%, 736px);
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1.06fr) minmax(260px, .94fr);
+      gap: 14px;
+      align-items: stretch;
+    }
+    #desk-agent-experience .da-product[data-layout="parallel"] { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    #desk-agent-experience .da-device, #desk-agent-experience .da-phone {
+      background: var(--da-paper);
+      border: 1px solid var(--da-line);
+      border-radius: var(--da-radius);
+      padding: 15px;
+      min-width: 0;
+    }
+    #desk-agent-experience .da-phone { background: var(--da-surface); display: flex; flex-direction: column; gap: 12px; }
+    #desk-agent-experience .da-top, #desk-agent-experience .da-row, #desk-agent-experience .da-section-head, #desk-agent-experience .da-phone-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    }
+    #desk-agent-experience .da-top { margin-bottom: 13px; }
+    #desk-agent-experience .da-brand { font-size: 14px; font-weight: 600; letter-spacing: .02em; }
+    #desk-agent-experience .da-time { color: var(--da-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    #desk-agent-experience .da-state { color: var(--da-accent); font-size: 12px; font-weight: 600; }
+    #desk-agent-experience .da-scene-nav { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 5px; margin-bottom: 12px; }
+    #desk-agent-experience button, #desk-agent-experience select {
+      border: 1px solid var(--da-line); border-radius: 12px; background: var(--da-surface); color: var(--da-ink);
+      min-height: 38px; padding: 7px 10px; font: inherit; font-size: 12px;
+    }
+    #desk-agent-experience .cursor-interaction { }
+    #desk-agent-experience button:hover { border-color: var(--da-accent); }
+    #desk-agent-experience button:focus-visible, #desk-agent-experience select:focus-visible { outline: 2px solid var(--da-accent); outline-offset: 2px; }
+    #desk-agent-experience .da-scene[aria-pressed="true"] { background: var(--da-accent); border-color: var(--da-accent); color: var(--da-accent-ink); }
+    #desk-agent-experience .da-screen {
+      min-height: 202px; border-radius: calc(var(--da-radius) - 4px); background: var(--da-surface); border: 1px solid var(--da-line);
+      display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 15px; text-align: center;
+    }
+    #desk-agent-experience .da-face { width: 124px; height: 76px; border-radius: 32px; display: flex; align-items: center; justify-content: center; gap: 26px; background: var(--da-soft); transition: transform .22s ease, border-radius .22s ease; }
+    #desk-agent-experience .da-eye { width: 12px; height: 19px; border-radius: 50%; background: var(--da-accent); display: block; }
+    #desk-agent-experience .da-mouth { width: 24px; height: 9px; margin-top: 33px; margin-left: -52px; border-bottom: 3px solid var(--da-accent); border-radius: 0 0 20px 20px; }
+    #desk-agent-experience .da-screen[data-scene="listening"] .da-face { transform: scale(1.04); border-radius: 26px; }
+    #desk-agent-experience .da-screen[data-scene="listening"] .da-mouth { width: 14px; height: 14px; margin-top: 27px; border: 2px solid var(--da-accent); border-radius: 50%; }
+    #desk-agent-experience .da-screen[data-scene="task"] .da-face { transform: rotate(-3deg); }
+    #desk-agent-experience .da-screen[data-scene="reminder"] .da-face { border-radius: 42px 42px 24px 24px; }
+    #desk-agent-experience .da-product[data-layout="expression"] .da-face { width: 144px; height: 90px; }
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-screen { display: grid; grid-template-columns: 76px minmax(0,1fr); justify-content: initial; text-align: left; gap: 3px 12px; }
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-face { width: 72px; height: 58px; grid-column: 1; grid-row: 1 / span 3; gap: 15px; border-radius: 20px; }
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-eye { width: 8px; height: 13px; }
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-mouth { width: 16px; height: 6px; margin-top: 23px; margin-left: -36px; }
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-face-copy,
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-screen-title,
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-screen-detail { grid-column: 2; margin: 0; }
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-mini-controls { grid-column: 1 / -1; }
+    #desk-agent-experience .da-product[data-layout="parallel"] .da-screen-title { font-size: 14px; }
+    #desk-agent-experience .da-face-copy { font-size: 12px; color: var(--da-muted); margin-top: 9px; }
+    #desk-agent-experience .da-screen-title { font-size: 16px; font-weight: 600; margin: 4px 0; }
+    #desk-agent-experience .da-screen-detail { font-size: 12px; color: var(--da-muted); line-height: 1.5; max-width: 34ch; }
+    #desk-agent-experience .da-scene[data-current="task"] ~ .da-screen .da-extra, #desk-agent-experience .da-extra { display: none; }
+    #desk-agent-experience .da-hint { font-size: 11px; color: var(--da-muted); margin: 10px 2px 0; line-height: 1.45; }
+    #desk-agent-experience .da-mini-controls { display: flex; gap: 7px; margin-top: 10px; flex-wrap: wrap; justify-content: center; }
+    #desk-agent-experience .da-mini-controls[hidden] { display: none; }
+    #desk-agent-experience .da-btn-primary { background: var(--da-accent); border-color: var(--da-accent); color: var(--da-accent-ink); }
+    #desk-agent-experience .da-btn-quiet { background: transparent; }
+    #desk-agent-experience .da-phone-head strong { font-size: 14px; }
+    #desk-agent-experience .da-pill { padding: 5px 8px; border-radius: 999px; background: var(--da-soft); color: var(--da-muted); font-size: 11px; white-space: nowrap; }
+    #desk-agent-experience .da-view {
+      min-height: 192px; position: relative; overflow: hidden; border-radius: 16px; background: #b8c2bb;
+      display: grid; place-items: center; color: #24332e; isolation: isolate;
+    }
+    #desk-agent-experience .da-view::before { content: ""; position: absolute; inset: 0; background: linear-gradient(145deg, #d3ddd3 0 42%, #8da295 42% 58%, #c2cbbd 58% 100%); z-index: -2; }
+    #desk-agent-experience .da-room { position: absolute; inset: 24px 14px 20px; border: 2px solid rgba(30,50,42,.3); border-bottom: 7px solid rgba(30,50,42,.25); border-radius: 10px 10px 3px 3px; }
+    #desk-agent-experience .da-window { position: absolute; left: 16%; top: 18%; width: 31%; height: 34%; border: 5px solid rgba(249,252,243,.8); background: linear-gradient(135deg, #dce9d9, #a9c6b7); border-radius: 5px; }
+    #desk-agent-experience .da-plant { position: absolute; right: 18%; bottom: 14%; width: 28px; height: 56px; border-radius: 50% 50% 7px 7px; background: #577865; }
+    #desk-agent-experience .da-camera-label { position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,.86); color: #24332e; padding: 5px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    #desk-agent-experience .da-view[data-view="off"]::before, #desk-agent-experience .da-view[data-view="broken"]::before { background: #29313b; }
+    #desk-agent-experience .da-view[data-view="off"] .da-room, #desk-agent-experience .da-view[data-view="off"] .da-camera-label,
+    #desk-agent-experience .da-view[data-view="broken"] .da-room, #desk-agent-experience .da-view[data-view="broken"] .da-camera-label { display: none; }
+    #desk-agent-experience .da-view-message { z-index: 1; color: #fff; font-size: 12px; text-align: center; padding: 12px; }
+    #desk-agent-experience .da-view-message[hidden] { display: none; }
+    #desk-agent-experience .da-camera-controls { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+    #desk-agent-experience .da-camera-controls select { width: 100%; }
+    #desk-agent-experience .da-pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 4px; justify-content: center; }
+    #desk-agent-experience .da-pad button { min-height: 44px; padding: 3px; }
+    #desk-agent-experience .da-pad .da-center { background: var(--da-soft); }
+    #desk-agent-experience .da-camera-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+    #desk-agent-experience .da-camera-actions button { flex: 1 1 auto; }
+    #desk-agent-experience .da-note { padding-top: 9px; border-top: 1px solid var(--da-line); font-size: 11px; color: var(--da-muted); line-height: 1.45; }
+    #desk-agent-experience .da-info[data-density="0"] .da-info-secondary { display: none; }
+    #desk-agent-experience .da-info[data-density="2"] .da-info-secondary { display: block; }
+    #desk-agent-experience .da-info-secondary { display: none; }
+    #desk-agent-experience .da-caption { max-width: 736px; margin: 8px auto 0; color: var(--da-muted); font-size: 11px; line-height: 1.45; }
+    #desk-agent-experience .da-status-line { font-size: 11px; color: var(--da-muted); min-height: 1.4em; }
+    #desk-agent-experience .da-status-line[aria-live] { display: block; }
+    #desk-agent-experience .da-running { color: var(--da-accent); }
+    #desk-agent-experience .da-waiting { color: var(--da-warn); }
+    #desk-agent-experience .da-finished { color: var(--da-muted); }
+    #desk-agent-experience .da-privacy-off { color: var(--da-danger); }
+    #desk-agent-experience .da-variant { min-height: 510px; }
+    @media (max-width: 600px) {
+      #desk-agent-experience .da-product, #desk-agent-experience .da-product[data-layout="parallel"] { grid-template-columns: minmax(0,1fr); }
+      #desk-agent-experience .da-variant { min-height: 900px; }
+      #desk-agent-experience .da-screen { min-height: 190px; }
+    }
+    @media (prefers-reduced-motion: reduce) { #desk-agent-experience .da-face { transition: none; } }
+  </style>
+
+  <div class="viz-carousel" aria-label="Desk Agent 两种交互布局" data-previous-label="上一种布局" data-next-label="下一种布局">
+    <section class="da-variant" data-variant="表情优先" aria-label="表情优先布局">
+      <div class="da-product" data-layout="expression" aria-label="表情优先产品示意">
+        <div class="da-device">
+          <div class="da-top"><div><div class="da-brand">Desk Agent</div><div class="da-time">周三 · 上午 09:41</div></div><span class="da-state">已连接</span></div>
+          <div class="da-scene-nav" role="group" aria-label="选择机器人演示场景">
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="idle" aria-label="显示待机场景" aria-pressed="true">待机</button>
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="listening" aria-label="显示语音聆听场景" aria-pressed="false">聆听</button>
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="task" aria-label="显示 Codex 任务场景" aria-pressed="false">任务</button>
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="reminder" aria-label="显示提醒场景" aria-pressed="false">提醒</button>
+          </div>
+          <div class="da-screen" data-scene="idle" aria-label="机器人屏幕概念示意">
+            <div class="da-face" aria-hidden="true"><span class="da-eye"></span><span class="da-eye"></span><span class="da-mouth"></span></div>
+            <div class="da-face-copy" data-role="face-caption">轻松待机</div>
+            <div class="da-screen-title" data-role="screen-title">早上好</div>
+            <div class="da-screen-detail" data-role="screen-detail">我在这里，需要时叫我。</div>
+            <div class="da-mini-controls" data-role="mini-actions" hidden></div>
+          </div>
+          <div class="da-info" data-density="1">
+            <div class="da-section-head"><strong style="font-size:12px">当前焦点</strong><span class="da-pill" data-role="focus-pill">陪伴</span></div>
+            <div class="da-status-line" data-role="status" aria-live="polite">可以直接说话，或选择一个场景体验。</div>
+            <div class="da-info-secondary"><div class="da-status-line">场景已切换。</div></div>
+          </div>
+        </div>
+        <div class="da-phone" aria-label="手机局域网实时查看页面示意">
+          <div class="da-phone-head"><strong>家庭实时查看</strong><span class="da-pill" data-role="view-status">未开始</span></div>
+          <div class="da-view" data-view="off" aria-label="摄像头预览示意，不是真实画面">
+            <div class="da-room" aria-hidden="true"><div class="da-window"></div><div class="da-plant"></div></div>
+            <span class="da-camera-label">示意画面 · 非真实摄像头</span>
+            <div class="da-view-message" data-role="view-message">预览已停止</div>
+          </div>
+          <div class="da-status-line" data-role="camera-line" aria-live="polite">允许局域网查看 · 当前未传输</div>
+          <div class="da-camera-controls">
+            <label class="da-status-line" for="stream-demo-a">预览状态</label>
+            <select id="stream-demo-a" class="cursor-interaction" data-role="stream-select" aria-label="选择预览演示状态"><option value="connected">连接正常</option><option value="broken">演示断流</option></select>
+          </div>
+          <div class="da-pad" role="group" aria-label="查看期间的云台方向控制">
+            <span></span><button type="button" class="cursor-interaction" data-pan="up" aria-label="云台向上">↑</button><span></span>
+            <button type="button" class="cursor-interaction" data-pan="left" aria-label="云台向左">←</button><button type="button" class="da-center cursor-interaction" data-pan="stop" aria-label="停止云台">■</button><button type="button" class="cursor-interaction" data-pan="right" aria-label="云台向右">→</button>
+            <span></span><button type="button" class="cursor-interaction" data-pan="down" aria-label="云台向下">↓</button><span></span>
+          </div>
+          <div class="da-camera-actions">
+            <button type="button" class="da-btn-primary cursor-interaction" data-camera="start" aria-label="开始实时查看">开始查看</button>
+            <button type="button" class="cursor-interaction" data-camera="stop" aria-label="停止当前查看">停止查看</button>
+            <button type="button" class="cursor-interaction" data-camera="privacy" aria-label="关闭摄像头">关闭摄像头</button>
+          </div>
+          <div class="da-note">查看期自动动作暂停；关闭查看释放云台。</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="da-variant" data-variant="信息并排" aria-label="信息并排布局" hidden>
+      <div class="da-product" data-layout="parallel" aria-label="信息并排产品示意">
+        <div class="da-device">
+          <div class="da-top"><div><div class="da-brand">Desk Agent</div><div class="da-time">周三 · 上午 09:41</div></div><span class="da-state">已连接</span></div>
+          <div class="da-section-head"><strong style="font-size:13px">机器人状态</strong><span class="da-pill" data-role="focus-pill">陪伴</span></div>
+          <div class="da-screen" data-scene="idle" aria-label="机器人表情与状态概念示意">
+            <div class="da-face" aria-hidden="true"><span class="da-eye"></span><span class="da-eye"></span><span class="da-mouth"></span></div>
+            <div class="da-face-copy" data-role="face-caption">轻松待机</div>
+            <div class="da-screen-title" data-role="screen-title">早上好</div>
+            <div class="da-screen-detail" data-role="screen-detail">我在这里，需要时叫我。</div>
+            <div class="da-mini-controls" data-role="mini-actions" hidden></div>
+          </div>
+          <div class="da-scene-nav" role="group" aria-label="选择机器人演示场景">
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="idle" aria-label="显示待机场景" aria-pressed="true">待机</button>
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="listening" aria-label="显示语音聆听场景" aria-pressed="false">聆听</button>
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="task" aria-label="显示 Codex 任务场景" aria-pressed="false">任务</button>
+            <button type="button" class="da-scene cursor-interaction" data-scene-choice="reminder" aria-label="显示提醒场景" aria-pressed="false">提醒</button>
+          </div>
+          <div class="da-info" data-density="1">
+            <div class="da-status-line" data-role="status" aria-live="polite">机器人以表情回应，简短状态文字辅助理解。</div>
+            <div class="da-info-secondary"><div class="da-status-line">完整任务详情在本地页面或 PC Companion 查看。</div></div>
+          </div>
+        </div>
+        <div class="da-phone" aria-label="手机局域网实时查看页面示意">
+          <div class="da-phone-head"><strong>家庭实时查看</strong><span class="da-pill" data-role="view-status">未开始</span></div>
+          <div class="da-view" data-view="off" aria-label="摄像头预览示意，不是真实画面">
+            <div class="da-room" aria-hidden="true"><div class="da-window"></div><div class="da-plant"></div></div>
+            <span class="da-camera-label">示意画面 · 非真实摄像头</span>
+            <div class="da-view-message" data-role="view-message">预览已停止</div>
+          </div>
+          <div class="da-status-line" data-role="camera-line" aria-live="polite">允许局域网查看 · 当前未传输</div>
+          <div class="da-camera-controls">
+            <label class="da-status-line" for="stream-demo-b">预览状态</label>
+            <select id="stream-demo-b" class="cursor-interaction" data-role="stream-select" aria-label="选择预览演示状态"><option value="connected">连接正常</option><option value="broken">演示断流</option></select>
+          </div>
+          <div class="da-pad" role="group" aria-label="查看期间的云台方向控制">
+            <span></span><button type="button" class="cursor-interaction" data-pan="up" aria-label="云台向上">↑</button><span></span>
+            <button type="button" class="cursor-interaction" data-pan="left" aria-label="云台向左">←</button><button type="button" class="da-center cursor-interaction" data-pan="stop" aria-label="停止云台">■</button><button type="button" class="cursor-interaction" data-pan="right" aria-label="云台向右">→</button>
+            <span></span><button type="button" class="cursor-interaction" data-pan="down" aria-label="云台向下">↓</button><span></span>
+          </div>
+          <div class="da-camera-actions">
+            <button type="button" class="da-btn-primary cursor-interaction" data-camera="start" aria-label="开始实时查看">开始查看</button>
+            <button type="button" class="cursor-interaction" data-camera="stop" aria-label="停止当前查看">停止查看</button>
+            <button type="button" class="cursor-interaction" data-camera="privacy" aria-label="关闭摄像头">关闭摄像头</button>
+          </div>
+          <div class="da-note">查看期间锁定云台自动动作；停止查看后释放云台。</div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <p class="da-caption">设计示意：所有按钮仅改变本地预览状态，不会操作真实设备或播放音频；机器人屏幕尺寸与显示能力仍待验证。</p>
+
+  <script>
+    (() => {
+      const root = document.getElementById("desk-agent-experience");
+      if (!root) return;
+      const defaults = { scene: "idle", taskState: "running", reminderState: "ringing", privacy: true, viewing: false, stream: "connected", panStatus: "", layout: "表情优先" };
+      let saved = {};
+      try { saved = window.openai?.widgetState?.privateContent || {}; } catch (_) {}
+      const state = { ...defaults, ...saved };
+      const sceneData = {
+        idle: { face: "轻松待机", title: "早上好", detail: "我在这里，需要时叫我。", focus: "陪伴", status: "可以直接说话，或选择一个场景体验。" },
+        listening: { face: "专注聆听", title: "我在听", detail: "说完后我会复述重点；你也可以随时纠正。", focus: "语音对话", status: "聆听状态示意；不会启用麦克风。" },
+        task: { face: "任务进行中", title: "检查启动失败", detail: "已交给 Codex · 工作区 DeskAgent", focus: "Codex 任务", status: "" },
+        reminder: { face: "轻声提醒", title: "喝水提醒", detail: "现在处理，或稍后 10 分钟再提醒。", focus: "提醒", status: "触摸停止响铃不会把事项标为完成。" }
+      };
+      function persist() {
+        try { window.openai?.setWidgetState?.({ modelContent: { scene: state.scene }, privateContent: { ...state } }).catch(() => {}); } catch (_) {}
+      }
+      function taskDescription() {
+        if (state.taskState === "running") return { face: "专注处理中", title: "检查启动失败", detail: "正在分析启动问题。", focus: "Codex 任务", status: "任务运行中。完成情况与用户验收分别展示。", cls: "da-running" };
+        if (state.taskState === "ended") return { face: "本轮已结束", title: "Codex 已结束本轮", detail: "请查看任务详情并决定是否验收。", focus: "Codex 任务", status: "本轮结束不代表检查通过或用户已验收。", cls: "da-finished" };
+        return { face: "等待 PC 确认", title: "有一项操作待确认", detail: "请在 PC 查看具体操作；机器人不代替确认。", focus: "Codex 任务", status: "等待 PC 对当前具体操作确认。", cls: "da-waiting" };
+      }
+      function renderScene(product) {
+        const data = state.scene === "task" ? taskDescription() : sceneData[state.scene] || sceneData.idle;
+        const screen = product.querySelector(".da-screen");
+        screen.dataset.scene = state.scene;
+        product.querySelector('[data-role="face-caption"]').textContent = data.face;
+        product.querySelector('[data-role="screen-title"]').textContent = data.title;
+        product.querySelector('[data-role="screen-detail"]').textContent = data.detail;
+        product.querySelector('[data-role="focus-pill"]').textContent = data.focus;
+        const status = product.querySelector('[data-role="status"]');
+        status.textContent = data.status || "";
+        status.className = "da-status-line" + (data.cls ? " " + data.cls : "");
+        product.querySelectorAll("[data-scene-choice]").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.sceneChoice === state.scene)));
+        const actions = product.querySelector('[data-role="mini-actions"]');
+        actions.replaceChildren();
+        actions.hidden = state.scene !== "task" && state.scene !== "reminder";
+        if (state.scene === "task") {
+          const select = document.createElement("select");
+          select.className = "cursor-interaction";
+          select.setAttribute("aria-label", "任务演示状态");
+          select.innerHTML = '<option value="running">运行中</option><option value="ended">本轮结束</option><option value="waiting">等待 PC 确认</option>';
+          select.value = state.taskState;
+          select.addEventListener("change", () => { state.taskState = select.value; renderAll(); persist(); });
+          actions.append(select);
+        }
+        if (state.scene === "reminder") {
+          const snooze = document.createElement("button"); snooze.type = "button"; snooze.className = "cursor-interaction"; snooze.textContent = "贪睡 10 分钟"; snooze.setAttribute("aria-label", "提醒贪睡10分钟");
+          snooze.addEventListener("click", () => { state.reminderState = "snoozed"; renderAll(); persist(); });
+          const stop = document.createElement("button"); stop.type = "button"; stop.className = "cursor-interaction"; stop.textContent = "停止响铃"; stop.setAttribute("aria-label", "停止提醒响铃但不完成事项");
+          stop.addEventListener("click", () => { state.reminderState = "stopped"; renderAll(); persist(); });
+          if (state.reminderState === "ringing") { actions.append(snooze, stop); }
+          else { const note = document.createElement("span"); note.className = "da-status-line"; note.textContent = state.reminderState === "snoozed" ? "已贪睡 10 分钟 · 事项仍未完成" : "已停止响铃 · 事项仍未完成"; actions.append(note); }
+        }
+      }
+      function renderCamera(product) {
+        const view = product.querySelector(".da-view");
+        const viewing = state.viewing && state.privacy;
+        const broken = viewing && state.stream === "broken";
+        view.dataset.view = !viewing ? "off" : broken ? "broken" : "live";
+        view.querySelector('[data-role="view-message"]').hidden = viewing && !broken;
+        view.querySelector('[data-role="view-message"]').textContent = !state.privacy ? "摄像头已关闭 · 当前未传输" : broken ? "连接中断 · 旧画面已隐藏" : "预览已停止";
+        product.querySelector('[data-role="view-status"]').textContent = !state.privacy ? "摄像头已关闭" : broken ? "已断流" : viewing ? "正在查看" : "未开始";
+        const cameraStatus = !state.privacy ? "摄像头已关闭 · 当前未传输" : broken ? "允许局域网查看 · 连接中断，已隐藏旧画面" : viewing ? (state.panStatus ? "允许局域网查看 · " + state.panStatus : "允许局域网查看 · 正在传输") : "允许局域网查看 · 当前未传输";
+        product.querySelector('[data-role="camera-line"]').textContent = cameraStatus;
+        product.querySelector('[data-role="stream-select"]').value = state.stream;
+        product.querySelector('[data-camera="privacy"]').textContent = state.privacy ? "关闭摄像头" : "允许查看";
+        product.querySelector('[data-camera="privacy"]').setAttribute("aria-label", state.privacy ? "关闭摄像头并停止传输" : "允许摄像头局域网查看");
+        product.querySelector('[data-camera="start"]').disabled = !state.privacy || viewing;
+        product.querySelector('[data-camera="stop"]').disabled = !viewing;
+        product.querySelectorAll("[data-pan]").forEach(button => { button.disabled = !viewing || broken; });
+      }
+      function renderAll() { root.querySelectorAll(".da-product").forEach(product => { renderScene(product); renderCamera(product); }); }
+      root.querySelectorAll("[data-scene-choice]").forEach(button => button.addEventListener("click", () => { const previous = state.scene; state.scene = button.dataset.sceneChoice; if (state.scene === "reminder" && previous !== "reminder") state.reminderState = "ringing"; renderAll(); persist(); }));
+      root.querySelectorAll("[data-camera='start']").forEach(button => button.addEventListener("click", () => { if (state.privacy && state.stream === "connected") state.viewing = true; renderAll(); persist(); }));
+      root.querySelectorAll("[data-camera='stop']").forEach(button => button.addEventListener("click", () => { state.viewing = false; renderAll(); persist(); }));
+      root.querySelectorAll("[data-camera='privacy']").forEach(button => button.addEventListener("click", () => { state.privacy = !state.privacy; if (!state.privacy) state.viewing = false; renderAll(); persist(); }));
+      root.querySelectorAll("[data-role='stream-select']").forEach(select => select.addEventListener("change", () => { state.stream = select.value; renderAll(); persist(); }));
+      root.querySelectorAll("[data-pan]").forEach(button => button.addEventListener("click", () => { state.panStatus = button.dataset.pan === "stop" ? "云台已停止" : "正在查看 · 云台方向：" + button.getAttribute("aria-label"); renderAll(); persist(); }));
+      root.querySelectorAll(".da-product").forEach((product, index) => {
+        const tweakState = { density: 1, radius: 20 };
+        const applyTweak = () => { product.style.setProperty("--da-radius", tweakState.radius + "px"); product.querySelectorAll(".da-info").forEach(el => el.dataset.density = String(tweakState.density)); };
+        applyTweak();
+        if (globalThis.Tweak) {
+          const tweak = new Tweak({ container: product, onChange: applyTweak });
+          tweak.addSlider(tweakState, "density", { label: "信息密度", min: 0, max: 2, step: 1, reference: "product.info-density" });
+          tweak.addSlider(tweakState, "radius", { label: "圆角", min: 12, max: 28, step: 2, unit: "px", reference: "product.radius" });
+        }
+      });
+      renderAll();
+      function applyGlobals(event) {
+        const update = event.detail?.globals?.widgetState?.privateContent;
+        if (!update || typeof update !== "object") return;
+        Object.assign(state, update);
+        renderAll();
+      }
+      window.addEventListener("openai:set_globals", applyGlobals);
+      const variants = root.querySelectorAll(".viz-carousel > [data-variant]");
+      if (globalThis.MutationObserver) {
+        const observer = new MutationObserver(() => {
+          const active = Array.from(variants).find(section => !section.hidden);
+          if (active && state.layout !== active.dataset.variant) { state.layout = active.dataset.variant; persist(); }
+        });
+        variants.forEach(section => observer.observe(section, { attributes: true, attributeFilter: ["hidden"] }));
+      }
+    })();
+  </script>
+</div>
