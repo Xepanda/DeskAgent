@@ -1,0 +1,35 @@
+{
+  "device_id": "desk-agent-r1-taishanpi-01",
+  "storage": {
+    "db_path": "/var/lib/desk-agent/life_service.db"
+  },
+  "home_assistant": {
+    "base_url": "http://homeassistant.local:8123",
+    "access_token": "REPLACE_WITH_LONG_LIVED_ACCESS_TOKEN",
+    "allowed_domains": [
+      "light",
+      "switch",
+      "cover",
+      "climate",
+      "fan",
+      "media_player",
+      "scene",
+      "input_boolean"
+    ],
+    "state_poll_timeout_ms": 5000
+  },
+  "camera": {
+    "default_lease_ms": 10000,
+    "max_lease_ms": 60000,
+    "stale_threshold_ms": 2000,
+    "http_port": 8088
+  },
+  "codex_companion": {
+    "endpoint": "http://192.168.1.100:8765/rpc",
+    "timeout_ms": 15000
+  },
+  "firmware_bridge": {
+    "serial_port": "/dev/ttyUSB0",
+    "baud_rate": 115200
+  }
+}

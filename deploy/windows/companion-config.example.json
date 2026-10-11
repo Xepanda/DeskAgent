@@ -1,0 +1,17 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "default_model": "gpt-5-codex",
+  "require_command_approval": true,
+  "registered_workspaces": {
+    "epanda-desk-agent": "D:\\ePanda\\DeskAgent",
+    "project-alpha": "C:\\Workspaces\\ProjectAlpha"
+  },
+  "security": {
+    "disallowed_command_patterns": [
+      "rmdir /s /q C:\\",
+      "format",
+      "diskpart"
+    ]
+  }
+}
