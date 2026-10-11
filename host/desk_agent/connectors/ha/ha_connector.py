@@ -18,11 +18,12 @@ class HAConnector:
         self,
         base_url: str = "http://localhost:8123",
         token: Optional[str] = None,
-        allowed_domains: Optional[set[str]] = None,
+        access_token: Optional[str] = None,
+        allowed_domains: Optional[Any] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token
-        self.allowed_domains = allowed_domains or {"light", "switch", "sensor", "binary_sensor", "climate"}
+        self.token = access_token or token
+        self.allowed_domains = set(allowed_domains) if allowed_domains else {"light", "switch", "sensor", "binary_sensor", "climate"}
         # Local cached entity states: entity_id -> state dict
         self._states: dict[str, dict[str, Any]] = {}
         self._connected = True

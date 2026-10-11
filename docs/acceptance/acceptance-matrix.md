@@ -60,11 +60,12 @@
 
 ### 2.3 Python 核心服务与集成测试证据 (Host Services & E2E)
 - **命令**: `python3 -m unittest discover -s tests -t . -p "test_*.py"`
+- **依赖锁定**: `requirements.txt` (jsonschema>=4.20.0, requests>=2.31.0, pytest>=7.4.0)
 - **输出证据**:
   ```
-  ..................
+  ....................
   ----------------------------------------------------------------------
-  Ran 18 tests in 0.071s
+  Ran 20 tests in 0.687s
 
   OK
   ```
@@ -78,6 +79,7 @@
   7. `test_ha_connector`: 域白名单强制校验。
   8. `test_codex_companion`: 跨平台工作区保护与目录逃逸防御。
   9. `test_camera_service`: 多客户端并发排它性测试。
+  10. `test_host_daemon`: 宿主守护进程 HTTP `/health` 与 `/api/rpc` 请求派发端到端验证。
 
 ---
 

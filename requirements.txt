@@ -1,0 +1,11 @@
+# Desk Agent R1 Python Dependencies
+# Target Hosts: TaishanPi RK3566 (ARM64 Linux) & Windows PC (Codex Companion)
+
+# Core schema validation
+jsonschema>=4.20.0,<5.0.0
+
+# HTTP requests for connectors
+requests>=2.31.0,<3.0.0
+
+# Development and testing
+pytest>=7.4.0
