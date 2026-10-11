@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "1.0.0",
+  "errors": {
+    "INVALID_ARGUMENT": {
+      "code": "INVALID_ARGUMENT",
+      "category": "CLIENT_ERROR",
+      "retryable": false,
+      "description": "The request payload failed schema validation, missing required field, or had out-of-range parameters."
+    },
+    "EXPIRED": {
+      "code": "EXPIRED",
+      "category": "CLIENT_ERROR",
+      "retryable": false,
+      "description": "The request expires_at timestamp has already elapsed upon receipt or queue processing."
+    },
+    "UNAUTHORIZED": {
+      "code": "UNAUTHORIZED",
+      "category": "SECURITY_ERROR",
+      "retryable": false,
+      "description": "The client identity or token lacks permissions for the requested operation or entity."
+    },
+    "UNKNOWN_OPERATION": {
+      "code": "UNKNOWN_OPERATION",
+      "category": "CLIENT_ERROR",
+      "retryable": false,
+      "description": "The requested operation is not registered or supported by any active domain handler."
+    },
+    "RESOURCE_BUSY": {
+      "code": "RESOURCE_BUSY",
+      "category": "TRANSIENT_ERROR",
+      "retryable": true,
+      "description": "The targeted hardware subsystem or lease is held by another higher/equal-priority owner."
+    },
+    "RESOURCE_NOT_FOUND": {
+      "code": "RESOURCE_NOT_FOUND",
+      "category": "CLIENT_ERROR",
+      "retryable": false,
+      "description": "The specified entity_id, task_id, reminder_id, or approval_id does not exist."
+    },
+    "OPERATION_TIMEOUT": {
+      "code": "OPERATION_TIMEOUT",
+      "category": "TRANSIENT_ERROR",
+      "retryable": true,
+      "description": "Execution exceeded allocated deadline without receiving confirmation."
+    },
+    "HARDWARE_FAULT": {
+      "code": "HARDWARE_FAULT",
+      "category": "HARDWARE_ERROR",
+      "retryable": false,
+      "description": "Hardware driver or peripheral reported a stall, bus error, or limit violation."
+    },
+    "UPSTREAM_UNAVAILABLE": {
+      "code": "UPSTREAM_UNAVAILABLE",
+      "category": "INTEGRATION_ERROR",
+      "retryable": true,
+      "description": "Upstream service (HA Core, Tuya Cloud, or Codex app-server) is disconnected or unreachable."
+    },
+    "STATE_UNCONFIRMED": {
+      "code": "STATE_UNCONFIRMED",
+      "category": "INTEGRATION_ERROR",
+      "retryable": false,
+      "description": "The command was accepted upstream, but physical state verification failed or timed out."
+    },
+    "APPROVAL_REJECTED": {
+      "code": "APPROVAL_REJECTED",
+      "category": "WORKFLOW_ERROR",
+      "retryable": false,
+      "description": "The explicit human approval for this turn or item was rejected."
+    },
+    "TASK_INTERRUPTED": {
+      "code": "TASK_INTERRUPTED",
+      "category": "WORKFLOW_ERROR",
+      "retryable": false,
+      "description": "The task was explicitly cancelled or interrupted by user command."
+    },
+    "DUPLICATE_REQUEST": {
+      "code": "DUPLICATE_REQUEST",
+      "category": "IDEMPOTENCY_INFO",
+      "retryable": false,
+      "description": "Request with identical request_id was previously received. Returning cached result."
+    }
+  }
+}

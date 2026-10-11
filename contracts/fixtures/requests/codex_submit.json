@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-codex-sub-003",
+  "operation": "codex.submit",
+  "arguments": {
+    "workspace_alias": "epanda-desk-agent",
+    "prompt": "Fix test failures in contracts validation suite",
+    "task_id": "tsk-codex-fix-99",
+    "model": "gpt-5-codex"
+  },
+  "expires_at": "2026-10-12T00:00:00Z",
+  "task_id": "tsk-codex-fix-99",
+  "client_id": "edge-application"
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "evt-ha-state-1001",
+  "sequence": 104,
+  "sequence_scope": "ha:event_bus",
+  "type": "ha.state_changed",
+  "timestamp": "2026-10-11T22:45:02Z",
+  "payload": {
+    "entity_id": "light.living_room_ceiling",
+    "old_state": "off",
+    "new_state": "on",
+    "attributes": {
+      "brightness": 200,
+      "color_temp": 3000
+    },
+    "timestamp": "2026-10-11T22:45:02Z",
+    "context_id": "ctx-ha-8812"
+  }
+}

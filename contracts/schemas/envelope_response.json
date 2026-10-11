@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/envelope_response.json",
+  "title": "DeskAgentResponseEnvelope",
+  "description": "Standard response / execution result envelope for Desk Agent R1",
+  "type": "object",
+  "required": ["schema_version", "request_id", "status", "timestamp"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1.0.0"],
+      "description": "Protocol contract version"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 64,
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "description": "Matches the request_id from the originating RequestEnvelope"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["accepted", "succeeded", "failed", "cancelled", "unknown"],
+      "description": "Lifecycle terminal or intermediate state. 'accepted' means acknowledged but not complete; 'succeeded', 'failed', 'cancelled', 'unknown' indicate resolution state."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of response generation"
+    },
+    "result": {
+      "type": "object",
+      "description": "Domain-specific output payload when status is succeeded or accepted"
+    },
+    "error": {
+      "type": "object",
+      "description": "Standardized error descriptor when status is failed or unknown",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z0-9_]+$",
+          "description": "Stable uppercase machine-readable error code"
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable diagnostic error message"
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "Indicates whether the caller may safely retry with the same request_id"
+        },
+        "details": {
+          "type": "object",
+          "description": "Structured machine-readable diagnostics or context"
+        }
+      }
+    },
+    "execution_duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total execution elapsed time in milliseconds"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-ha-state-001",
+  "operation": "ha.get_state",
+  "arguments": {
+    "entity_id": "light.living_room_ceiling"
+  },
+  "expires_at": "2026-10-12T00:00:00Z",
+  "client_id": "tclaw-firmware"
+}

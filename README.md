@@ -30,16 +30,18 @@ TClaw 驱动的桌面机器人：连接 Tuya 云端对话、Home Assistant 与 W
 - docs/：V2.0/V2.1 草案与早期能力核验记录。
 - docs/research/：三个专项研究与技术总评。
 - docs/architecture/：最新系统架构。
+- docs/implementation/：实施规范（基线台账 baseline.md、公共接口 interfaces.md、G1 贯通方案 g1-validation.md）。
+- contracts/：跨模块公共契约（JSON Schemas、稳定错误码、可校验 fixtures 与自动化校验器）。
 - docs/superpowers/plans/：多 agent 实施计划。
 - docs/handoff/：下一阶段派发提示词。
 - docs/prototypes/：两种交互布局 HTML，依赖原可视化宿主，不是独立产品页面。
 - img/：历史系统框图参考图；最新架构以 docs/architecture/ 为准。
 
-未来代码路径只是计划中的 ownership 建议，A0 先定位实际源码仓库并冻结映射。
+未来代码路径只是计划中的 ownership 建议，A0 已定位实际源码仓库并冻结映射。
 
 ## 首轮目标
 
-完成 G0 基线与公共契约，然后由 A1/A2 证明 TClaw 云端对话与官方 Python SDK 同时工作；接口冻结后并行开展 HA、Codex 和生活服务。尚无固件烧录、泰山派部署或端到端验收证据。
+G0 基线与公共契约已完成制定与校验冻结（见 [baseline.md](docs/implementation/baseline.md) 与 [contracts/](contracts/)）。下一步由 A1/A2 启动 G1 最小贯通实验，证明 TClaw 云端对话与官方 Python SDK 同时工作；接口冻结后并行开展 HA、Codex 和生活服务。尚无固件烧录、泰山派部署或端到端验收证据。
 
 ## 公开参考项目
 

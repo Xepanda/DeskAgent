@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "evt-touch-1006",
+  "sequence": 88,
+  "sequence_scope": "device:inputs",
+  "type": "resource.touch_event",
+  "timestamp": "2026-10-11T22:45:22Z",
+  "payload": {
+    "target": "backtouch",
+    "action": "short_press",
+    "timestamp": "2026-10-11T22:45:22Z"
+  }
+}

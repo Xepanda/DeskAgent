@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-motion-mv-007",
+  "status": "failed",
+  "timestamp": "2026-10-11T22:45:20Z",
+  "error": {
+    "code": "RESOURCE_BUSY",
+    "message": "Camera viewing session active; motion control locked by lease-holder",
+    "retryable": true,
+    "details": {
+      "active_lease_owner": "lan-web-viewer",
+      "lease_expires_in_ms": 4500
+    }
+  },
+  "execution_duration_ms": 5
+}

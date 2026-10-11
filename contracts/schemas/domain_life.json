@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/domain_life.json",
+  "title": "DeskAgentLifeDomainSchemas",
+  "description": "Schemas for Life Services (reminders, alarms, notes) domain operations and event payloads",
+  "definitions": {
+    "reminder_create_args": {
+      "type": "object",
+      "required": ["title", "due_at"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "due_at": { "type": "string", "format": "date-time" },
+        "timezone": { "type": "string", "default": "Asia/Shanghai" },
+        "repeat_rule": { "type": "string", "description": "iCalendar RFC 5545 RRULE string or preset (e.g. 'FREQ=DAILY')" },
+        "priority": { "type": "string", "enum": ["low", "normal", "high"], "default": "normal" }
+      }
+    },
+    "reminder_update_args": {
+      "type": "object",
+      "required": ["reminder_id"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "due_at": { "type": "string", "format": "date-time" },
+        "repeat_rule": { "type": "string" }
+      }
+    },
+    "reminder_delete_args": {
+      "type": "object",
+      "required": ["reminder_id"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" }
+      }
+    },
+    "reminder_snooze_args": {
+      "type": "object",
+      "required": ["reminder_id", "snooze_minutes"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" },
+        "occurrence_id": { "type": "string" },
+        "snooze_minutes": { "type": "integer", "minimum": 1, "maximum": 1440 }
+      }
+    },
+    "reminder_complete_args": {
+      "type": "object",
+      "required": ["reminder_id"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" },
+        "occurrence_id": { "type": "string" }
+      }
+    },
+    "note_create_args": {
+      "type": "object",
+      "required": ["title", "content"],
+      "additionalProperties": false,
+      "properties": {
+        "note_id": { "type": "string" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "content": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "note_read_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "note_id": { "type": "string" },
+        "query": { "type": "string" }
+      }
+    },
+    "reminder_create_result": {
+      "type": "object",
+      "required": ["reminder_id", "title", "due_at", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" },
+        "title": { "type": "string" },
+        "due_at": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["scheduled"] },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "reminder_triggered_payload": {
+      "type": "object",
+      "required": ["reminder_id", "occurrence_id", "title", "due_at"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" },
+        "occurrence_id": { "type": "string" },
+        "title": { "type": "string" },
+        "due_at": { "type": "string", "format": "date-time" },
+        "repeat_rule": { "type": "string" }
+      }
+    }
+  }
+}

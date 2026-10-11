@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-ha-exec-002",
+  "operation": "ha.execute",
+  "arguments": {
+    "entity_id": "light.living_room_ceiling",
+    "action": "turn_on",
+    "parameters": {
+      "brightness": 200
+    },
+    "wait_for_state": {
+      "expected_state": "on",
+      "timeout_ms": 3000
+    }
+  },
+  "expires_at": "2026-10-12T00:00:00Z",
+  "task_id": "tsk-voice-home-01",
+  "client_id": "tclaw-firmware"
+}

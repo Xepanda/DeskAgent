@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/domain_resource.json",
+  "title": "DeskAgentResourceDomainSchemas",
+  "description": "Schemas for Hardware and Resource arbitration (motion, expression, camera, audio, inputs)",
+  "definitions": {
+    "expression_set_args": {
+      "type": "object",
+      "required": ["preset"],
+      "additionalProperties": false,
+      "properties": {
+        "preset": {
+          "type": "string",
+          "enum": ["idle", "listening", "thinking", "speaking", "happy", "sleep", "alert", "curious", "custom"]
+        },
+        "duration_ms": { "type": "integer", "minimum": 100, "maximum": 60000 },
+        "status_text": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "motion_move_args": {
+      "type": "object",
+      "required": ["pan_deg", "tilt_deg", "duration_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "pan_deg": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 180,
+          "description": "Pan angle in degrees (hardware clamped to physical limit 0..180)"
+        },
+        "tilt_deg": {
+          "type": "number",
+          "minimum": 100,
+          "maximum": 140,
+          "description": "Tilt angle in degrees (hardware clamped to physical limit 100..140)"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 5000,
+          "description": "Target transition duration in milliseconds"
+        },
+        "profile": {
+          "type": "string",
+          "enum": ["smooth", "linear", "fast"],
+          "default": "smooth"
+        }
+      }
+    },
+    "motion_stop_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "emergency": { "type": "boolean", "default": false }
+      }
+    },
+    "camera_acquire_args": {
+      "type": "object",
+      "required": ["client_id", "lease_duration_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "client_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "lease_duration_ms": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 60000,
+          "description": "Lease duration in milliseconds. Must be periodically refreshed."
+        },
+        "format": { "type": "string", "enum": ["jpeg"], "default": "jpeg" },
+        "target_fps": { "type": "number", "minimum": 0.5, "maximum": 15.0, "default": 2.0 }
+      }
+    },
+    "camera_release_args": {
+      "type": "object",
+      "required": ["client_id"],
+      "additionalProperties": false,
+      "properties": {
+        "client_id": { "type": "string" },
+        "lease_id": { "type": "string" }
+      }
+    },
+    "audio_stop_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stream_id": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "reason": { "type": "string" }
+      }
+    },
+    "motion_completed_payload": {
+      "type": "object",
+      "required": ["job_id", "pan_deg", "tilt_deg", "execution_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "type": "string" },
+        "pan_deg": { "type": "number" },
+        "tilt_deg": { "type": "number" },
+        "execution_ms": { "type": "integer" }
+      }
+    },
+    "touch_event_payload": {
+      "type": "object",
+      "required": ["target", "action", "timestamp"],
+      "additionalProperties": false,
+      "properties": {
+        "target": { "type": "string", "enum": ["backtouch", "screentouch", "roller"] },
+        "action": { "type": "string", "enum": ["short_press", "long_press", "scroll_up", "scroll_down"] },
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
