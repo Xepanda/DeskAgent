@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/envelope_event.json",
+  "title": "DeskAgentEventEnvelope",
+  "description": "Standard event notification envelope for Desk Agent R1",
+  "type": "object",
+  "required": ["schema_version", "event_id", "sequence", "sequence_scope", "type", "timestamp", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["1.0.0"],
+      "description": "Protocol contract version"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 64,
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "description": "Globally unique identifier for this event emission"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonically increasing sequence number scoped to sequence_scope. Gaps indicate dropped events."
+    },
+    "sequence_scope": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "description": "Scope identifier for the sequence number (e.g., 'device:esp32s3', 'task:tsk-1234', 'ha:event_bus')"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 64,
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "description": "Correlation request ID if this event was triggered by an explicit request"
+    },
+    "type": {
+      "type": "string",
+      "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$",
+      "description": "Event category in domain.event_name format"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of event occurrence"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Domain-specific event data"
+    }
+  }
+}

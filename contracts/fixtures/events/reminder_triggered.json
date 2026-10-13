@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "evt-rem-trig-1004",
+  "sequence": 1,
+  "sequence_scope": "reminder:rem-daily-standup",
+  "type": "reminder.triggered",
+  "timestamp": "2026-10-12T10:00:00Z",
+  "payload": {
+    "reminder_id": "rem-daily-standup",
+    "occurrence_id": "occ-20261012-100000",
+    "title": "Team daily standup meeting",
+    "due_at": "2026-10-12T10:00:00Z",
+    "repeat_rule": "FREQ=DAILY;INTERVAL=1"
+  }
+}

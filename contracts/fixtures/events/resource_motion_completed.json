@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "evt-mot-comp-1005",
+  "sequence": 42,
+  "sequence_scope": "device:stm32_body",
+  "request_id": "req-motion-mv-007",
+  "type": "resource.motion.completed",
+  "timestamp": "2026-10-11T22:45:21Z",
+  "payload": {
+    "job_id": "job-mot-882",
+    "pan_deg": 90.0,
+    "tilt_deg": 120.0,
+    "execution_ms": 785
+  }
+}

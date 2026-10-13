@@ -1,0 +1,24 @@
+[Unit]
+Description=Desk Agent R1 Host Application Daemon (TaishanPi RK3566)
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deskagent
+Group=deskagent
+WorkingDirectory=/opt/desk-agent
+ExecStart=/opt/desk-agent/venv/bin/python3 -m host.desk_agent.main --config /etc/desk-agent/config.json
+Restart=always
+RestartSec=5s
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+# Security sandbox settings
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/desk-agent
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-codex-cancel-011",
+  "status": "cancelled",
+  "timestamp": "2026-10-11T22:45:25Z",
+  "result": {
+    "task_id": "tsk-codex-fix-99",
+    "turn_id": "trn_01a0eae6",
+    "reason": "User requested turn interrupt"
+  },
+  "execution_duration_ms": 350
+}

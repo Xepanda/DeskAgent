@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "evt-codex-turn-1002",
+  "sequence": 12,
+  "sequence_scope": "task:tsk-codex-fix-99",
+  "request_id": "req-codex-sub-003",
+  "type": "codex.turn_completed",
+  "timestamp": "2026-10-11T22:45:15Z",
+  "payload": {
+    "task_id": "tsk-codex-fix-99",
+    "thread_id": "thr_win_01a0eae5",
+    "turn_id": "trn_01a0eae6",
+    "resolution": "completed",
+    "summary": "Fixed edge case in envelope validator schema and added tests",
+    "diff_stats": {
+      "files_changed": 2,
+      "insertions": 48,
+      "deletions": 6
+    }
+  }
+}

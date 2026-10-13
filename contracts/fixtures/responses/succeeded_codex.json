@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-codex-sub-003",
+  "status": "succeeded",
+  "timestamp": "2026-10-11T22:45:10Z",
+  "result": {
+    "task_id": "tsk-codex-fix-99",
+    "workspace_alias": "epanda-desk-agent",
+    "thread_id": "thr_win_01a0eae5",
+    "turn_id": "trn_01a0eae6",
+    "state": "running"
+  },
+  "execution_duration_ms": 120
+}

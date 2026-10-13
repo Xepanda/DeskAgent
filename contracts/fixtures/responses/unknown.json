@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-ha-unknown-012",
+  "status": "unknown",
+  "timestamp": "2026-10-11T22:45:30Z",
+  "error": {
+    "code": "STATE_UNCONFIRMED",
+    "message": "HA service responded but device state did not change within timeout; physical execution status is unknown",
+    "retryable": false,
+    "details": {
+      "entity_id": "switch.water_heater",
+      "action": "turn_on",
+      "timeout_ms": 5000
+    }
+  },
+  "execution_duration_ms": 5020
+}

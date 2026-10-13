@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.0.0",
+  "operation": "ha.get_state",
+  "arguments": {
+    "entity_id": "light.desk_lamp"
+  },
+  "expires_at": "2026-10-12T00:00:00Z"
+}

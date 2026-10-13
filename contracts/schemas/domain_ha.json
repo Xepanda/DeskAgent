@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/domain_ha.json",
+  "title": "DeskAgentHADomainSchemas",
+  "description": "Schemas for Home Assistant integration domain operations and event payloads",
+  "definitions": {
+    "ha_get_state_args": {
+      "type": "object",
+      "required": ["entity_id"],
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+\\.[a-z0-9_]+$",
+          "description": "Target entity ID (e.g., 'light.living_room_ceiling')"
+        }
+      }
+    },
+    "ha_execute_args": {
+      "type": "object",
+      "required": ["entity_id", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+\\.[a-z0-9_]+$",
+          "description": "Target entity ID"
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Service action to execute (e.g., 'turn_on', 'turn_off', 'toggle', 'set_temperature')"
+        },
+        "parameters": {
+          "type": "object",
+          "description": "Optional parameters passed to the service call"
+        },
+        "wait_for_state": {
+          "type": "object",
+          "required": ["expected_state", "timeout_ms"],
+          "additionalProperties": false,
+          "properties": {
+            "expected_state": {
+              "type": "string",
+              "description": "Expected state to observe before reporting state_confirmed=true"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 500,
+              "maximum": 30000,
+              "description": "Maximum duration to poll/wait for observed physical state transition"
+            }
+          }
+        }
+      }
+    },
+    "ha_execute_result": {
+      "type": "object",
+      "required": ["entity_id", "action", "accepted", "state_confirmed"],
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": { "type": "string" },
+        "action": { "type": "string" },
+        "accepted": { "type": "boolean" },
+        "observed_state": { "type": ["string", "null"] },
+        "state_confirmed": {
+          "type": "boolean",
+          "description": "Must be false if the state could not be independently verified from the entity readout"
+        },
+        "note": { "type": "string" }
+      }
+    },
+    "ha_state_changed_payload": {
+      "type": "object",
+      "required": ["entity_id", "new_state", "timestamp"],
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": { "type": "string" },
+        "old_state": { "type": ["string", "null"] },
+        "new_state": { "type": "string" },
+        "attributes": { "type": "object" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "context_id": { "type": "string" }
+      }
+    }
+  }
+}

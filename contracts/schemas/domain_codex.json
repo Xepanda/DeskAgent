@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/domain_codex.json",
+  "title": "DeskAgentCodexDomainSchemas",
+  "description": "Schemas for Windows Companion and Codex integration domain operations and event payloads",
+  "definitions": {
+    "codex_submit_args": {
+      "type": "object",
+      "required": ["workspace_alias", "prompt"],
+      "additionalProperties": false,
+      "properties": {
+        "workspace_alias": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Pre-registered workspace alias on Windows host (rejects raw directory paths)"
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "description": "Task instructions"
+        },
+        "task_id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64
+        },
+        "model": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    },
+    "codex_append_args": {
+      "type": "object",
+      "required": ["task_id", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 8192 }
+      }
+    },
+    "codex_cancel_args": {
+      "type": "object",
+      "required": ["task_id"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "reason": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "codex_continue_args": {
+      "type": "object",
+      "required": ["task_id"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "text": { "type": "string", "maxLength": 8192 }
+      }
+    },
+    "codex_get_args": {
+      "type": "object",
+      "required": ["task_id"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" }
+      }
+    },
+    "codex_respond_approval_args": {
+      "type": "object",
+      "required": ["approval_id", "decision", "task_id"],
+      "additionalProperties": false,
+      "properties": {
+        "approval_id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64,
+          "description": "Identifier of the pending approval request"
+        },
+        "task_id": {
+          "type": "string",
+          "description": "Associated task ID verifying approval correlation"
+        },
+        "decision": {
+          "type": "string",
+          "enum": ["approve", "reject"]
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "codex_submit_result": {
+      "type": "object",
+      "required": ["task_id", "workspace_alias", "thread_id", "state"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "workspace_alias": { "type": "string" },
+        "thread_id": { "type": "string" },
+        "turn_id": { "type": "string" },
+        "state": { "type": "string", "enum": ["submitted", "running", "waiting_approval"] }
+      }
+    },
+    "codex_approval_requested_payload": {
+      "type": "object",
+      "required": ["approval_id", "task_id", "thread_id", "turn_id", "action_type", "description", "expires_at"],
+      "additionalProperties": false,
+      "properties": {
+        "approval_id": { "type": "string" },
+        "task_id": { "type": "string" },
+        "thread_id": { "type": "string" },
+        "turn_id": { "type": "string" },
+        "item_id": { "type": "string" },
+        "action_type": { "type": "string", "enum": ["command", "file_change", "network"] },
+        "command_or_path": { "type": "string" },
+        "description": { "type": "string" },
+        "expires_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "codex_turn_completed_payload": {
+      "type": "object",
+      "required": ["task_id", "thread_id", "turn_id", "resolution"],
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" },
+        "thread_id": { "type": "string" },
+        "turn_id": { "type": "string" },
+        "resolution": { "type": "string", "enum": ["completed", "interrupted", "failed"] },
+        "summary": { "type": "string" },
+        "diff_stats": {
+          "type": "object",
+          "properties": {
+            "files_changed": { "type": "integer" },
+            "insertions": { "type": "integer" },
+            "deletions": { "type": "integer" }
+          }
+        }
+      }
+    }
+  }
+}

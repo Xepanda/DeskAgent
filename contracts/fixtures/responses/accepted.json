@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-ha-exec-002",
+  "status": "accepted",
+  "timestamp": "2026-10-11T22:45:00Z",
+  "result": {
+    "entity_id": "light.living_room_ceiling",
+    "action": "turn_on",
+    "accepted": true,
+    "observed_state": null,
+    "state_confirmed": false,
+    "note": "Service call dispatched to HA; awaiting physical state confirmation"
+  },
+  "execution_duration_ms": 45
+}

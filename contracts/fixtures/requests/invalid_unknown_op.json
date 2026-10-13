@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-invalid-op-010",
+  "operation": "unsupported_single_token_operation",
+  "arguments": {},
+  "expires_at": "2026-10-12T00:00:00Z"
+}
