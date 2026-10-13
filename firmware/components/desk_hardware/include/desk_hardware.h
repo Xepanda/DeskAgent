@@ -78,6 +78,7 @@ int desk_hardware_camera_stream_stop(void);
 
 /* Display & Expression API */
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text);
+int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len, char *out_status, size_t max_status_len);
 
 /* Input Event Subscription */
 int desk_hardware_register_input_cb(desk_touch_event_cb_t cb, void *user_data);

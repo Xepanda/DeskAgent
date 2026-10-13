@@ -12,6 +12,7 @@ extern "C" {
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 typedef enum {
     TCLAW_STATE_IDLE = 0,
@@ -20,6 +21,8 @@ typedef enum {
     TCLAW_STATE_SPEAKING,
     TCLAW_STATE_TOOL_CALLING
 } desk_tclaw_state_t;
+
+typedef int (*desk_tclaw_tool_dispatcher_t)(const char *request_envelope_json, void *user_data);
 
 /**
  * @brief Initialize TClaw dialogue loop and MCP tools registry.
@@ -40,6 +43,26 @@ desk_tclaw_state_t desk_tclaw_get_state(void);
  * @brief Inject synthetic user text into TClaw session (for automated testing).
  */
 int desk_tclaw_inject_text(const char *user_prompt);
+
+/**
+ * @brief Begin speech output, acquiring audio playback ownership.
+ */
+int desk_tclaw_start_speaking(const char *speech_text);
+
+/**
+ * @brief Barge-in / Touch interrupt active speech output.
+ */
+int desk_tclaw_interrupt(void);
+
+/**
+ * @brief Register callback for outbound MCP / external tool requests.
+ */
+int desk_tclaw_register_tool_dispatcher(desk_tclaw_tool_dispatcher_t dispatcher, void *user_data);
+
+/**
+ * @brief Trigger an external tool call through the MCP gateway.
+ */
+int desk_tclaw_trigger_tool_call(const char *request_id, const char *operation, const char *arguments_json);
 
 /**
  * @brief Handle external tool execution result returned from Python Application.

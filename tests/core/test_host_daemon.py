@@ -39,6 +39,7 @@ class TestHostDaemon(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
+        cls.app.life_service.close()
         cls.temp_dir.cleanup()
 
     def test_health_endpoint(self) -> None:
@@ -66,6 +67,89 @@ class TestHostDaemon(unittest.TestCase):
             data = json.loads(resp.read().decode())
             self.assertEqual(data["status"], "succeeded")
             self.assertEqual(data["request_id"], "req-daemon-test-01")
+
+    def test_rpc_reminder_flow(self) -> None:
+        create_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-daemon-rem-01",
+            "operation": "reminder.create",
+            "arguments": {
+                "reminder_id": "rem-daemon-01",
+                "title": "Edge check",
+                "due_at": "2026-10-15T12:00:00Z",
+            },
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(create_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+            self.assertEqual(data["result"]["reminder_id"], "rem-daemon-01")
+
+        list_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-daemon-rem-02",
+            "operation": "reminder.list",
+            "arguments": {},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req2 = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(list_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req2) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+            self.assertTrue(len(data["result"]["items"]) >= 1)
+
+    def test_rpc_note_flow(self) -> None:
+        note_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-daemon-note-01",
+            "operation": "note.create",
+            "arguments": {
+                "note_id": "note-daemon-01",
+                "title": "Meeting memo",
+                "content": "Discuss architecture baseline",
+                "tags": ["work"],
+            },
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(note_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+            self.assertEqual(data["result"]["note_id"], "note-daemon-01")
+
+        get_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-daemon-note-02",
+            "operation": "note.get",
+            "arguments": {"note_id": "note-daemon-01"},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req2 = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(get_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req2) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+            self.assertEqual(data["result"]["title"], "Meeting memo")
 
 
 if __name__ == "__main__":

@@ -86,10 +86,15 @@ class DeskAgentHostApp:
         # Life - Reminders & Notes
         self.router.register("reminder.create", self._handle_reminder_create)
         self.router.register("reminder.list", self._handle_reminder_list)
+        self.router.register("reminder.update", self._handle_reminder_update)
+        self.router.register("reminder.delete", self._handle_reminder_delete)
         self.router.register("reminder.complete", self._handle_reminder_complete)
         self.router.register("reminder.snooze", self._handle_reminder_snooze)
+        self.router.register("reminder.stop_ringing", self._handle_reminder_stop_ringing)
         self.router.register("note.create", self._handle_note_create)
+        self.router.register("note.get", self._handle_note_get)
         self.router.register("note.list", self._handle_note_list)
+        self.router.register("note.delete", self._handle_note_delete)
 
         # Camera & Hardware resources
         self.router.register("resource.camera.acquire", self._handle_camera_acquire)
@@ -128,6 +133,20 @@ class DeskAgentHostApp:
         items = self.life_service.list_reminders(status=status_filter)
         return ResponseEnvelope.create_success(req.request_id, {"items": items})
 
+    def _handle_reminder_update(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments
+        res = self.life_service.update_reminder(
+            reminder_id=args["reminder_id"],
+            title=args.get("title"),
+            due_at=args.get("due_at"),
+            repeat_rule=args.get("repeat_rule"),
+        )
+        return ResponseEnvelope.create_success(req.request_id, res)
+
+    def _handle_reminder_delete(self, req: RequestEnvelope) -> ResponseEnvelope:
+        deleted = self.life_service.delete_reminder(req.arguments["reminder_id"])
+        return ResponseEnvelope.create_success(req.request_id, {"deleted": deleted})
+
     def _handle_reminder_complete(self, req: RequestEnvelope) -> ResponseEnvelope:
         item = self.life_service.complete_reminder(req.arguments["reminder_id"])
         return ResponseEnvelope.create_success(req.request_id, item)
@@ -137,10 +156,15 @@ class DeskAgentHostApp:
         item = self.life_service.snooze_reminder(req.arguments["reminder_id"], snooze_min)
         return ResponseEnvelope.create_success(req.request_id, item)
 
+    def _handle_reminder_stop_ringing(self, req: RequestEnvelope) -> ResponseEnvelope:
+        item = self.life_service.stop_ringing(req.arguments["occurrence_id"])
+        return ResponseEnvelope.create_success(req.request_id, item)
+
     def _handle_note_create(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
         res = self.life_service.create_note(
             note_id=args.get("note_id", req.request_id),
+            title=args.get("title", "Untitled"),
             content=args["content"],
             tags=args.get("tags"),
         )
@@ -148,8 +172,25 @@ class DeskAgentHostApp:
 
     def _handle_note_list(self, req: RequestEnvelope) -> ResponseEnvelope:
         tag_filter = req.arguments.get("tag")
-        items = self.life_service.list_notes(tag=tag_filter)
+        query_filter = req.arguments.get("query")
+        items = self.life_service.list_notes(query=query_filter, tag=tag_filter)
         return ResponseEnvelope.create_success(req.request_id, {"items": items})
+
+    def _handle_note_get(self, req: RequestEnvelope) -> ResponseEnvelope:
+        note_id = req.arguments["note_id"]
+        item = self.life_service.get_note(note_id)
+        if not item:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="RESOURCE_NOT_FOUND",
+                message=f"Note '{note_id}' not found",
+            )
+        return ResponseEnvelope.create_success(req.request_id, item)
+
+    def _handle_note_delete(self, req: RequestEnvelope) -> ResponseEnvelope:
+        note_id = req.arguments["note_id"]
+        deleted = self.life_service.delete_note(note_id)
+        return ResponseEnvelope.create_success(req.request_id, {"deleted": deleted})
 
     def _handle_camera_acquire(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")

@@ -58,6 +58,9 @@ int desk_hardware_audio_play_stop(void)
     return 0;
 }
 
+static char s_current_preset[32] = "idle";
+static char s_current_status[64] = "Ready";
+
 int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms)
 {
     /* Enforce strict mechanical clamping */
@@ -66,14 +69,21 @@ int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duratio
     if (tilt_deg < DESK_MOTION_TILT_MIN_DEG) tilt_deg = DESK_MOTION_TILT_MIN_DEG;
     if (tilt_deg > DESK_MOTION_TILT_MAX_DEG) tilt_deg = DESK_MOTION_TILT_MAX_DEG;
 
-    if (desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE, 50) != DESK_ARBITER_OK) {
-        return -1; /* Gimbal locked or busy */
+    desk_resource_owner_t current = desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL);
+    bool need_release = false;
+    if (current == DESK_OWNER_NONE) {
+        if (desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE, 50) != DESK_ARBITER_OK) {
+            return -1; /* Gimbal locked or busy */
+        }
+        need_release = true;
     }
 
     s_current_pan = pan_deg;
     s_current_tilt = tilt_deg;
 
-    desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
+    if (need_release) {
+        desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
+    }
     return 0;
 }
 
@@ -119,6 +129,27 @@ int desk_hardware_camera_stream_stop(void)
 
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text)
 {
+    if (preset_name) {
+        strncpy(s_current_preset, preset_name, sizeof(s_current_preset) - 1);
+        s_current_preset[sizeof(s_current_preset) - 1] = '\0';
+    }
+    if (status_text) {
+        strncpy(s_current_status, status_text, sizeof(s_current_status) - 1);
+        s_current_status[sizeof(s_current_status) - 1] = '\0';
+    }
+    return 0;
+}
+
+int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len, char *out_status, size_t max_status_len)
+{
+    if (out_preset && max_preset_len > 0) {
+        strncpy(out_preset, s_current_preset, max_preset_len - 1);
+        out_preset[max_preset_len - 1] = '\0';
+    }
+    if (out_status && max_status_len > 0) {
+        strncpy(out_status, s_current_status, max_status_len - 1);
+        out_status[max_status_len - 1] = '\0';
+    }
     return 0;
 }
 

@@ -63,9 +63,87 @@
   </div>
 
   <script>
-    function sendMotion(action) {
-      console.log("Dispatching motion action:", action);
+    const clientId = "web-client-" + Math.random().toString(36).substring(2, 9);
+    let leaseActive = false;
+    let heartbeatTimer = null;
+    let frameTimer = null;
+
+    async function rpcCall(operation, args = {}) {
+      try {
+        const resp = await fetch("/api/rpc", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            schema_version: "1.0.0",
+            request_id: "req-" + Date.now(),
+            operation: operation,
+            client_id: clientId,
+            arguments: args,
+            expires_at: new Date(Date.now() + 5000).toISOString()
+          })
+        });
+        return await resp.json();
+      } catch (err) {
+        console.error("RPC call failed:", err);
+        return { status: "failed", error: { message: err.message } };
+      }
     }
+
+    async function acquireCameraLease() {
+      const res = await rpcCall("resource.camera.acquire", { client_id: clientId, lease_duration_ms: 10000 });
+      if (res.status === "succeeded" && res.result && res.result.granted) {
+        leaseActive = true;
+        document.getElementById("frameStats").innerText = "租约: 激活 (Active) | 帧率: 连接中";
+        startPolling();
+      } else {
+        leaseActive = false;
+        const reason = res.error ? res.error.message : (res.result ? res.result.reason : "未知错误");
+        document.getElementById("videoPlaceholder").innerText = "无法获取租约: " + reason;
+        document.getElementById("frameStats").innerText = "租约: 被拒绝 (" + reason + ")";
+      }
+    }
+
+    async function releaseCameraLease() {
+      if (leaseActive) {
+        await rpcCall("resource.camera.release", { client_id: clientId });
+        leaseActive = false;
+        clearInterval(heartbeatTimer);
+        clearInterval(frameTimer);
+        document.getElementById("videoPlaceholder").innerText = "查看会话已关闭";
+        document.getElementById("frameStats").innerText = "租约: 已释放";
+      }
+    }
+
+    function startPolling() {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (frameTimer) clearInterval(frameTimer);
+
+      // Heartbeat lease renewal every 5 seconds
+      heartbeatTimer = setInterval(async () => {
+        if (!leaseActive) return;
+        const res = await rpcCall("resource.camera.acquire", { client_id: clientId, lease_duration_ms: 10000 });
+        if (res.status !== "succeeded" || !res.result || !res.result.granted) {
+          leaseActive = false;
+          document.getElementById("frameStats").innerText = "租约续订失败，已断开";
+        }
+      }, 5000);
+    }
+
+    async function sendMotion(action) {
+      console.log("Dispatching motion action:", action);
+      let pan = 90, tilt = 120;
+      if (action === "pan_left") pan = 60;
+      if (action === "pan_right") pan = 120;
+      if (action === "tilt_up") tilt = 135;
+      if (action === "tilt_down") tilt = 105;
+
+      const res = await rpcCall("resource.motion.move", { action: action, pan: pan, tilt: tilt });
+      console.log("Motion response:", res);
+    }
+
+    // Auto-acquire on load and release on unload
+    window.addEventListener("load", acquireCameraLease);
+    window.addEventListener("beforeunload", releaseCameraLease);
   </script>
 </body>
 </html>

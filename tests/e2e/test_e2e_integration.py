@@ -6,6 +6,7 @@ HA execution with state confirmation, Codex task lifecycle, and Camera lease arb
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,8 +15,21 @@ from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, Respo
 from host.desk_agent.core.router import Router
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
-from companion.src.codex_companion import CodexCompanion
+from companion.src.codex_companion import CodexCompanion, JsonRpcTransport
 from host.desk_agent.camera.camera_service import CameraViewerService
+
+
+class E2EMockCodexTransport(JsonRpcTransport):
+    def send_request(self, method: str, params: dict) -> dict:
+        if method == "initialize":
+            return {"serverInfo": {"name": "MockCodexServer", "version": "1.0.0"}}
+        elif method == "thread/start":
+            return {"thread_id": "thr_e2e_001"}
+        elif method == "turn/start":
+            return {"turn_id": "turn_e2e_001", "state": "running"}
+        elif method == "turn/approval/respond":
+            return {"status": "applied"}
+        return {}
 
 
 class TestDeskAgentE2E(unittest.TestCase):
@@ -25,7 +39,10 @@ class TestDeskAgentE2E(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "test_desk_agent.db"
         self.life_service = LifeService(self.db_path)
         self.ha_connector = HAConnector()
-        self.codex_companion = CodexCompanion()
+        self.codex_companion = CodexCompanion(
+            allowed_workspaces={"epanda-desk-agent": os.path.realpath(self.temp_dir.name)},
+            transport=E2EMockCodexTransport(),
+        )
         self.camera_service = CameraViewerService()
 
         # Register router handlers
@@ -36,6 +53,7 @@ class TestDeskAgentE2E(unittest.TestCase):
         self.router.register("codex.respond_approval", self._handle_codex_approval)
 
     def tearDown(self) -> None:
+        self.life_service.close()
         self.temp_dir.cleanup()
 
     def _handle_ha_get_state(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -154,6 +172,7 @@ class TestDeskAgentE2E(unittest.TestCase):
         restarted_service.complete_reminder("rem-standup-01")
         item_done = restarted_service.get_reminder("rem-standup-01")
         self.assertEqual(item_done["status"], "completed")
+        restarted_service.close()
 
     def test_codex_companion_task_and_approval_flow(self) -> None:
         # Submit task
