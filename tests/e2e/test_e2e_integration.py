@@ -241,6 +241,46 @@ class TestDeskAgentE2E(unittest.TestCase):
         self.assertTrue(self.camera_service.release_lease("client-web-01"))
         self.assertFalse(self.camera_service.is_lease_valid())
 
+    def test_firmware_to_host_tool_call_flow(self) -> None:
+        """
+        Verifies end-to-end tool call dispatch flow:
+        Simulated firmware envelope arrives -> Host Router routes -> Service processes -> Dynamic response returned.
+        Also verifies reminder creation followed by due occurrence evaluation and ringing outbox dispatch.
+        """
+        # 1. Firmware requests reminder creation via Router
+        req_rem = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-fw-rem-01",
+            operation="reminder.create",
+            arguments={
+                "reminder_id": "rem-fw-01",
+                "title": "Drink warm water",
+                "due_at": "2026-10-15T09:00:00Z",
+                "priority": "high",
+            },
+            expires_at="2030-01-01T00:00:00Z",
+        )
+        resp_rem = self.router.dispatch(req_rem)
+        self.assertEqual(resp_rem.status, ResponseStatus.SUCCEEDED)
+        self.assertEqual(resp_rem.result["reminder_id"], "rem-fw-01")
+
+        # 2. Verify reminder is retrieved and occurrence is generated
+        due_items = self.life_service.get_due_occurrences("2026-10-15T09:30:00Z")
+        self.assertEqual(len(due_items), 1)
+        occ = due_items[0]
+        self.assertEqual(occ["reminder_id"], "rem-fw-01")
+
+        # 3. Mark occurrence ringing and queue proactive notification outbox message
+        self.life_service.mark_occurrence_ringing(occ["occurrence_id"])
+        self.life_service.queue_outbox_message(
+            topic="reminder.alert",
+            payload={"occurrence_id": occ["occurrence_id"], "reminder_id": "rem-fw-01", "title": "Drink warm water"},
+        )
+        outbox = self.life_service.get_pending_outbox_messages(limit=5)
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(outbox[0]["topic"], "reminder.alert")
+        self.assertEqual(outbox[0]["payload"]["reminder_id"], "rem-fw-01")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,11 +47,13 @@ typedef struct {
     char magic[4];          /* "WSPK" */
     uint8_t frame_type;     /* 1: Audio, 2: Camera JPEG, 3: Data */
     uint8_t flags;          /* Flags, e.g. 0x01: EOS, 0x02: Keyframe */
-    uint16_t stream_id;     /* Stream ID (Big-Endian network order) */
-    uint32_t sequence;      /* Packet sequence (Big-Endian network order) */
-    uint32_t payload_size;  /* Payload length (Big-Endian network order) */
+    uint16_t stream_id;     /* Stream ID (Little-Endian per official SDK) */
+    uint32_t sequence;      /* Packet sequence (Little-Endian) */
+    uint32_t payload_size;  /* Payload length (Little-Endian) */
 } desk_wspk_header_t;
 #pragma pack(pop)
+
+#define DESK_WSPK_LEGACY_HEADER_SIZE 14
 
 typedef int (*desk_sdk_outbound_send_cb_t)(const char *data, size_t len, void *user_data);
 typedef int (*desk_sdk_tool_response_cb_t)(const char *response_envelope_json, void *user_data);
@@ -82,7 +84,7 @@ int desk_sdk_bridge_register_outbound(desk_sdk_outbound_send_cb_t cb, void *user
 int desk_sdk_bridge_register_tool_response_cb(desk_sdk_tool_response_cb_t cb, void *user_data);
 
 /**
- * @brief Pack WSPK binary header.
+ * @brief Pack WSPK binary header (16-byte Little Endian <4sBBHII).
  */
 int desk_wspk_pack_header(uint8_t frame_type,
                           uint8_t flags,
@@ -93,19 +95,32 @@ int desk_wspk_pack_header(uint8_t frame_type,
                           size_t buf_len);
 
 /**
- * @brief Unpack and validate WSPK binary header.
+ * @brief Unpack and validate WSPK binary header (supports 16-byte and 14-byte legacy).
  */
 int desk_wspk_unpack_header(const uint8_t *buf,
                             size_t buf_len,
                             desk_wspk_header_t *out_hdr);
 
 /**
+ * @brief Pack a complete WSPK media frame (Header + Payload).
+ */
+int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
+                                     uint8_t flags,
+                                     uint16_t stream_id,
+                                     uint32_t sequence,
+                                     const uint8_t *payload,
+                                     size_t payload_len,
+                                     uint8_t *out_buf,
+                                     size_t max_buf_len,
+                                     size_t *out_len);
+
+/**
+ * @brief Process UDP pairing request (port 37021 protocol watcher_lan_pairing_v1).
+ */
+int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len);
+
+/**
  * @brief Process incoming JSON command from Python SDK client.
- *
- * @param json_in Raw JSON command string.
- * @param out_buf Buffer to store JSON response string.
- * @param max_out_len Maximum capacity of out_buf.
- * @return 0 on success, negative error code on failure.
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
 
@@ -131,6 +146,26 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json);
  * @brief Handle external tool response envelope returned by Python Application.
  */
 int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json);
+
+/**
+ * @brief Start local socket server for SDK and test clients.
+ */
+int desk_sdk_socket_server_start(uint16_t port);
+
+/**
+ * @brief Poll and process socket events.
+ */
+int desk_sdk_socket_server_poll(int timeout_ms);
+
+/**
+ * @brief Stop local socket server.
+ */
+int desk_sdk_socket_server_stop(void);
+
+/**
+ * @brief Get currently bound socket port.
+ */
+int desk_sdk_socket_server_get_port(void);
 
 #ifdef __cplusplus
 }

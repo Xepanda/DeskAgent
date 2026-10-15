@@ -94,6 +94,17 @@ class TestTClawDialogue(unittest.TestCase):
             ctypes.c_char_p,
         ]
 
+        SPEECH_STREAM_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_bool, ctypes.c_void_p)
+        cls.SPEECH_STREAM_CB = SPEECH_STREAM_CB
+        cls.lib.desk_tclaw_register_speech_stream_cb.restype = ctypes.c_int
+        cls.lib.desk_tclaw_register_speech_stream_cb.argtypes = [SPEECH_STREAM_CB, ctypes.c_void_p]
+
+        cls.lib.desk_tclaw_get_last_response.restype = ctypes.c_int
+        cls.lib.desk_tclaw_get_last_response.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+
+        cls.lib.desk_tclaw_get_turn_count.restype = ctypes.c_int
+        cls.lib.desk_tclaw_get_turn_count.argtypes = []
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
@@ -169,6 +180,67 @@ class TestTClawDialogue(unittest.TestCase):
         self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_SPEAKING)
         self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_TCLAW_VOICE)
 
+        # Verify dynamic response text reflects tool result rather than fixed text
+        resp_buf = ctypes.create_string_buffer(512)
+        self.lib.desk_tclaw_get_last_response(resp_buf, 512)
+        resp_text = resp_buf.value.decode("utf-8")
+        self.assertIn("Action completed successfully", resp_text)
+        self.assertIn("status", resp_text)
+
         # End of turn
         self.lib.desk_tclaw_interrupt()
         self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_IDLE)
+
+    def test_intent_recognition_and_tool_dispatch(self) -> None:
+        """Verifies natural speech intent parses into external tool calls."""
+        dispatched = []
+        @TOOL_DISPATCH_CB
+        def dispatcher(env_ptr, user_data):
+            dispatched.append(json.loads(ctypes.string_at(env_ptr).decode("utf-8")))
+            return 0
+
+        self.lib.desk_tclaw_register_tool_dispatcher(dispatcher, None)
+
+        # 1. Light intent -> ha.call_service
+        self.lib.desk_tclaw_inject_text(b"Please turn on the light in the office")
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["operation"], "ha.call_service")
+        self.assertEqual(dispatched[0]["arguments"]["entity_id"], "light.desk_lamp")
+
+        # 2. Reminder intent -> life.create_reminder
+        self.lib.desk_tclaw_inject_text(b"Set a reminder for my meeting")
+        self.assertEqual(len(dispatched), 2)
+        self.assertEqual(dispatched[1]["operation"], "life.create_reminder")
+
+        # 3. Camera intent -> camera.capture
+        self.lib.desk_tclaw_inject_text(b"Take a camera snapshot")
+        self.assertEqual(len(dispatched), 3)
+        self.assertEqual(dispatched[2]["operation"], "camera.capture")
+
+    def test_contextual_response_and_token_streaming(self) -> None:
+        """Verifies conversational response echoes context dynamically and streams speech tokens."""
+        streamed_tokens = []
+        def on_stream(token_ptr, is_final, user_data):
+            streamed_tokens.append((ctypes.string_at(token_ptr).decode("utf-8"), is_final))
+
+        cb_holder = self.SPEECH_STREAM_CB(on_stream)
+        self.lib.desk_tclaw_register_speech_stream_cb(cb_holder, None)
+
+        # Non-tool conversational prompt
+        prompt = b"What time is it right now?"
+        self.lib.desk_tclaw_inject_text(prompt)
+
+        # Verify response text is contextual and NOT hardcoded "Processed response"
+        resp_buf = ctypes.create_string_buffer(512)
+        self.lib.desk_tclaw_get_last_response(resp_buf, 512)
+        resp_text = resp_buf.value.decode("utf-8")
+
+        self.assertNotIn("Processed response", resp_text)
+        self.assertIn("What time is it right now?", resp_text)
+
+        # Verify streaming tokens
+        self.assertGreater(len(streamed_tokens), 0)
+        self.assertTrue(streamed_tokens[-1][1], "Last token must have is_final=True")
+        full_streamed = " ".join(t[0] for t in streamed_tokens)
+        self.assertEqual(full_streamed, resp_text)
+

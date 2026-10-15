@@ -152,6 +152,38 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_sdk_bridge_handle_tool_response.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_handle_tool_response.argtypes = [ctypes.c_char_p]
 
+        cls.lib.desk_sdk_bridge_process_pairing_udp.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_process_pairing_udp.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+
+        cls.lib.desk_sdk_bridge_pack_media_frame.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_pack_media_frame.argtypes = [
+            ctypes.c_uint8,
+            ctypes.c_uint8,
+            ctypes.c_uint16,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+
+        cls.lib.desk_sdk_socket_server_start.restype = ctypes.c_int
+        cls.lib.desk_sdk_socket_server_start.argtypes = [ctypes.c_uint16]
+
+        cls.lib.desk_sdk_socket_server_get_port.restype = ctypes.c_int
+        cls.lib.desk_sdk_socket_server_get_port.argtypes = []
+
+        cls.lib.desk_sdk_socket_server_poll.restype = ctypes.c_int
+        cls.lib.desk_sdk_socket_server_poll.argtypes = [ctypes.c_int]
+
+        cls.lib.desk_sdk_socket_server_stop.restype = ctypes.c_int
+        cls.lib.desk_sdk_socket_server_stop.argtypes = []
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
@@ -383,3 +415,134 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(len(received_responses), 1)
         resp_parsed = json.loads(received_responses[0])
         self.assertEqual(resp_parsed["request_id"], "req-tclaw-9988")
+
+    def test_udp_pairing_protocol_exchange(self) -> None:
+        """Verifies UDP pair.request handling and pair.accept generation per watcher_lan_pairing_v1."""
+        pair_req = json.dumps({
+            "type": "pair.request",
+            "protocol": "watcher-lan-pairing",
+            "version": "1.0",
+            "request_id": "21a9dbf05ea3443480e62076f79a3b12",
+            "daemon_instance_id": "f730f29e670c49f7a3320c4314eb9805",
+            "pairing_code": "123456",
+            "target_mode": "python_sdk",
+            "websocket_port": 8765,
+        })
+        out_buf = ctypes.create_string_buffer(1024)
+        rc = self.lib.desk_sdk_bridge_process_pairing_udp(pair_req.encode("utf-8"), out_buf, 1024)
+        self.assertEqual(rc, 0)
+
+        rsp = json.loads(out_buf.value.decode("utf-8"))
+        self.assertEqual(rsp["type"], "pair.accept")
+        self.assertEqual(rsp["protocol"], "watcher-lan-pairing")
+        self.assertEqual(rsp["version"], "1.0")
+        self.assertEqual(rsp["request_id"], "21a9dbf05ea3443480e62076f79a3b12")
+        self.assertEqual(rsp["daemon_instance_id"], "f730f29e670c49f7a3320c4314eb9805")
+        self.assertEqual(rsp["target_mode"], "python_sdk")
+        self.assertEqual(len(rsp["session_token"]), 64)
+
+    def test_hardware_hello_handshake_with_audio_negotiation(self) -> None:
+        """Verifies sys.client.hello with role=hardware negotiates Opus audio uplink per contract."""
+        hardware_hello = json.dumps({
+            "type": "sys.client.hello",
+            "code": 0,
+            "data": {
+                "role": "hardware",
+                "pairing_protocol": "watcher-lan-pairing",
+                "pairing_version": "1.0",
+                "pair_request_id": "21a9dbf05ea3443480e62076f79a3b12",
+                "daemon_instance_id": "f730f29e670c49f7a3320c4314eb9805",
+                "session_token": "f84a1e16ce6f35f14d167f227a93ea93d1a9c4d9eb5517112030f2839d57ae4b",
+                "mode": "python_sdk",
+            },
+        })
+        out_buf = ctypes.create_string_buffer(2048)
+        rc = self.lib.desk_sdk_bridge_process_command(hardware_hello.encode("utf-8"), out_buf, 2048)
+        self.assertEqual(rc, 0)
+
+        rsp = json.loads(out_buf.value.decode("utf-8"))
+        self.assertEqual(rsp["type"], "sys.ack")
+        self.assertEqual(rsp["code"], 0)
+        self.assertEqual(rsp["data"]["role"], "hardware")
+        self.assertEqual(rsp["data"]["session_state"], "connected")
+        audio_up = rsp["data"]["negotiated"]["audio_uplink"]
+        self.assertEqual(audio_up["codec"], "opus")
+        self.assertEqual(audio_up["sample_rate"], 16000)
+        self.assertEqual(audio_up["channels"], 1)
+
+    def test_media_frame_pack_and_unpack(self) -> None:
+        """Verifies packaging complete WSPK binary media frames with Little-Endian headers."""
+        payload = b"TEST_AUDIO_PAYLOAD_BYTES"
+        out_buf = ctypes.create_string_buffer(128)
+        out_len = ctypes.c_size_t()
+
+        rc = self.lib.desk_sdk_bridge_pack_media_frame(
+            1, 0, 42, 100, payload, len(payload), out_buf, 128, ctypes.byref(out_len)
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out_len.value, 16 + len(payload))
+
+        # Check raw bytes
+        raw = bytes(out_buf.raw[:out_len.value])
+        self.assertEqual(raw[:4], b"WSPK")
+        import struct
+        magic, f_type, flags, s_id, seq, p_size = struct.unpack("<4sBBHII", raw[:16])
+        self.assertEqual(f_type, 1)
+        self.assertEqual(s_id, 42)
+        self.assertEqual(seq, 100)
+        self.assertEqual(p_size, len(payload))
+        self.assertEqual(raw[16:], payload)
+
+    def test_live_tcp_socket_communication(self) -> None:
+        """Verifies live TCP socket server startup, connection, JSON command processing, and event dispatch."""
+        import socket
+        import time
+
+        # Start socket server on ephemeral port (127.0.0.1)
+        rc = self.lib.desk_sdk_socket_server_start(0)
+        self.assertEqual(rc, 0)
+
+        port = self.lib.desk_sdk_socket_server_get_port()
+        self.assertGreater(port, 1024)
+
+        # Connect a real TCP socket client
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_sock.connect(("127.0.0.1", port))
+        client_sock.settimeout(2.0)
+
+        # Poll server to accept client
+        self.lib.desk_sdk_socket_server_poll(100)
+
+        # Send sys.ping over TCP
+        ping_msg = json.dumps({"type": "sys.ping"}).encode("utf-8")
+        client_sock.sendall(ping_msg)
+
+        # Poll server to process command
+        self.lib.desk_sdk_socket_server_poll(100)
+
+        # Read response from socket
+        resp_data = client_sock.recv(1024).decode("utf-8").strip()
+        resp_json = json.loads(resp_data)
+        self.assertEqual(resp_json["type"], "sys.pong")
+
+        # Send motion.move over TCP
+        move_msg = json.dumps({"type": "motion.move", "pan_deg": 110.0, "tilt_deg": 115.0, "duration_ms": 300}).encode("utf-8")
+        client_sock.sendall(move_msg)
+        self.lib.desk_sdk_socket_server_poll(100)
+
+        resp_move = client_sock.recv(1024).decode("utf-8").strip()
+        resp_move_json = json.loads(resp_move)
+        self.assertEqual(resp_move_json["type"], "sys.ack")
+        self.assertEqual(resp_move_json["data"]["status"], "succeeded")
+        self.assertEqual(resp_move_json["data"]["pan_deg"], 110.0)
+
+        # Trigger event and verify socket receives it
+        self.lib.desk_sdk_bridge_send_event(b"device.status", b'{"battery": 95}')
+        event_raw = client_sock.recv(1024).decode("utf-8").strip()
+        event_json = json.loads(event_raw)
+        self.assertEqual(event_json["type"], "device.status")
+        self.assertEqual(event_json["payload"]["battery"], 95)
+
+        client_sock.close()
+        self.lib.desk_sdk_socket_server_stop()
+

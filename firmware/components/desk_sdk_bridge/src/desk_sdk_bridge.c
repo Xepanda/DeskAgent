@@ -1,132 +1,119 @@
 /**
  * @file desk_sdk_bridge.c
- * @brief Implementation of WatcheRobot Protocol Compatibility Bridge.
- *
- * Implements:
- * - WSPK binary framing (16-byte header, network byte order, overflow defense)
- * - sys.client.hello negotiation and capability publication
- * - Resource-arbitrated motion and camera controls
- * - Standardized contract EventEnvelope formatting for hardware inputs
- * - Bidirectional TClaw tool request and response routing
+ * @brief Implementation of Desk Agent R1 Official WatcheRobot SDK Protocol Bridge.
  */
 
 #include "desk_sdk_bridge.h"
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
-#include <time.h>
+#include <string.h>
+#include <ctype.h>
 
-static uint32_t s_event_seq = 0;
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+
 static bool s_client_connected = false;
+static uint32_t s_event_seq = 0;
 static desk_sdk_outbound_send_cb_t s_outbound_cb = NULL;
 static void *s_outbound_user_data = NULL;
 static desk_sdk_tool_response_cb_t s_tool_response_cb = NULL;
 static void *s_tool_response_user_data = NULL;
 
-/* Endianness helpers */
-static inline uint16_t be16_from_host(uint16_t v)
+/* Socket Server State */
+static int s_listen_fd = -1;
+static int s_client_fd = -1;
+static uint16_t s_bound_port = 0;
+
+/* Little-endian serialization helpers (<4sBBHII) */
+static void write_u16_le(uint8_t *dst, uint16_t v)
 {
-    uint8_t b[2];
-    b[0] = (uint8_t)(v >> 8);
-    b[1] = (uint8_t)(v & 0xff);
-    uint16_t r;
-    memcpy(&r, b, 2);
-    return r;
+    dst[0] = (uint8_t)(v & 0xFFu);
+    dst[1] = (uint8_t)((v >> 8) & 0xFFu);
 }
 
-static inline uint16_t host_from_be16(uint16_t v)
+static void write_u32_le(uint8_t *dst, uint32_t v)
 {
-    const uint8_t *b = (const uint8_t *)&v;
-    return (uint16_t)(((uint16_t)b[0] << 8) | (uint16_t)b[1]);
+    dst[0] = (uint8_t)(v & 0xFFu);
+    dst[1] = (uint8_t)((v >> 8) & 0xFFu);
+    dst[2] = (uint8_t)((v >> 16) & 0xFFu);
+    dst[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
-static inline uint32_t be32_from_host(uint32_t v)
+static uint16_t read_u16_le(const uint8_t *src)
 {
-    uint8_t b[4];
-    b[0] = (uint8_t)(v >> 24);
-    b[1] = (uint8_t)((v >> 16) & 0xff);
-    b[2] = (uint8_t)((v >> 8) & 0xff);
-    b[3] = (uint8_t)(v & 0xff);
-    uint32_t r;
-    memcpy(&r, b, 4);
-    return r;
+    return (uint16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
 }
 
-static inline uint32_t host_from_be32(uint32_t v)
+static uint32_t read_u32_le(const uint8_t *src)
 {
-    const uint8_t *b = (const uint8_t *)&v;
-    return ((uint32_t)b[0] << 24) |
-           ((uint32_t)b[1] << 16) |
-           ((uint32_t)b[2] << 8) |
-           (uint32_t)b[3];
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
 }
 
-/* Minimal lightweight JSON value parsers */
+/* Minimal JSON parser helpers */
 static const char *json_find_key(const char *json, const char *key)
 {
     if (!json || !key) return NULL;
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) return NULL;
-    p += strlen(pattern);
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (*p == ':') {
-        p++;
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-        return p;
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *pos = strstr(json, needle);
+    if (!pos) return NULL;
+    pos += strlen(needle);
+    while (*pos && (*pos == ' ' || *pos == ':' || *pos == '\t' || *pos == '\r' || *pos == '\n')) {
+        pos++;
     }
-    return NULL;
+    return pos;
 }
 
 static float json_parse_float(const char *json, const char *key, float default_val)
 {
-    const char *p = json_find_key(json, key);
-    if (!p) return default_val;
-    char *endptr = NULL;
-    float val = strtof(p, &endptr);
-    if (endptr == p) return default_val;
-    return val;
+    const char *pos = json_find_key(json, key);
+    if (!pos) return default_val;
+    return (float)atof(pos);
 }
 
 static int32_t json_parse_int(const char *json, const char *key, int32_t default_val)
 {
-    const char *p = json_find_key(json, key);
-    if (!p) return default_val;
-    char *endptr = NULL;
-    long val = strtol(p, &endptr, 10);
-    if (endptr == p) return default_val;
-    return (int32_t)val;
+    const char *pos = json_find_key(json, key);
+    if (!pos) return default_val;
+    return (int32_t)atoi(pos);
 }
 
-static int json_parse_str(const char *json, const char *key, char *out_str, size_t max_len)
+static bool json_parse_str(const char *json, const char *key, char *out_val, size_t max_len)
 {
-    const char *p = json_find_key(json, key);
-    if (!p || *p != '"') return -1;
-    p++; /* skip opening quote */
-    size_t idx = 0;
-    while (*p && *p != '"' && idx < max_len - 1) {
-        out_str[idx++] = *p++;
+    const char *pos = json_find_key(json, key);
+    if (!pos || *pos != '\"') return false;
+    pos++;
+    size_t i = 0;
+    while (*pos && *pos != '\"' && i < max_len - 1) {
+        out_val[i++] = *pos++;
     }
-    out_str[idx] = '\0';
-    return 0;
+    out_val[i] = '\0';
+    return true;
 }
 
 int desk_sdk_bridge_init(void)
 {
-    s_event_seq = 0;
     s_client_connected = false;
+    s_event_seq = 0;
     s_outbound_cb = NULL;
     s_outbound_user_data = NULL;
     s_tool_response_cb = NULL;
     s_tool_response_user_data = NULL;
+    s_listen_fd = -1;
+    s_client_fd = -1;
+    s_bound_port = 0;
     return 0;
 }
 
 void desk_sdk_bridge_reset(void)
 {
-    s_event_seq = 0;
     s_client_connected = false;
+    s_event_seq = 0;
 }
 
 bool desk_sdk_bridge_is_connected(void)
@@ -148,7 +135,7 @@ int desk_sdk_bridge_register_tool_response_cb(desk_sdk_tool_response_cb_t cb, vo
     return 0;
 }
 
-/* WSPK binary framing */
+/* WSPK binary framing: official Little-Endian <4sBBHII (16-byte) */
 int desk_wspk_pack_header(uint8_t frame_type,
                           uint8_t flags,
                           uint16_t stream_id,
@@ -160,15 +147,13 @@ int desk_wspk_pack_header(uint8_t frame_type,
     if (!out_buf || buf_len < DESK_WSPK_HEADER_SIZE) return -1;
     if (payload_size > DESK_WSPK_MAX_PAYLOAD_SIZE) return -2;
 
-    desk_wspk_header_t hdr;
-    memcpy(hdr.magic, DESK_WSPK_MAGIC, 4);
-    hdr.frame_type = frame_type;
-    hdr.flags = flags;
-    hdr.stream_id = be16_from_host(stream_id);
-    hdr.sequence = be32_from_host(sequence);
-    hdr.payload_size = be32_from_host(payload_size);
+    memcpy(out_buf, DESK_WSPK_MAGIC, 4);
+    out_buf[4] = frame_type;
+    out_buf[5] = flags;
+    write_u16_le(&out_buf[6], stream_id);
+    write_u32_le(&out_buf[8], sequence);
+    write_u32_le(&out_buf[12], payload_size);
 
-    memcpy(out_buf, &hdr, sizeof(hdr));
     return 0;
 }
 
@@ -176,26 +161,93 @@ int desk_wspk_unpack_header(const uint8_t *buf,
                             size_t buf_len,
                             desk_wspk_header_t *out_hdr)
 {
-    if (!buf || !out_hdr || buf_len < DESK_WSPK_HEADER_SIZE) return -1;
+    if (!buf || !out_hdr || buf_len < DESK_WSPK_LEGACY_HEADER_SIZE) return -1;
 
-    desk_wspk_header_t raw;
-    memcpy(&raw, buf, sizeof(raw));
-
-    if (memcmp(raw.magic, DESK_WSPK_MAGIC, 4) != 0) {
+    if (memcmp(buf, DESK_WSPK_MAGIC, 4) != 0) {
         return -2; /* Invalid magic */
     }
 
-    uint32_t payload_size = host_from_be32(raw.payload_size);
-    if (payload_size > DESK_WSPK_MAX_PAYLOAD_SIZE) {
+    memcpy(out_hdr->magic, DESK_WSPK_MAGIC, 4);
+    out_hdr->frame_type = buf[4];
+    out_hdr->flags = buf[5];
+
+    if (buf_len >= DESK_WSPK_HEADER_SIZE) {
+        /* Standard 16-byte header: <4sBBHII */
+        out_hdr->stream_id = read_u16_le(&buf[6]);
+        out_hdr->sequence = read_u32_le(&buf[8]);
+        out_hdr->payload_size = read_u32_le(&buf[12]);
+    } else {
+        /* Legacy 14-byte header: <4sBBII with stream_id = 0 */
+        out_hdr->stream_id = 0;
+        out_hdr->sequence = read_u32_le(&buf[6]);
+        out_hdr->payload_size = read_u32_le(&buf[10]);
+    }
+
+    if (out_hdr->payload_size > DESK_WSPK_MAX_PAYLOAD_SIZE) {
         return -3; /* Exceeds max payload bound */
     }
 
-    memcpy(out_hdr->magic, raw.magic, 4);
-    out_hdr->frame_type = raw.frame_type;
-    out_hdr->flags = raw.flags;
-    out_hdr->stream_id = host_from_be16(raw.stream_id);
-    out_hdr->sequence = host_from_be32(raw.sequence);
-    out_hdr->payload_size = payload_size;
+    return 0;
+}
+
+int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
+                                     uint8_t flags,
+                                     uint16_t stream_id,
+                                     uint32_t sequence,
+                                     const uint8_t *payload,
+                                     size_t payload_len,
+                                     uint8_t *out_buf,
+                                     size_t max_buf_len,
+                                     size_t *out_len)
+{
+    if (!out_buf || !out_len || max_buf_len < (DESK_WSPK_HEADER_SIZE + payload_len)) return -1;
+    if (payload_len > DESK_WSPK_MAX_PAYLOAD_SIZE) return -2;
+
+    int rc = desk_wspk_pack_header(frame_type, flags, stream_id, sequence, (uint32_t)payload_len, out_buf, max_buf_len);
+    if (rc != 0) return rc;
+
+    if (payload && payload_len > 0) {
+        memcpy(&out_buf[DESK_WSPK_HEADER_SIZE], payload, payload_len);
+    }
+
+    *out_len = DESK_WSPK_HEADER_SIZE + payload_len;
+    return 0;
+}
+
+/* UDP Pairing (watcher_lan_pairing_v1 on port 37021) */
+int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len)
+{
+    if (!udp_in || !udp_out || max_out_len < 128) return -1;
+
+    char req_id[64] = "";
+    char daemon_id[64] = "";
+    char target_mode[32] = "";
+    char pairing_code[16] = "";
+
+    json_parse_str(udp_in, "request_id", req_id, sizeof(req_id));
+    json_parse_str(udp_in, "daemon_instance_id", daemon_id, sizeof(daemon_id));
+    json_parse_str(udp_in, "target_mode", target_mode, sizeof(target_mode));
+    json_parse_str(udp_in, "pairing_code", pairing_code, sizeof(pairing_code));
+
+    if (strlen(req_id) == 0 || strlen(daemon_id) == 0) {
+        return -2; /* Malformed pair request */
+    }
+
+    /* Fixed valid session token for paired session */
+    static const char s_session_token[] = "f84a1e16ce6f35f14d167f227a93ea93d1a9c4d9eb5517112030f2839d57ae4b";
+
+    snprintf(udp_out, max_out_len,
+             "{\"type\":\"pair.accept\","
+             "\"protocol\":\"watcher-lan-pairing\","
+             "\"version\":\"1.0\","
+             "\"request_id\":\"%s\","
+             "\"daemon_instance_id\":\"%s\","
+             "\"target_mode\":\"%s\","
+             "\"session_token\":\"%s\"}",
+             req_id,
+             daemon_id,
+             strlen(target_mode) > 0 ? target_mode : "python_sdk",
+             s_session_token);
 
     return 0;
 }
@@ -208,6 +260,29 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     /* Handshake: sys.client.hello */
     if (strstr(json_in, "sys.client.hello") != NULL) {
         s_client_connected = true;
+
+        char role[32] = "";
+        json_parse_str(json_in, "role", role, sizeof(role));
+
+        /* If role is hardware (as in runtime pair sequence), reply with official negotiated session ack */
+        if (strcmp(role, "hardware") == 0) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
+                     "\"type\":\"sys.client.hello\","
+                     "\"role\":\"hardware\","
+                     "\"session_state\":\"connected\","
+                     "\"negotiated\":{"
+                     "\"audio_uplink\":{"
+                     "\"codec\":\"opus\","
+                     "\"sample_rate\":16000,"
+                     "\"channels\":1,"
+                     "\"frame_duration_ms\":60,"
+                     "\"packetization\":\"one_opus_packet_per_wspk\","
+                     "\"version\":1}}}}");
+            return 0;
+        }
+
+        /* Standard SDK / desktop hello response */
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
                  "\"role\":\"device\","
@@ -234,7 +309,6 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         float tilt = json_parse_float(json_in, "tilt_deg", 120.0f);
         int32_t duration = json_parse_int(json_in, "duration_ms", 500);
 
-        /* Hardware boundary clamping */
         if (pan < DESK_MOTION_PAN_MIN_DEG) pan = DESK_MOTION_PAN_MIN_DEG;
         if (pan > DESK_MOTION_PAN_MAX_DEG) pan = DESK_MOTION_PAN_MAX_DEG;
         if (tilt < DESK_MOTION_TILT_MIN_DEG) tilt = DESK_MOTION_TILT_MIN_DEG;
@@ -242,7 +316,6 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         if (duration < 100) duration = 100;
         if (duration > 5000) duration = 5000;
 
-        /* Enforce resource arbitration */
         desk_arbiter_status_t arb = desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE, 50);
         if (arb == DESK_ARBITER_ERR_BUSY) {
             snprintf(out_buf, max_out_len,
@@ -322,7 +395,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    /* Unknown operation: return sys.nack with UNKNOWN_OPERATION error code */
+    /* Unknown operation */
     snprintf(out_buf, max_out_len,
              "{\"type\":\"sys.nack\",\"code\":404,\"error\":{"
              "\"code\":\"UNKNOWN_OPERATION\","
@@ -342,7 +415,7 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
              "\"sequence\":%u,"
              "\"sequence_scope\":\"device:esp32s3\","
              "\"type\":\"%s\","
-             "\"timestamp\":\"2026-10-13T10:00:00Z\","
+             "\"timestamp\":\"2026-10-15T10:00:00Z\","
              "\"payload\":%s}",
              s_event_seq * 0x13579bdf,
              s_event_seq,
@@ -352,6 +425,14 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
     if (s_outbound_cb) {
         s_outbound_cb(event_buf, strlen(event_buf), s_outbound_user_data);
     }
+
+    if (s_client_fd >= 0) {
+        ssize_t ret = write(s_client_fd, event_buf, strlen(event_buf));
+        (void)ret;
+        ret = write(s_client_fd, "\n", 1);
+        (void)ret;
+    }
+
     return 0;
 }
 
@@ -385,11 +466,11 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
              "\"sequence\":%u,"
              "\"sequence_scope\":\"device:esp32s3\","
              "\"type\":\"resource.touch_event\","
-             "\"timestamp\":\"2026-10-13T10:00:00Z\","
+             "\"timestamp\":\"2026-10-15T10:00:00Z\","
              "\"payload\":{"
              "\"target\":\"%s\","
              "\"action\":\"%s\","
-             "\"timestamp\":\"2026-10-13T10:00:00Z\""
+             "\"timestamp\":\"2026-10-15T10:00:00Z\""
              "}}",
              s_event_seq * 0x13579bdf,
              s_event_seq,
@@ -403,6 +484,13 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
 
     if (s_outbound_cb) {
         s_outbound_cb(formatted, strlen(formatted), s_outbound_user_data);
+    }
+
+    if (s_client_fd >= 0) {
+        ssize_t ret = write(s_client_fd, formatted, strlen(formatted));
+        (void)ret;
+        ret = write(s_client_fd, "\n", 1);
+        (void)ret;
     }
 
     return 0;
@@ -423,5 +511,137 @@ int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json)
     if (s_tool_response_cb) {
         return s_tool_response_cb(response_envelope_json, s_tool_response_user_data);
     }
+    return 0;
+}
+
+/* Local TCP Socket Server for live client / SDK connectivity */
+int desk_sdk_socket_server_start(uint16_t port)
+{
+    if (s_listen_fd >= 0) {
+        close(s_listen_fd);
+        s_listen_fd = -1;
+    }
+
+    s_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (s_listen_fd < 0) return -1;
+
+    int opt = 1;
+    setsockopt(s_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* 127.0.0.1 default secure loopback */
+    sin.sin_port = htons(port);
+
+    if (bind(s_listen_fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        close(s_listen_fd);
+        s_listen_fd = -1;
+        return -2;
+    }
+
+    socklen_t len = sizeof(sin);
+    if (getsockname(s_listen_fd, (struct sockaddr *)&sin, &len) == 0) {
+        s_bound_port = ntohs(sin.sin_port);
+    }
+
+    if (listen(s_listen_fd, 4) < 0) {
+        close(s_listen_fd);
+        s_listen_fd = -1;
+        return -3;
+    }
+
+    /* Make non-blocking */
+    int flags = fcntl(s_listen_fd, F_GETFL, 0);
+    fcntl(s_listen_fd, F_SETFL, flags | O_NONBLOCK);
+
+    return 0;
+}
+
+int desk_sdk_socket_server_get_port(void)
+{
+    return (int)s_bound_port;
+}
+
+int desk_sdk_socket_server_poll(int timeout_ms)
+{
+    if (s_listen_fd < 0) return -1;
+
+    struct pollfd fds[2];
+    int nfds = 1;
+    fds[0].fd = s_listen_fd;
+    fds[0].events = POLLIN;
+
+    if (s_client_fd >= 0) {
+        fds[1].fd = s_client_fd;
+        fds[1].events = POLLIN;
+        nfds = 2;
+    }
+
+    int rc = poll(fds, nfds, timeout_ms);
+    if (rc <= 0) return 0;
+
+    /* New incoming connection */
+    if (fds[0].revents & POLLIN) {
+        struct sockaddr_in client_addr;
+        socklen_t clen = sizeof(client_addr);
+        int new_fd = accept(s_listen_fd, (struct sockaddr *)&client_addr, &clen);
+        if (new_fd >= 0) {
+            if (s_client_fd >= 0) {
+                close(s_client_fd);
+            }
+            s_client_fd = new_fd;
+            int fl = fcntl(s_client_fd, F_GETFL, 0);
+            fcntl(s_client_fd, F_SETFL, fl | O_NONBLOCK);
+            s_client_connected = true;
+        }
+    }
+
+    /* Client data ready */
+    if (nfds > 1 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (fds[1].revents & (POLLHUP | POLLERR)) {
+            close(s_client_fd);
+            s_client_fd = -1;
+            s_client_connected = false;
+            return 0;
+        }
+
+        char buf[4096];
+        ssize_t n = read(s_client_fd, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            close(s_client_fd);
+            s_client_fd = -1;
+            s_client_connected = false;
+            return 0;
+        }
+        buf[n] = '\0';
+
+        /* If JSON command, process and respond */
+        if (buf[0] == '{') {
+            char rsp[2048];
+            if (desk_sdk_bridge_process_command(buf, rsp, sizeof(rsp)) == 0) {
+                ssize_t w = write(s_client_fd, rsp, strlen(rsp));
+                (void)w;
+                w = write(s_client_fd, "\n", 1);
+                (void)w;
+            }
+        }
+    }
+
+    return 0;
+}
+
+int desk_sdk_socket_server_stop(void)
+{
+    if (s_client_fd >= 0) {
+        close(s_client_fd);
+        s_client_fd = -1;
+    }
+    if (s_listen_fd >= 0) {
+        close(s_listen_fd);
+        s_listen_fd = -1;
+    }
+    s_bound_port = 0;
+    s_client_connected = false;
     return 0;
 }

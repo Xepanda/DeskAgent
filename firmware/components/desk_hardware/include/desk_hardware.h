@@ -63,8 +63,29 @@ int desk_hardware_init(void);
 int desk_hardware_audio_record_start(uint32_t sample_rate_hz);
 int desk_hardware_audio_record_read(int16_t *pcm_buf, size_t samples, size_t *read_samples);
 int desk_hardware_audio_record_stop(void);
+int desk_hardware_audio_record_inject(const int16_t *pcm_buf, size_t samples);
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
 int desk_hardware_audio_play_stop(void);
+
+typedef void (*desk_hardware_audio_play_cb_t)(const int16_t *pcm_buf,
+                                              size_t samples,
+                                              uint32_t sample_rate_hz,
+                                              void *user_data);
+int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void *user_data);
+
+/* STM32 Coprocessor MCU Frame Definitions */
+#define MCU_FRAME_MAGIC0          0xA5u
+#define MCU_FRAME_MAGIC1          0x5Au
+#define MCU_FRAME_PROTO_VERSION   0x01u
+#define MCU_FRAME_CLASS_MOTION    0x02u
+#define MCU_MOTION_MSG_SERVO_MOVE 0x01u
+#define MCU_MOTION_MSG_SERVO_STOP 0x02u
+
+typedef void (*desk_hardware_mcu_tx_cb_t)(const uint8_t *frame_data,
+                                          size_t frame_len,
+                                          void *user_data);
+int desk_hardware_register_mcu_tx_cb(desk_hardware_mcu_tx_cb_t cb, void *user_data);
+int desk_hardware_get_last_mcu_frame(uint8_t *out_buf, size_t max_len, size_t *out_len);
 
 /* Motion / Gimbal API */
 int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms);
@@ -75,6 +96,8 @@ int desk_hardware_motion_get_position(float *out_pan, float *out_tilt);
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
 int desk_hardware_camera_stream_start(float target_fps, desk_camera_frame_cb_t cb, void *user_data);
 int desk_hardware_camera_stream_stop(void);
+int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, uint32_t timestamp_ms);
+int desk_hardware_camera_stream_pump(void);
 
 /* Display & Expression API */
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text);
@@ -82,6 +105,7 @@ int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len
 
 /* Input Event Subscription */
 int desk_hardware_register_input_cb(desk_touch_event_cb_t cb, void *user_data);
+int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_action_t action);
 
 #ifdef __cplusplus
 }

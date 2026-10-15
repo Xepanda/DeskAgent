@@ -39,7 +39,7 @@ class TestHostDaemon(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
-        cls.app.life_service.close()
+        cls.app.close()
         cls.temp_dir.cleanup()
 
     def test_health_endpoint(self) -> None:
@@ -150,6 +150,130 @@ class TestHostDaemon(unittest.TestCase):
             data = json.loads(resp.read().decode())
             self.assertEqual(data["status"], "succeeded")
             self.assertEqual(data["result"]["title"], "Meeting memo")
+
+    def test_rpc_codex_routes(self) -> None:
+        """Verifies codex.submit_turn and codex.get_task routes registered on Host."""
+        submit_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-daemon-codex-01",
+            "operation": "codex.submit_turn",
+            "arguments": {
+                "task_id": "tsk-host-codex-01",
+                "workspace_alias": "epanda-desk-agent",
+                "prompt": "run tests",
+            },
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(submit_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+            self.assertEqual(data["result"]["task_id"], "tsk-host-codex-01")
+
+        # Query task status via Host
+        get_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-daemon-codex-02",
+            "operation": "codex.get_task",
+            "arguments": {"task_id": "tsk-host-codex-01"},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req2 = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(get_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req2) as resp2:
+            data2 = json.loads(resp2.read().decode())
+            self.assertEqual(data2["status"], "succeeded")
+            self.assertEqual(data2["result"]["task_id"], "tsk-host-codex-01")
+
+    def test_camera_acquire_and_frame_endpoint(self) -> None:
+        """Verifies acquiring camera lease enables /api/camera/frame JPEG stream retrieval."""
+        # 1. Acquire lease
+        acq_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-cam-acq-01",
+            "operation": "resource.camera.acquire",
+            "arguments": {"client_id": "web-viewer-01", "lease_duration_ms": 5000},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(acq_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+            self.assertTrue(data["result"]["granted"])
+
+        # 2. Fetch live frame
+        frame_req = Request(f"http://127.0.0.1:{self.port}/api/camera/frame?client_id=web-viewer-01")
+        with urlopen(frame_req) as frame_resp:
+            self.assertEqual(frame_resp.status, 200)
+            self.assertEqual(frame_resp.headers.get("Content-Type"), "image/jpeg")
+            raw_jpeg = frame_resp.read()
+            self.assertTrue(raw_jpeg.startswith(b"\xff\xd8"))
+
+        # 3. Release lease
+        rel_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-cam-rel-01",
+            "operation": "resource.camera.release",
+            "arguments": {"client_id": "web-viewer-01"},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req_rel = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(rel_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req_rel) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+            self.assertTrue(data["result"]["released"])
+
+    def test_reminder_automatic_scheduler_delivery(self) -> None:
+        """Verifies background ReminderScheduler automatically triggers ringing and outbox alert for due items."""
+        # Create a reminder due 1 minute ago
+        past_time = "2020-01-01T12:00:00Z"
+        create_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-sched-rem-01",
+            "operation": "reminder.create",
+            "arguments": {
+                "reminder_id": "rem-auto-deliver-01",
+                "title": "Immediate Alert",
+                "due_at": past_time,
+            },
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(create_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "succeeded")
+
+        # Allow background scheduler loop (polls every 1.0s) to detect and deliver
+        time.sleep(1.2)
+
+        # Verify outbox has delivered alert message
+        msgs = self.app.life_service.get_pending_outbox_messages(limit=10)
+        delivered_topics = [m["topic"] for m in msgs]
+        self.assertIn("reminder.alert", delivered_topics)
 
 
 if __name__ == "__main__":

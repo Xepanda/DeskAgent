@@ -229,6 +229,24 @@ class LifeService:
             )
             conn.commit()
 
+    def mark_occurrence_ringing(self, occurrence_id: str) -> None:
+        """Transitions occurrence state from pending to ringing and updates reminder status."""
+        now_str = self._now_utc_str()
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute("SELECT reminder_id FROM occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+            if not row:
+                raise KeyError(f"Occurrence '{occurrence_id}' not found")
+            reminder_id = row["reminder_id"]
+            conn.execute(
+                "UPDATE occurrences SET state = 'ringing' WHERE occurrence_id = ?",
+                (occurrence_id,),
+            )
+            conn.execute(
+                "UPDATE reminders SET status = 'ringing', updated_at = ? WHERE reminder_id = ?",
+                (now_str, reminder_id),
+            )
+            conn.commit()
+
     def stop_ringing(self, occurrence_id: str) -> dict[str, Any]:
         """
         User dismisses the active alarm/ringing.
@@ -344,6 +362,25 @@ class LifeService:
                 (now_str, outbox_id),
             )
             conn.commit()
+
+    def queue_outbox_message(self, topic: str, payload: Mapping[str, Any]) -> str:
+        """Alias for enqueue_outbox with topic-oriented signature."""
+        return self.enqueue_outbox(event_type=topic, payload=payload)
+
+    def get_pending_outbox_messages(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Returns pending outbox entries with 'topic' field populated."""
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            result = []
+            for r in rows:
+                item = dict(r)
+                item["topic"] = item["event_type"]
+                item["payload"] = json.loads(item.pop("payload_json", "{}"))
+                result.append(item)
+            return result
 
     # =========================================================================
     # Notes API

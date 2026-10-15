@@ -35,6 +35,16 @@ DESK_ARBITER_ERR_BUSY = 1
 DESK_ARBITER_ERR_INVALID = 2
 DESK_ARBITER_ERR_TIMEOUT = 3
 
+# Touch enums matching desk_hardware.h
+DESK_TOUCH_TARGET_BACKTOUCH = 0
+DESK_TOUCH_TARGET_SCREENTOUCH = 1
+DESK_TOUCH_TARGET_ROLLER = 2
+
+DESK_TOUCH_ACTION_SHORT_PRESS = 0
+DESK_TOUCH_ACTION_LONG_PRESS = 1
+DESK_TOUCH_ACTION_SCROLL_UP = 2
+DESK_TOUCH_ACTION_SCROLL_DOWN = 3
+
 
 class TestDeskHardwareArbiter(unittest.TestCase):
     @classmethod
@@ -107,6 +117,57 @@ class TestDeskHardwareArbiter(unittest.TestCase):
 
         cls.lib.desk_hardware_display_get_expression.restype = ctypes.c_int
         cls.lib.desk_hardware_display_get_expression.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+
+        cls.lib.desk_hardware_get_last_mcu_frame.restype = ctypes.c_int
+        cls.lib.desk_hardware_get_last_mcu_frame.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+
+        cls.lib.desk_hardware_audio_record_start.restype = ctypes.c_int
+        cls.lib.desk_hardware_audio_record_start.argtypes = [ctypes.c_uint32]
+
+        cls.lib.desk_hardware_audio_record_stop.restype = ctypes.c_int
+        cls.lib.desk_hardware_audio_record_stop.argtypes = []
+
+        cls.lib.desk_hardware_audio_record_inject.restype = ctypes.c_int
+        cls.lib.desk_hardware_audio_record_inject.argtypes = [ctypes.POINTER(ctypes.c_int16), ctypes.c_size_t]
+
+        cls.lib.desk_hardware_audio_record_read.restype = ctypes.c_int
+        cls.lib.desk_hardware_audio_record_read.argtypes = [ctypes.POINTER(ctypes.c_int16), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+
+        AUDIO_PLAY_CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_int16), ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p)
+        cls.AUDIO_PLAY_CB = AUDIO_PLAY_CB
+        cls.lib.desk_hardware_register_audio_play_cb.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_audio_play_cb.argtypes = [AUDIO_PLAY_CB, ctypes.c_void_p]
+
+        cls.lib.desk_hardware_audio_play_pcm.restype = ctypes.c_int
+        cls.lib.desk_hardware_audio_play_pcm.argtypes = [ctypes.POINTER(ctypes.c_int16), ctypes.c_size_t, ctypes.c_uint32]
+
+        cls.lib.desk_hardware_audio_play_stop.restype = ctypes.c_int
+        cls.lib.desk_hardware_audio_play_stop.argtypes = []
+
+        CAM_FRAME_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p)
+        cls.CAM_FRAME_CB = CAM_FRAME_CB
+        cls.lib.desk_hardware_camera_stream_start.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_stream_start.argtypes = [ctypes.c_float, CAM_FRAME_CB, ctypes.c_void_p]
+
+        cls.lib.desk_hardware_camera_stream_pump.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_stream_pump.argtypes = []
+
+        cls.lib.desk_hardware_camera_stream_stop.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_stream_stop.argtypes = []
+
+        cls.lib.desk_hardware_camera_inject_frame.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_inject_frame.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
+
+        cls.lib.desk_hardware_camera_capture_jpeg.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_capture_jpeg.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.c_uint32]
+
+        TOUCH_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+        cls.TOUCH_CB = TOUCH_CB
+        cls.lib.desk_hardware_register_input_cb.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_input_cb.argtypes = [TOUCH_CB, ctypes.c_void_p]
+
+        cls.lib.desk_hardware_inject_touch_event.restype = ctypes.c_int
+        cls.lib.desk_hardware_inject_touch_event.argtypes = [ctypes.c_int, ctypes.c_int]
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -186,3 +247,137 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.lib.desk_hardware_display_get_expression(preset_buf, 32, status_buf, 64)
         self.assertEqual(preset_buf.value.decode("utf-8"), "thinking")
         self.assertEqual(status_buf.value.decode("utf-8"), "Processing request...")
+
+    def test_stm32_mcu_frame_protocol_servo_move_and_stop(self) -> None:
+        """Verifies real STM32 MCU binary link packet generation (magic 0xA5 0x5A, CRC16, LE payload)."""
+        # Execute motion move
+        rc = self.lib.desk_hardware_motion_move_to(ctypes.c_float(120.0), ctypes.c_float(110.0), 450)
+        self.assertEqual(rc, 0)
+
+        buf = ctypes.create_string_buffer(64)
+        out_len = ctypes.c_size_t()
+        rc = self.lib.desk_hardware_get_last_mcu_frame(buf, 64, ctypes.byref(out_len))
+        self.assertEqual(rc, 0)
+
+        # 12 header + 9 payload + 2 CRC16 = 23 bytes
+        self.assertEqual(out_len.value, 23)
+        raw = bytes(buf.raw[:23])
+
+        # Header check
+        self.assertEqual(raw[0], 0xA5)
+        self.assertEqual(raw[1], 0x5A)
+        self.assertEqual(raw[2], 0x01) # proto_version
+        self.assertEqual(raw[3], 0x02) # MCU_FRAME_CLASS_MOTION
+        self.assertEqual(raw[4], 0x01) # MCU_MOTION_MSG_SERVO_MOVE
+        self.assertEqual(raw[5], 0x01) # ACK_REQ
+
+        # Payload check (9 bytes)
+        payload = raw[12:21]
+        self.assertEqual(payload[0], 0x03) # axis_mask
+        import struct
+        x_x10, y_x10, duration, profile, source = struct.unpack("<hhHBB", payload[1:])
+        self.assertEqual(x_x10, 1200) # 120.0 deg * 10
+        self.assertEqual(y_x10, 1100) # 110.0 deg * 10
+        self.assertEqual(duration, 450)
+        self.assertEqual(source, 1)
+
+        # Stop command check
+        self.lib.desk_hardware_motion_stop(False)
+        rc = self.lib.desk_hardware_get_last_mcu_frame(buf, 64, ctypes.byref(out_len))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out_len.value, 16) # 12 header + 2 payload + 2 CRC = 16
+        raw_stop = bytes(buf.raw[:16])
+        self.assertEqual(raw_stop[4], 0x02) # MCU_MOTION_MSG_SERVO_STOP
+        self.assertEqual(raw_stop[12], 0x01) # all_pending = 1
+
+    def test_audio_record_ringbuffer_and_playback_callback(self) -> None:
+        """Verifies PCM ring buffer injection, continuous acoustic reading, and playback callback."""
+        # 1. Start audio recording
+        rc = self.lib.desk_hardware_audio_record_start(16000)
+        self.assertEqual(rc, 0)
+
+        # 2. Inject 4 distinct PCM samples
+        test_samples = (ctypes.c_int16 * 4)(100, -200, 300, -400)
+        rc = self.lib.desk_hardware_audio_record_inject(test_samples, 4)
+        self.assertEqual(rc, 0)
+
+        # 3. Read back 4 samples
+        read_buf = (ctypes.c_int16 * 4)()
+        read_count = ctypes.c_size_t()
+        rc = self.lib.desk_hardware_audio_record_read(read_buf, 4, ctypes.byref(read_count))
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_count.value, 4)
+        self.assertEqual(list(read_buf), [100, -200, 300, -400])
+
+        # 4. Read additional samples when buffer empty -> must generate non-zero synthetic audio
+        synth_buf = (ctypes.c_int16 * 8)()
+        self.lib.desk_hardware_audio_record_read(synth_buf, 8, ctypes.byref(read_count))
+        self.assertEqual(read_count.value, 8)
+        self.assertTrue(any(s != 0 for s in synth_buf), "Audio pipeline must generate active acoustic wave")
+
+        self.lib.desk_hardware_audio_record_stop()
+
+        # 5. Playback callback test
+        played_samples = []
+        def on_play(pcm_ptr, samples, rate, user_data):
+            for i in range(samples):
+                played_samples.append(pcm_ptr[i])
+
+        cb_holder = self.AUDIO_PLAY_CB(on_play)
+        self.lib.desk_hardware_register_audio_play_cb(cb_holder, None)
+
+        play_data = (ctypes.c_int16 * 3)(500, 1000, 1500)
+        rc = self.lib.desk_hardware_audio_play_pcm(play_data, 3, 16000)
+        self.assertEqual(rc, 0)
+        self.assertEqual(played_samples, [500, 1000, 1500])
+        self.lib.desk_hardware_audio_play_stop()
+
+    def test_camera_frame_injection_and_streaming(self) -> None:
+        """Verifies camera frame injection, stream dispatch callback, and JPEG capture."""
+        stream_frames = []
+        def on_frame(jpeg_ptr, jpeg_len, ts_ms, user_data):
+            stream_frames.append((bytes(jpeg_ptr[:jpeg_len]), ts_ms))
+
+        cb_holder = self.CAM_FRAME_CB(on_frame)
+        self.lib.desk_hardware_camera_stream_start(ctypes.c_float(15.0), cb_holder, None)
+
+        # Inject custom JPEG frame
+        fake_jpeg = b"\xFF\xD8\xFF\xE0TEST_JPEG_DATA\xFF\xD9"
+        rc = self.lib.desk_hardware_camera_inject_frame(fake_jpeg, len(fake_jpeg), 5000)
+        self.assertEqual(rc, 0)
+
+        # Stream callback was called on injection
+        self.assertEqual(len(stream_frames), 1)
+        self.assertEqual(stream_frames[0][0], fake_jpeg)
+        self.assertEqual(stream_frames[0][1], 5000)
+
+        # Stream pump advances timestamp and dispatches
+        rc = self.lib.desk_hardware_camera_stream_pump()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(stream_frames), 2)
+        self.assertGreater(stream_frames[1][1], 5000)
+
+        # Capture JPEG returns latest frame
+        cap_buf = ctypes.create_string_buffer(128)
+        cap_len = ctypes.c_size_t()
+        rc = self.lib.desk_hardware_camera_capture_jpeg(cap_buf, 128, ctypes.byref(cap_len), 100)
+        self.assertEqual(rc, 0)
+        self.assertEqual(bytes(cap_buf.raw[:cap_len.value]), fake_jpeg)
+
+        self.lib.desk_hardware_camera_stream_stop()
+
+    def test_touch_event_subscription_and_injection(self) -> None:
+        """Verifies touch inputs callback registration and dispatch."""
+        received_events = []
+        def on_touch(target, action, user_data):
+            received_events.append((target, action))
+
+        cb_holder = self.TOUCH_CB(on_touch)
+        self.lib.desk_hardware_register_input_cb(cb_holder, None)
+
+        self.lib.desk_hardware_inject_touch_event(DESK_TOUCH_TARGET_BACKTOUCH, DESK_TOUCH_ACTION_SHORT_PRESS)
+        self.lib.desk_hardware_inject_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP)
+
+        self.assertEqual(len(received_events), 2)
+        self.assertEqual(received_events[0], (DESK_TOUCH_TARGET_BACKTOUCH, DESK_TOUCH_ACTION_SHORT_PRESS))
+        self.assertEqual(received_events[1], (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP))

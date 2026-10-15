@@ -11,8 +11,11 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from typing import Any, Mapping, Optional
 from companion.src.codex_companion import CodexCompanion, JsonRpcTransport
@@ -173,6 +176,135 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(resp["status"], "applied")
         self.assertEqual(len(sent_approvals), 1)
         self.assertEqual(sent_approvals[0]["decision"], "approve")
+
+    # -------------------------------------------------------------------------
+    # 5. Stdio Transport ID Matching & Asynchronous Notifications
+    # -------------------------------------------------------------------------
+    def test_stdio_transport_id_matching_and_notifications(self) -> None:
+        """Verifies SubprocessJsonRpcTransport background reader matches response IDs and routes notifications."""
+        from companion.src.codex_companion import SubprocessJsonRpcTransport
+        import io
+        import threading
+        import time
+
+        notifications = []
+        def on_notify(method, params):
+            notifications.append((method, params))
+
+        transport = SubprocessJsonRpcTransport(codex_bin="codex", on_notification=on_notify)
+
+        # Mock process stdout and stdin with simulated pipes
+        class PipeIO(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self._cond = threading.Condition()
+                self._lines = []
+
+            def write_line(self, s: str):
+                with self._cond:
+                    self._lines.append(s)
+                    self._cond.notify_all()
+
+            def readline(self):
+                with self._cond:
+                    while not self._lines and transport._running:
+                        self._cond.wait(timeout=0.1)
+                    if self._lines:
+                        return self._lines.pop(0) + "\n"
+                    return ""
+
+        mock_stdout = PipeIO()
+        mock_stdin = io.StringIO()
+
+        class MockProc:
+            def __init__(self):
+                self.stdin = mock_stdin
+                self.stdout = mock_stdout
+            def poll(self):
+                return None
+            def terminate(self):
+                pass
+            def wait(self, timeout=None):
+                pass
+            def kill(self):
+                pass
+
+        transport._proc = MockProc()
+        transport._running = True
+        transport._reader_thread = threading.Thread(
+            target=transport._reader_loop, args=(transport._proc,), daemon=True
+        )
+        transport._reader_thread.start()
+
+        # Send request 1 in background thread
+        req1_res = {}
+        def do_req1():
+            req1_res.update(transport.send_request("thread/create", {"model": "default"}))
+
+        t1 = threading.Thread(target=do_req1)
+        t1.start()
+
+        time.sleep(0.05)
+        # Push notification first (should NOT be consumed as response)
+        mock_stdout.write_line(json.dumps({"method": "turn/progress", "params": {"step": 1}}))
+
+        # Push response with id=1
+        mock_stdout.write_line(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"thread_id": "thr-101"}}))
+
+        t1.join(timeout=2.0)
+        self.assertEqual(req1_res.get("thread_id"), "thr-101")
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(notifications[0][0], "turn/progress")
+        self.assertEqual(notifications[0][1]["step"], 1)
+
+        transport.close()
+
+    # -------------------------------------------------------------------------
+    # 6. Companion Server Authentication & Loopback Binding
+    # -------------------------------------------------------------------------
+    def test_companion_server_bearer_token_auth(self) -> None:
+        """Verifies start_companion_server enforces Bearer Token authentication and loopback default."""
+        import urllib.request
+        import urllib.error
+        from companion.src.codex_companion import start_companion_server
+
+        server_thread = None
+        port = 18765
+        token = "test-auth-token-12345"
+
+        from http.server import HTTPServer
+        from socketserver import ThreadingMixIn
+
+        # Run companion server instance in background thread
+        def run_srv():
+            start_companion_server(port=port, host="127.0.0.1", auth_token=token)
+
+        srv_thread = threading.Thread(target=run_srv, daemon=True)
+        srv_thread.start()
+        time.sleep(0.1)
+
+        # 1. GET /health is public
+        req_health = urllib.request.Request(f"http://127.0.0.1:{port}/health")
+        with urllib.request.urlopen(req_health, timeout=2.0) as resp:
+            self.assertEqual(resp.status, 200)
+
+        # 2. POST /rpc without token -> 401
+        rpc_body = json.dumps({"operation": "codex.get", "arguments": {"task_id": "t1"}}).encode("utf-8")
+        req_no_auth = urllib.request.Request(f"http://127.0.0.1:{port}/rpc", data=rpc_body)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req_no_auth, timeout=2.0)
+        self.assertEqual(ctx.exception.code, 401)
+
+        # 3. POST /rpc with valid Bearer token -> 200
+        req_auth = urllib.request.Request(
+            f"http://127.0.0.1:{port}/rpc",
+            data=rpc_body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req_auth, timeout=2.0) as resp:
+            self.assertEqual(resp.status, 200)
+            data = json.loads(resp.read().decode("utf-8"))
+            self.assertTrue(data.get("success"))
 
 
 if __name__ == "__main__":

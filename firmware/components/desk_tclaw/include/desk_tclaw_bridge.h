@@ -72,6 +72,22 @@ int desk_tclaw_handle_tool_response(const char *request_id,
                                     const char *result_json,
                                     const char *error_json);
 
+/**
+ * @brief Speech stream token callback for streaming TTS / audio synthesis.
+ */
+typedef void (*desk_tclaw_speech_stream_cb_t)(const char *token, bool is_final, void *user_data);
+int desk_tclaw_register_speech_stream_cb(desk_tclaw_speech_stream_cb_t cb, void *user_data);
+
+/**
+ * @brief Retrieve last dialogue response text.
+ */
+int desk_tclaw_get_last_response(char *out_buf, size_t max_len);
+
+/**
+ * @brief Retrieve total dialogue turns completed.
+ */
+int desk_tclaw_get_turn_count(void);
+
 #ifdef __cplusplus
 }
 #endif

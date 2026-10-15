@@ -46,10 +46,12 @@ class DefaultMockTransport(JsonRpcTransport):
     def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
         if method == "initialize":
             return {"capabilities": {}}
-        elif method == "thread/create":
-            return {"thread_id": f"thr_win_{uuid.uuid4().hex[:8]}"}
+        elif method in ("thread/start", "thread/create"):
+            tid = f"thr_win_{uuid.uuid4().hex[:8]}"
+            return {"thread_id": tid, "thread": {"id": tid}}
         elif method == "turn/start":
-            return {"turn_id": f"trn_win_{uuid.uuid4().hex[:8]}", "state": "running"}
+            trn_id = f"trn_win_{uuid.uuid4().hex[:8]}"
+            return {"turn_id": trn_id, "state": "running", "turn": {"id": trn_id, "status": "running"}}
         elif method == "turn/interrupt":
             return {"interrupted": True}
         elif method == "turn/append":
@@ -60,13 +62,58 @@ class DefaultMockTransport(JsonRpcTransport):
 
 
 class SubprocessJsonRpcTransport(JsonRpcTransport):
-    """Production stdio JSON-RPC transport communicating with `codex app-server`."""
+    """Production stdio JSON-RPC transport communicating with `codex app-server`.
+    Features continuous background reader thread, response ID matching,
+    and notification dispatch (turn progress, completion, approval requests).
+    """
 
-    def __init__(self, codex_bin: str = "codex") -> None:
+    def __init__(
+        self,
+        codex_bin: str = "codex",
+        on_notification: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    ) -> None:
         self.codex_bin = codex_bin
+        self.on_notification = on_notification
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._req_counter = 0
+        self._pending: dict[int, threading.Event] = {}
+        self._responses: dict[int, dict[str, Any]] = {}
+        self._errors: dict[int, str] = {}
+        self._reader_thread: Optional[threading.Thread] = None
+        self._running = False
+
+    def _reader_loop(self, proc: subprocess.Popen) -> None:
+        while self._running:
+            if proc.stdout is None or proc.poll() is not None:
+                break
+            try:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+
+                req_id = msg.get("id")
+                if req_id is not None and req_id in self._pending:
+                    if "error" in msg:
+                        self._errors[req_id] = str(msg["error"])
+                    else:
+                        self._responses[req_id] = msg.get("result", {})
+                    self._pending[req_id].set()
+                elif "method" in msg:
+                    if self.on_notification:
+                        try:
+                            self.on_notification(msg.get("method", ""), msg.get("params", {}))
+                        except Exception as e:
+                            logger.warning("Error in notification handler: %s", e)
+            except Exception:
+                break
 
     def _ensure_proc(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -90,16 +137,23 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
                 text=True,
                 bufsize=1,
             )
+            self._running = True
+            self._reader_thread = threading.Thread(
+                target=self._reader_loop, args=(self._proc,), daemon=True
+            )
+            self._reader_thread.start()
         except Exception as exc:
             raise ConnectionError(f"Failed to launch Codex app-server: {exc}") from exc
 
         return self._proc
 
-    def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    def send_request(self, method: str, params: Mapping[str, Any], timeout: float = 10.0) -> dict[str, Any]:
         with self._lock:
             proc = self._ensure_proc()
             self._req_counter += 1
             req_id = self._req_counter
+            evt = threading.Event()
+            self._pending[req_id] = evt
 
             msg = {
                 "jsonrpc": "2.0",
@@ -113,19 +167,25 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
             try:
                 proc.stdin.write(json.dumps(msg) + "\n")
                 proc.stdin.flush()
-                resp_line = proc.stdout.readline()
-                if not resp_line:
-                    raise ConnectionError("Codex app-server closed connection unexpectedly")
-
-                resp = json.loads(resp_line)
-                if "error" in resp:
-                    raise RuntimeError(f"Codex JSON-RPC error: {resp['error']}")
-                return resp.get("result", {})
             except Exception as exc:
+                self._pending.pop(req_id, None)
                 raise ConnectionError(f"Error communicating with Codex app-server: {exc}") from exc
+
+        # Wait for reader thread to match response ID
+        if not evt.wait(timeout=timeout):
+            self._pending.pop(req_id, None)
+            raise TimeoutError(f"Codex app-server timed out waiting for response to '{method}' (id={req_id})")
+
+        self._pending.pop(req_id, None)
+        if req_id in self._errors:
+            err = self._errors.pop(req_id)
+            raise RuntimeError(f"Codex JSON-RPC error: {err}")
+
+        return self._responses.pop(req_id, {})
 
     def close(self) -> None:
         with self._lock:
+            self._running = False
             if self._proc is not None:
                 try:
                     self._proc.terminate()
@@ -133,6 +193,9 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
                 except Exception:
                     self._proc.kill()
                 self._proc = None
+            self._pending.clear()
+            self._responses.clear()
+            self._errors.clear()
 
 
 class CodexCompanion:
@@ -165,20 +228,40 @@ class CodexCompanion:
         resolved = os.path.realpath(os.path.abspath(abs_path))
         self.workspaces[alias] = resolved
 
+    def _handle_server_notification(self, method: str, params: dict[str, Any]) -> None:
+        with self._lock:
+            if method in ("approval/request", "item/approval"):
+                approval_id = params.get("approval_id") or f"appr-{uuid.uuid4().hex[:8]}"
+                self._pending_approvals[approval_id] = {
+                    "approval_id": approval_id,
+                    "task_id": params.get("task_id", ""),
+                    "action_type": params.get("action_type", "command"),
+                    "command_or_path": params.get("command_or_path") or params.get("command", ""),
+                    "description": params.get("description", "Approval required by Codex"),
+                    "status": "pending",
+                }
+            elif method in ("turn/progress", "task/progress"):
+                task_id = params.get("task_id")
+                if task_id and task_id in self._tasks:
+                    self._tasks[task_id]["progress"] = params.get("progress")
+            elif method in ("turn/completed", "task/completed"):
+                task_id = params.get("task_id")
+                if task_id and task_id in self._tasks:
+                    self._tasks[task_id]["status"] = "completed"
+
     def _get_transport(self) -> JsonRpcTransport:
         if self._transport is not None:
             return self._transport
 
-        # If an explicit non-standard binary path was supplied or running in production
-        if self.codex_bin != "codex" or not ("unittest" in sys.modules):
-            self._transport = SubprocessJsonRpcTransport(self.codex_bin)
+        # In unit tests with default codex binary, use DefaultMockTransport unless explicitly forced
+        if self.codex_bin == "codex" and "unittest" in sys.modules and os.environ.get("DESK_AGENT_USE_REAL_CODEX") != "1":
+            self._transport = DefaultMockTransport()
             return self._transport
 
-        # In unit tests with default codex binary on machine without codex installed
-        if shutil.which(self.codex_bin):
-            self._transport = SubprocessJsonRpcTransport(self.codex_bin)
-        else:
-            self._transport = DefaultMockTransport()
+        # If an explicit non-standard binary path was supplied or running in production
+        self._transport = SubprocessJsonRpcTransport(
+            self.codex_bin, on_notification=self._handle_server_notification
+        )
         return self._transport
 
     def _ensure_initialized(self) -> None:
@@ -209,18 +292,43 @@ class CodexCompanion:
         self._ensure_initialized()
         transport = self._get_transport()
 
-        # 1. Create real thread in workspace
-        thread_res = transport.send_request("thread/create", {"workspace_path": target_dir})
-        thread_id = thread_res.get("thread_id", f"thr_win_{task_id[:8]}")
+        # 1. Create real thread in workspace (supports both thread/create and real codex thread/start)
+        try:
+            thread_res = transport.send_request("thread/create", {"workspace_path": target_dir})
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "unknown variant `thread/create`" in err_msg or "method not found" in err_msg or "-32600" in err_msg or "-32601" in err_msg:
+                thread_res = transport.send_request("thread/start", {"workspace_path": target_dir, "cwd": target_dir})
+            else:
+                raise
 
-        # 2. Start turn
+        if not thread_res.get("thread_id") and not thread_res.get("thread"):
+            try:
+                alt = transport.send_request("thread/start", {"workspace_path": target_dir, "cwd": target_dir})
+                if alt:
+                    thread_res = alt
+            except Exception:
+                pass
+
+        if "thread" in thread_res and isinstance(thread_res["thread"], dict):
+            thread_id = thread_res["thread"].get("id", f"thr_win_{task_id[:8]}")
+        else:
+            thread_id = thread_res.get("thread_id", f"thr_win_{task_id[:8]}")
+
+        # 2. Start turn (Codex app-server uses threadId and input array)
         turn_res = transport.send_request("turn/start", {
+            "threadId": thread_id,
             "thread_id": thread_id,
+            "input": [{"type": "text", "text": prompt}],
             "prompt": prompt,
             "model": model or "gpt-5-codex",
         })
-        turn_id = turn_res.get("turn_id", f"trn_{task_id[:8]}_01")
-        state = turn_res.get("state", "running")
+        if "turn" in turn_res and isinstance(turn_res["turn"], dict):
+            turn_id = turn_res["turn"].get("id", f"trn_{task_id[:8]}_01")
+            state = turn_res["turn"].get("status", "running")
+        else:
+            turn_id = turn_res.get("turn_id", f"trn_{task_id[:8]}_01")
+            state = turn_res.get("state", "running")
 
         with self._lock:
             self._tasks[task_id] = {
@@ -341,7 +449,12 @@ class CodexCompanion:
             return dict(task) if task else None
 
 
-def start_companion_server(config_path: Optional[str] = None, port: int = 8765, host: str = "0.0.0.0") -> None:
+def start_companion_server(
+    config_path: Optional[str] = None,
+    port: int = 8765,
+    host: str = "127.0.0.1",
+    auth_token: Optional[str] = None,
+) -> None:
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from socketserver import ThreadingMixIn
 
@@ -355,6 +468,7 @@ def start_companion_server(config_path: Optional[str] = None, port: int = 8765, 
                 port = cfg.get("port", port)
                 host = cfg.get("host", host)
                 codex_bin = cfg.get("codex_bin", codex_bin)
+                auth_token = cfg.get("auth_token", auth_token)
         except Exception as e:
             logger.warning("Failed to load config %s: %s", config_path, e)
 
@@ -364,6 +478,17 @@ def start_companion_server(config_path: Optional[str] = None, port: int = 8765, 
     )
 
     class CompanionHandler(BaseHTTPRequestHandler):
+        def _check_auth(self) -> bool:
+            if not auth_token:
+                return True
+            auth_hdr = self.headers.get("Authorization", "")
+            tok_hdr = self.headers.get("X-Companion-Token", "")
+            if auth_hdr.startswith("Bearer "):
+                return auth_hdr[7:].strip() == auth_token
+            if tok_hdr:
+                return tok_hdr.strip() == auth_token
+            return False
+
         def do_GET(self) -> None:
             if self.path == "/health":
                 self.send_response(200)
@@ -375,6 +500,13 @@ def start_companion_server(config_path: Optional[str] = None, port: int = 8765, 
                 self.end_headers()
 
         def do_POST(self) -> None:
+            if not self._check_auth():
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"success": false, "error": "Unauthorized: invalid or missing bearer token"}')
+                return
+
             if self.path == "/rpc":
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length).decode("utf-8")

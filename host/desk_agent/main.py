@@ -1,7 +1,7 @@
 """
 Desk Agent R1 Host Daemon Entrypoint.
 Runs on TaishanPi RK3566 (Linux), hosting Life Services, HA Connector,
-Camera Leased Viewer, and Envelope RPC Dispatcher.
+Codex Companion Router, Camera Leased Viewer, and Envelope RPC Dispatcher.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -23,6 +25,7 @@ from host.desk_agent.core.router import Router
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
 from host.desk_agent.camera.camera_service import CameraViewerService
+from companion.src.codex_companion import CodexCompanion
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,20 +56,69 @@ class DeskAgentHostApp:
             default_lease_ms=cam_cfg.get("default_lease_ms", 10000)
         )
 
+        codex_cfg = self.config.get("codex", {})
+        self.companion = CodexCompanion(
+            allowed_workspaces=codex_cfg.get("workspaces"),
+            codex_bin=codex_cfg.get("codex_bin", "codex"),
+        )
+
         # Router Setup
         self.router = Router()
         self._register_routes()
 
+        # Background Reminder Delivery Scheduler
+        self._scheduler_stop = threading.Event()
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop, name="desk-reminder-scheduler", daemon=True
+        )
+        self._scheduler_thread.start()
+
+    def _scheduler_loop(self) -> None:
+        """Periodically polls for due reminder occurrences and triggers delivery."""
+        while not self._scheduler_stop.is_set():
+            try:
+                if self._scheduler_stop.is_set():
+                    break
+                due = self.life_service.get_due_occurrences()
+                for occ in due:
+                    logger.info("Delivering due reminder: %s (id=%s)", occ.get("title"), occ.get("occurrence_id"))
+                    self.life_service.mark_occurrence_ringing(occ["occurrence_id"])
+                    self.life_service.queue_outbox_message(
+                        topic="reminder.alert",
+                        payload={
+                            "occurrence_id": occ["occurrence_id"],
+                            "reminder_id": occ["reminder_id"],
+                            "title": occ.get("title", ""),
+                        },
+                    )
+            except Exception as e:
+                if not self._scheduler_stop.is_set():
+                    logger.warning("Error in reminder scheduler: %s", e)
+            self._scheduler_stop.wait(1.0)
+
+    def close(self) -> None:
+        self._scheduler_stop.set()
+        if self._scheduler_thread and self._scheduler_thread.is_alive():
+            self._scheduler_thread.join(timeout=2.0)
+        self.life_service.close()
+
     def _load_config(self, config_path: Optional[str]) -> dict[str, Any]:
         default_cfg = {
             "device_id": "desk-agent-r1-host",
-            "server": {"host": "0.0.0.0", "port": 8088},
+            "server": {"host": "127.0.0.1", "port": 8088},
+            "auth_token": None,
             "storage": {"db_path": "life_service.db"},
             "home_assistant": {
                 "base_url": "http://homeassistant.local:8123",
                 "allowed_domains": ["light", "switch", "cover", "climate", "fan", "media_player", "scene", "input_boolean"],
             },
             "camera": {"default_lease_ms": 10000},
+            "codex": {
+                "workspaces": {
+                    "epanda-desk-agent": os.path.realpath("."),
+                    "desk-agent-core": os.path.realpath("."),
+                }
+            },
         }
         if config_path and os.path.exists(config_path):
             try:
@@ -95,6 +147,12 @@ class DeskAgentHostApp:
         self.router.register("note.get", self._handle_note_get)
         self.router.register("note.list", self._handle_note_list)
         self.router.register("note.delete", self._handle_note_delete)
+
+        # Codex Companion
+        self.router.register("codex.submit_turn", self._handle_codex_submit_turn)
+        self.router.register("codex.get_task", self._handle_codex_get_task)
+        self.router.register("codex.decide_approval", self._handle_codex_decide_approval)
+        self.router.register("codex.list_workspaces", self._handle_codex_list_workspaces)
 
         # Camera & Hardware resources
         self.router.register("resource.camera.acquire", self._handle_camera_acquire)
@@ -139,12 +197,13 @@ class DeskAgentHostApp:
             reminder_id=args["reminder_id"],
             title=args.get("title"),
             due_at=args.get("due_at"),
-            repeat_rule=args.get("repeat_rule"),
+            status=args.get("status"),
         )
         return ResponseEnvelope.create_success(req.request_id, res)
 
     def _handle_reminder_delete(self, req: RequestEnvelope) -> ResponseEnvelope:
-        deleted = self.life_service.delete_reminder(req.arguments["reminder_id"])
+        reminder_id = req.arguments["reminder_id"]
+        deleted = self.life_service.delete_reminder(reminder_id)
         return ResponseEnvelope.create_success(req.request_id, {"deleted": deleted})
 
     def _handle_reminder_complete(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -192,6 +251,39 @@ class DeskAgentHostApp:
         deleted = self.life_service.delete_note(note_id)
         return ResponseEnvelope.create_success(req.request_id, {"deleted": deleted})
 
+    def _handle_codex_submit_turn(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments
+        task_id = args.get("task_id") or f"tsk-{uuid.uuid4().hex[:8]}"
+        workspace_alias = args.get("workspace_alias", "desk-agent-core")
+        prompt = args.get("prompt", "")
+        model = args.get("model")
+        res = self.companion.submit_task(task_id, workspace_alias, prompt, model=model)
+        return ResponseEnvelope.create_success(req.request_id, res)
+
+    def _handle_codex_get_task(self, req: RequestEnvelope) -> ResponseEnvelope:
+        task_id = req.arguments.get("task_id", "")
+        st = self.companion.get_task_status(task_id)
+        if not st:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="RESOURCE_NOT_FOUND",
+                message=f"Task '{task_id}' not found",
+            )
+        return ResponseEnvelope.create_success(req.request_id, st)
+
+    def _handle_codex_decide_approval(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments
+        res = self.companion.respond_approval(
+            approval_id=args["approval_id"],
+            task_id=args["task_id"],
+            decision=args["decision"],
+            reason=args.get("reason"),
+        )
+        return ResponseEnvelope.create_success(req.request_id, res)
+
+    def _handle_codex_list_workspaces(self, req: RequestEnvelope) -> ResponseEnvelope:
+        return ResponseEnvelope.create_success(req.request_id, {"workspaces": list(self.companion.workspaces.keys())})
+
     def _handle_camera_acquire(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")
         lease_ms = req.arguments.get("lease_duration_ms")
@@ -203,6 +295,19 @@ class DeskAgentHostApp:
                 message=f"Camera lease is currently held by '{res.get('current_owner')}'",
                 details=res,
             )
+
+        # Inject initial valid JPEG frame so viewing begins immediately
+        if self.camera_service._latest_jpeg is None:
+            initial_jpeg = (
+                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00"
+                b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08"
+                b"\xff\xc0\x00\x0b\x08\x00\x10\x00\x10\x01\x01\x11\x00\xff\xc4\x00"
+                b"\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00"
+                b"\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00"
+                b"\x08\x01\x01\x00\x00?\x00\xbf\x80\xff\xd9"
+            )
+            self.camera_service.push_frame(initial_jpeg)
+
         return ResponseEnvelope.create_success(req.request_id, res)
 
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -211,7 +316,6 @@ class DeskAgentHostApp:
         return ResponseEnvelope.create_success(req.request_id, {"released": released})
 
     def _handle_motion_move(self, req: RequestEnvelope) -> ResponseEnvelope:
-        # Move command acknowledged and routed to gimbal controller
         args = req.arguments
         return ResponseEnvelope.create_success(
             req.request_id,
@@ -224,6 +328,18 @@ def make_request_handler(app: DeskAgentHostApp):
     index_html_path = web_dir / "index.html"
 
     class DeskAgentHTTPHandler(BaseHTTPRequestHandler):
+        def _check_auth(self) -> bool:
+            auth_token = app.config.get("auth_token")
+            if not auth_token:
+                return True
+            auth_hdr = self.headers.get("Authorization", "")
+            tok_hdr = self.headers.get("X-Desk-Agent-Token", "")
+            if auth_hdr.startswith("Bearer "):
+                return auth_hdr[7:].strip() == auth_token
+            if tok_hdr:
+                return tok_hdr.strip() == auth_token
+            return False
+
         def do_GET(self) -> None:
             if self.path in ("/", "/index.html"):
                 if index_html_path.exists():
@@ -242,6 +358,13 @@ def make_request_handler(app: DeskAgentHostApp):
                 resp = json.dumps({"status": "healthy", "uptime_s": uptime}).encode()
                 self.wfile.write(resp)
             elif self.path.startswith("/api/camera/frame"):
+                if not self._check_auth():
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "Unauthorized"}')
+                    return
+
                 # Extract client_id from query params if present
                 client_id = "web-client"
                 if "?" in self.path:
@@ -269,6 +392,13 @@ def make_request_handler(app: DeskAgentHostApp):
                 self.end_headers()
 
         def do_POST(self) -> None:
+            if not self._check_auth():
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "Unauthorized: invalid or missing bearer token"}')
+                return
+
             if self.path == "/api/rpc":
                 content_len = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_len).decode("utf-8")
@@ -302,13 +432,14 @@ def main() -> None:
 
     app = DeskAgentHostApp(config_path=args.config)
     port = args.port or app.config.get("server", {}).get("port", 8088)
-    host = app.config.get("server", {}).get("host", "0.0.0.0")
+    host = app.config.get("server", {}).get("host", "127.0.0.1")
 
     handler_cls = make_request_handler(app)
     httpd = ThreadedHTTPServer((host, port), handler_cls)
 
     def handle_signal(sig, frame):
         logger.info("Received signal %s, shutting down...", sig)
+        app.close()
         httpd.shutdown()
         sys.exit(0)
 
@@ -321,6 +452,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        app.close()
         httpd.server_close()
         logger.info("Host daemon terminated cleanly.")
 
