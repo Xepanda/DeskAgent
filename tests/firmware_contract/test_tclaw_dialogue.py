@@ -105,6 +105,22 @@ class TestTClawDialogue(unittest.TestCase):
         cls.lib.desk_tclaw_get_turn_count.restype = ctypes.c_int
         cls.lib.desk_tclaw_get_turn_count.argtypes = []
 
+        # Tuya Cloud Dialogue Session API
+        cls.lib.desk_tclaw_tuya_session_start.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_session_start.argtypes = [ctypes.c_char_p]
+
+        cls.lib.desk_tclaw_tuya_get_session_id.restype = ctypes.c_char_p
+        cls.lib.desk_tclaw_tuya_get_session_id.argtypes = []
+
+        cls.lib.desk_tclaw_tuya_session_feed_audio.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_session_feed_audio.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+
+        cls.lib.desk_tclaw_tuya_send_tool_result.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_send_tool_result.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+
+        cls.lib.desk_tclaw_tuya_session_stop.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_session_stop.argtypes = []
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
@@ -243,4 +259,25 @@ class TestTClawDialogue(unittest.TestCase):
         self.assertTrue(streamed_tokens[-1][1], "Last token must have is_final=True")
         full_streamed = " ".join(t[0] for t in streamed_tokens)
         self.assertEqual(full_streamed, resp_text)
+
+    def test_tuya_cloud_dialogue_session_and_events(self) -> None:
+        """Verifies Tuya Cloud dialogue session lifecycle and audio streaming feeding."""
+        # 1. Start Tuya session
+        rc = self.lib.desk_tclaw_tuya_session_start(b"tuya-test-sess-001")
+        self.assertEqual(rc, 0)
+        sess_id = self.lib.desk_tclaw_tuya_get_session_id().decode("utf-8")
+        self.assertEqual(sess_id, "tuya-test-sess-001")
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_LISTENING)
+
+        # 2. Feed microphone audio data into active session
+        fake_pcm = b"\x00\x10" * 32
+        rc_audio = self.lib.desk_tclaw_tuya_session_feed_audio(fake_pcm, len(fake_pcm))
+        self.assertEqual(rc_audio, 0)
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_LISTENING)
+
+        # 3. Stop session
+        rc_stop = self.lib.desk_tclaw_tuya_session_stop()
+        self.assertEqual(rc_stop, 0)
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_IDLE)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_NONE)
 

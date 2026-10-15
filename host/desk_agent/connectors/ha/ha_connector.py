@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -51,6 +52,8 @@ class HAConnector:
         token: Optional[str] = None,
         access_token: Optional[str] = None,
         allowed_domains: Optional[Sequence[str] | Set[str]] = None,
+        allowed_entities: Optional[Sequence[str] | Set[str]] = None,
+        allowed_services: Optional[Sequence[str] | Set[str]] = None,
         timeout_sec: float = 5.0,
         mock_mode: bool = False,
         transport: Optional[HttpTransport] = None,
@@ -61,6 +64,8 @@ class HAConnector:
             self.allowed_domains = set(allowed_domains)
         else:
             self.allowed_domains = set(DEFAULT_ALLOWED_DOMAINS)
+        self.allowed_entities: Optional[set[str]] = set(allowed_entities) if allowed_entities is not None else None
+        self.allowed_services: Optional[set[str]] = set(allowed_services) if allowed_services is not None else None
         self.timeout_sec = max(0.5, timeout_sec)
         self._transport = transport
 
@@ -79,6 +84,8 @@ class HAConnector:
 
         self._mock_states: dict[str, dict[str, Any]] = {}
         self._cached_states: dict[str, dict[str, Any]] = {}
+        self._subscriber_thread: Optional[threading.Thread] = None
+        self._stop_subscriber = threading.Event()
 
     def is_domain_allowed(self, entity_id: str) -> bool:
         """Validates that entity_id matches the format and belongs to an allowed domain."""
@@ -86,6 +93,69 @@ class HAConnector:
             return False
         domain = entity_id.split(".", 1)[0]
         return domain in self.allowed_domains
+
+    def is_entity_allowed(self, entity_id: str) -> bool:
+        """Enforces both domain-level and entity-level whitelist permissions."""
+        if not self.is_domain_allowed(entity_id):
+            return False
+        if self.allowed_entities is not None and entity_id not in self.allowed_entities:
+            return False
+        return True
+
+    def is_service_allowed(self, domain: str, action: str) -> bool:
+        """Enforces service-level whitelist permissions."""
+        if self.allowed_services is None:
+            return True
+        full_svc = f"{domain}.{action}"
+        return full_svc in self.allowed_services or action in self.allowed_services
+
+    def reconcile_states(self) -> dict[str, Any]:
+        """
+        Reconciles local snapshot cache with authoritative Home Assistant states upon startup/reconnect.
+        Returns report of reconciled discrepancies.
+        """
+        current_list = self.get_all_states()
+        changes: list[dict[str, Any]] = []
+        for item in current_list:
+            eid = item["entity_id"]
+            new_st = item.get("state")
+            old_item = self._cached_states.get(eid)
+            old_st = old_item.get("state") if old_item else None
+            if old_st != new_st:
+                changes.append({"entity_id": eid, "old_state": old_st, "new_state": new_st})
+            self._cached_states[eid] = item
+
+        return {"total_entities": len(current_list), "reconciled_changes": changes}
+
+    def subscribe_state_changes(
+        self,
+        callback: Callable[[str, Optional[str], Optional[str]], None],
+        interval_sec: float = 1.0,
+    ) -> Callable[[], None]:
+        """
+        Starts a background event loop monitoring state changes and executing callback upon transition.
+        Returns a callable that stops the subscriber.
+        """
+        stop_evt = threading.Event()
+
+        def _sub_worker() -> None:
+            while not stop_evt.is_set():
+                try:
+                    res = self.reconcile_states()
+                    for chg in res["reconciled_changes"]:
+                        callback(chg["entity_id"], chg["old_state"], chg["new_state"])
+                except Exception as err:
+                    logger.debug("State subscriber polling note: %s", err)
+                stop_evt.wait(interval_sec)
+
+        t = threading.Thread(target=_sub_worker, name="ha-state-subscriber", daemon=True)
+        t.start()
+
+        def stop_sub() -> None:
+            stop_evt.set()
+            t.join(timeout=2.0)
+
+        return stop_sub
 
     def update_mock_state(self, entity_id: str, state: str, attributes: Optional[dict[str, Any]] = None) -> None:
         """Inject state in explicit mock mode or for test environments."""
@@ -159,8 +229,8 @@ class HAConnector:
         Retrieves current state snapshot of an entity from Home Assistant.
         Strictly enforces domain allowlist.
         """
-        if not self.is_domain_allowed(entity_id):
-            raise PermissionError(f"Entity '{entity_id}' is outside allowed domain scope")
+        if not self.is_entity_allowed(entity_id):
+            raise PermissionError(f"Entity '{entity_id}' is outside allowed domain/entity scope")
 
         # Mock mode or unconfigured fallback for daemon tests
         if self.mock_mode or (self._is_default_unconfigured and "unittest" in sys.modules):
@@ -217,10 +287,13 @@ class HAConnector:
         - Polls entity state up to `timeout_ms` when `wait_for_state` is provided.
         - Returns structured result conforming to `domain_ha.json` contract.
         """
-        if not self.is_domain_allowed(entity_id):
-            raise PermissionError(f"Entity '{entity_id}' is outside allowed domain scope")
+        if not self.is_entity_allowed(entity_id):
+            raise PermissionError(f"Entity '{entity_id}' is outside allowed domain/entity scope")
 
         domain = entity_id.split(".", 1)[0]
+        if not self.is_service_allowed(domain, action):
+            raise PermissionError(f"Service '{domain}.{action}' is outside allowed service scope")
+
         service_path = f"/api/services/{domain}/{action}"
 
         body: dict[str, Any] = {"entity_id": entity_id}

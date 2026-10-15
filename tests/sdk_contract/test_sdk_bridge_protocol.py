@@ -178,11 +178,29 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_sdk_socket_server_get_port.restype = ctypes.c_int
         cls.lib.desk_sdk_socket_server_get_port.argtypes = []
 
+        cls.lib.desk_sdk_socket_server_start_ex.restype = ctypes.c_int
+        cls.lib.desk_sdk_socket_server_start_ex.argtypes = [ctypes.c_char_p, ctypes.c_uint16]
+
         cls.lib.desk_sdk_socket_server_poll.restype = ctypes.c_int
         cls.lib.desk_sdk_socket_server_poll.argtypes = [ctypes.c_int]
 
         cls.lib.desk_sdk_socket_server_stop.restype = ctypes.c_int
         cls.lib.desk_sdk_socket_server_stop.argtypes = []
+
+        cls.lib.desk_sdk_pairing_server_start.restype = ctypes.c_int
+        cls.lib.desk_sdk_pairing_server_start.argtypes = [ctypes.c_uint16]
+
+        cls.lib.desk_sdk_pairing_server_poll.restype = ctypes.c_int
+        cls.lib.desk_sdk_pairing_server_poll.argtypes = [ctypes.c_int]
+
+        cls.lib.desk_sdk_pairing_server_stop.restype = ctypes.c_int
+        cls.lib.desk_sdk_pairing_server_stop.argtypes = []
+
+        cls.lib.desk_sdk_pairing_server_get_port.restype = ctypes.c_int
+        cls.lib.desk_sdk_pairing_server_get_port.argtypes = []
+
+        cls.lib.desk_firmware_poll.restype = ctypes.c_int
+        cls.lib.desk_firmware_poll.argtypes = [ctypes.c_int]
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -544,5 +562,60 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(event_json["payload"]["battery"], 95)
 
         client_sock.close()
+        self.lib.desk_sdk_socket_server_stop()
+
+    def test_udp_pairing_discovery_server(self) -> None:
+        """Verifies UDP Pairing Discovery server (watcher_lan_pairing_v1) responds to pairing requests."""
+        import socket
+
+        # Start UDP pairing server on ephemeral port
+        rc = self.lib.desk_sdk_pairing_server_start(0)
+        self.assertEqual(rc, 0)
+
+        udp_port = self.lib.desk_sdk_pairing_server_get_port()
+        self.assertGreater(udp_port, 1024)
+
+        # Send pair.request datagram from client
+        client_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client_udp.settimeout(2.0)
+
+        pair_req = json.dumps({
+            "type": "pair.request",
+            "protocol": "watcher_lan_pairing_v1",
+            "client_id": "test_py_sdk_runner",
+            "timestamp": 1792000000,
+        }).encode("utf-8")
+
+        client_udp.sendto(pair_req, ("127.0.0.1", udp_port))
+
+        # Poll pairing server to process datagram and reply
+        self.lib.desk_sdk_pairing_server_poll(100)
+
+        # Read reply from server
+        data, _ = client_udp.recvfrom(2048)
+        reply = json.loads(data.decode("utf-8"))
+
+        self.assertEqual(reply.get("type"), "pair.accept")
+        self.assertEqual(reply.get("status"), "accepted")
+        self.assertIn("device_id", reply)
+        self.assertIn("token", reply)
+        self.assertIn("port", reply)
+
+        client_udp.close()
+        self.lib.desk_sdk_pairing_server_stop()
+
+    def test_socket_server_bind_any(self) -> None:
+        """Verifies TCP socket server can bind to 0.0.0.0 via start_ex or start."""
+        rc = self.lib.desk_sdk_socket_server_start_ex(b"0.0.0.0", 0)
+        self.assertEqual(rc, 0)
+        port = self.lib.desk_sdk_socket_server_get_port()
+        self.assertGreater(port, 1024)
+
+        # Connect over loopback to verify 0.0.0.0 accepts loopback connections
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(("127.0.0.1", port))
+        self.lib.desk_sdk_socket_server_poll(50)
+        s.close()
         self.lib.desk_sdk_socket_server_stop()
 

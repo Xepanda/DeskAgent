@@ -151,6 +151,7 @@ int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json);
  * @brief Start local socket server for SDK and test clients.
  */
 int desk_sdk_socket_server_start(uint16_t port);
+int desk_sdk_socket_server_start_ex(const char *bind_addr, uint16_t port);
 
 /**
  * @brief Poll and process socket events.
@@ -166,6 +167,31 @@ int desk_sdk_socket_server_stop(void);
  * @brief Get currently bound socket port.
  */
 int desk_sdk_socket_server_get_port(void);
+
+/**
+ * @brief Start UDP Pairing Discovery Server (Port 37021 watcher_lan_pairing_v1).
+ */
+int desk_sdk_pairing_server_start(uint16_t port);
+
+/**
+ * @brief Poll and process UDP pairing discovery requests.
+ */
+int desk_sdk_pairing_server_poll(int timeout_ms);
+
+/**
+ * @brief Stop UDP pairing server.
+ */
+int desk_sdk_pairing_server_stop(void);
+
+/**
+ * @brief Get bound pairing UDP port.
+ */
+int desk_sdk_pairing_server_get_port(void);
+
+/**
+ * @brief Poll all active firmware communication channels (TCP SDK and UDP pairing).
+ */
+int desk_firmware_poll(int timeout_ms);
 
 #ifdef __cplusplus
 }

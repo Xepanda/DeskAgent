@@ -24,7 +24,11 @@
 <body>
   <div class="header">
     <h2>🤖 Desk Agent R1 管理控制台</h2>
-    <div>状态: <span class="badge badge-green">在线 (Online)</span></div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <input id="tokenInput" type="password" placeholder="Access Token (局域网鉴权)" style="background:#1e293b; border:1px solid #475569; color:#f8fafc; padding:6px 10px; border-radius:4px; font-size:12px; width:160px;" />
+      <button class="btn" style="padding:6px 12px; font-size:12px;" onclick="saveToken()">保存认证</button>
+      <div>状态: <span class="badge badge-green">在线 (Online)</span></div>
+    </div>
   </div>
 
   <div class="grid">
@@ -69,11 +73,33 @@
     let heartbeatTimer = null;
     let frameTimer = null;
 
+    function getAuthHeaders(extra = {}) {
+      const token = localStorage.getItem("desk_agent_token") || "";
+      const headers = { ...extra };
+      if (token) {
+        headers["Authorization"] = "Bearer " + token;
+        headers["X-Desk-Agent-Token"] = token;
+      }
+      return headers;
+    }
+
+    function saveToken() {
+      const tok = document.getElementById("tokenInput").value.trim();
+      if (tok) {
+        localStorage.setItem("desk_agent_token", tok);
+        alert("Token 已保存，将随请求发送至 Host");
+      } else {
+        localStorage.removeItem("desk_agent_token");
+        alert("Token 已清除");
+      }
+      acquireCameraLease();
+    }
+
     async function rpcCall(operation, args = {}) {
       try {
         const resp = await fetch("/api/rpc", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             schema_version: "1.0.0",
             request_id: "req-" + Date.now(),
@@ -83,6 +109,10 @@
             expires_at: new Date(Date.now() + 5000).toISOString()
           })
         });
+        if (resp.status === 401) {
+          document.getElementById("videoPlaceholder").innerText = "⚠️ 401 未授权：请在右上角输入合法的 Access Token 并点击保存认证";
+          return { status: "failed", error: { code: "UNAUTHORIZED", message: "401 Unauthorized" } };
+        }
         return await resp.json();
       } catch (err) {
         console.error("RPC call failed:", err);
@@ -144,7 +174,9 @@
         if (!leaseActive) return;
         try {
           const t0 = performance.now();
-          const resp = await fetch("/api/camera/frame?client_id=" + clientId);
+          const resp = await fetch("/api/camera/frame?client_id=" + clientId, {
+            headers: getAuthHeaders()
+          });
           if (resp.status === 200) {
             const blob = await resp.blob();
             const latency = Math.round(performance.now() - t0);
@@ -155,6 +187,10 @@
             img.style.display = "block";
             placeholder.style.display = "none";
             document.getElementById("frameStats").innerText = `租约: 激活 (Active) | 帧序号: #${frameSeq} | 延迟: ${latency} ms`;
+          } else if (resp.status === 401) {
+            leaseActive = false;
+            clearInterval(frameTimer);
+            document.getElementById("videoPlaceholder").innerText = "⚠️ 401 未授权：请在右上角输入合法的 Access Token 并保存认证";
           } else if (resp.status === 403) {
             leaseActive = false;
             clearInterval(frameTimer);
@@ -184,7 +220,13 @@
     }
 
     // Auto-acquire on load and release on unload
-    window.addEventListener("load", acquireCameraLease);
+    window.addEventListener("load", () => {
+      const savedToken = localStorage.getItem("desk_agent_token");
+      if (savedToken) {
+        document.getElementById("tokenInput").value = savedToken;
+      }
+      acquireCameraLease();
+    });
     window.addEventListener("beforeunload", releaseCameraLease);
   </script>
 </body>

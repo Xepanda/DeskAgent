@@ -86,7 +86,39 @@ int desk_tclaw_get_last_response(char *out_buf, size_t max_len);
 /**
  * @brief Retrieve total dialogue turns completed.
  */
-int desk_tclaw_get_turn_count(void);
+/**
+ * @brief Tuya Cloud Dialogue Event Types
+ */
+typedef enum {
+    TUYA_DIALOGUE_EVT_SESSION_START = 1,
+    TUYA_DIALOGUE_EVT_STREAM_TOKEN,
+    TUYA_DIALOGUE_EVT_TOOL_CALL,
+    TUYA_DIALOGUE_EVT_TTS_CHUNK,
+    TUYA_DIALOGUE_EVT_SESSION_END,
+    TUYA_DIALOGUE_EVT_ERROR
+} tuya_dialogue_event_type_t;
+
+typedef struct {
+    tuya_dialogue_event_type_t type;
+    const char *session_id;
+    const char *token;           /* For STREAM_TOKEN */
+    bool is_final_token;
+    const char *tool_name;       /* For TOOL_CALL */
+    const char *tool_arguments;  /* For TOOL_CALL (JSON args) */
+    const uint8_t *tts_data;     /* For TTS_CHUNK */
+    size_t tts_len;
+    const char *error_msg;       /* For ERROR */
+} tuya_dialogue_event_t;
+
+/**
+ * @brief Tuya Cloud Voice Dialogue Session Management
+ */
+int desk_tclaw_tuya_session_start(const char *session_id);
+int desk_tclaw_tuya_session_feed_audio(const uint8_t *pcm_data, size_t len);
+int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event);
+int desk_tclaw_tuya_send_tool_result(const char *session_id, const char *tool_name, const char *result_json);
+int desk_tclaw_tuya_session_stop(void);
+const char *desk_tclaw_tuya_get_session_id(void);
 
 #ifdef __cplusplus
 }

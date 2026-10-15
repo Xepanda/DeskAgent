@@ -363,6 +363,20 @@ class LifeService:
             )
             conn.commit()
 
+    def record_outbox_failure(self, outbox_id: str, error_message: str, max_retries: int = 5) -> None:
+        """Records an outbox delivery failure, increments retry count, and marks failed if max retries exceeded."""
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute("SELECT retry_count FROM outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            if not row:
+                return
+            new_retries = row["retry_count"] + 1
+            new_state = "failed" if new_retries >= max_retries else "pending"
+            conn.execute(
+                "UPDATE outbox SET retry_count = ?, state = ? WHERE outbox_id = ?",
+                (new_retries, new_state, outbox_id),
+            )
+            conn.commit()
+
     def queue_outbox_message(self, topic: str, payload: Mapping[str, Any]) -> str:
         """Alias for enqueue_outbox with topic-oriented signature."""
         return self.enqueue_outbox(event_type=topic, payload=payload)

@@ -309,11 +309,17 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.assertEqual(read_count.value, 4)
         self.assertEqual(list(read_buf), [100, -200, 300, -400])
 
-        # 4. Read additional samples when buffer empty -> must generate non-zero synthetic audio
-        synth_buf = (ctypes.c_int16 * 8)()
-        self.lib.desk_hardware_audio_record_read(synth_buf, 8, ctypes.byref(read_count))
+        # 4. Read additional samples when buffer empty -> must return 0 read without fake 440Hz wave synthesis
+        empty_buf = (ctypes.c_int16 * 8)()
+        self.lib.desk_hardware_audio_record_read(empty_buf, 8, ctypes.byref(read_count))
+        self.assertEqual(read_count.value, 0, "Empty mic buffer must return 0 read samples without synthetic wave")
+
+        # Inject real stream samples and verify reading them
+        real_samples = (ctypes.c_int16 * 8)(10, 20, 30, 40, 50, 60, 70, 80)
+        self.lib.desk_hardware_audio_record_inject(real_samples, 8)
+        self.lib.desk_hardware_audio_record_read(empty_buf, 8, ctypes.byref(read_count))
         self.assertEqual(read_count.value, 8)
-        self.assertTrue(any(s != 0 for s in synth_buf), "Audio pipeline must generate active acoustic wave")
+        self.assertEqual(list(empty_buf), [10, 20, 30, 40, 50, 60, 70, 80])
 
         self.lib.desk_hardware_audio_record_stop()
 

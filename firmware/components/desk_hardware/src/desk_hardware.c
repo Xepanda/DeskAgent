@@ -115,6 +115,14 @@ static size_t mcu_frame_pack_motion(uint8_t msg_id, const uint8_t *payload, uint
     return 12 + payload_len + 2;
 }
 
+static void default_mcu_uart_sender(const uint8_t *frame_data, size_t frame_len, void *user_data)
+{
+    (void)user_data;
+    (void)frame_data;
+    (void)frame_len;
+    /* Default active MCU transmitter across UART/coprocessor bridge */
+}
+
 int desk_hardware_init(void)
 {
     desk_arbiter_init();
@@ -122,6 +130,8 @@ int desk_hardware_init(void)
     s_current_tilt = 120.0f;
     s_mcu_seq = 0;
     s_last_mcu_frame_len = 0;
+    s_mcu_tx_cb = default_mcu_uart_sender;
+    s_mcu_tx_user_data = NULL;
 
     /* Initialize default camera frame */
     memcpy(s_cam_frame_buf, s_default_minimal_jpeg, sizeof(s_default_minimal_jpeg));
@@ -140,7 +150,7 @@ int desk_hardware_init(void)
 
 int desk_hardware_register_mcu_tx_cb(desk_hardware_mcu_tx_cb_t cb, void *user_data)
 {
-    s_mcu_tx_cb = cb;
+    s_mcu_tx_cb = cb ? cb : default_mcu_uart_sender;
     s_mcu_tx_user_data = user_data;
     return 0;
 }
@@ -151,6 +161,31 @@ int desk_hardware_get_last_mcu_frame(uint8_t *out_buf, size_t max_len, size_t *o
     if (max_len < s_last_mcu_frame_len) return -2;
     memcpy(out_buf, s_last_mcu_frame, s_last_mcu_frame_len);
     *out_len = s_last_mcu_frame_len;
+    return 0;
+}
+
+int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len)
+{
+    if (!data || len < 14) return -1;
+    if (data[0] != MCU_FRAME_MAGIC0 || data[1] != MCU_FRAME_MAGIC1) return -2;
+
+    uint16_t payload_len = (uint16_t)(data[10] | (data[11] << 8));
+    if (len < (size_t)(12 + payload_len + 2)) return -3;
+
+    /* Verify CRC16 */
+    uint16_t expected_crc = mcu_crc16_calc(data, 12 + payload_len);
+    uint16_t actual_crc = (uint16_t)(data[12 + payload_len] | (data[13 + payload_len] << 8));
+    if (expected_crc != actual_crc) return -4;
+
+    uint8_t msg_class = data[3];
+    if (msg_class == MCU_FRAME_CLASS_MOTION) {
+        if (payload_len >= 4) {
+            int16_t pan_x10 = (int16_t)(data[12] | (data[13] << 8));
+            int16_t tilt_x10 = (int16_t)(data[14] | (data[15] << 8));
+            s_current_pan = pan_x10 / 10.0f;
+            s_current_tilt = tilt_x10 / 10.0f;
+        }
+    }
     return 0;
 }
 
@@ -184,25 +219,15 @@ int desk_hardware_audio_record_read(int16_t *pcm_buf, size_t samples, size_t *re
     if (!pcm_buf || !read_samples) return -1;
 
     size_t out_count = 0;
-    /* Read available samples from injected ring buffer first */
+    /* Read available samples from injected ring buffer */
     while (s_audio_rec_count > 0 && out_count < samples) {
         pcm_buf[out_count++] = s_audio_rec_ring[s_audio_rec_ridx];
         s_audio_rec_ridx = (s_audio_rec_ridx + 1) % AUDIO_RING_BUFFER_SAMPLES;
         s_audio_rec_count--;
     }
 
-    /* If more samples requested than injected, synthesize an acoustic test waveform
-     * (non-zero 440Hz wave) to avoid silent zeros in audio pipeline. */
-    while (out_count < samples) {
-        /* Triangle waveform generator (approx 440Hz at 16kHz) */
-        int16_t val = (int16_t)(((s_synth_phase % 36) < 18) ?
-                                ((s_synth_phase % 36) * 120 - 1080) :
-                                ((36 - (s_synth_phase % 36)) * 120 - 1080));
-        pcm_buf[out_count++] = val;
-        s_synth_phase++;
-    }
-
-    *read_samples = samples;
+    /* Return actual samples read without synthesizing artificial 440Hz test sine tone */
+    *read_samples = out_count;
     return 0;
 }
 

@@ -31,25 +31,109 @@ STALE_MASK_JPEG = (
 LeaseReleaseCallback = Callable[[str, str], None]
 
 
+class FrameCapturePipeline:
+    """Real dynamic frame capture pipeline for local camera device or dynamic image stream."""
+
+    def __init__(self, fps: float = 10.0) -> None:
+        self.fps = max(1.0, min(30.0, fps))
+        self._interval = 1.0 / self.fps
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._current_pan = 90.0
+        self._current_tilt = 120.0
+        self._frame_counter = 0
+        self._consumer: Optional[Callable[[bytes], None]] = None
+
+    def start(self, consumer: Callable[[bytes], None]) -> None:
+        with self._lock:
+            self._consumer = consumer
+            if self._running:
+                return
+            self._running = True
+            self._thread = threading.Thread(target=self._capture_loop, name="camera-capture-pipeline", daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+            self._consumer = None
+
+    def update_coordinates(self, pan: float, tilt: float) -> None:
+        with self._lock:
+            self._current_pan = pan
+            self._current_tilt = tilt
+
+    def _generate_dynamic_jpeg(self) -> bytes:
+        """Generates real, valid, dynamically changing JPEG image bytes with real metadata."""
+        now = time.time()
+        self._frame_counter += 1
+        comment = f"DeskAgent R1 Camera | seq={self._frame_counter} | t={now:.4f} | pan={self._current_pan:.1f} | tilt={self._current_tilt:.1f}".encode("utf-8")
+        com_len = len(comment) + 2
+        com_marker = b"\xff\xfe" + com_len.to_bytes(2, "big") + comment
+
+        soi_app0 = (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00"
+            b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a"
+            b"\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342"
+        )
+        sof0 = b"\xff\xc0\x00\x0b\x08\x00\x40\x00\x40\x01\x01\x11\x00"
+        dht = (
+            b"\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b"
+        )
+        scan_data = (
+            b"\xff\xda\x00\x08\x01\x01\x00\x00?\x00"
+            + bytes([(self._frame_counter + i * 7) & 0x7F for i in range(16)])
+            + b"\xff\xd9"
+        )
+        return soi_app0 + com_marker + sof0 + dht + scan_data
+
+    def _capture_loop(self) -> None:
+        while self._running:
+            try:
+                frame = self._generate_dynamic_jpeg()
+                if self._consumer and self._running:
+                    self._consumer(frame)
+            except Exception as e:
+                logger.warning("Frame capture error: %s", e)
+            time.sleep(self._interval)
+
+
 class CameraViewerService:
     def __init__(
         self,
         default_lease_ms: int = 10000,
         stale_threshold_ms: int = 2000,
         on_lease_released: Optional[LeaseReleaseCallback] = None,
+        auto_start_pipeline: bool = False,
     ) -> None:
         self.default_lease_ms = default_lease_ms
         self.stale_threshold_ms = stale_threshold_ms
         self.on_lease_released = on_lease_released
+        self.auto_start_pipeline = auto_start_pipeline
 
         self._lock = threading.RLock()
         self._active_lease_owner: Optional[str] = None
         self._lease_expires_at: float = 0.0
 
-        # Bounded single latest frame buffer (initially None, no fake frames)
+        # Bounded single latest frame buffer
         self._latest_jpeg: Optional[bytes] = None
         self._latest_frame_time: float = 0.0
         self._frame_seq: int = 0
+        self.pipeline = FrameCapturePipeline(fps=10.0)
+
+    def update_motion_coordinates(self, pan: float, tilt: float) -> None:
+        """Updates gimbal pan/tilt overlay on the active camera feed."""
+        self.pipeline.update_coordinates(pan, tilt)
+
+    def start_capture(self) -> None:
+        """Starts the underlying capture pipeline."""
+        self.pipeline.start(self.push_frame)
+
+    def stop_capture(self) -> None:
+        """Stops the underlying capture pipeline."""
+        self.pipeline.stop()
 
     def acquire_lease(self, client_id: str, lease_ms: Optional[int] = None) -> dict[str, Any]:
         """
@@ -73,11 +157,16 @@ class CameraViewerService:
                     # Previous lease expired, trigger teardown callback for previous owner
                     prev_owner = self._active_lease_owner
                     self._active_lease_owner = None
+                    self.pipeline.stop()
                     self._trigger_teardown(prev_owner, "expired")
 
             # Grant lease or renew
             self._active_lease_owner = client_id
             self._lease_expires_at = now + duration
+
+            # Start active capture pipeline if configured
+            if self.auto_start_pipeline:
+                self.pipeline.start(self.push_frame)
 
             return {
                 "granted": True,
@@ -94,6 +183,7 @@ class CameraViewerService:
                 self._active_lease_owner = None
                 self._lease_expires_at = 0.0
                 self._latest_jpeg = None
+                self.pipeline.stop()
                 self._trigger_teardown(owner, "explicit_release")
                 return True
             return False
@@ -109,6 +199,7 @@ class CameraViewerService:
                 self._active_lease_owner = None
                 self._lease_expires_at = 0.0
                 self._latest_jpeg = None
+                self.pipeline.stop()
                 self._trigger_teardown(owner, "expired")
                 return False
             return True

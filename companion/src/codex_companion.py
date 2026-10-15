@@ -35,6 +35,10 @@ class JsonRpcTransport(abc.ABC):
         """Sends a JSON-RPC request and synchronously awaits the response."""
         raise NotImplementedError
 
+    def send_response(self, req_id: Any, result: Mapping[str, Any]) -> None:
+        """Sends a JSON-RPC response back to the server for a server-initiated request."""
+        pass
+
     def close(self) -> None:
         """Closes the underlying transport or process."""
         pass
@@ -42,6 +46,12 @@ class JsonRpcTransport(abc.ABC):
 
 class DefaultMockTransport(JsonRpcTransport):
     """Fallback mock transport used in unit test runners when codex binary is absent."""
+
+    def __init__(self) -> None:
+        self.sent_responses: list[dict[str, Any]] = []
+
+    def send_response(self, req_id: Any, result: Mapping[str, Any]) -> None:
+        self.sent_responses.append({"id": req_id, "result": dict(result)})
 
     def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
         if method == "initialize":
@@ -70,7 +80,7 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
     def __init__(
         self,
         codex_bin: str = "codex",
-        on_notification: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        on_notification: Optional[Callable[..., None]] = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.on_notification = on_notification
@@ -109,11 +119,33 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
                 elif "method" in msg:
                     if self.on_notification:
                         try:
-                            self.on_notification(msg.get("method", ""), msg.get("params", {}))
+                            # Pass server req_id if this was a server-initiated request needing response
+                            server_req_id = msg.get("id")
+                            try:
+                                self.on_notification(msg.get("method", ""), msg.get("params", {}), server_req_id)
+                            except TypeError:
+                                self.on_notification(msg.get("method", ""), msg.get("params", {}))
                         except Exception as e:
                             logger.warning("Error in notification handler: %s", e)
             except Exception:
                 break
+
+    def send_response(self, req_id: Any, result: Mapping[str, Any]) -> None:
+        """Sends a JSON-RPC response back to the server for a server-initiated request."""
+        with self._lock:
+            proc = self._ensure_proc()
+            if proc.stdin is None:
+                raise ConnectionError("Codex app-server stdio pipe is not available")
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": dict(result),
+            }
+            try:
+                proc.stdin.write(json.dumps(payload) + "\n")
+                proc.stdin.flush()
+            except Exception as exc:
+                raise ConnectionError(f"Error sending response to Codex app-server: {exc}") from exc
 
     def _ensure_proc(self) -> subprocess.Popen:
         if self._proc is not None and self._proc.poll() is None:
@@ -219,6 +251,8 @@ class CodexCompanion:
         self._initialized = False
         self._tasks: dict[str, dict[str, Any]] = {}
         self._pending_approvals: dict[str, dict[str, Any]] = {}
+        self._thread_to_task: dict[str, str] = {}
+        self._turn_to_task: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def register_workspace(self, alias: str, abs_path: str) -> None:
@@ -228,26 +262,43 @@ class CodexCompanion:
         resolved = os.path.realpath(os.path.abspath(abs_path))
         self.workspaces[alias] = resolved
 
-    def _handle_server_notification(self, method: str, params: dict[str, Any]) -> None:
+    def _resolve_task_id(self, thread_id: Optional[str], turn_id: Optional[str]) -> str:
+        if turn_id and turn_id in self._turn_to_task:
+            return self._turn_to_task[turn_id]
+        if thread_id and thread_id in self._thread_to_task:
+            return self._thread_to_task[thread_id]
+        return ""
+
+    def _handle_server_notification(
+        self, method: str, params: dict[str, Any], server_req_id: Optional[Any] = None
+    ) -> None:
         with self._lock:
-            if method in ("approval/request", "item/approval"):
+            # Resolve task_id from threadId or turnId in real Codex notification
+            thread_id = params.get("threadId") or params.get("thread_id")
+            turn_id = params.get("turnId") or params.get("turn_id")
+            task_id = params.get("task_id") or self._resolve_task_id(thread_id, turn_id)
+
+            if method in ("approval/request", "item/approval", "item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
                 approval_id = params.get("approval_id") or f"appr-{uuid.uuid4().hex[:8]}"
                 self._pending_approvals[approval_id] = {
                     "approval_id": approval_id,
-                    "task_id": params.get("task_id", ""),
-                    "action_type": params.get("action_type", "command"),
-                    "command_or_path": params.get("command_or_path") or params.get("command", ""),
+                    "server_req_id": server_req_id,
+                    "task_id": task_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "action_type": params.get("action_type") or params.get("type", "command"),
+                    "command_or_path": params.get("command_or_path") or params.get("command") or params.get("path", ""),
                     "description": params.get("description", "Approval required by Codex"),
                     "status": "pending",
                 }
-            elif method in ("turn/progress", "task/progress"):
-                task_id = params.get("task_id")
+            elif method in ("turn/progress", "task/progress", "item/updated", "turn/step"):
                 if task_id and task_id in self._tasks:
-                    self._tasks[task_id]["progress"] = params.get("progress")
-            elif method in ("turn/completed", "task/completed"):
-                task_id = params.get("task_id")
+                    self._tasks[task_id]["progress"] = params.get("progress") or params.get("message") or "in_progress"
+                    self._tasks[task_id]["state"] = "running"
+            elif method in ("turn/completed", "task/completed", "turn/finished"):
                 if task_id and task_id in self._tasks:
                     self._tasks[task_id]["status"] = "completed"
+                    self._tasks[task_id]["state"] = "completed"
 
     def _get_transport(self) -> JsonRpcTransport:
         if self._transport is not None:
@@ -331,6 +382,8 @@ class CodexCompanion:
             state = turn_res.get("state", "running")
 
         with self._lock:
+            self._thread_to_task[thread_id] = task_id
+            self._turn_to_task[turn_id] = task_id
             self._tasks[task_id] = {
                 "task_id": task_id,
                 "workspace_alias": workspace_alias,
@@ -421,15 +474,24 @@ class CodexCompanion:
 
             thread_id = appr.get("thread_id")
             turn_id = appr.get("turn_id")
+            server_req_id = appr.get("server_req_id")
 
         transport = self._get_transport()
-        transport.send_request("turn/approval/respond", {
-            "approval_id": approval_id,
-            "thread_id": thread_id,
-            "turn_id": turn_id,
-            "decision": decision,
-            "reason": reason,
-        })
+        if server_req_id is not None:
+            # Server initiated request with ID: respond with JSON-RPC response ID
+            transport.send_response(server_req_id, {
+                "decision": decision,
+                "reason": reason or "",
+                "status": "applied" if decision == "approve" else "rejected",
+            })
+        else:
+            transport.send_request("turn/approval/respond", {
+                "approval_id": approval_id,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "decision": decision,
+                "reason": reason,
+            })
 
         with self._lock:
             appr["status"] = "applied" if decision == "approve" else "rejected"

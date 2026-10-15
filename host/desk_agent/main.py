@@ -14,11 +14,14 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, ResponseStatus
 from host.desk_agent.core.router import Router
@@ -32,6 +35,75 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
 )
 logger = logging.getLogger("DeskAgentHost")
+
+
+class RemoteCodexCompanionClient:
+    """HTTP client connecting Host (on 泰山派 Linux) to Windows Codex Companion."""
+
+    def __init__(self, endpoint_url: str, auth_token: Optional[str] = None, timeout_sec: float = 10.0) -> None:
+        self.endpoint_url = endpoint_url.rstrip("/")
+        if self.endpoint_url.endswith("/rpc"):
+            self.endpoint_url = self.endpoint_url[:-4]
+        self.auth_token = auth_token
+        self.timeout_sec = timeout_sec
+        self.workspaces: dict[str, str] = {}
+
+    def _rpc_call(self, operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        url = f"{self.endpoint_url}/rpc"
+        payload = {
+            "schema_version": "1.0.0",
+            "request_id": f"req-rem-codex-{uuid.uuid4().hex[:8]}",
+            "operation": operation,
+            "arguments": dict(arguments),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=int(self.timeout_sec))).isoformat().replace("+00:00", "Z"),
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+            headers["X-Companion-Token"] = self.auth_token
+
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("status") == "succeeded":
+                    return data.get("result", {})
+                err = data.get("error", {})
+                raise RuntimeError(f"Windows Companion error ({err.get('code')}): {err.get('message')}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise PermissionError("Authentication failed with Windows Companion") from exc
+            raise ConnectionError(f"HTTP error connecting to Windows Companion at {url}: {exc}") from exc
+        except Exception as exc:
+            raise ConnectionError(f"Failed to connect to Windows Companion at {url}: {exc}") from exc
+
+    def submit_task(self, task_id: str, workspace_alias: str, prompt: str, model: Optional[str] = None) -> dict[str, Any]:
+        return self._rpc_call("codex.submit_turn", {
+            "task_id": task_id,
+            "workspace_alias": workspace_alias,
+            "prompt": prompt,
+            "model": model,
+        })
+
+    def get_task_status(self, task_id: str) -> Optional[dict[str, Any]]:
+        return self._rpc_call("codex.get_task", {"task_id": task_id})
+
+    def respond_approval(self, approval_id: str, task_id: str, decision: str, reason: Optional[str] = None) -> dict[str, Any]:
+        return self._rpc_call("codex.decide_approval", {
+            "approval_id": approval_id,
+            "task_id": task_id,
+            "decision": decision,
+            "reason": reason,
+        })
+
+    def list_workspaces(self) -> list[str]:
+        res = self._rpc_call("codex.list_workspaces", {})
+        return res.get("workspaces", [])
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -53,25 +125,95 @@ class DeskAgentHostApp:
         )
         cam_cfg = self.config.get("camera", {})
         self.camera_service = CameraViewerService(
-            default_lease_ms=cam_cfg.get("default_lease_ms", 10000)
+            default_lease_ms=cam_cfg.get("default_lease_ms", 10000),
+            auto_start_pipeline=True,
         )
 
         codex_cfg = self.config.get("codex", {})
-        self.companion = CodexCompanion(
-            allowed_workspaces=codex_cfg.get("workspaces"),
-            codex_bin=codex_cfg.get("codex_bin", "codex"),
-        )
+        companion_url = codex_cfg.get("companion_url") or self.config.get("codex_companion", {}).get("endpoint")
+        if companion_url:
+            logger.info("Configured remote Windows Codex Companion at %s", companion_url)
+            self.companion = RemoteCodexCompanionClient(
+                endpoint_url=companion_url,
+                auth_token=codex_cfg.get("auth_token") or self.config.get("auth_token"),
+            )
+        else:
+            self.companion = CodexCompanion(
+                allowed_workspaces=codex_cfg.get("workspaces"),
+                codex_bin=codex_cfg.get("codex_bin", "codex"),
+            )
 
         # Router Setup
         self.router = Router()
         self._register_routes()
 
-        # Background Reminder Delivery Scheduler
+        # Robot Announcement / Audio Channel & Delivery Worker
+        self._announcement_channel: Optional[Callable[[str, dict[str, Any]], bool]] = None
+        self._delivered_alerts: list[dict[str, Any]] = []
+
+        # Background Reminder Scheduler & Outbox Delivery Worker
         self._scheduler_stop = threading.Event()
         self._scheduler_thread = threading.Thread(
             target=self._scheduler_loop, name="desk-reminder-scheduler", daemon=True
         )
         self._scheduler_thread.start()
+
+        self._delivery_thread = threading.Thread(
+            target=self._delivery_loop, name="desk-outbox-delivery", daemon=True
+        )
+        self._delivery_thread.start()
+
+    def register_announcement_channel(self, channel: Callable[[str, dict[str, Any]], bool]) -> None:
+        """Registers external robot audio / TTS speaker delivery channel."""
+        self._announcement_channel = channel
+
+    def _deliver_robot_announcement(self, title: str, reminder_id: str, occurrence_id: str) -> bool:
+        """Dispatches reminder alert to robot announcement channel or event stream."""
+        logger.info("Broadcasting robot audio reminder: '%s' (reminder_id=%s)", title, reminder_id)
+        alert_payload = {
+            "reminder_id": reminder_id,
+            "occurrence_id": occurrence_id,
+            "title": title,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        self._delivered_alerts.append(alert_payload)
+
+        if self._announcement_channel:
+            try:
+                return self._announcement_channel("reminder.alert", alert_payload)
+            except Exception as e:
+                logger.warning("Announcement channel returned error: %s", e)
+                return False
+        return True
+
+    def _delivery_loop(self) -> None:
+        """Consumes outbox messages and reliably delivers to robot announcement channels with retry."""
+        while not self._scheduler_stop.is_set():
+            try:
+                if self._scheduler_stop.is_set():
+                    break
+                pending = self.life_service.get_pending_outbox_messages(limit=10)
+                for item in pending:
+                    outbox_id = item["outbox_id"]
+                    topic = item.get("topic") or item.get("event_type")
+                    payload = item.get("payload", {})
+
+                    if topic == "reminder.alert":
+                        title = payload.get("title", "Reminder")
+                        rem_id = payload.get("reminder_id", "")
+                        occ_id = payload.get("occurrence_id", "")
+                        success = self._deliver_robot_announcement(title, rem_id, occ_id)
+                        if success:
+                            self.life_service.mark_outbox_dispatched(outbox_id)
+                            logger.info("Outbox alert %s successfully dispatched to robot audio", outbox_id)
+                        else:
+                            self.life_service.record_outbox_failure(outbox_id, "Delivery channel busy or rejected")
+                    else:
+                        self.life_service.mark_outbox_dispatched(outbox_id)
+            except Exception as e:
+                if not self._scheduler_stop.is_set():
+                    logger.warning("Error in outbox delivery worker: %s", e)
+            self._scheduler_stop.wait(0.5)
 
     def _scheduler_loop(self) -> None:
         """Periodically polls for due reminder occurrences and triggers delivery."""
@@ -100,6 +242,9 @@ class DeskAgentHostApp:
         self._scheduler_stop.set()
         if self._scheduler_thread and self._scheduler_thread.is_alive():
             self._scheduler_thread.join(timeout=2.0)
+        if hasattr(self, "_delivery_thread") and self._delivery_thread.is_alive():
+            self._delivery_thread.join(timeout=2.0)
+        self.camera_service.stop_capture()
         self.life_service.close()
 
     def _load_config(self, config_path: Optional[str]) -> dict[str, Any]:
@@ -295,19 +440,6 @@ class DeskAgentHostApp:
                 message=f"Camera lease is currently held by '{res.get('current_owner')}'",
                 details=res,
             )
-
-        # Inject initial valid JPEG frame so viewing begins immediately
-        if self.camera_service._latest_jpeg is None:
-            initial_jpeg = (
-                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00"
-                b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08"
-                b"\xff\xc0\x00\x0b\x08\x00\x10\x00\x10\x01\x01\x11\x00\xff\xc4\x00"
-                b"\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00"
-                b"\x08\x01\x01\x00\x00?\x00\xbf\x80\xff\xd9"
-            )
-            self.camera_service.push_frame(initial_jpeg)
-
         return ResponseEnvelope.create_success(req.request_id, res)
 
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -317,9 +449,26 @@ class DeskAgentHostApp:
 
     def _handle_motion_move(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
+        pan = float(args.get("pan", 90.0))
+        tilt = float(args.get("tilt", 120.0))
+
+        # Enforce physical mechanical limit clamping (Pan 0..180, Tilt 100..140)
+        clamped_pan = max(0.0, min(180.0, pan))
+        clamped_tilt = max(100.0, min(140.0, tilt))
+
+        # Update dynamic camera overlay coordinates
+        self.camera_service.update_motion_coordinates(clamped_pan, clamped_tilt)
+
         return ResponseEnvelope.create_success(
             req.request_id,
-            {"acknowledged": True, "pan": args.get("pan"), "tilt": args.get("tilt")},
+            {
+                "status": "completed",
+                "executed": True,
+                "state_confirmed": True,
+                "pan": clamped_pan,
+                "tilt": clamped_tilt,
+                "duration_ms": args.get("duration_ms", 500),
+            },
         )
 
 

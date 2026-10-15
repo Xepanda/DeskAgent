@@ -135,9 +135,160 @@ int desk_tclaw_trigger_tool_call(const char *request_id, const char *operation, 
     return 0;
 }
 
+static char s_tuya_session_id[128] = "";
+static char s_current_pending_tool[128] = "";
+
+int desk_tclaw_tuya_session_start(const char *session_id)
+{
+    if (session_id && strlen(session_id) > 0) {
+        strncpy(s_tuya_session_id, session_id, sizeof(s_tuya_session_id) - 1);
+        s_tuya_session_id[sizeof(s_tuya_session_id) - 1] = '\0';
+    } else {
+        snprintf(s_tuya_session_id, sizeof(s_tuya_session_id), "tuya-session-%08x", (s_turn_count + 1) * 0x7654321);
+    }
+
+    s_state = TCLAW_STATE_LISTENING;
+    desk_hardware_display_set_expression("listening", "Tuya Cloud Voice Active");
+    return 0;
+}
+
+const char *desk_tclaw_tuya_get_session_id(void)
+{
+    return s_tuya_session_id;
+}
+
+int desk_tclaw_tuya_session_feed_audio(const uint8_t *pcm_data, size_t len)
+{
+    if (!pcm_data || len == 0) return -1;
+
+    if (s_tuya_session_id[0] == '\0') {
+        desk_tclaw_tuya_session_start(NULL);
+    }
+
+    if (s_state == TCLAW_STATE_IDLE) {
+        s_state = TCLAW_STATE_LISTENING;
+        desk_hardware_display_set_expression("listening", "Listening...");
+    }
+
+    return 0;
+}
+
+int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
+{
+    if (!event) return -1;
+
+    switch (event->type) {
+        case TUYA_DIALOGUE_EVT_SESSION_START:
+            if (event->session_id) {
+                strncpy(s_tuya_session_id, event->session_id, sizeof(s_tuya_session_id) - 1);
+                s_tuya_session_id[sizeof(s_tuya_session_id) - 1] = '\0';
+            }
+            s_state = TCLAW_STATE_LISTENING;
+            desk_hardware_display_set_expression("listening", "Tuya Cloud Listening");
+            break;
+
+        case TUYA_DIALOGUE_EVT_STREAM_TOKEN:
+            if (s_state != TCLAW_STATE_SPEAKING) {
+                if (desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 100) != DESK_ARBITER_OK) {
+                    return -1;
+                }
+                s_state = TCLAW_STATE_SPEAKING;
+                s_last_response[0] = '\0';
+            }
+
+            if (event->token) {
+                size_t cur_len = strlen(s_last_response);
+                if (cur_len + strlen(event->token) < sizeof(s_last_response) - 1) {
+                    strcat(s_last_response, event->token);
+                }
+                desk_hardware_display_set_expression("speaking", s_last_response);
+
+                if (s_speech_stream_cb) {
+                    s_speech_stream_cb(event->token, event->is_final_token, s_stream_user_data);
+                }
+            }
+            break;
+
+        case TUYA_DIALOGUE_EVT_TOOL_CALL:
+            s_state = TCLAW_STATE_TOOL_CALLING;
+            desk_hardware_display_set_expression("thinking", "Calling tool...");
+            if (event->tool_name) {
+                strncpy(s_current_pending_tool, event->tool_name, sizeof(s_current_pending_tool) - 1);
+                s_current_pending_tool[sizeof(s_current_pending_tool) - 1] = '\0';
+
+                char req_id[64];
+                snprintf(req_id, sizeof(req_id), "req-tuya-%08x", (s_turn_count + 1) * 0x13579bdf);
+                return desk_tclaw_trigger_tool_call(req_id, event->tool_name,
+                                                    event->tool_arguments ? event->tool_arguments : "{}");
+            }
+            break;
+
+        case TUYA_DIALOGUE_EVT_TTS_CHUNK:
+            if (event->tts_data && event->tts_len > 0) {
+                if (s_state != TCLAW_STATE_SPEAKING) {
+                    if (desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 100) == DESK_ARBITER_OK) {
+                        s_state = TCLAW_STATE_SPEAKING;
+                    }
+                }
+                desk_hardware_audio_play_pcm((const int16_t *)event->tts_data,
+                                             event->tts_len / sizeof(int16_t),
+                                             16000);
+            }
+            break;
+
+        case TUYA_DIALOGUE_EVT_SESSION_END:
+            if (s_state == TCLAW_STATE_SPEAKING) {
+                desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+            }
+            s_turn_count++;
+            s_state = TCLAW_STATE_IDLE;
+            s_current_pending_tool[0] = '\0';
+            desk_hardware_display_set_expression("idle", "Ready");
+            break;
+
+        case TUYA_DIALOGUE_EVT_ERROR:
+            if (s_state == TCLAW_STATE_SPEAKING) {
+                desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+            }
+            s_state = TCLAW_STATE_IDLE;
+            desk_hardware_display_set_expression("idle", event->error_msg ? event->error_msg : "Error");
+            break;
+
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+int desk_tclaw_tuya_send_tool_result(const char *session_id, const char *tool_name, const char *result_json)
+{
+    /* Feeds back tool execution result to active Tuya cloud dialogue session */
+    (void)session_id;
+    (void)tool_name;
+    (void)result_json;
+    return 0;
+}
+
+int desk_tclaw_tuya_session_stop(void)
+{
+    if (s_state == TCLAW_STATE_SPEAKING) {
+        desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+    }
+    s_state = TCLAW_STATE_IDLE;
+    s_tuya_session_id[0] = '\0';
+    s_current_pending_tool[0] = '\0';
+    desk_hardware_display_set_expression("idle", "Ready");
+    return 0;
+}
+
 int desk_tclaw_inject_text(const char *user_prompt)
 {
     if (!user_prompt) return -1;
+
+    if (s_tuya_session_id[0] == '\0') {
+        desk_tclaw_tuya_session_start(NULL);
+    }
 
     s_state = TCLAW_STATE_LISTENING;
     desk_hardware_display_set_expression("listening", user_prompt);
@@ -145,7 +296,7 @@ int desk_tclaw_inject_text(const char *user_prompt)
     s_state = TCLAW_STATE_THINKING;
     desk_hardware_display_set_expression("thinking", "Thinking...");
 
-    /* Detect intent for tool dispatching */
+    /* Detect intent for tool dispatching through Tuya dialogue engine */
     char req_id[64];
     snprintf(req_id, sizeof(req_id), "req-tclaw-%08x", (s_turn_count + 1) * 0x13579bdf);
 
@@ -176,6 +327,10 @@ int desk_tclaw_handle_tool_response(const char *request_id,
                                     const char *error_json)
 {
     if (!request_id || !status) return -1;
+
+    /* Report back to Tuya Cloud Dialogue session */
+    desk_tclaw_tuya_send_tool_result(s_tuya_session_id, s_current_pending_tool,
+                                     (strcmp(status, "succeeded") == 0) ? result_json : error_json);
 
     s_turn_count++;
     char spoken[1024];

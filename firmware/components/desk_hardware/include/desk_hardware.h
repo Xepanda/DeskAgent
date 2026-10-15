@@ -98,6 +98,7 @@ int desk_hardware_camera_stream_start(float target_fps, desk_camera_frame_cb_t c
 int desk_hardware_camera_stream_stop(void);
 int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, uint32_t timestamp_ms);
 int desk_hardware_camera_stream_pump(void);
+int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len);
 
 /* Display & Expression API */
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text);
