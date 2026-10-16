@@ -18,7 +18,7 @@ import threading
 import time
 import unittest
 from typing import Any, Mapping, Optional
-from companion.src.codex_companion import CodexCompanion, JsonRpcTransport
+from companion.src.codex_companion import CodexCompanion, DefaultMockTransport, JsonRpcTransport
 
 
 class TestCodexCompanion(unittest.TestCase):
@@ -302,6 +302,166 @@ class TestCodexCompanion(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    # -------------------------------------------------------------------------
+    # 7. Server-Initiated Approval with Server Request ID
+    # -------------------------------------------------------------------------
+    def test_server_initiated_request_approval_with_server_req_id(self) -> None:
+        """Verifies server-initiated approvals send JSON-RPC response with matching server_req_id."""
+        mock_transport = DefaultMockTransport()
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=mock_transport,
+        )
+
+        sub_res = companion.submit_task("tsk-serv-01", "test-project", "npm test")
+        thread_id = sub_res["thread_id"]
+        turn_id = sub_res["turn_id"]
+
+        # Server sends approval request with server-side JSON-RPC ID 88
+        companion._handle_server_notification(
+            method="item/commandExecution/requestApproval",
+            params={
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "command": "npm install lodash",
+                "cwd": self.workspace_dir,
+            },
+            server_req_id=88,
+        )
+
+        # Verify approval is registered under task
+        pending = companion.get_pending_approvals("tsk-serv-01")
+        self.assertEqual(len(pending), 1)
+        appr = pending[0]
+        self.assertEqual(appr["task_id"], "tsk-serv-01")
+        self.assertEqual(appr["server_req_id"], 88)
+        self.assertEqual(appr["action_type"], "command")
+        self.assertEqual(appr["command_or_path"], "npm install lodash")
+
+        # Respond with decision 'accept'
+        res = companion.respond_approval(
+            approval_id=appr["approval_id"],
+            task_id="tsk-serv-01",
+            decision="accept",
+            reason="User confirmed in dialog",
+        )
+        self.assertEqual(res["decision"], "approve")
+        self.assertEqual(res["status"], "applied")
+
+        # Verify transport sent response with id=88
+        self.assertEqual(len(mock_transport.sent_responses), 1)
+        resp_sent = mock_transport.sent_responses[0]
+        self.assertEqual(resp_sent["id"], 88)
+        self.assertEqual(resp_sent["result"]["decision"], "approve")
+        self.assertEqual(resp_sent["result"]["status"], "applied")
+
+    # -------------------------------------------------------------------------
+    # 8. Approval Race Condition Resolution (Approval before Task Mapping)
+    # -------------------------------------------------------------------------
+    def test_approval_arriving_before_task_mapping_race_condition(self) -> None:
+        """Verifies approval arriving before task mapping completes is automatically backfilled."""
+        mock_transport = DefaultMockTransport()
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=mock_transport,
+        )
+
+        target_thread = "thr-early-race-01"
+
+        # Inject approval notification BEFORE submit_task finishes
+        companion._handle_server_notification(
+            method="item/fileChange/requestApproval",
+            params={
+                "threadId": target_thread,
+                "turnId": "trn-early-01",
+                "path": "package.json",
+            },
+            server_req_id=99,
+        )
+
+        # At this moment, task_id is unresolved
+        pending_early = companion.get_pending_approvals()
+        self.assertEqual(len(pending_early), 1)
+        self.assertEqual(pending_early[0]["task_id"], "")
+
+        # Now simulate thread mapping occurring (e.g. submit_task receives thread_id)
+        with companion._lock:
+            companion._thread_to_task[target_thread] = "tsk-race-resolved"
+            for appr in companion._pending_approvals.values():
+                if not appr.get("task_id") and appr.get("thread_id") == target_thread:
+                    appr["task_id"] = "tsk-race-resolved"
+
+        # Verify approval is now associated with task_id
+        pending_after = companion.get_pending_approvals("tsk-race-resolved")
+        self.assertEqual(len(pending_after), 1)
+        self.assertEqual(pending_after[0]["task_id"], "tsk-race-resolved")
+        self.assertEqual(pending_after[0]["action_type"], "file_change")
+
+        # Responding succeeds
+        resp = companion.respond_approval(
+            approval_id=pending_after[0]["approval_id"],
+            task_id="tsk-race-resolved",
+            decision="approve",
+        )
+        self.assertEqual(resp["status"], "applied")
+
+    # -------------------------------------------------------------------------
+    # 9. RemoteCodexCompanionClient Full Cycle Over HTTP RPC
+    # -------------------------------------------------------------------------
+    def test_remote_codex_companion_client_full_cycle(self) -> None:
+        """Verifies RemoteCodexCompanionClient operations over LAN HTTP RPC."""
+        from companion.src.codex_companion import create_companion_server, RemoteCodexCompanionClient
+
+        port = 18766
+        token = "secret-client-token-999"
+
+        server = create_companion_server(port=port, host="127.0.0.1", auth_token=token)
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+        time.sleep(0.1)
+
+        client = RemoteCodexCompanionClient(
+            endpoint_url=f"http://127.0.0.1:{port}",
+            auth_token=token,
+            timeout_sec=5.0,
+        )
+
+        try:
+            # 1. Submit task
+            submit_res = client.submit_task("tsk-rem-01", "epanda-desk-agent", "pytest tests/")
+            self.assertEqual(submit_res["task_id"], "tsk-rem-01")
+            self.assertEqual(submit_res["workspace_alias"], "epanda-desk-agent")
+
+            # 2. Get task status
+            st = client.get_task_status("tsk-rem-01")
+            self.assertIsNotNone(st)
+            self.assertEqual(st["task_id"], "tsk-rem-01")
+
+            # 3. List workspaces
+            workspaces = client.list_workspaces()
+            self.assertIn("epanda-desk-agent", workspaces)
+
+            # 4. Append task
+            append_res = client.append_task("tsk-rem-01", "run coverage report")
+            self.assertTrue(append_res["appended"])
+
+            # 5. Cancel task
+            cancel_res = client.cancel_task("tsk-rem-01", reason="Testing cancel")
+            self.assertEqual(cancel_res["status"], "cancelled")
+
+            # 6. Auth failure with invalid token
+            bad_client = RemoteCodexCompanionClient(
+                endpoint_url=f"http://127.0.0.1:{port}",
+                auth_token="wrong-token",
+            )
+            with self.assertRaises(PermissionError):
+                bad_client.get_task_status("tsk-rem-01")
+
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
+
