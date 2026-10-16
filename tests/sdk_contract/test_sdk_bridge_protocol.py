@@ -684,9 +684,12 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         srv_sock.listen(1)
         port = srv_sock.getsockname()[1]
 
+        conn_box: list[socket.socket] = []
+
         def _srv():
             try:
                 conn, _ = srv_sock.accept()
+                conn_box.append(conn)
                 # Receive sys.client.hello and send sys.ack
                 hello_line = conn.recv(1024).decode("utf-8")
                 if "hello" in hello_line:
@@ -699,6 +702,12 @@ class TestSdkBridgeProtocol(unittest.TestCase):
                         break
             except Exception:
                 pass
+            finally:
+                if conn_box:
+                    try:
+                        conn_box[0].close()
+                    except Exception:
+                        pass
 
         th = threading.Thread(target=_srv, daemon=True)
         th.start()
@@ -714,7 +723,100 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             self.assertIn("TIMEOUT", res.get("error", {}).get("code", ""))
         finally:
             adapter.stop()
+            if conn_box:
+                try:
+                    conn_box[0].close()
+                except Exception:
+                    pass
             srv_sock.close()
             th.join(timeout=1.0)
+
+    def test_e2e_real_bridge_tool_dispatch_and_response_loop(self) -> None:
+        """Verifies real end-to-end tool request dispatch from firmware to RobotAdapter and tool response back."""
+        import socket
+        import threading
+        import time
+        from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
+
+        # 1. Start C bridge TCP socket server on ephemeral port
+        rc = self.lib.desk_sdk_socket_server_start(0)
+        self.assertEqual(rc, 0)
+        port = self.lib.desk_sdk_socket_server_get_port()
+        self.assertGreater(port, 1024)
+
+        # 2. Register C bridge tool response callback
+        received_responses: list[dict] = []
+        @TOOL_RESP_CB
+        def on_bridge_tool_response(resp_ptr, user_data):
+            raw = ctypes.string_at(resp_ptr).decode("utf-8")
+            received_responses.append(json.loads(raw))
+            return 0
+
+        self.lib.desk_sdk_bridge_register_tool_response_cb(on_bridge_tool_response, None)
+
+        # 3. Create RobotAdapter and register tool request handler
+        adapter = RobotAdapter(host="127.0.0.1", tcp_port=port, auto_pair=False, token="e2e-token")
+        received_requests: list[dict] = []
+        response_sent_event = threading.Event()
+        adapter_send_result: list[bool] = []
+
+        def on_adapter_tool_request(raw_msg: dict) -> None:
+            received_requests.append(raw_msg)
+            req_id = raw_msg.get("request_id") or raw_msg.get("data", {}).get("request_id")
+            tool_resp = {
+                "schema_version": "1.0.0",
+                "request_id": req_id,
+                "status": "succeeded",
+                "timestamp": "2026-10-16T15:30:00Z",
+                "result": {"status": "ok", "delivered": True},
+            }
+            res = adapter.send_tool_response(tool_resp)
+            adapter_send_result.append(res)
+            response_sent_event.set()
+
+        adapter.register_tool_request_handler(on_adapter_tool_request)
+
+        try:
+            # 4. Start RobotAdapter and poll C bridge server until connected
+            adapter.start()
+            t0 = time.time()
+            while time.time() - t0 < 2.0:
+                self.lib.desk_sdk_socket_server_poll(20)
+                if adapter.is_connected:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(adapter.is_connected, "RobotAdapter failed to connect to C bridge")
+
+            # 5. Dispatch tool request from C bridge over TCP
+            t_start = time.time()
+            tool_req = json.dumps({
+                "schema_version": "1.0.0",
+                "request_id": "req-e2e-tclaw-99",
+                "operation": "reminder.create",
+                "arguments": {"title": "Team Standup", "due_at": "2026-10-16T18:00:00Z"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            })
+            rc_disp = self.lib.desk_sdk_bridge_dispatch_tool_request(tool_req.encode("utf-8"))
+            self.assertEqual(rc_disp, 0)
+
+            # 6. Poll C bridge until tool response is received and ACKed
+            while time.time() - t_start < 2.0:
+                self.lib.desk_sdk_socket_server_poll(20)
+                if len(received_responses) > 0 and len(adapter_send_result) > 0:
+                    break
+                time.sleep(0.01)
+
+            elapsed_ms = (time.time() - t_start) * 1000
+            self.assertTrue(response_sent_event.wait(timeout=1.0), "Response event was not set")
+            self.assertEqual(len(received_requests), 1)
+            self.assertEqual(received_requests[0].get("request_id"), "req-e2e-tclaw-99")
+            self.assertEqual(len(adapter_send_result), 1)
+            self.assertTrue(adapter_send_result[0], "send_tool_response must return True (code 0)")
+            self.assertEqual(len(received_responses), 1)
+            self.assertEqual(received_responses[0].get("request_id"), "req-e2e-tclaw-99")
+            self.assertEqual(received_responses[0].get("data", {}).get("status"), "succeeded")
+        finally:
+            adapter.stop()
+            self.lib.desk_sdk_socket_server_stop()
 
 

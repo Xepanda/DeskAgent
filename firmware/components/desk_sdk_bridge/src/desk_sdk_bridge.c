@@ -18,6 +18,10 @@
 #include <errno.h>
 #include <time.h>
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 static void desk_sdk_format_iso8601(time_t t, char *out_buf, size_t buf_len)
 {
     if (!out_buf || buf_len < 21) return;
@@ -795,10 +799,21 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
     }
 
     if (s_client_fd >= 0) {
-        ssize_t ret = write(s_client_fd, formatted, strlen(formatted));
-        (void)ret;
-        ret = write(s_client_fd, "\n", 1);
-        (void)ret;
+        ssize_t ret = send(s_client_fd, formatted, strlen(formatted), MSG_NOSIGNAL);
+        if (ret < 0) {
+            if (errno == EPIPE || errno == ECONNRESET || errno == EBADF) {
+                close(s_client_fd);
+                s_client_fd = -1;
+                s_client_connected = false;
+            }
+        } else {
+            ret = send(s_client_fd, "\n", 1, MSG_NOSIGNAL);
+            if (ret < 0 && (errno == EPIPE || errno == ECONNRESET || errno == EBADF)) {
+                close(s_client_fd);
+                s_client_fd = -1;
+                s_client_connected = false;
+            }
+        }
     }
 
     return 0;
@@ -815,11 +830,20 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
 
     if (s_client_fd >= 0) {
         size_t len = strlen(request_envelope_json);
-        ssize_t written = write(s_client_fd, request_envelope_json, len);
-        (void)written;
-        if (len == 0 || request_envelope_json[len - 1] != '\n') {
-            written = write(s_client_fd, "\n", 1);
-            (void)written;
+        ssize_t w = send(s_client_fd, request_envelope_json, len, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EPIPE || errno == ECONNRESET || errno == EBADF) {
+                close(s_client_fd);
+                s_client_fd = -1;
+                s_client_connected = false;
+            }
+        } else if (len == 0 || request_envelope_json[len - 1] != '\n') {
+            ssize_t wn = send(s_client_fd, "\n", 1, MSG_NOSIGNAL);
+            if (wn < 0 && (errno == EPIPE || errno == ECONNRESET || errno == EBADF)) {
+                close(s_client_fd);
+                s_client_fd = -1;
+                s_client_connected = false;
+            }
         }
     }
 

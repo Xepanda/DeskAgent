@@ -247,10 +247,13 @@ class RobotAdapter:
             # Route tool requests from TClaw to Host
             if msg_type == "tool.request" or msg.get("operation"):
                 if self._tool_request_handler:
-                    try:
-                        self._tool_request_handler(msg)
-                    except Exception as err:
-                        logger.warning("Tool request handler error: %s", err)
+                    handler = self._tool_request_handler
+                    def _dispatch(payload: dict[str, Any]) -> None:
+                        try:
+                            handler(payload)
+                        except Exception as err:
+                            logger.warning("Tool request handler error: %s", err)
+                    threading.Thread(target=_dispatch, args=(msg,), name="desk-tool-dispatch", daemon=True).start()
         except Exception as e:
             logger.debug("Failed to parse incoming line from robot: %s (%s)", line, e)
 
@@ -270,7 +273,7 @@ class RobotAdapter:
 
         # Wait for ack response
         deadline = time.time() + timeout
-        expected_key = req_id if req_id in cmd_dict else cmd_type
+        expected_key = req_id if "request_id" in cmd_dict else cmd_type
         while time.time() < deadline and not self._stop_event.is_set():
             with self._lock:
                 if expected_key in self._pending_responses:
@@ -362,10 +365,13 @@ class RobotAdapter:
 
     def send_tool_response(self, response_envelope: dict[str, Any]) -> bool:
         """Sends tool response envelope back to firmware TClaw."""
-        cmd = {
+        req_id = response_envelope.get("request_id")
+        cmd: dict[str, Any] = {
             "type": "tool.response",
             "data": response_envelope,
         }
+        if req_id:
+            cmd["request_id"] = req_id
         try:
             res = self.send_command(cmd, timeout=1.5)
             return res.get("code", 0) == 0
