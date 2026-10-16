@@ -178,6 +178,7 @@ class DeskAgentHostApp:
             )
             self.register_robot_hardware_client(self.robot_adapter)
             self.register_announcement_channel(self.robot_adapter.send_announcement)
+            self.robot_adapter.register_tool_request_handler(self._on_robot_tool_request)
             self.robot_adapter.start()
 
         # HA State Subscription
@@ -249,6 +250,42 @@ class DeskAgentHostApp:
         except Exception as e:
             logger.warning("Announcement channel returned error: %s", e)
             return False
+
+    def _on_robot_tool_request(self, raw_msg: dict[str, Any]) -> None:
+        """Handles tool requests from robot TClaw dialogue engine and routes them."""
+        try:
+            if not isinstance(raw_msg, dict):
+                logger.warning("Invalid raw tool request format from robot: %s", raw_msg)
+                return
+
+            if raw_msg.get("type") == "tool.request" and isinstance(raw_msg.get("data"), dict):
+                env_dict = dict(raw_msg["data"])
+            else:
+                env_dict = dict(raw_msg)
+
+            if "request_id" not in env_dict or "operation" not in env_dict:
+                logger.warning("Tool request missing required fields: %s", raw_msg)
+                return
+
+            if "expires_at" not in env_dict:
+                # Default 60s expiration if omitted by firmware
+                env_dict["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+
+            req = RequestEnvelope.from_dict(env_dict)
+            resp = self.router.dispatch(req)
+            if self.robot_adapter:
+                self.robot_adapter.send_tool_response(resp.to_dict())
+        except Exception as exc:
+            logger.exception("Failed to process tool request from robot: %s", exc)
+            if isinstance(raw_msg, dict):
+                req_id = raw_msg.get("request_id") or (raw_msg.get("data", {}).get("request_id") if isinstance(raw_msg.get("data"), dict) else None)
+                if req_id and self.robot_adapter:
+                    err_resp = ResponseEnvelope.create_error(
+                        request_id=req_id,
+                        code="INTERNAL_ERROR",
+                        message=str(exc),
+                    )
+                    self.robot_adapter.send_tool_response(err_resp.to_dict())
 
     def _delivery_loop(self) -> None:
         """Consumes outbox messages and reliably delivers to robot announcement channels with retry."""

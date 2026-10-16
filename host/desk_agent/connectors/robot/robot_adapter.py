@@ -53,6 +53,7 @@ class RobotAdapter:
         self._pending_responses: dict[str, Any] = {}
         self._event_listeners: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
         self._tool_request_handler: Optional[Callable[[dict[str, Any]], None]] = None
+        self._recv_buf: str = ""
 
     @property
     def is_connected(self) -> bool:
@@ -92,6 +93,7 @@ class RobotAdapter:
                 pass
             self._sock = None
         self._connected = False
+        self._recv_buf = ""
 
     def pair_udp(self, timeout: float = 2.0) -> Optional[str]:
         """Performs UDP Pairing Discovery (watcher_lan_pairing_v1) to obtain dynamic session token."""
@@ -225,7 +227,7 @@ class RobotAdapter:
             req_id = msg.get("request_id")
 
             # Route response acks
-            if msg_type in ("sys.ack", "sys.nack") or req_id:
+            if msg_type in ("sys.ack", "sys.nack") or (req_id and not msg.get("operation") and msg_type != "tool.request"):
                 with self._lock:
                     key = req_id or msg_type
                     self._pending_responses[key] = msg
@@ -277,9 +279,40 @@ class RobotAdapter:
                     return self._pending_responses.pop("sys.ack")
                 if "sys.nack" in self._pending_responses:
                     return self._pending_responses.pop("sys.nack")
-            time.sleep(0.02)
 
-        return {"type": "sys.ack", "code": 0, "status": "sent_unacknowledged"}
+            worker_alive = bool(self._worker_thread and self._worker_thread.is_alive())
+            if not worker_alive and self._sock:
+                try:
+                    rlist, _, _ = select.select([self._sock], [], [], 0.05)
+                    if rlist:
+                        data = self._sock.recv(4096)
+                        if data:
+                            self._recv_buf += data.decode("utf-8", errors="replace")
+                            while "\n" in self._recv_buf:
+                                line, self._recv_buf = self._recv_buf.split("\n", 1)
+                                line = line.strip()
+                                if line:
+                                    self._handle_incoming_line(line)
+                        else:
+                            with self._lock:
+                                self._close_socket()
+                            break
+                    else:
+                        time.sleep(0.01)
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.02)
+
+        return {
+            "type": "sys.nack",
+            "code": 408,
+            "status": "timeout",
+            "error": {
+                "code": "TIMEOUT",
+                "message": "No ACK received from robot within timeout",
+            },
+        }
 
     def send_motion_move(self, pan: float, tilt: float, duration_ms: int = 500) -> dict[str, Any]:
         """Executes physical motion command on robot gimbal."""
@@ -292,10 +325,11 @@ class RobotAdapter:
             },
         }
         res = self.send_command(cmd, timeout=2.0)
-        status = res.get("data", {}).get("status") if isinstance(res.get("data"), dict) else "completed"
+        confirmed = res.get("code") == 0
+        status = res.get("data", {}).get("status") if isinstance(res.get("data"), dict) else res.get("status", "completed")
         return {
-            "status": "completed" if status == "succeeded" else status,
-            "confirmed": res.get("code") == 0,
+            "status": "completed" if (status == "succeeded" or (confirmed and status == "completed")) else status,
+            "confirmed": confirmed,
             "pan": pan,
             "tilt": tilt,
             "duration_ms": duration_ms,

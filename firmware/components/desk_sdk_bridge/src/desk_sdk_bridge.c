@@ -675,10 +675,18 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* External tool response envelope from Python client */
-    if (strstr(json_in, "\"status\":") != NULL && strstr(json_in, "\"request_id\":") != NULL) {
+    if (strstr(json_in, "tool.response") != NULL || (strstr(json_in, "\"status\":") != NULL && strstr(json_in, "\"request_id\":") != NULL)) {
         desk_sdk_bridge_handle_tool_response(json_in);
-        snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"received\"}}");
+        char req_id[64] = "";
+        json_parse_str(json_in, "request_id", req_id, sizeof(req_id));
+        if (req_id[0] != '\0') {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"request_id\":\"%s\",\"data\":{\"status\":\"received\"}}",
+                     req_id);
+        } else {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"received\"}}");
+        }
         return 0;
     }
 
@@ -799,10 +807,23 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
 int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
 {
     if (!request_envelope_json) return -1;
+
+    int ret = 0;
     if (s_outbound_cb) {
-        return s_outbound_cb(request_envelope_json, strlen(request_envelope_json), s_outbound_user_data);
+        ret = s_outbound_cb(request_envelope_json, strlen(request_envelope_json), s_outbound_user_data);
     }
-    return 0;
+
+    if (s_client_fd >= 0) {
+        size_t len = strlen(request_envelope_json);
+        ssize_t written = write(s_client_fd, request_envelope_json, len);
+        (void)written;
+        if (len == 0 || request_envelope_json[len - 1] != '\n') {
+            written = write(s_client_fd, "\n", 1);
+            (void)written;
+        }
+    }
+
+    return ret;
 }
 
 int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json)

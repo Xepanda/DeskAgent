@@ -619,3 +619,102 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         s.close()
         self.lib.desk_sdk_socket_server_stop()
 
+    def test_tcp_tool_request_forwarding_over_socket(self) -> None:
+        """Verifies desk_sdk_bridge_dispatch_tool_request writes tool request envelope to TCP client."""
+        import socket
+        rc = self.lib.desk_sdk_socket_server_start(0)
+        self.assertEqual(rc, 0)
+        port = self.lib.desk_sdk_socket_server_get_port()
+
+        client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_sock.connect(("127.0.0.1", port))
+        client_sock.settimeout(1.0)
+        self.lib.desk_sdk_socket_server_poll(100)
+
+        # Dispatch tool request
+        tool_req = json.dumps({
+            "schema_version": "1.0.0",
+            "request_id": "req-tclaw-tcp-01",
+            "operation": "reminder.create",
+            "arguments": {"title": "Meeting in 5 mins", "due_at": "2026-10-16T15:00:00Z"},
+            "expires_at": "2026-10-16T15:01:00Z",
+        })
+        rc_disp = self.lib.desk_sdk_bridge_dispatch_tool_request(tool_req.encode("utf-8"))
+        self.assertEqual(rc_disp, 0)
+
+        # Receive on client socket
+        raw_received = client_sock.recv(4096).decode("utf-8")
+        self.assertTrue(raw_received.endswith("\n"))
+        data = json.loads(raw_received.strip())
+        self.assertEqual(data["request_id"], "req-tclaw-tcp-01")
+        self.assertEqual(data["operation"], "reminder.create")
+
+        # Reply with tool response
+        tool_resp = json.dumps({
+            "type": "tool.response",
+            "request_id": "req-tclaw-tcp-01",
+            "data": {
+                "schema_version": "1.0.0",
+                "request_id": "req-tclaw-tcp-01",
+                "status": "succeeded",
+                "timestamp": "2026-10-16T15:00:01Z",
+                "result": {"reminder_id": "rem-101"},
+            },
+        })
+        client_sock.sendall((tool_resp + "\n").encode("utf-8"))
+        self.lib.desk_sdk_socket_server_poll(100)
+
+        ack_data = client_sock.recv(1024).decode("utf-8").strip()
+        ack_json = json.loads(ack_data)
+        self.assertEqual(ack_json.get("type"), "sys.ack")
+        self.assertEqual(ack_json.get("code"), 0)
+
+        client_sock.close()
+        self.lib.desk_sdk_socket_server_stop()
+
+    def test_robot_adapter_send_command_timeout_returns_408_nack(self) -> None:
+        """Verifies RobotAdapter.send_command returns 408 NACK instead of 0 on timeout."""
+        import socket
+        import threading
+        from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
+
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv_sock.bind(("127.0.0.1", 0))
+        srv_sock.listen(1)
+        port = srv_sock.getsockname()[1]
+
+        def _srv():
+            try:
+                conn, _ = srv_sock.accept()
+                # Receive sys.client.hello and send sys.ack
+                hello_line = conn.recv(1024).decode("utf-8")
+                if "hello" in hello_line:
+                    ack = json.dumps({"type": "sys.ack", "code": 0, "data": {"capabilities": ["motion"]}}) + "\n"
+                    conn.sendall(ack.encode("utf-8"))
+                # For next commands, don't reply so client times out
+                while True:
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+            except Exception:
+                pass
+
+        th = threading.Thread(target=_srv, daemon=True)
+        th.start()
+
+        adapter = RobotAdapter(host="127.0.0.1", tcp_port=port, auto_pair=False, token="dummy-token")
+        try:
+            self.assertTrue(adapter.connect_tcp(timeout=2.0))
+            # Send a command with a very short timeout
+            res = adapter.send_command({"type": "ctrl.motion.move", "data": {"pan": 0}}, timeout=0.1)
+            self.assertEqual(res.get("type"), "sys.nack")
+            self.assertEqual(res.get("code"), 408)
+            self.assertEqual(res.get("status"), "timeout")
+            self.assertIn("TIMEOUT", res.get("error", {}).get("code", ""))
+        finally:
+            adapter.stop()
+            srv_sock.close()
+            th.join(timeout=1.0)
+
+

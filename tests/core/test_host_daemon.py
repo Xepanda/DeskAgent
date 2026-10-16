@@ -279,6 +279,67 @@ class TestHostDaemon(unittest.TestCase):
             f"Alert must be processed: delivered={delivered_ids}, pending={pending_topics}",
         )
 
+    def test_robot_tool_request_dispatched_to_router(self) -> None:
+        """Verifies Host processes tool request from robot dialogue engine and sends response back."""
+        # 1. Wrapped format
+        wrapped_req = {
+            "type": "tool.request",
+            "data": {
+                "schema_version": "1.0.0",
+                "request_id": "req-tclaw-router-01",
+                "operation": "reminder.create",
+                "arguments": {
+                    "reminder_id": "rem-tclaw-bridge-01",
+                    "title": "Drink Coffee",
+                    "due_at": "2026-10-16T16:00:00Z",
+                },
+                "expires_at": "2030-01-01T00:00:00Z",
+            },
+        }
+
+        sent_responses: list[dict] = []
+        if self.app.robot_adapter:
+            original_send = self.app.robot_adapter.send_tool_response
+            self.app.robot_adapter.send_tool_response = lambda resp: sent_responses.append(resp) or True
+        else:
+            class DummyAdapter:
+                def send_tool_response(self, resp):
+                    sent_responses.append(resp)
+                    return True
+            self.app.robot_adapter = DummyAdapter()
+            original_send = None
+
+        try:
+            self.app._on_robot_tool_request(wrapped_req)
+            self.assertEqual(len(sent_responses), 1)
+            resp = sent_responses[0]
+            self.assertEqual(resp["request_id"], "req-tclaw-router-01")
+            self.assertEqual(resp["status"], "succeeded")
+            self.assertEqual(resp["result"]["reminder_id"], "rem-tclaw-bridge-01")
+
+            # Check reminder actually exists in life service
+            rem = self.app.life_service.get_reminder("rem-tclaw-bridge-01")
+            self.assertIsNotNone(rem)
+            self.assertEqual(rem["title"], "Drink Coffee")
+
+            # 2. Direct envelope format
+            direct_req = {
+                "schema_version": "1.0.0",
+                "request_id": "req-tclaw-router-02",
+                "operation": "ha.get_state",
+                "arguments": {"entity_id": "light.living_room"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            self.app._on_robot_tool_request(direct_req)
+            self.assertEqual(len(sent_responses), 2)
+            resp2 = sent_responses[1]
+            self.assertEqual(resp2["request_id"], "req-tclaw-router-02")
+            self.assertEqual(resp2["status"], "succeeded")
+        finally:
+            if original_send and self.app.robot_adapter:
+                self.app.robot_adapter.send_tool_response = original_send
+
 
 if __name__ == "__main__":
     unittest.main()
+
