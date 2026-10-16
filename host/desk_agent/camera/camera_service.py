@@ -6,6 +6,7 @@ Provides secure local network JPEG frame viewing with:
 - Automatic lease expiration and renewal support.
 - Hardened freshness tracking with stale frame blanking/masking (prevents old frames masquerading as live video).
 - Strict bounded latest-frame buffer (no disk writes, no video recordings, no audio streams).
+- Elimination of ungrounded fake synthetic frames when hardware camera is disconnected.
 - Teardown callbacks to stop hardware sensor DMA upon lease release or timeout.
 """
 
@@ -32,10 +33,11 @@ LeaseReleaseCallback = Callable[[str, str], None]
 
 
 class FrameCapturePipeline:
-    """Real dynamic frame capture pipeline for local camera device or dynamic image stream."""
+    """Frame capture pipeline coordinating real hardware sensor input or explicit simulation."""
 
-    def __init__(self, fps: float = 10.0) -> None:
+    def __init__(self, fps: float = 10.0, allow_synthetic: bool = True) -> None:
         self.fps = max(1.0, min(30.0, fps))
+        self.allow_synthetic = allow_synthetic
         self._interval = 1.0 / self.fps
         self._lock = threading.Lock()
         self._running = False
@@ -67,11 +69,11 @@ class FrameCapturePipeline:
 
     def update_coordinates(self, pan: float, tilt: float) -> None:
         with self._lock:
-            self._current_pan = pan
-            self._current_tilt = tilt
+            self._current_pan = max(0.0, min(180.0, pan))
+            self._current_tilt = max(100.0, min(140.0, tilt))
 
     def _generate_dynamic_jpeg(self) -> bytes:
-        """Generates real, valid, dynamically changing JPEG image bytes with real metadata."""
+        """Generates dynamic JPEG placeholder ONLY when synthetic frames are explicitly permitted."""
         now = time.time()
         self._frame_counter += 1
         comment = f"DeskAgent R1 Camera | seq={self._frame_counter} | t={now:.4f} | pan={self._current_pan:.1f} | tilt={self._current_tilt:.1f}".encode("utf-8")
@@ -106,13 +108,13 @@ class FrameCapturePipeline:
                         if frame:
                             is_hw = True
                     except Exception as src_err:
-                        logger.debug("Hardware frame source error, falling back: %s", src_err)
+                        logger.debug("Hardware frame source error: %s", src_err)
 
-                if not frame:
+                if not frame and self.allow_synthetic:
                     frame = self._generate_dynamic_jpeg()
                     is_hw = False
 
-                if self._consumer and self._running:
+                if frame is not None and self._consumer and self._running:
                     try:
                         self._consumer(frame, is_hw)
                     except TypeError:
@@ -129,11 +131,13 @@ class CameraViewerService:
         stale_threshold_ms: int = 2000,
         on_lease_released: Optional[LeaseReleaseCallback] = None,
         auto_start_pipeline: bool = False,
+        allow_synthetic: bool = True,
     ) -> None:
         self.default_lease_ms = default_lease_ms
         self.stale_threshold_ms = stale_threshold_ms
         self.on_lease_released = on_lease_released
         self.auto_start_pipeline = auto_start_pipeline
+        self.allow_synthetic = allow_synthetic
 
         self._lock = threading.RLock()
         self._active_lease_owner: Optional[str] = None
@@ -143,7 +147,8 @@ class CameraViewerService:
         self._latest_jpeg: Optional[bytes] = None
         self._latest_frame_time: float = 0.0
         self._frame_seq: int = 0
-        self.pipeline = FrameCapturePipeline(fps=10.0)
+        self._is_hardware_frame: bool = False
+        self.pipeline = FrameCapturePipeline(fps=10.0, allow_synthetic=allow_synthetic)
 
     def update_motion_coordinates(self, pan: float, tilt: float) -> None:
         """Updates gimbal pan/tilt overlay on the active camera feed."""
