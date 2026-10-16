@@ -279,6 +279,33 @@ class TestHostDaemon(unittest.TestCase):
             f"Alert must be processed: delivered={delivered_ids}, pending={pending_topics}",
         )
 
+    def test_scheduler_loop_uses_atomic_trigger(self) -> None:
+        """Verifies scheduler loop triggers due reminders via atomic trigger_occurrence_to_outbox."""
+        called_occs = []
+        original_trigger = getattr(self.app.life_service, "trigger_occurrence_to_outbox", None)
+
+        def spy_trigger(occurrence_id, topic="reminder.alert", is_catchup=False):
+            called_occs.append(occurrence_id)
+            if original_trigger:
+                return original_trigger(occurrence_id, topic=topic, is_catchup=is_catchup)
+            return None
+
+        self.app.life_service.trigger_occurrence_to_outbox = spy_trigger
+        try:
+            self.app.life_service.create_reminder(
+                reminder_id="rem-atomic-sched-01",
+                title="Atomic Sched Alert",
+                due_at="2020-01-01T00:00:00Z",
+            )
+            # Wait for scheduler loop to pick it up
+            time.sleep(1.2)
+            self.assertTrue(len(called_occs) >= 1, "Scheduler loop must call trigger_occurrence_to_outbox")
+        finally:
+            if original_trigger:
+                self.app.life_service.trigger_occurrence_to_outbox = original_trigger
+            elif hasattr(self.app.life_service, "trigger_occurrence_to_outbox"):
+                delattr(self.app.life_service, "trigger_occurrence_to_outbox")
+
     def test_robot_tool_request_dispatched_to_router(self) -> None:
         """Verifies Host processes tool request from robot dialogue engine and sends response back."""
         # 1. Wrapped format

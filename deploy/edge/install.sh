@@ -7,10 +7,12 @@ set -euo pipefail
 INSTALL_DIR="/opt/desk-agent"
 DATA_DIR="/var/lib/desk-agent"
 CONFIG_DIR="/etc/desk-agent"
-SERVICE_SRC="$(dirname "$0")/desk-agent.service"
-CONFIG_SRC="$(dirname "$0")/config.example.json"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+SERVICE_SRC="${SCRIPT_DIR}/desk-agent.service"
+CONFIG_SRC="${SCRIPT_DIR}/config.example.json"
 
-echo "=== [1/5] Creating dedicated system user 'deskagent' ==="
+echo "=== [1/6] Creating dedicated system user 'deskagent' ==="
 if ! id "deskagent" &>/dev/null; then
     useradd --system --user-group --shell /usr/sbin/nologin deskagent
     echo "Created system user: deskagent"
@@ -18,7 +20,7 @@ else
     echo "System user 'deskagent' already exists"
 fi
 
-echo "=== [2/5] Setting up data and config directories ==="
+echo "=== [2/6] Setting up data and config directories ==="
 mkdir -p "${DATA_DIR}"
 mkdir -p "${CONFIG_DIR}"
 chown -R deskagent:deskagent "${DATA_DIR}"
@@ -33,29 +35,48 @@ else
     echo "Preserved existing config at ${CONFIG_DIR}/config.json"
 fi
 
-echo "=== [3/5] Verifying Python virtual environment ==="
-if [ -d "${INSTALL_DIR}/venv" ]; then
-    echo "Virtual environment detected at ${INSTALL_DIR}/venv"
+echo "=== [3/6] Installing application code to ${INSTALL_DIR} ==="
+mkdir -p "${INSTALL_DIR}"
+cp -r "${PROJECT_ROOT}/host" "${INSTALL_DIR}/"
+if [ -d "${PROJECT_ROOT}/companion" ]; then
+    cp -r "${PROJECT_ROOT}/companion" "${INSTALL_DIR}/"
+fi
+if [ -d "${PROJECT_ROOT}/contracts" ]; then
+    cp -r "${PROJECT_ROOT}/contracts" "${INSTALL_DIR}/"
+fi
+cp "${PROJECT_ROOT}/requirements.txt" "${INSTALL_DIR}/requirements.txt"
+echo "Application code copied to ${INSTALL_DIR}"
+
+echo "=== [4/6] Setting up Python virtual environment and dependencies ==="
+if [ ! -d "${INSTALL_DIR}/venv" ]; then
+    echo "Creating Python virtual environment at ${INSTALL_DIR}/venv..."
+    python3 -m venv "${INSTALL_DIR}/venv"
 else
-    echo "Warning: Virtual environment at ${INSTALL_DIR}/venv not found."
-    echo "Please set up the venv before starting the systemd service:"
-    echo "  python3 -m venv ${INSTALL_DIR}/venv"
-    echo "  ${INSTALL_DIR}/venv/bin/pip install -r requirements.txt"
+    echo "Reusing existing virtual environment at ${INSTALL_DIR}/venv"
 fi
 
-echo "=== [4/5] Installing systemd service unit ==="
+echo "Installing requirements into ${INSTALL_DIR}/venv..."
+"${INSTALL_DIR}/venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt"
+
+echo "Setting permissions on ${INSTALL_DIR}..."
+chown -R deskagent:deskagent "${INSTALL_DIR}"
+
+echo "=== [5/6] Installing systemd service unit ==="
 if [ -f "${SERVICE_SRC}" ]; then
     cp "${SERVICE_SRC}" /etc/systemd/system/desk-agent.service
-    systemctl daemon-reload
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    fi
     echo "Systemd service installed to /etc/systemd/system/desk-agent.service"
 else
     echo "Error: desk-agent.service template not found at ${SERVICE_SRC}"
     exit 1
 fi
 
-echo "=== [5/5] Deployment Complete ==="
+echo "=== [6/6] Deployment Complete ==="
 echo "To enable and start the service:"
 echo "  sudo systemctl enable --now desk-agent.service"
 echo "To check status and logs:"
 echo "  sudo systemctl status desk-agent.service"
 echo "  sudo journalctl -u desk-agent.service -f"
+

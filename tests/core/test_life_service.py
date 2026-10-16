@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -347,5 +348,149 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(len(pending_after), 0, "Failed message must transition out of pending state into failed")
 
 
+    # -------------------------------------------------------------------------
+    # 11. Atomic trigger_occurrence_to_outbox
+    # -------------------------------------------------------------------------
+    def test_trigger_occurrence_to_outbox_atomic_success(self) -> None:
+        self.service.create_reminder(
+            reminder_id="rem-atomic-01",
+            title="Atomic Pill",
+            due_at="2026-10-15T08:00:00Z",
+        )
+        due = self.service.get_due_occurrences("2026-10-15T09:00:00Z")
+        self.assertEqual(len(due), 1)
+        occ_id = due[0]["occurrence_id"]
+
+        result = self.service.trigger_occurrence_to_outbox(occ_id, topic="reminder.alert", is_catchup=False)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["occurrence_id"], occ_id)
+        self.assertEqual(result["reminder_id"], "rem-atomic-01")
+
+        # Occurrence state is ringing
+        all_occs = self.service.get_all_occurrences("rem-atomic-01")
+        self.assertEqual(len(all_occs), 1)
+        self.assertEqual(all_occs[0]["state"], "ringing")
+
+        # Reminder status is ringing
+        rem = self.service.get_reminder("rem-atomic-01")
+        self.assertEqual(rem["status"], "ringing")
+
+        # Outbox message is created
+        pending = self.service.get_pending_outbox_messages()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["topic"], "reminder.alert")
+        self.assertEqual(pending[0]["payload"]["reminder_id"], "rem-atomic-01")
+        self.assertEqual(pending[0]["payload"]["occurrence_id"], occ_id)
+        self.assertEqual(pending[0]["payload"]["title"], "Atomic Pill")
+        self.assertFalse(pending[0]["payload"]["is_catchup"])
+
+    def test_trigger_occurrence_to_outbox_recurring_schedules_next(self) -> None:
+        self.service.create_reminder(
+            reminder_id="rem-atomic-rec",
+            title="Daily Exercise",
+            due_at="2026-10-15T07:00:00Z",
+            repeat_rule="daily",
+            timezone_str="Asia/Shanghai",
+        )
+        due = self.service.get_due_occurrences("2026-10-15T07:05:00Z")
+        occ_id = due[0]["occurrence_id"]
+
+        result = self.service.trigger_occurrence_to_outbox(occ_id, topic="reminder.alert", is_catchup=False)
+        self.assertIsNotNone(result)
+
+        occs = self.service.get_all_occurrences("rem-atomic-rec")
+        self.assertEqual(len(occs), 2)
+        self.assertEqual(occs[0]["state"], "ringing")
+        self.assertEqual(occs[1]["state"], "pending")
+        self.assertEqual(occs[1]["scheduled_at"], "2026-10-16T07:00:00Z")
+
+        pending = self.service.get_pending_outbox_messages()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["payload"]["reminder_id"], "rem-atomic-rec")
+
+    def test_trigger_occurrence_to_outbox_atomic_rollback_on_failure(self) -> None:
+        """Verifies that an error during triggering rolls back ringing state and does NOT leave orphaned records."""
+        self.service.create_reminder(
+            reminder_id="rem-rollback-01",
+            title="Rollback Test",
+            due_at="2026-10-15T08:00:00Z",
+        )
+        due = self.service.get_due_occurrences("2026-10-15T09:00:00Z")
+        occ_id = due[0]["occurrence_id"]
+
+        original_conn = self.service._get_connection()
+        original_conn.execute("""
+            CREATE TRIGGER fail_outbox_insert BEFORE INSERT ON outbox
+            BEGIN
+                SELECT RAISE(FAIL, 'Simulated disk/power failure during outbox insert');
+            END;
+        """)
+
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                self.service.trigger_occurrence_to_outbox(occ_id)
+        finally:
+            original_conn.execute("DROP TRIGGER IF EXISTS fail_outbox_insert;")
+
+        # Verify ATOMIC ROLLBACK:
+        # Occurrence MUST still be 'pending' (NOT orphaned into 'ringing' without outbox message!)
+        all_occs = self.service.get_all_occurrences("rem-rollback-01")
+        self.assertEqual(len(all_occs), 1)
+        self.assertEqual(all_occs[0]["state"], "pending")
+
+        # Reminder MUST still be 'scheduled'
+        rem = self.service.get_reminder("rem-rollback-01")
+        self.assertEqual(rem["status"], "scheduled")
+
+        # Outbox MUST have 0 records
+        pending = self.service.get_pending_outbox_messages()
+        self.assertEqual(len(pending), 0)
+
+    # -------------------------------------------------------------------------
+    # 12. Timezone-Aware Recurrence
+    # -------------------------------------------------------------------------
+    def test_compute_next_occurrence_timezone_aware(self) -> None:
+        from host.desk_agent.services.life_service import compute_next_occurrence
+
+        # 1. DST transition test: America/New_York (clocks spring forward 1 hour on 2026-03-08)
+        # 2026-03-07 09:00 EST is 2026-03-07 14:00:00 UTC
+        # With tz_name="America/New_York", daily recurrence should remain at 09:00 local EDT (2026-03-08 13:00:00 UTC)
+        next_dst = compute_next_occurrence("2026-03-07T14:00:00Z", "daily", tz_name="America/New_York")
+        self.assertEqual(next_dst, "2026-03-08T13:00:00Z")
+
+        # Without timezone (UTC naive step), +24h gives 14:00:00 UTC
+        next_utc = compute_next_occurrence("2026-03-07T14:00:00Z", "daily")
+        self.assertEqual(next_utc, "2026-03-08T14:00:00Z")
+
+        # 2. Weekday calculation in local timezone:
+        next_sh = compute_next_occurrence("2026-10-16T08:00:00Z", "daily", tz_name="Asia/Shanghai")
+        self.assertEqual(next_sh, "2026-10-17T08:00:00Z")
+
+        # 3. Graceful fallback for invalid timezone:
+        next_fallback = compute_next_occurrence("2026-10-16T08:00:00Z", "daily", tz_name="Invalid/Unknown_Zone")
+        self.assertEqual(next_fallback, "2026-10-17T08:00:00Z")
+
+        # 4. Keyword argument backwards compatibility with timezone_str
+        next_kw = compute_next_occurrence("2026-03-07T14:00:00Z", "daily", timezone_str="America/New_York")
+        self.assertEqual(next_kw, "2026-03-08T13:00:00Z")
+
+    # -------------------------------------------------------------------------
+    # 13. LifeService Close & Context Manager
+    # -------------------------------------------------------------------------
+    def test_life_service_close_and_context_manager(self) -> None:
+        # 1. Explicit close sets _conn to None
+        svc = LifeService(self.db_path)
+        self.assertIsNotNone(svc._get_connection())
+        svc.close()
+        self.assertIsNone(svc._conn)
+
+        # 2. Context manager support
+        with LifeService(self.db_path) as s:
+            s.create_reminder("rem-cm-01", "Context Test", "2026-10-15T12:00:00Z")
+            self.assertIsNotNone(s._conn)
+        self.assertIsNone(s._conn)
+
+
 if __name__ == "__main__":
     unittest.main()
+

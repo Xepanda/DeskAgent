@@ -333,16 +333,10 @@ class DeskAgentHostApp:
                         "Delivering due reminder: %s (id=%s, catchup=%s)",
                         occ.get("title"), occ.get("occurrence_id"), is_catchup
                     )
-                    self.life_service.mark_occurrence_ringing(occ["occurrence_id"])
-                    self.life_service.queue_outbox_message(
+                    self.life_service.trigger_occurrence_to_outbox(
+                        occurrence_id=occ["occurrence_id"],
                         topic="reminder.alert",
-                        payload={
-                            "occurrence_id": occ["occurrence_id"],
-                            "reminder_id": occ["reminder_id"],
-                            "title": occ.get("title", ""),
-                            "scheduled_at": occ.get("scheduled_at", ""),
-                            "is_catchup": is_catchup,
-                        },
+                        is_catchup=is_catchup,
                     )
             except Exception as e:
                 if not self._scheduler_stop.is_set():
