@@ -1,31 +1,54 @@
 # Desk Agent R1 公共契约与接口规范 (Interfaces & Contracts)
 
-> 文档版本：V1.0.0  
+> 文档版本：V2.0.0  
 > 责任 Agent：A0 架构与协议  
-> 状态：G0 关口冻结 (Frozen)  
+> 状态：**G0 关口公共契约冻结 (Public Contracts Frozen)**  
 > 配套 Schema：`contracts/schemas/`  
 > 配套 Fixtures：`contracts/fixtures/`  
 > 验证工具：`contracts/validator/validate.py`
 
 ---
 
-## 1. 契约设计准则
+## 1. 契约设计准则与通用处理规则 (Contract Principles)
 
-1. **版本化与自描述**：所有跨模块信封强制包含 `schema_version: "1.0.0"`。
-2. **幂等性与去重保证**：所有命令请求强制包含由调用方生成的 `request_id`（8~64 字符）。网络重试、崩溃恢复必须重用原 `request_id`。服务方必须维护去重缓存，不可对同一 `request_id` 重复触发副作用。
-3. **严格时效性约束**：所有请求必须包含 `expires_at`（ISO 8601 UTC 时间）。若处理队列或接收方发现已过期，必须立即拒绝并返回 `EXPIRED` 错误，严禁回放过期命令（如旧关灯、旧舵机转动）。
-4. **两阶段状态反馈**：
-   - `accepted`：仅代表服务端成功接收并进入执行队列；
-   - `succeeded` / `failed` / `cancelled` / `unknown`：终态结果，携带明确数据或稳定错误码。
-   - **禁止**把 API 200 或 `accepted` 宣称为物理动作已完成。
-5. **事件序号与作用域**：事件通知携带 `sequence`，其单调递增性严格限定在 `sequence_scope` 作用域内。序号出现空洞表明发生丢包，接收方必须通过拉取快照对账，不能假定事件永久保留。
+### 1.1 请求 ID 与幂等性规则 (Request ID & Idempotency)
+1. **调用方强制生成**：所有跨模块控制信封（RequestEnvelope）强制包含 `request_id`，格式为 8~64 字符的字母数字及下划线短横线（正则 `^[a-zA-Z0-9_-]+$`）。
+2. **重试一致性**：由于局域网抖动、超时重传或崩溃自愈产生的重试，调用方**必须重用原 `request_id`**，严禁生成新 ID。
+3. **服务端去重缓存**：
+   - 接收方（Router / Host / Companion）必须维护至少 1000 条最近请求的去重记录；
+   - 若检测到相同 `request_id` 且已处理完成，直接返回历史响应结构；
+   - 若相同 `request_id` 正在后台执行中，返回 `RESOURCE_BUSY`（带有 `retryable: true`）或复用进行中任务句柄；
+   - **严禁对同一 `request_id` 重复触发任何物理副作用**（如重复开闭继电器、舵机重复下发、日历重复创建）。
+
+### 1.2 严格时效性与动态过期规则 (Expiration Rules)
+1. **动态 UTC 时间戳**：所有请求必须包含 `expires_at`，格式为 ISO 8601 UTC 时间字符串（例如 `2026-10-16T12:00:15Z`）。
+2. **动态生成**：有效期必须依据当前系统时钟加 TTL 动态计算（例如 `now + 10s`），**严禁在代码或固件中硬编码固定的未来时间戳**。
+3. **过期立即拒绝**：接收方在收到请求、出队分发或下发底层前，必须比对本地 UTC 时钟。若 `now >= expires_at`，必须立即拒绝并返回稳定错误码 `EXPIRED`，**严禁在网络恢复后盲目回放过期积压指令**。
+
+### 1.3 超时与重试策略 (Timeouts & Retries)
+各业务领域的标准超时时限与处理要求：
+- **Codex 任务提交/执行**：默认超时 15,000 ms。
+- **Home Assistant 状态查询**：默认超时 3,000 ms；服务调用等待确认：默认超时 5,000 ms。
+- **机头云台舵机运动**：默认超时 3,000 ms。
+- **相机单帧 JPEG 捕获**：默认超时 5,000 ms。
+- **超时处置规则**：在超时阈值内未收到底层响应或对账状态时，返回 `status: "failed"` 或 `status: "unknown"`，附带错误码 `OPERATION_TIMEOUT` 及 `retryable: true`。**禁止在超时后假冒返回成功**。
+
+### 1.4 两阶段状态确认机制 (Two-Phase State Confirmation)
+为了防止误报，系统严格区分“指令已受理”与“物理已达成”：
+1. `accepted`：仅代表请求通过合法性、权限白名单及参数校验，已成功进入执行队列或已向物理总线发出。
+2. `succeeded`：已通过传感器回读、HA 状态订阅、或舵机完成事件确认目标状态已达成（`state_confirmed: true`）。
+3. 若指令下发成功但超过确认时间无法观测到物理状态，终态必须标记为 `status: "unknown"`，`state_confirmed: false`，错误码 `STATE_UNCONFIRMED`。
+
+### 1.5 取消与打断机制 (Cancellation & Barge-in)
+1. 正在进行的异步任务支持通过取消操作中断（如 `codex.cancel`, `resource.motion.stop`, `resource.audio.stop`）。
+2. 中断完成后终态返回 `status: "cancelled"`，错误信息为 `TASK_INTERRUPTED`。
+3. 用户在物理设备上语音打断或按键打断时，固件仲裁器优先切断当前 I2S DMA 播报，并向宿主通知打断事件。
 
 ---
 
 ## 2. 信封规范 (Envelope Specifications)
 
 ### 2.1 请求信封 (`envelope_request.json`)
-
 ```json
 {
   "schema_version": "1.0.0",
@@ -35,7 +58,7 @@
     "entity_id": "light.living_room_ceiling",
     "action": "turn_on"
   },
-  "expires_at": "2026-10-12T00:00:00Z",
+  "expires_at": "2026-10-16T12:00:10Z",
   "task_id": "tsk-voice-home-01",
   "session_id": "sess-turn-441",
   "client_id": "tclaw-firmware"
@@ -51,18 +74,17 @@
 | `expires_at` | String | 是 | ISO 8601 UTC 时间戳，超时丢弃 |
 | `task_id` | String | 否 | 关联的高层任务 ID |
 | `session_id` | String | 否 | 关联的对话或会话轮次 ID |
-| `client_id` | String | 否 | 发起方子系统标识 |
+| `client_id` | String | 否 | 发起方标识（如 `tclaw-firmware`、`edge-hub`） |
 
 ---
 
 ### 2.2 响应与终态信封 (`envelope_response.json`)
-
 ```json
 {
   "schema_version": "1.0.0",
   "request_id": "req-ha-exec-002",
   "status": "succeeded",
-  "timestamp": "2026-10-11T22:45:02Z",
+  "timestamp": "2026-10-16T12:00:02Z",
   "result": {
     "entity_id": "light.living_room_ceiling",
     "action": "turn_on",
@@ -70,7 +92,7 @@
     "observed_state": "on",
     "state_confirmed": true
   },
-  "execution_duration_ms": 2040
+  "execution_duration_ms": 1840
 }
 ```
 
@@ -87,7 +109,6 @@
 ---
 
 ### 2.3 事件信封 (`envelope_event.json`)
-
 ```json
 {
   "schema_version": "1.0.0",
@@ -96,30 +117,25 @@
   "sequence_scope": "ha:event_bus",
   "request_id": "req-ha-exec-002",
   "type": "ha.state_changed",
-  "timestamp": "2026-10-11T22:45:02Z",
-  "payload": { ... }
+  "timestamp": "2026-10-16T12:00:02Z",
+  "payload": {
+    "entity_id": "light.living_room_ceiling",
+    "old_state": "off",
+    "new_state": "on"
+  }
 }
 ```
-
-| 字段 | 类型 | 必填 | 约束与说明 |
-| :--- | :--- | :--- | :--- |
-| `schema_version` | String | 是 | 固定 `"1.0.0"` |
-| `event_id` | String | 是 | 事件唯一 ID，8~64 字符 |
-| `sequence` | Integer | 是 | 递增序号 (≥ 0) |
-| `sequence_scope` | String | 是 | 序号作用域 (如 `'device:inputs'`, `'task:tsk-01'`) |
-| `request_id` | String | 否 | 若事件由明确请求触发则携带 |
-| `type` | String | 是 | 格式 `domain.event_name` |
-| `timestamp` | String | 是 | 发生时间 (ISO 8601 UTC) |
-| `payload` | Object | 是 | 领域事件数据 |
 
 ---
 
 ## 3. 稳定错误代码体系 (`contracts/error_codes.json`)
 
+系统统一定义 13 个不可变稳定错误码：
+
 | 错误代码 | 错误类别 | 可重试 | 产生场景与处理规范 |
-| :--- | :--- | :--- | :--- |
+| :--- | :--- | :---: | :--- |
 | `INVALID_ARGUMENT` | CLIENT_ERROR | 否 | 参数缺失、格式错误或超出物理限位，调用方修正入参 |
-| `EXPIRED` | CLIENT_ERROR | 否 | 请求到达时已超过 `expires_at`，直接丢弃，不重放 |
+| `EXPIRED` | CLIENT_ERROR | 否 | 请求到达时已超过 `expires_at`，直接丢弃，严禁重放 |
 | `UNAUTHORIZED` | SECURITY_ERROR | 否 | 访问未经允许的 HA 实体或未注册的 Windows 工作区 |
 | `UNKNOWN_OPERATION` | CLIENT_ERROR | 否 | 调用的 `domain.action` 未实现或未注册 |
 | `RESOURCE_BUSY` | TRANSIENT_ERROR | 是 | 硬件被更高/同级所有者占用（如相机预览中禁止跟随运动） |
@@ -134,62 +150,94 @@
 
 ---
 
-## 4. 业务领域契约明细
+## 4. 业务领域公共接口明细 (Public Domain Contracts)
 
-### 4.1 Home Assistant (`domain_ha.json`)
+### 4.1 生活服务与提醒 (`domain_life.json`)
 - **操作列表**：
-  - `ha.get_state`: 查询实体当前状态快照（入参 `entity_id`）。
-  - `ha.execute`: 触发受限服务调用（入参 `entity_id`, `action`, `parameters`, `wait_for_state`）。
-- **执行与回读原则**：
-  - `wait_for_state` 指定了期望的目标状态及最长等待毫秒数。
-  - 若在超时时间内实体 `state` 更新为预期值，返回 `state_confirmed=true`；若超时仍未变化，返回 `state_confirmed=false`，状态标记为 `unknown`。
+  - `reminder.create`: 创建提醒（入参：`title`, `due_at`, `timezone`, `repeat_rule`, `priority`）。
+  - `reminder.update`: 修改提醒内容或时间（入参：`reminder_id`, 可选 `title`, `due_at`, `repeat_rule`）。
+  - `reminder.delete`: 删除提醒（入参：`reminder_id`）。
+  - `reminder.snooze`: 贪睡推迟提醒（入参：`reminder_id`, `occurrence_id`, `snooze_minutes`: 1~1440）。
+  - `reminder.complete`: 标记事项完成（入参：`reminder_id`, `occurrence_id`）。
+  - `reminder.stop_ringing`: **停止扬声器响铃**（入参：`reminder_id`, 可选 `occurrence_id`）。
+    > [!IMPORTANT]
+    > **停止响铃与完成事项的严格解耦**：用户按键或语音说“别响了/关闭闹钟”时，仅触发 `reminder.stop_ringing` 终止音频播报；**严禁私自调用 `reminder.complete` 将未做事项销毁**。事项完成必须由用户明确发出完成意图。
+  - `note.create`: 创建便签备忘（入参：`title`, `content`, `tags`）。
+  - `note.read`: 查询便签（入参：`note_id` 或 `query` 模糊关键词）。
 - **事件**：
-  - `ha.state_changed`: 订阅推送的实体状态变化事件。
-
-### 4.2 Windows Codex (`domain_codex.json`)
-- **操作列表**：
-  - `codex.submit`: 启动受控任务（入参 `workspace_alias`, `prompt`, `task_id`, `model`）。禁止传入未经校验的 Windows 绝对路径。
-  - `codex.append`: 追加进行中 turn 的说明文本。
-  - `codex.cancel`: 请求中断活动 turn。
-  - `codex.continue`: 恢复已中断的任务 thread。
-  - `codex.get`: 查询任务运行状态。
-  - `codex.respond_approval`: 响应待决审批（入参 `approval_id`, `task_id`, `decision: "approve" | "reject"`）。
-- **审批安全规则**：
-  - 审批项必须与具体 `thread_id`/`turn_id`/`item_id` 严格绑定；
-  - 严禁任何形式的跨任务通用授权或静默自动批准。
-
-### 4.3 生活服务 (`domain_life.json`)
-- **操作列表**：
-  - `reminder.create` / `update` / `delete`: 提醒维护，基于 RFC 5545 规则与 IANA 时区。
-  - `reminder.snooze`: 贪睡指定分钟数（1~1440 分钟）。
-  - `reminder.complete`: 标记任务完成。
-  - `note.create` / `read`: 纯文本持久化备忘。
-- **重要准则**：
-  - 用户按下机器人触摸键停止响铃时，仅执行 `stop_ringing`，**严禁自动调用 `reminder.complete`**。
-  - 提醒落库必须在 SQLite 事务提交成功后方可确认。
-
-### 4.4 硬件与资源仲裁 (`domain_resource.json`)
-- **操作列表**：
-  - `resource.expression.set`: 设置命名表情与文本状态。
-  - `resource.motion.move`: 控制机头转动（限制：Pan 0~180°, Tilt 100~140°，硬件强制夹限）。
-  - `resource.motion.stop`: 紧急停止机头动作。
-  - `resource.camera.acquire`: 申请相机最新帧查看租约。
-  - `resource.camera.release`: 显式释放相机租约。
-  - `resource.audio.stop`: 停止当前音频播放。
-- **事件**：
-  - `resource.motion.completed`: 物理运动完成。
-  - `resource.touch_event`: 触摸板、背部触摸或滚轮交互事件。
+  - `reminder.triggered`: 调度器发现到期轮次并入库 outbox。
+  - `reminder.alert`: 投递到机器人播报通道的播报事件。
 
 ---
 
-## 5. 与第三方协议通道映射表
+### 4.2 云台与硬件资源仲裁 (`domain_resource.json`)
+- **操作列表**：
+  - `resource.motion.move`: 控制机头转动。
+    - 入参：`pan_deg` (0.0 ~ 180.0°), `tilt_deg` (100.0 ~ 140.0°), `duration_ms` (100 ~ 5000), `profile` (`smooth` | `linear` | `fast`)。
+    - 硬件强制限位：固件驱动层严格 Clamp 到 Pan 0~180°, Tilt 100~140°，杜绝物理撞击。
+  - `resource.motion.stop`: 紧急停止机头动作（入参：`emergency: true/false`）。
+  - `resource.expression.set`: 设置表情与状态文字（入参：`preset`, `status_text`, `duration_ms`）。
+  - `resource.camera.acquire`: 申请相机最新帧查看租约。
+    - 入参：`client_id`, `lease_duration_ms` (1000~60000ms), `format: "jpeg"`, `target_fps` (0.5~15.0)。
+    - **仲裁约束**：持有活动相机租约期间，仲裁器自动锁定机头自动跟随，禁止 TClaw 表情点头破坏监控画面。
+  - `resource.camera.release`: 显式释放租约（入参：`client_id`, `lease_id`）。
+  - `resource.audio.stop`: 停止当前音频播放（入参：`stream_id`, `reason`）。
+- **事件**：
+  - `resource.motion.completed`: 机头转动完成（载荷：`job_id`, `pan_deg`, `tilt_deg`, `execution_ms`）。
+  - `resource.touch_event`: 触摸板、旋钮输入事件（载荷：`target`: `backtouch`/`screentouch`/`roller`, `action`: `short_press`/`long_press`/`scroll_up`/`scroll_down`）。
 
-| Desk Agent 契约概念 | 对应 WatcheRobot Python SDK 映射 | 对应 Tuya / TClaw 映射 |
-| :--- | :--- | :--- |
-| 请求下发 | `transport.send_command(message_type, data)` | TClaw MCP 工具 / `acp_client_inject()` |
-| 结果回传 | `{"type": "sys.ack" / "sys.nack", "data": ...}` | ACP `chat.send` 回复 / 消息总线响应 |
-| 音频采音 | `robot.microphone.open_pcm()` (Opus 帧解码) | TClaw 硬件 I2S DMA 采音 |
-| 音频播报 | `robot.play_pcm()` (WSPK Binary Frame `type=1`) | TClaw Tuya TTS / ES8311 I2S 输出 |
-| 相机拉流 | `robot.camera.capture()` (单帧 JPEG 请求) | HX6538 PTL JPEG 回调 |
-| 机头运动 | `robot.motion.move_to()` | STM32 Body Protocol 串口/SPI 指令 |
-| 输入事件 | `robot.inputs` 事件监听器 | ESP32 GPIO 中断 / 触摸驱动事件 |
+---
+
+### 4.3 摄像头与多媒体时效性接口 (Camera & Media Freshness)
+- **单帧拉流端点**：`GET /api/camera/frame`
+- **帧元数据报头**：
+  - `X-Frame-Seq`: 递增帧序号。
+  - `X-Frame-Age-Ms`: 图像产生至今的毫秒数。
+  - `X-Frame-Source`: `hardware_sensor`（真实硬件采集）或 `static_placeholder`（仅用于测试，生产严禁启用）。
+- **过期黑帧防冒充机制**：
+  - 阈值：`stale_threshold_ms`（默认 2000 ms）；
+  - 若摄像头拔除、网络拥塞导致超过阈值无新硬件帧注入，接口自动返回带有“STALE / DISCONNECTED”提示的黑帧，**严禁将旧画面或静态图谎称为实时监控**。
+
+---
+
+### 4.4 Windows Codex 任务与审批接口 (`domain_codex.json`)
+- **操作列表**：
+  - `codex.submit_turn` (别名 `codex.submit`): 提交代码任务（入参：`workspace_alias`, `prompt`, `task_id`, `model`）。
+    - 路径安全：只允许传入在 Companion 配置中预注册的别名（如 `epanda-desk-agent`），严禁客户端传入 Windows 绝对盘符。
+  - `codex.get_task` (别名 `codex.get`): 查询任务状态（入参：`task_id`）。返回结果嵌入 `pending_approvals` 列表。
+  - `codex.get_pending_approvals`: 专门查询待决审批（入参：可选 `task_id`）。
+  - `codex.respond_approval`: 响应审批决定（入参：`approval_id`, `task_id`, `decision: "approve" | "reject"`, `reason`）。
+  - `codex.cancel`: 中断正在运行的 turn（入参：`task_id`, `reason`）。
+- **审批安全闭环**：
+  - 审批项必须与具体 `thread_id`/`turn_id`/`item_id` 严格绑定；
+  - 消除 early-approval 关联竞态：在 `turn/start` 触发前即完成任务映射绑定；
+  - **严禁**任何形式的静默自动批准或跨任务通用授权。
+
+---
+
+### 4.5 Home Assistant 家居控制接口 (`domain_ha.json`)
+- **操作列表**：
+  - `ha.get_state`: 查询实体状态快照（入参：`entity_id`）。
+  - `ha.execute`: 触发受控服务调用（入参：`entity_id`, `action`, `parameters`, `wait_for_state`）。
+  - `ha.list_changes`: 查询实体状态历史变更记录。
+- **状态确认**：
+  - 执行 `action` 后，连接器在最长 `state_poll_timeout_ms` 时间内轮询或接收 WS 变更，确认实体 `state` 到达目标值后才标记 `state_confirmed: true`。
+
+---
+
+## 5. 跨模块链路映射与验证方法台账 (Cross-Module Link Catalog)
+
+系统每条跨边界通信链路都有确定的调用方、接收方、协议及独立验证方法，不存在未经确认的暗道：
+
+| 链路编号 | 调用方 (Caller) | 接收方 (Receiver) | 通信通道与协议 | 承载操作 / 接口 | 验证命令与测试用例 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **L-01** | TClaw 语音框架 (ESP32) | Tuya Cloud 大模型 | TLS WebSocket | 语音 Opus 流上传、云端 ASR、LLM 推理、TTS 音频下发、Tool Call 事件 | `tests/firmware_contract/test_tclaw_dialogue.py` (仿真) / 真机台架 (A1 实测) |
+| **L-02** | TClaw MCP 工具 (ESP32) | Host 核心路由器 (RK3566) | TCP 37020 协议桥接通道 | `RequestEnvelope` (格式: `ha.*`, `codex.*`, `reminder.*`) | `tests/firmware_contract/test_tclaw_dialogue.py` / `test_p1_final_closure.py` |
+| **L-03** | Host 核心路由器 (RK3566) | TClaw 语音框架 (ESP32) | TCP 37020 协议桥接通道 | `ResponseEnvelope` (执行结果及终态反馈) | `tests/firmware_contract/test_tclaw_dialogue.py` / `test_g1_official_sdk_and_tuya_interop.py` |
+| **L-04** | Host 提醒调度器 (RK3566) | 机器人扬声器 (ESP32) | TCP 37020 `RobotAdapter` | `reminder.alert` -> `ctrl.expression.play` / WSPK 音频流 | `tests/core/test_host_daemon.py` / `test_p1_final_closure.py` |
+| **L-05** | Host 核心路由器 (RK3566) | Windows Companion (PC) | HTTP RPC (端口 8765, Bearer Token) | `codex.submit_turn`, `codex.get_task`, `codex.respond_approval`, `codex.get_pending_approvals` | `tests/companion/test_codex_companion.py` / `test_p1_final_closure.py` |
+| **L-06** | Windows Companion (PC) | Codex app-server | Stdio JSON-RPC 双向管道 | `thread/start`, `turn/start`, `turn/approval`, `thread/cancel` | `tests/companion/test_codex_companion.py` |
+| **L-07** | Host HAConnector (RK3566) | Home Assistant 实例 | REST API + WebSocket API | `GET /api/states`, `POST /api/services`, WS 事件订阅 | `tests/connectors/test_ha_connector.py` / `test_p1_final_closure.py` |
+| **L-08** | Web 浏览器 / 管理端 | Host 相机与控制台 (RK3566) | HTTP (端口 8088, Token 认证) | `resource.camera.acquire`, `GET /api/camera/frame`, `POST /api/rpc` | `tests/camera/test_camera_service.py` / `test_host_daemon.py` |
+| **L-09** | 官方 Python SDK (RK3566) | 固件 SDK 桥接器 (ESP32) | UDP 37021 (配对发现) + TCP 37020 (数据流) | `sys.client.hello`, `ctrl.motion.move`, `ctrl.expression.play`, `WSPK` 二进制音频帧 | `tests/sdk_contract/test_sdk_bridge_protocol.py` / `test_wspk_framing.py` |
+| **L-10** | 固件板级驱动 (ESP32) | STM32 身体微控制器 | UART2 (TX:19, RX:20, 921600) | `watche_hw_body_move`, `watche_hw_body_stop`, `position_request` | `firmware/build/desk_agent_firmware_test` (C 驱动层) / 真机台架 (A1 实测) |

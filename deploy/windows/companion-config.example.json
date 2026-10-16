@@ -1,6 +1,8 @@
 {
   "host": "0.0.0.0",
   "port": 8765,
+  "auth_token": "REPLACE_WITH_STRONG_SHARED_TOKEN_MATCHING_TAISHANPI_CONFIG",
+  "comment": "Default in code is 127.0.0.1 for local isolation. When set to 0.0.0.0 for TaishanPi remote access across LAN, auth_token is strictly enforced to protect Windows host.",
   "default_model": "gpt-5-codex",
   "require_command_approval": true,
   "registered_workspaces": {
