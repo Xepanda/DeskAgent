@@ -104,6 +104,19 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             ctypes.POINTER(ctypes.c_float),
         ]
 
+        cls.lib.desk_hardware_display_get_expression.restype = ctypes.c_int
+        cls.lib.desk_hardware_display_get_expression.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+
+        AUDIO_PLAY_CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_int16), ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p)
+        cls.AUDIO_PLAY_CB = AUDIO_PLAY_CB
+        cls.lib.desk_hardware_register_audio_play_cb.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_audio_play_cb.argtypes = [AUDIO_PLAY_CB, ctypes.c_void_p]
+
         cls.lib.desk_sdk_bridge_init.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_init.argtypes = []
 
@@ -818,5 +831,105 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         finally:
             adapter.stop()
             self.lib.desk_sdk_socket_server_stop()
+
+    def test_ctrl_expression_play_and_set_success(self) -> None:
+        """Verifies ctrl.expression.play and ctrl.expression.set update hardware expression and trigger audio alert."""
+        audio_played = []
+        def on_audio_play(pcm_ptr, samples, rate, user_data):
+            for i in range(samples):
+                audio_played.append(pcm_ptr[i])
+
+        cb_holder = self.AUDIO_PLAY_CB(on_audio_play)
+        self.lib.desk_hardware_register_audio_play_cb(cb_holder, None)
+
+        # 1. Test ctrl.expression.play with reminder.alert event
+        resp = self._process_cmd({
+            "type": "ctrl.expression.play",
+            "request_id": "req-play-alert-1",
+            "data": {
+                "preset": "alert",
+                "text": "Meeting Reminder",
+                "event_type": "reminder.alert",
+            },
+        })
+        self.assertEqual(resp.get("type"), "sys.ack")
+        self.assertEqual(resp.get("code"), 0)
+        self.assertEqual(resp.get("request_id"), "req-play-alert-1")
+        self.assertEqual(resp.get("data", {}).get("status"), "succeeded")
+        self.assertEqual(resp.get("data", {}).get("preset"), "alert")
+        self.assertEqual(resp.get("data", {}).get("text"), "Meeting Reminder")
+
+        preset_buf = ctypes.create_string_buffer(32)
+        status_buf = ctypes.create_string_buffer(64)
+        self.lib.desk_hardware_display_get_expression(preset_buf, 32, status_buf, 64)
+        self.assertEqual(preset_buf.value.decode("utf-8"), "alert")
+        self.assertEqual(status_buf.value.decode("utf-8"), "Meeting Reminder")
+        self.assertGreater(len(audio_played), 0, "Alert audio PCM should be played when event_type is reminder.alert")
+
+        # 2. Test ctrl.expression.set
+        resp2 = self._process_cmd({
+            "type": "ctrl.expression.set",
+            "request_id": "req-set-happy-2",
+            "data": {
+                "preset": "happy",
+                "text": "Standing By",
+            },
+        })
+        self.assertEqual(resp2.get("type"), "sys.ack")
+        self.assertEqual(resp2.get("code"), 0)
+        self.assertEqual(resp2.get("request_id"), "req-set-happy-2")
+        self.assertEqual(resp2.get("data", {}).get("preset"), "happy")
+        self.assertEqual(resp2.get("data", {}).get("text"), "Standing By")
+
+        self.lib.desk_hardware_display_get_expression(preset_buf, 32, status_buf, 64)
+        self.assertEqual(preset_buf.value.decode("utf-8"), "happy")
+        self.assertEqual(status_buf.value.decode("utf-8"), "Standing By")
+
+    def test_ctrl_expression_play_resource_busy_preemption(self) -> None:
+        """Verifies ctrl.expression.play returns 409 RESOURCE_BUSY when DESK_RES_DISPLAY is held by higher priority owner."""
+        # 1. Acquire display by higher priority owner (TCLAW_VOICE)
+        rc = self.lib.desk_arbiter_acquire(DESK_RES_DISPLAY_UI, DESK_OWNER_TCLAW_VOICE, 0)
+        self.assertEqual(rc, DESK_ARBITER_OK)
+
+        # 2. Attempt ctrl.expression.play from SDK client -> must return 409 RESOURCE_BUSY
+        resp = self._process_cmd({
+            "type": "ctrl.expression.play",
+            "request_id": "req-busy-409",
+            "data": {
+                "preset": "alert",
+                "text": "Blocked Announcement",
+            },
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 409)
+        self.assertEqual(resp.get("request_id"), "req-busy-409")
+        self.assertEqual(resp.get("error", {}).get("code"), "RESOURCE_BUSY")
+
+        # 3. Release display and verify expression play succeeds
+        self.lib.desk_arbiter_release(DESK_RES_DISPLAY_UI, DESK_OWNER_TCLAW_VOICE)
+        resp2 = self._process_cmd({
+            "type": "ctrl.expression.play",
+            "request_id": "req-unlocked-200",
+            "data": {
+                "preset": "idle",
+                "text": "Unlocked",
+            },
+        })
+        self.assertEqual(resp2.get("type"), "sys.ack")
+        self.assertEqual(resp2.get("code"), 0)
+
+    def test_ctrl_motion_stop(self) -> None:
+        """Verifies ctrl.motion.stop stops gimbal and returns sys.ack with stopped: True."""
+        resp = self._process_cmd({
+            "type": "ctrl.motion.stop",
+            "request_id": "req-motion-stop-1",
+            "data": {"emergency": True},
+        })
+        self.assertEqual(resp.get("type"), "sys.ack")
+        self.assertEqual(resp.get("code"), 0)
+        self.assertEqual(resp.get("request_id"), "req-motion-stop-1")
+        self.assertEqual(resp.get("data", {}).get("status"), "succeeded")
+        self.assertTrue(resp.get("data", {}).get("stopped"))
+
 
 

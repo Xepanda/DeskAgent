@@ -184,6 +184,15 @@ static bool json_parse_str(const char *json, const char *key, char *out_val, siz
     return true;
 }
 
+static bool json_parse_bool(const char *json, const char *key, bool default_val)
+{
+    const char *pos = json_find_key(json, key);
+    if (!pos) return default_val;
+    if (strncmp(pos, "true", 4) == 0 || strncmp(pos, "1", 1) == 0) return true;
+    if (strncmp(pos, "false", 5) == 0 || strncmp(pos, "0", 1) == 0) return false;
+    return default_val;
+}
+
 int desk_sdk_bridge_init(void)
 {
     s_client_connected = false;
@@ -557,9 +566,18 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
 
     /* Motion stop: ctrl.motion.stop / motion.stop */
     if (strstr(json_in, "motion.stop") != NULL) {
-        desk_hardware_motion_stop(false);
-        snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"succeeded\"}}");
+        char req_id[64] = "";
+        json_parse_str(json_in, "request_id", req_id, sizeof(req_id));
+        bool emergency = json_parse_bool(json_in, "emergency", false);
+        desk_hardware_motion_stop(emergency);
+        if (req_id[0] != '\0') {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"request_id\":\"%s\",\"data\":{\"status\":\"succeeded\",\"stopped\":true}}",
+                     req_id);
+        } else {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"succeeded\",\"stopped\":true}}");
+        }
         return 0;
     }
 
@@ -661,6 +679,98 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         desk_hardware_audio_record_stop();
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"succeeded\"}}");
+        return 0;
+    }
+
+    /* Expression play / set: ctrl.expression.play / ctrl.expression.set */
+    if (strstr(json_in, "expression.play") != NULL || strstr(json_in, "expression.set") != NULL) {
+        char req_id[64] = "";
+        json_parse_str(json_in, "request_id", req_id, sizeof(req_id));
+
+        char preset[32] = "idle";
+        if (!json_parse_str(json_in, "preset", preset, sizeof(preset)) || preset[0] == '\0') {
+            strncpy(preset, "idle", sizeof(preset) - 1);
+            preset[sizeof(preset) - 1] = '\0';
+        }
+
+        char text[64] = "";
+        if (!json_parse_str(json_in, "text", text, sizeof(text))) {
+            if (!json_parse_str(json_in, "status_text", text, sizeof(text))) {
+                json_parse_str(json_in, "title", text, sizeof(text));
+            }
+        }
+
+        int32_t duration_ms = json_parse_int(json_in, "duration_ms", 0);
+        (void)duration_ms;
+
+        desk_arbiter_status_t arb = desk_arbiter_acquire(DESK_RES_DISPLAY, DESK_OWNER_SDK_CLIENT, 500);
+        if (arb == DESK_ARBITER_ERR_BUSY) {
+            if (req_id[0] != '\0') {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":409,\"request_id\":\"%s\",\"error\":{"
+                         "\"code\":\"RESOURCE_BUSY\","
+                         "\"message\":\"Display UI is currently held by higher priority owner\"}}",
+                         req_id);
+            } else {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":409,\"error\":{"
+                         "\"code\":\"RESOURCE_BUSY\","
+                         "\"message\":\"Display UI is currently held by higher priority owner\"}}");
+            }
+            return 0;
+        } else if (arb != DESK_ARBITER_OK) {
+            if (req_id[0] != '\0') {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":500,\"request_id\":\"%s\",\"error\":{"
+                         "\"code\":\"RESOURCE_ERROR\","
+                         "\"message\":\"Failed to acquire display resource\"}}",
+                         req_id);
+            } else {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":500,\"error\":{"
+                         "\"code\":\"RESOURCE_ERROR\","
+                         "\"message\":\"Failed to acquire display resource\"}}");
+            }
+            return 0;
+        }
+
+        desk_hardware_display_set_expression(preset, text);
+        desk_arbiter_release(DESK_RES_DISPLAY, DESK_OWNER_SDK_CLIENT);
+
+        char event_type[64] = "";
+        json_parse_str(json_in, "event_type", event_type, sizeof(event_type));
+        bool alert_audio = (strcmp(event_type, "reminder.alert") == 0 ||
+                            strstr(json_in, "\"play_audio\":true") != NULL ||
+                            strstr(json_in, "\"play_audio\": true") != NULL ||
+                            strcmp(preset, "alert") == 0);
+
+        if (alert_audio) {
+            desk_arbiter_status_t audio_arb = desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_CLIENT, 500);
+            if (audio_arb == DESK_ARBITER_OK) {
+                static const int16_t s_sine_lut_16[16] = {
+                    0, 3062, 5657, 7396, 8000, 7396, 5657, 3062,
+                    0, -3062, -5657, -7396, -8000, -7396, -5657, -3062
+                };
+                int16_t alert_pcm[1600];
+                for (size_t i = 0; i < 1600; i++) {
+                    alert_pcm[i] = s_sine_lut_16[i % 16];
+                }
+                desk_hardware_audio_play_pcm(alert_pcm, 1600, 16000);
+                desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_CLIENT);
+            }
+        }
+
+        if (req_id[0] != '\0') {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"request_id\":\"%s\",\"data\":{"
+                     "\"status\":\"succeeded\",\"preset\":\"%s\",\"text\":\"%s\"}}",
+                     req_id, preset, text);
+        } else {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
+                     "\"status\":\"succeeded\",\"preset\":\"%s\",\"text\":\"%s\"}}",
+                     preset, text);
+        }
         return 0;
     }
 

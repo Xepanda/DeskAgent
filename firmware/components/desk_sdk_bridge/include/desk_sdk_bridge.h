@@ -134,6 +134,7 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
  * @brief Process incoming JSON command from Python SDK client.
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
+#define desk_sdk_bridge_process_line desk_sdk_bridge_process_command
 
 /**
  * @brief Send an event notification to connected Python SDK client.
