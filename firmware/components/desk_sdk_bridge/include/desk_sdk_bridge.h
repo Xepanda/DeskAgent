@@ -38,8 +38,9 @@ extern "C" {
 #define DESK_WSPK_MAGIC            "WSPK"
 #define DESK_WSPK_HEADER_SIZE      16
 #define DESK_WSPK_TYPE_AUDIO       1
-#define DESK_WSPK_TYPE_IMAGE       2
-#define DESK_WSPK_TYPE_DATA        3
+#define DESK_WSPK_TYPE_VIDEO       2
+#define DESK_WSPK_TYPE_IMAGE       3
+#define DESK_WSPK_TYPE_DATA        4
 #define DESK_WSPK_MAX_PAYLOAD_SIZE (128 * 1024) /* 128KB max to prevent OOM */
 
 #pragma pack(push, 1)
@@ -113,6 +114,16 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
                                      uint8_t *out_buf,
                                      size_t max_buf_len,
                                      size_t *out_len);
+
+/**
+ * @brief Send a complete WSPK binary media frame over active socket connection or outbound cb.
+ */
+int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
+                                     uint8_t flags,
+                                     uint16_t stream_id,
+                                     uint32_t sequence,
+                                     const uint8_t *payload,
+                                     size_t payload_len);
 
 /**
  * @brief Process UDP pairing request (port 37021 protocol watcher_lan_pairing_v1).
