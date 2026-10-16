@@ -734,14 +734,29 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
             return 0;
         }
 
-        desk_hardware_display_set_expression(preset, text);
+        int disp_rc = desk_hardware_display_set_expression(preset, text);
         desk_arbiter_release(DESK_RES_DISPLAY, DESK_OWNER_SDK_CLIENT);
+        if (disp_rc != DESK_HW_OK) {
+            if (req_id[0] != '\0') {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":500,\"request_id\":\"%s\",\"error\":{"
+                         "\"code\":\"HARDWARE_ERROR\","
+                         "\"message\":\"Display hardware unavailable or driver failed\"}}",
+                         req_id);
+            } else {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":500,\"error\":{"
+                         "\"code\":\"HARDWARE_ERROR\","
+                         "\"message\":\"Display hardware unavailable or driver failed\"}}");
+            }
+            return 0;
+        }
 
         char event_type[64] = "";
         json_parse_str(json_in, "event_type", event_type, sizeof(event_type));
+        bool play_audio_flag = json_parse_bool(json_in, "play_audio", false);
         bool alert_audio = (strcmp(event_type, "reminder.alert") == 0 ||
-                            strstr(json_in, "\"play_audio\":true") != NULL ||
-                            strstr(json_in, "\"play_audio\": true") != NULL ||
+                            play_audio_flag ||
                             strcmp(preset, "alert") == 0);
 
         if (alert_audio) {
@@ -751,11 +766,15 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                     0, 3062, 5657, 7396, 8000, 7396, 5657, 3062,
                     0, -3062, -5657, -7396, -8000, -7396, -5657, -3062
                 };
-                int16_t alert_pcm[1600];
-                for (size_t i = 0; i < 1600; i++) {
-                    alert_pcm[i] = s_sine_lut_16[i % 16];
+                static int16_t s_alert_pcm[1600];
+                static bool s_alert_pcm_initialized = false;
+                if (!s_alert_pcm_initialized) {
+                    for (size_t i = 0; i < 1600; i++) {
+                        s_alert_pcm[i] = s_sine_lut_16[i % 16];
+                    }
+                    s_alert_pcm_initialized = true;
                 }
-                desk_hardware_audio_play_pcm(alert_pcm, 1600, 16000);
+                desk_hardware_audio_play_pcm(s_alert_pcm, 1600, 16000);
                 desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_CLIENT);
             }
         }

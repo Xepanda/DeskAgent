@@ -117,6 +117,12 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_hardware_register_audio_play_cb.restype = ctypes.c_int
         cls.lib.desk_hardware_register_audio_play_cb.argtypes = [AUDIO_PLAY_CB, ctypes.c_void_p]
 
+        cls.lib.desk_hardware_set_strict_mode.restype = None
+        cls.lib.desk_hardware_set_strict_mode.argtypes = [ctypes.c_bool]
+
+        cls.lib.desk_hardware_set_display_initialized.restype = None
+        cls.lib.desk_hardware_set_display_initialized.argtypes = [ctypes.c_bool]
+
         cls.lib.desk_sdk_bridge_init.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_init.argtypes = []
 
@@ -930,6 +936,52 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("request_id"), "req-motion-stop-1")
         self.assertEqual(resp.get("data", {}).get("status"), "succeeded")
         self.assertTrue(resp.get("data", {}).get("stopped"))
+
+    def test_ctrl_expression_play_hardware_error_in_strict_mode(self) -> None:
+        """Verifies ctrl.expression.play returns 500 HARDWARE_ERROR when display hardware fails in strict mode."""
+        self.lib.desk_hardware_set_strict_mode(True)
+        self.lib.desk_hardware_set_display_initialized(False)
+
+        preset_buf = ctypes.create_string_buffer(32)
+        status_buf = ctypes.create_string_buffer(64)
+        self.lib.desk_hardware_display_get_expression(preset_buf, 32, status_buf, 64)
+        initial_preset = preset_buf.value.decode("utf-8")
+        initial_status = status_buf.value.decode("utf-8")
+
+        resp = self._process_cmd({
+            "type": "ctrl.expression.play",
+            "request_id": "req-hw-err-500",
+            "data": {
+                "preset": "dizzy",
+                "text": "Failing Hardware",
+            },
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 500)
+        self.assertEqual(resp.get("request_id"), "req-hw-err-500")
+        self.assertEqual(resp.get("error", {}).get("code"), "HARDWARE_ERROR")
+
+        # Verify dirty cache prevention: caches did NOT update on failure
+        self.lib.desk_hardware_display_get_expression(preset_buf, 32, status_buf, 64)
+        self.assertEqual(preset_buf.value.decode("utf-8"), initial_preset)
+        self.assertEqual(status_buf.value.decode("utf-8"), initial_status)
+
+        # Re-enabling display hardware in strict mode allows expression play to succeed
+        self.lib.desk_hardware_set_display_initialized(True)
+        resp2 = self._process_cmd({
+            "type": "ctrl.expression.play",
+            "request_id": "req-hw-ok-200",
+            "data": {
+                "preset": "happy",
+                "text": "Hardware OK",
+            },
+        })
+        self.assertEqual(resp2.get("type"), "sys.ack")
+        self.assertEqual(resp2.get("code"), 0)
+        self.assertEqual(resp2.get("data", {}).get("preset"), "happy")
+
+        self.lib.desk_hardware_set_strict_mode(False)
+
 
 
 

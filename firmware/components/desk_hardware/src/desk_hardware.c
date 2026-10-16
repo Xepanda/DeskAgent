@@ -353,14 +353,7 @@ static int default_driver_display_expression(const char *preset_name, const char
     if (s_strict_hardware_mode && !s_display_hw_initialized) {
         return DESK_HW_ERR_UNAVAILABLE;
     }
-    if (preset_name) {
-        strncpy(s_current_preset, preset_name, sizeof(s_current_preset) - 1);
-        s_current_preset[sizeof(s_current_preset) - 1] = '\0';
-    }
-    if (status_text) {
-        strncpy(s_current_status, status_text, sizeof(s_current_status) - 1);
-        s_current_status[sizeof(s_current_status) - 1] = '\0';
-    }
+    (void)status_text;
     return DESK_HW_OK;
 }
 
@@ -658,13 +651,18 @@ int desk_hardware_motion_stop(bool emergency)
     if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
         s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
     }
+    int drv_rc = DESK_HW_OK;
     if (s_board_driver_ops && s_board_driver_ops->motion_stop) {
-        s_board_driver_ops->motion_stop(emergency);
+        drv_rc = s_board_driver_ops->motion_stop(emergency);
     }
 
     desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
     desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
-    return 0;
+
+    if (s_strict_hardware_mode && drv_rc != DESK_HW_OK) {
+        return drv_rc;
+    }
+    return DESK_HW_OK;
 }
 
 int desk_hardware_motion_get_position(float *out_pan, float *out_tilt)
@@ -744,6 +742,12 @@ int desk_hardware_camera_stream_stop(void)
 /* Display & Expression API */
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text)
 {
+    if (s_board_driver_ops && s_board_driver_ops->display_expression) {
+        int rc = s_board_driver_ops->display_expression(preset_name, status_text);
+        if (rc != DESK_HW_OK) {
+            return rc;
+        }
+    }
     if (preset_name) {
         strncpy(s_current_preset, preset_name, sizeof(s_current_preset) - 1);
         s_current_preset[sizeof(s_current_preset) - 1] = '\0';
@@ -751,12 +755,6 @@ int desk_hardware_display_set_expression(const char *preset_name, const char *st
     if (status_text) {
         strncpy(s_current_status, status_text, sizeof(s_current_status) - 1);
         s_current_status[sizeof(s_current_status) - 1] = '\0';
-    }
-    if (s_board_driver_ops && s_board_driver_ops->display_expression) {
-        int rc = s_board_driver_ops->display_expression(preset_name, status_text);
-        if (rc != 0) {
-            return rc;
-        }
     }
     return DESK_HW_OK;
 }
