@@ -5,7 +5,14 @@
 
 #include "desk_hardware.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#ifdef ESP_PLATFORM
+#include "driver/uart.h"
+#endif
 
 /* --- Motion & STM32 Link State --- */
 static float s_current_pan = 90.0f;
@@ -117,39 +124,92 @@ static size_t mcu_frame_pack_motion(uint8_t msg_id, const uint8_t *payload, uint
 
 static const desk_board_driver_ops_t *s_board_driver_ops = NULL;
 
-static int default_driver_init(void) { return 0; }
+#ifndef ESP_PLATFORM
+static int s_uart_fd = -1;
+static int s_audio_out_fd = -1;
+#endif
+
+static int default_driver_init(void)
+{
+#ifndef ESP_PLATFORM
+    const char *uart_dev = getenv("DESK_UART_DEVICE");
+    if (uart_dev && strlen(uart_dev) > 0 && s_uart_fd < 0) {
+        s_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NDELAY);
+    }
+    const char *audio_dev = getenv("DESK_AUDIO_OUT_DEVICE");
+    if (audio_dev && strlen(audio_dev) > 0 && s_audio_out_fd < 0) {
+        s_audio_out_fd = open(audio_dev, O_WRONLY | O_NONBLOCK);
+    }
+#endif
+    return 0;
+}
+
 static int default_driver_audio_read(int16_t *pcm_buf, size_t samples, size_t *read_samples)
 {
     (void)pcm_buf; (void)samples;
     *read_samples = 0;
     return 0;
 }
+
 static int default_driver_audio_play(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz)
 {
-    (void)pcm_buf; (void)samples; (void)sample_rate_hz;
+    (void)sample_rate_hz;
+    if (!pcm_buf || samples == 0) return 0;
+#ifdef ESP_PLATFORM
+    /* On ESP-IDF, write to I2S speaker peripheral if available */
+#else
+    if (s_audio_out_fd >= 0) {
+        size_t bytes_to_write = samples * sizeof(int16_t);
+        ssize_t w = write(s_audio_out_fd, pcm_buf, bytes_to_write);
+        (void)w;
+    }
+#endif
     return 0;
 }
+
 static int default_driver_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms)
 {
     (void)pan_deg; (void)tilt_deg; (void)duration_ms;
     return 0;
 }
+
 static int default_driver_motion_stop(bool emergency)
 {
     (void)emergency;
     return 0;
 }
+
 static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len)
 {
+#ifdef ESP_PLATFORM
+    /* On ESP-IDF with esp-camera component */
     (void)out_buf; (void)max_len; (void)out_len;
+#else
+    (void)out_buf; (void)max_len; (void)out_len;
+#endif
     return -1;
 }
+
 static int default_driver_display_expression(const char *preset_name, const char *status_text)
 {
     (void)preset_name; (void)status_text;
     return 0;
 }
-static int default_driver_deinit(void) { return 0; }
+
+static int default_driver_deinit(void)
+{
+#ifndef ESP_PLATFORM
+    if (s_uart_fd >= 0) {
+        close(s_uart_fd);
+        s_uart_fd = -1;
+    }
+    if (s_audio_out_fd >= 0) {
+        close(s_audio_out_fd);
+        s_audio_out_fd = -1;
+    }
+#endif
+    return 0;
+}
 
 static const desk_board_driver_ops_t s_default_esp32_driver_ops = {
     .driver_name = "esp32s3_desk_bsp_v1",
@@ -183,9 +243,25 @@ const desk_board_driver_ops_t *desk_hardware_get_driver_ops(void)
 static void default_mcu_uart_sender(const uint8_t *frame_data, size_t frame_len, void *user_data)
 {
     (void)user_data;
-    (void)frame_data;
-    (void)frame_len;
-    /* Default active MCU transmitter across UART/coprocessor bridge */
+    if (!frame_data || frame_len == 0) return;
+
+#ifdef ESP_PLATFORM
+    uart_write_bytes(UART_NUM_1, (const char *)frame_data, frame_len);
+#else
+    if (s_uart_fd >= 0) {
+        ssize_t w = write(s_uart_fd, frame_data, frame_len);
+        (void)w;
+    } else {
+        const char *uart_dev = getenv("DESK_UART_DEVICE");
+        if (uart_dev && strlen(uart_dev) > 0) {
+            s_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NDELAY);
+            if (s_uart_fd >= 0) {
+                ssize_t w = write(s_uart_fd, frame_data, frame_len);
+                (void)w;
+            }
+        }
+    }
+#endif
 }
 
 int desk_hardware_init(void)
@@ -437,6 +513,18 @@ int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, 
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
 {
     if (!out_buf || !out_len) return -1;
+    (void)timeout_ms;
+
+    /* First attempt capturing live frame from registered hardware driver */
+    if (s_board_driver_ops && s_board_driver_ops->camera_capture) {
+        size_t drv_len = 0;
+        int drv_ret = s_board_driver_ops->camera_capture(out_buf, max_len, &drv_len);
+        if (drv_ret == 0 && drv_len > 0) {
+            *out_len = drv_len;
+            return 0;
+        }
+    }
+
     if (max_len < s_cam_frame_len) return -2;
 
     memcpy(out_buf, s_cam_frame_buf, s_cam_frame_len);

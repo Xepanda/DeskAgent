@@ -253,7 +253,7 @@ class CodexCompanion:
         self._pending_approvals: dict[str, dict[str, Any]] = {}
         self._thread_to_task: dict[str, str] = {}
         self._turn_to_task: dict[str, str] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def register_workspace(self, alias: str, abs_path: str) -> None:
         # Prevent traversal and escape: must be non-empty absolute path
@@ -366,6 +366,13 @@ class CodexCompanion:
         else:
             thread_id = thread_res.get("thread_id", f"thr_win_{task_id[:8]}")
 
+        # Bind thread_id immediately before turn/start so approvals during turn/start resolve task_id
+        with self._lock:
+            self._thread_to_task[thread_id] = task_id
+            for appr in self._pending_approvals.values():
+                if not appr.get("task_id") and appr.get("thread_id") == thread_id:
+                    appr["task_id"] = task_id
+
         # 2. Start turn (Codex app-server uses threadId and input array)
         turn_res = transport.send_request("turn/start", {
             "threadId": thread_id,
@@ -382,8 +389,10 @@ class CodexCompanion:
             state = turn_res.get("state", "running")
 
         with self._lock:
-            self._thread_to_task[thread_id] = task_id
             self._turn_to_task[turn_id] = task_id
+            for appr in self._pending_approvals.values():
+                if not appr.get("task_id") and (appr.get("turn_id") == turn_id or appr.get("thread_id") == thread_id):
+                    appr["task_id"] = task_id
             self._tasks[task_id] = {
                 "task_id": task_id,
                 "workspace_alias": workspace_alias,
@@ -505,18 +514,34 @@ class CodexCompanion:
             "status": appr["status"],
         }
 
+    def get_pending_approvals(self, task_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """Returns active pending approvals, optionally filtered by task_id."""
+        with self._lock:
+            approvals = []
+            for appr in self._pending_approvals.values():
+                if appr.get("status") != "pending":
+                    continue
+                if task_id and appr.get("task_id") != task_id:
+                    continue
+                approvals.append(dict(appr))
+            return approvals
+
     def get_task_status(self, task_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
             task = self._tasks.get(task_id)
-            return dict(task) if task else None
+            if not task:
+                return None
+            res = dict(task)
+            res["pending_approvals"] = self.get_pending_approvals(task_id)
+            return res
 
 
-def start_companion_server(
+def create_companion_server(
     config_path: Optional[str] = None,
     port: int = 8765,
     host: str = "127.0.0.1",
     auth_token: Optional[str] = None,
-) -> None:
+):
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from socketserver import ThreadingMixIn
 
@@ -540,6 +565,13 @@ def start_companion_server(
     )
 
     class CompanionHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def end_headers(self) -> None:
+            self.send_header("Connection", "close")
+            super().end_headers()
+            self.close_connection = True
+
         def _check_auth(self) -> bool:
             if not auth_token:
                 return True
@@ -610,6 +642,9 @@ def start_companion_server(
                             command_or_path=args["command_or_path"],
                             description=args["description"],
                         )
+                    elif op in ("codex.get_pending_approvals", "codex.list_approvals"):
+                        task_id = args.get("task_id")
+                        res = {"approvals": companion.get_pending_approvals(task_id)}
                     elif op in ("codex.list_workspaces", "workspaces.list"):
                         res = {"workspaces": list(companion.workspaces.keys())}
                     else:
@@ -642,6 +677,16 @@ def start_companion_server(
         daemon_threads = True
 
     server = ThreadedServer((host, port), CompanionHandler)
+    return server
+
+
+def start_companion_server(
+    config_path: Optional[str] = None,
+    port: int = 8765,
+    host: str = "127.0.0.1",
+    auth_token: Optional[str] = None,
+) -> None:
+    server = create_companion_server(config_path=config_path, port=port, host=host, auth_token=auth_token)
     logger.info("Codex Companion server listening on %s:%s", host, port)
     try:
         server.serve_forever()

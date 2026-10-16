@@ -43,9 +43,15 @@ class FrameCapturePipeline:
         self._current_pan = 90.0
         self._current_tilt = 120.0
         self._frame_counter = 0
-        self._consumer: Optional[Callable[[bytes], None]] = None
+        self._consumer: Optional[Callable[[bytes, bool], None]] = None
+        self._frame_source: Optional[Callable[[], Optional[bytes]]] = None
 
-    def start(self, consumer: Callable[[bytes], None]) -> None:
+    def set_frame_source(self, source: Optional[Callable[[], Optional[bytes]]]) -> None:
+        """Sets external hardware frame capture callback (e.g. V4L2 device or robot frame stream)."""
+        with self._lock:
+            self._frame_source = source
+
+    def start(self, consumer: Callable[[bytes, bool], None]) -> None:
         with self._lock:
             self._consumer = consumer
             if self._running:
@@ -92,9 +98,25 @@ class FrameCapturePipeline:
     def _capture_loop(self) -> None:
         while self._running:
             try:
-                frame = self._generate_dynamic_jpeg()
+                frame = None
+                is_hw = False
+                if self._frame_source:
+                    try:
+                        frame = self._frame_source()
+                        if frame:
+                            is_hw = True
+                    except Exception as src_err:
+                        logger.debug("Hardware frame source error, falling back: %s", src_err)
+
+                if not frame:
+                    frame = self._generate_dynamic_jpeg()
+                    is_hw = False
+
                 if self._consumer and self._running:
-                    self._consumer(frame)
+                    try:
+                        self._consumer(frame, is_hw)
+                    except TypeError:
+                        self._consumer(frame)
             except Exception as e:
                 logger.warning("Frame capture error: %s", e)
             time.sleep(self._interval)
@@ -134,6 +156,14 @@ class CameraViewerService:
     def stop_capture(self) -> None:
         """Stops the underlying capture pipeline."""
         self.pipeline.stop()
+
+    def set_hardware_frame_source(self, source_fn: Optional[Callable[[], Optional[bytes]]]) -> None:
+        """Sets external hardware frame capture callback (e.g. V4L2 device or robot frame stream)."""
+        self.pipeline.set_frame_source(source_fn)
+
+    def ingest_robot_frame(self, frame_bytes: bytes) -> None:
+        """Ingests live raw JPEG frame from physical robot camera link."""
+        self.push_frame(frame_bytes, is_hardware=True)
 
     def acquire_lease(self, client_id: str, lease_ms: Optional[int] = None) -> dict[str, Any]:
         """

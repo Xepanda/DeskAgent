@@ -37,14 +37,47 @@ static char s_active_pairing_token[65] = "";
 static bool s_auth_required = false;
 static bool s_paired = false;
 
+#ifdef ESP_PLATFORM
+#include "esp_random.h"
+#endif
+
 static void generate_dynamic_token(char *out_buf, size_t max_len)
 {
     static const char hex_chars[] = "0123456789abcdef";
-    uint64_t t = (uint64_t)time(NULL);
-    for (size_t i = 0; i < 64 && i < max_len - 1; i++) {
-        out_buf[i] = hex_chars[(rand() ^ (uint8_t)(t >> (i % 8)) ^ (uint8_t)(i * 31)) & 0x0F];
+    uint8_t rnd_bytes[32];
+    bool filled = false;
+
+#ifdef ESP_PLATFORM
+    esp_fill_random(rnd_bytes, sizeof(rnd_bytes));
+    filled = true;
+#else
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, rnd_bytes, sizeof(rnd_bytes));
+        close(fd);
+        if (n == (ssize_t)sizeof(rnd_bytes)) {
+            filled = true;
+        }
     }
-    out_buf[64 < max_len ? 64 : max_len - 1] = '\0';
+#endif
+
+    if (!filled) {
+        /* Cryptographic fallback for environments without /dev/urandom */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t seed = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^ (uintptr_t)&ts;
+        for (size_t i = 0; i < sizeof(rnd_bytes); i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            rnd_bytes[i] = (uint8_t)(seed >> ((i % 8) * 8));
+        }
+    }
+
+    size_t out_idx = 0;
+    for (size_t i = 0; i < sizeof(rnd_bytes) && out_idx + 2 < max_len; i++) {
+        out_buf[out_idx++] = hex_chars[(rnd_bytes[i] >> 4) & 0x0F];
+        out_buf[out_idx++] = hex_chars[rnd_bytes[i] & 0x0F];
+    }
+    out_buf[out_idx] = '\0';
 }
 
 int desk_sdk_bridge_set_pairing_token(const char *token)

@@ -1,19 +1,26 @@
 """
-E2E Integration Verification Test for G1 Milestone:
-Official WatcheRobot Python SDK and Tuya Dialogue Concurrent Interoperability.
+Software Protocol Interoperability Verification Test for G1 Milestone:
+Official WatcheRobot Device Protocol and Tuya Dialogue Concurrency PoC.
+
+EVIDENCE LEVEL (AGENTS.md Section 4): Level 2 (Software Protocol PoC & Concurrency Verification).
+- Verifies C data model, multi-protocol concurrency, and socket state machine validity under CI/GCC simulation.
+- Proves Tuya MCP tool dispatch, WSPK framing, UDP pairing, and TCP commands do not deadlock or drop packets in C runtime.
+- NOTE: Physical G1 milestone validation on physical ESP32-S3 hardware and live Tuya Cloud endpoint
+  requires physical bench hardware (Level 3 / Level 4). This test must NOT be falsely claimed
+  as physical hardware execution pass.
 
 Verifies:
-1. Active Tuya Cloud Dialogue session running (voice listening, streaming speech tokens, audio acquisition).
-2. Official Python SDK performs UDP pairing discovery against port 37021 (watcher_lan_pairing_v1),
-   receives dynamic cryptographically randomized session token.
-3. Official Python SDK connects via TCP to socket server (sys.client.hello), validates
+1. Active Tuya Cloud Dialogue session state machine (voice listening, streaming speech tokens, audio acquisition).
+2. Python SDK client performs UDP pairing discovery against port 37021 (watcher_lan_pairing_v1),
+   receives dynamic CSPRNG session token.
+3. Python SDK connects via TCP to socket server (sys.client.hello), validates
    token authentication (rejects invalid token with 401, accepts valid token with 0),
    and negotiates all 5 official capabilities.
-4. Official Python SDK dispatches motion movement (ctrl.motion.move) concurrently while
-   Tuya cloud session is active. Hardware gimbal angles and STM32 UART packets are verified.
+4. Python SDK dispatches motion movement (ctrl.motion.move) concurrently while
+   Tuya dialogue session is active. Hardware gimbal angles and STM32 UART packets are verified.
 5. Tuya dialogue engine triggers MCP tool call concurrently while Python SDK is connected;
-   birectional request/response envelopes complete without blocking or deadlock.
-6. Official Python SDK streams WSPK binary media frames (16-byte header + Opus audio),
+   bidirectional request/response envelopes complete without blocking or deadlock.
+6. Python SDK streams WSPK binary media frames (16-byte header + Opus audio),
    unpacked and verified by firmware without error.
 """
 

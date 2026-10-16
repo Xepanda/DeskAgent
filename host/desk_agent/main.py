@@ -28,6 +28,7 @@ from host.desk_agent.core.router import Router
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
 from host.desk_agent.camera.camera_service import CameraViewerService
+from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
 from companion.src.codex_companion import CodexCompanion
 
 logging.basicConfig(
@@ -107,6 +108,11 @@ class RemoteCodexCompanionClient:
             "reason": reason,
         })
 
+    def get_pending_approvals(self, task_id: Optional[str] = None) -> list[dict[str, Any]]:
+        args = {"task_id": task_id} if task_id else {}
+        res = self._rpc_call("codex.get_pending_approvals", args)
+        return res.get("approvals", [])
+
     def list_workspaces(self) -> list[str]:
         res = self._rpc_call("codex.list_workspaces", {})
         return res.get("workspaces", [])
@@ -156,6 +162,45 @@ class DeskAgentHostApp:
         # Robot Announcement / Audio Channel & Delivery Worker
         self._announcement_channel: Optional[Callable[[str, dict[str, Any]], bool]] = None
         self._delivered_alerts: list[dict[str, Any]] = []
+        self._robot_client: Optional[Any] = None
+
+        # Robot Hardware Link / SDK Bridge Adapter
+        robot_cfg = self.config.get("robot", {})
+        self.robot_adapter: Optional[RobotAdapter] = None
+        if robot_cfg.get("enabled", True):
+            self.robot_adapter = RobotAdapter(
+                host=robot_cfg.get("host", "127.0.0.1"),
+                tcp_port=robot_cfg.get("tcp_port", 37020),
+                udp_port=robot_cfg.get("udp_port", 37021),
+                auto_pair=robot_cfg.get("auto_pair", True),
+                token=robot_cfg.get("token"),
+                reconnect_interval=robot_cfg.get("reconnect_interval", 2.0),
+            )
+            self.register_robot_hardware_client(self.robot_adapter)
+            self.register_announcement_channel(self.robot_adapter.send_announcement)
+            self.robot_adapter.start()
+
+        # HA State Subscription
+        self._ha_state_changes: list[dict[str, Any]] = []
+        def _on_ha_state_change(entity_id: str, old_state: Optional[str], new_state: Optional[str]) -> None:
+            logger.info("HA entity %s changed: %s -> %s", entity_id, old_state, new_state)
+            self._ha_state_changes.append({
+                "entity_id": entity_id,
+                "old_state": old_state,
+                "new_state": new_state,
+                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            })
+            if len(self._ha_state_changes) > 100:
+                self._ha_state_changes.pop(0)
+
+        ha_cfg = self.config.get("home_assistant", {})
+        if ha_cfg.get("subscribe_events", True):
+            self._ha_sub_stop: Optional[Callable[[], None]] = self.ha_connector.subscribe_state_changes(
+                _on_ha_state_change,
+                interval_sec=float(ha_cfg.get("poll_interval_sec", 2.0)),
+            )
+        else:
+            self._ha_sub_stop = None
 
         # Background Reminder Scheduler & Outbox Delivery Worker
         self._scheduler_stop = threading.Event()
@@ -257,6 +302,13 @@ class DeskAgentHostApp:
             self._scheduler_thread.join(timeout=2.0)
         if hasattr(self, "_delivery_thread") and self._delivery_thread.is_alive():
             self._delivery_thread.join(timeout=2.0)
+        if getattr(self, "robot_adapter", None):
+            self.robot_adapter.stop()
+        if getattr(self, "_ha_sub_stop", None):
+            try:
+                self._ha_sub_stop()
+            except Exception:
+                pass
         self.camera_service.stop_capture()
         self.life_service.close()
 
@@ -271,6 +323,14 @@ class DeskAgentHostApp:
                 "allowed_domains": ["light", "switch", "cover", "climate", "fan", "media_player", "scene", "input_boolean"],
             },
             "camera": {"default_lease_ms": 10000},
+            "robot": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "tcp_port": 37020,
+                "udp_port": 37021,
+                "auto_pair": True,
+                "reconnect_interval": 2.0,
+            },
             "codex": {
                 "workspaces": {
                     "epanda-desk-agent": os.path.realpath("."),
@@ -292,6 +352,7 @@ class DeskAgentHostApp:
         # HA
         self.router.register("ha.get_state", self._handle_ha_get_state)
         self.router.register("ha.execute", self._handle_ha_execute)
+        self.router.register("ha.list_changes", self._handle_ha_list_changes)
 
         # Life - Reminders & Notes
         self.router.register("reminder.create", self._handle_reminder_create)
@@ -310,6 +371,8 @@ class DeskAgentHostApp:
         self.router.register("codex.submit_turn", self._handle_codex_submit_turn)
         self.router.register("codex.get_task", self._handle_codex_get_task)
         self.router.register("codex.decide_approval", self._handle_codex_decide_approval)
+        self.router.register("codex.get_pending_approvals", self._handle_codex_get_pending_approvals)
+        self.router.register("codex.list_approvals", self._handle_codex_get_pending_approvals)
         self.router.register("codex.list_workspaces", self._handle_codex_list_workspaces)
 
         # Camera & Hardware resources
@@ -331,6 +394,9 @@ class DeskAgentHostApp:
             wait_for_state=args.get("wait_for_state"),
         )
         return ResponseEnvelope.create_success(req.request_id, res)
+
+    def _handle_ha_list_changes(self, req: RequestEnvelope) -> ResponseEnvelope:
+        return ResponseEnvelope.create_success(req.request_id, {"changes": list(self._ha_state_changes)})
 
     def _handle_reminder_create(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
@@ -439,6 +505,11 @@ class DeskAgentHostApp:
         )
         return ResponseEnvelope.create_success(req.request_id, res)
 
+    def _handle_codex_get_pending_approvals(self, req: RequestEnvelope) -> ResponseEnvelope:
+        task_id = req.arguments.get("task_id")
+        approvals = self.companion.get_pending_approvals(task_id=task_id)
+        return ResponseEnvelope.create_success(req.request_id, {"approvals": approvals})
+
     def _handle_codex_list_workspaces(self, req: RequestEnvelope) -> ResponseEnvelope:
         return ResponseEnvelope.create_success(req.request_id, {"workspaces": list(self.companion.workspaces.keys())})
 
@@ -466,7 +537,12 @@ class DeskAgentHostApp:
 
     def has_robot_hardware_connected(self) -> bool:
         """Checks if physical robot hardware link is actively connected."""
-        return getattr(self, "_robot_client", None) is not None
+        client = getattr(self, "_robot_client", None)
+        if client is None:
+            return False
+        if hasattr(client, "is_connected"):
+            return bool(client.is_connected)
+        return True
 
     def _handle_motion_move(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
@@ -534,9 +610,16 @@ def make_request_handler(app: DeskAgentHostApp):
             auth_hdr = self.headers.get("Authorization", "")
             tok_hdr = self.headers.get("X-Desk-Agent-Token", "")
             if auth_hdr.startswith("Bearer "):
-                return auth_hdr[7:].strip() == auth_token
-            if tok_hdr:
-                return tok_hdr.strip() == auth_token
+                if auth_hdr[7:].strip() == auth_token:
+                    return True
+            if tok_hdr and tok_hdr.strip() == auth_token:
+                return True
+            if "?" in self.path:
+                query = self.path.split("?", 1)[1]
+                for param in query.split("&"):
+                    if param.startswith("token="):
+                        if param.split("=", 1)[1] == auth_token:
+                            return True
             return False
 
         def do_GET(self) -> None:

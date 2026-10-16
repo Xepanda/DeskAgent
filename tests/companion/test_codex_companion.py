@@ -265,46 +265,42 @@ class TestCodexCompanion(unittest.TestCase):
     def test_companion_server_bearer_token_auth(self) -> None:
         """Verifies start_companion_server enforces Bearer Token authentication and loopback default."""
         import urllib.request
-        import urllib.error
-        from companion.src.codex_companion import start_companion_server
+        from companion.src.codex_companion import create_companion_server
 
-        server_thread = None
         port = 18765
         token = "test-auth-token-12345"
 
-        from http.server import HTTPServer
-        from socketserver import ThreadingMixIn
-
-        # Run companion server instance in background thread
-        def run_srv():
-            start_companion_server(port=port, host="127.0.0.1", auth_token=token)
-
-        srv_thread = threading.Thread(target=run_srv, daemon=True)
+        server = create_companion_server(port=port, host="127.0.0.1", auth_token=token)
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
         srv_thread.start()
         time.sleep(0.1)
 
-        # 1. GET /health is public
-        req_health = urllib.request.Request(f"http://127.0.0.1:{port}/health")
-        with urllib.request.urlopen(req_health, timeout=2.0) as resp:
-            self.assertEqual(resp.status, 200)
+        try:
+            # 1. GET /health is public
+            req_health = urllib.request.Request(f"http://127.0.0.1:{port}/health")
+            with urllib.request.urlopen(req_health, timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
 
-        # 2. POST /rpc without token -> 401
-        rpc_body = json.dumps({"operation": "codex.get", "arguments": {"task_id": "t1"}}).encode("utf-8")
-        req_no_auth = urllib.request.Request(f"http://127.0.0.1:{port}/rpc", data=rpc_body)
-        with self.assertRaises(urllib.error.HTTPError) as ctx:
-            urllib.request.urlopen(req_no_auth, timeout=2.0)
-        self.assertEqual(ctx.exception.code, 401)
+            # 2. POST /rpc without token -> 401
+            rpc_body = json.dumps({"operation": "codex.get", "arguments": {"task_id": "t1"}}).encode("utf-8")
+            req_no_auth = urllib.request.Request(f"http://127.0.0.1:{port}/rpc", data=rpc_body)
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_no_auth, timeout=2.0)
+            self.assertEqual(ctx.exception.code, 401)
 
-        # 3. POST /rpc with valid Bearer token -> 200
-        req_auth = urllib.request.Request(
-            f"http://127.0.0.1:{port}/rpc",
-            data=rpc_body,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req_auth, timeout=2.0) as resp:
-            self.assertEqual(resp.status, 200)
-            data = json.loads(resp.read().decode("utf-8"))
-            self.assertTrue(data.get("success"))
+            # 3. POST /rpc with valid Bearer token -> 200
+            req_auth = urllib.request.Request(
+                f"http://127.0.0.1:{port}/rpc",
+                data=rpc_body,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req_auth, timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(data.get("success"))
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
