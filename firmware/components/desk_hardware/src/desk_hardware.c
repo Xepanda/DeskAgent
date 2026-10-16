@@ -123,11 +123,37 @@ static size_t mcu_frame_pack_motion(uint8_t msg_id, const uint8_t *payload, uint
 }
 
 static const desk_board_driver_ops_t *s_board_driver_ops = NULL;
+static bool s_strict_hardware_mode = false;
 
 #ifndef ESP_PLATFORM
 static int s_uart_fd = -1;
 static int s_audio_out_fd = -1;
 #endif
+
+void desk_hardware_set_strict_mode(bool strict)
+{
+    s_strict_hardware_mode = strict;
+}
+
+bool desk_hardware_is_strict_mode(void)
+{
+    return s_strict_hardware_mode;
+}
+
+bool desk_hardware_camera_has_frame(void)
+{
+    return s_cam_frame_len > 0;
+}
+
+float desk_hardware_get_pan(void)
+{
+    return s_current_pan;
+}
+
+float desk_hardware_get_tilt(void)
+{
+    return s_current_tilt;
+}
 
 static int default_driver_init(void)
 {
@@ -156,7 +182,7 @@ static int default_driver_audio_play(const int16_t *pcm_buf, size_t samples, uin
     (void)sample_rate_hz;
     if (!pcm_buf || samples == 0) return 0;
 #ifdef ESP_PLATFORM
-    /* On ESP-IDF, write to I2S speaker peripheral if available */
+    /* On ESP-IDF, write to I2S speaker peripheral (I2S0 ES8311 DAC) */
 #else
     if (s_audio_out_fd >= 0) {
         size_t bytes_to_write = samples * sizeof(int16_t);
@@ -182,7 +208,7 @@ static int default_driver_motion_stop(bool emergency)
 static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len)
 {
 #ifdef ESP_PLATFORM
-    /* On ESP-IDF with esp-camera component */
+    /* On ESP-IDF with Himax HX6538 SPI2 / PTL sensor */
     (void)out_buf; (void)max_len; (void)out_len;
 #else
     (void)out_buf; (void)max_len; (void)out_len;
@@ -192,7 +218,10 @@ static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_
 
 static int default_driver_display_expression(const char *preset_name, const char *status_text)
 {
-    (void)preset_name; (void)status_text;
+    if (!preset_name || strlen(preset_name) == 0) {
+        return -1;
+    }
+    (void)status_text;
     return 0;
 }
 
@@ -246,7 +275,8 @@ static void default_mcu_uart_sender(const uint8_t *frame_data, size_t frame_len,
     if (!frame_data || frame_len == 0) return;
 
 #ifdef ESP_PLATFORM
-    uart_write_bytes(UART_NUM_1, (const char *)frame_data, frame_len);
+    /* STM32 Body Coprocessor is wired to UART_NUM_2 (TX: GPIO 19, RX: GPIO 20) @ 921600 */
+    uart_write_bytes(UART_NUM_2, (const char *)frame_data, frame_len);
 #else
     if (s_uart_fd >= 0) {
         ssize_t w = write(s_uart_fd, frame_data, frame_len);
@@ -274,10 +304,10 @@ int desk_hardware_init(void)
     s_last_mcu_frame_len = 0;
     s_mcu_tx_cb = default_mcu_uart_sender;
     s_mcu_tx_user_data = NULL;
+    s_strict_hardware_mode = false;
 
-    /* Initialize default camera frame */
-    memcpy(s_cam_frame_buf, s_default_minimal_jpeg, sizeof(s_default_minimal_jpeg));
-    s_cam_frame_len = sizeof(s_default_minimal_jpeg);
+    /* Camera sensor starts uninitialized without synthetic dummy picture */
+    s_cam_frame_len = 0;
     s_cam_streaming = false;
     s_cam_cb = NULL;
 
@@ -416,6 +446,14 @@ int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duratio
     if (tilt_deg < DESK_MOTION_TILT_MIN_DEG) tilt_deg = DESK_MOTION_TILT_MIN_DEG;
     if (tilt_deg > DESK_MOTION_TILT_MAX_DEG) tilt_deg = DESK_MOTION_TILT_MAX_DEG;
 
+    if (s_strict_hardware_mode) {
+#ifndef ESP_PLATFORM
+        if (s_uart_fd < 0 && s_mcu_tx_cb == default_mcu_uart_sender) {
+            return DESK_HW_ERR_UNAVAILABLE;
+        }
+#endif
+    }
+
     desk_resource_owner_t current = desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL);
     bool need_release = false;
     if (current == DESK_OWNER_NONE) {
@@ -512,7 +550,7 @@ int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, 
 
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
 {
-    if (!out_buf || !out_len) return -1;
+    if (!out_buf || !out_len) return DESK_HW_ERR_INVALID_ARG;
     (void)timeout_ms;
 
     /* First attempt capturing live frame from registered hardware driver */
@@ -521,15 +559,20 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
         int drv_ret = s_board_driver_ops->camera_capture(out_buf, max_len, &drv_len);
         if (drv_ret == 0 && drv_len > 0) {
             *out_len = drv_len;
-            return 0;
+            return DESK_HW_OK;
         }
     }
 
-    if (max_len < s_cam_frame_len) return -2;
+    if (s_cam_frame_len == 0) {
+        /* No frame in sensor buffer and driver unavailable: return real error, do not fake dummy */
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+
+    if (max_len < s_cam_frame_len) return DESK_HW_ERR_INVALID_ARG;
 
     memcpy(out_buf, s_cam_frame_buf, s_cam_frame_len);
     *out_len = s_cam_frame_len;
-    return 0;
+    return DESK_HW_OK;
 }
 
 int desk_hardware_camera_stream_start(float target_fps, desk_camera_frame_cb_t cb, void *user_data)

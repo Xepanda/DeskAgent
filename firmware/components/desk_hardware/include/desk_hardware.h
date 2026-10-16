@@ -20,6 +20,15 @@ extern "C" {
 #include <stddef.h>
 #include "desk_arbiter.h"
 
+/* Standard Hardware Error Codes */
+#define DESK_HW_OK                  0
+#define DESK_HW_ERR_INVALID_ARG    -1
+#define DESK_HW_ERR_UNAVAILABLE    -2
+#define DESK_HW_ERR_TIMEOUT        -3
+#define DESK_HW_ERR_IO             -4
+#define DESK_HW_ERR_BUSY           -5
+#define DESK_HW_ERR_STALL          -6
+
 /* Motion Limit Constraints (degrees) */
 #define DESK_MOTION_PAN_MIN_DEG    0.0f
 #define DESK_MOTION_PAN_MAX_DEG    180.0f
@@ -132,6 +141,13 @@ int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len
 /* Input Event Subscription */
 int desk_hardware_register_input_cb(desk_touch_event_cb_t cb, void *user_data);
 int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_action_t action);
+
+/* Strict Hardware Mode & Status Inspection */
+void desk_hardware_set_strict_mode(bool strict);
+bool desk_hardware_is_strict_mode(void);
+bool desk_hardware_camera_has_frame(void);
+float desk_hardware_get_pan(void);
+float desk_hardware_get_tilt(void);
 
 #ifdef __cplusplus
 }

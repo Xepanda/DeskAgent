@@ -116,12 +116,29 @@ typedef struct {
 } tuya_dialogue_event_t;
 
 /**
+ * @brief Tuya Cloud Connection States
+ */
+typedef enum {
+    TUYA_CLOUD_DISCONNECTED = 0,
+    TUYA_CLOUD_CONNECTING,
+    TUYA_CLOUD_CONNECTED,
+    TUYA_CLOUD_STREAMING,
+    TUYA_CLOUD_RECONNECTING,
+    TUYA_CLOUD_ERROR
+} tuya_cloud_connection_state_t;
+
+/**
  * @brief Tuya Cloud Voice Dialogue Session Management
  */
+int desk_tclaw_tuya_session_connect(const char *endpoint, const char *device_id, const char *token);
+int desk_tclaw_tuya_session_disconnect(void);
+int desk_tclaw_tuya_session_reconnect(void);
+tuya_cloud_connection_state_t desk_tclaw_tuya_session_get_connection_state(void);
 int desk_tclaw_tuya_session_start(const char *session_id);
 int desk_tclaw_tuya_session_feed_audio(const uint8_t *pcm_data, size_t len);
 int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event);
 int desk_tclaw_tuya_send_tool_result(const char *session_id, const char *tool_name, const char *result_json);
+int desk_tclaw_tuya_get_last_tool_result(char *out_buf, size_t max_len);
 int desk_tclaw_tuya_session_stop(void);
 const char *desk_tclaw_tuya_get_session_id(void);
 
