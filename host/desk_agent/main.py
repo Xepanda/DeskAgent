@@ -431,6 +431,7 @@ class DeskAgentHostApp:
         self.router.register("resource.camera.acquire", self._handle_camera_acquire)
         self.router.register("resource.camera.release", self._handle_camera_release)
         self.router.register("resource.motion.move", self._handle_motion_move)
+        self.router.register("resource.motion.stop", self._handle_motion_stop)
 
     def _handle_ha_get_state(self, req: RequestEnvelope) -> ResponseEnvelope:
         entity_id = req.arguments["entity_id"]
@@ -598,8 +599,8 @@ class DeskAgentHostApp:
 
     def _handle_motion_move(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
-        pan = float(args.get("pan", 90.0))
-        tilt = float(args.get("tilt", 120.0))
+        pan = float(args.get("pan_deg", args.get("pan", 90.0)))
+        tilt = float(args.get("tilt_deg", args.get("tilt", 120.0)))
         duration_ms = int(args.get("duration_ms", 500))
 
         # Enforce physical mechanical limit clamping (Pan 0..180, Tilt 100..140)
@@ -646,6 +647,48 @@ class DeskAgentHostApp:
                     "pan": clamped_pan,
                     "tilt": clamped_tilt,
                     "duration_ms": duration_ms,
+                },
+            )
+
+    def _handle_motion_stop(self, req: RequestEnvelope) -> ResponseEnvelope:
+        emergency = bool(req.arguments.get("emergency", False))
+
+        if self.has_robot_hardware_connected():
+            try:
+                ack = self._robot_client.send_motion_stop(emergency)
+                confirmed = bool(ack.get("confirmed", True)) if isinstance(ack, dict) else True
+                stopped = bool(ack.get("stopped", True)) if isinstance(ack, dict) else True
+                status = (
+                    ack.get("status", "completed" if confirmed else "failed")
+                    if isinstance(ack, dict)
+                    else ("completed" if confirmed else "failed")
+                )
+                return ResponseEnvelope.create_success(
+                    req.request_id,
+                    {
+                        "status": status,
+                        "stopped": stopped,
+                        "state_confirmed": confirmed,
+                        "hardware_link": "connected",
+                        "emergency": emergency,
+                    },
+                )
+            except Exception as exc:
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code="HARDWARE_ERROR",
+                    message=f"Failed to execute physical motion stop on robot: {exc}",
+                )
+        else:
+            return ResponseEnvelope.create_success(
+                req.request_id,
+                {
+                    "status": "simulated",
+                    "stopped": True,
+                    "state_confirmed": False,
+                    "hardware_link": "disconnected",
+                    "reason": "NO_PHYSICAL_ROBOT_CONNECTED",
+                    "emergency": emergency,
                 },
             )
 
@@ -719,6 +762,8 @@ def make_request_handler(app: DeskAgentHostApp):
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
                 self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
+                self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
+                self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
                 self.end_headers()
                 self.wfile.write(frame_info["jpeg_data"])
             else:

@@ -266,6 +266,21 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertAlmostEqual(pan.value, 45.0, places=1)
         self.assertAlmostEqual(tilt.value, 110.0, places=1)
 
+    def test_motion_move_with_pan_tilt_fallback(self) -> None:
+        """Verifies motion command accepts pan/tilt when pan_deg/tilt_deg are omitted."""
+        resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "data": {"pan": 55.0, "tilt": 125.0, "duration_ms": 350},
+        })
+        self.assertEqual(resp.get("type"), "sys.ack")
+        self.assertEqual(resp.get("code"), 0)
+
+        pan = ctypes.c_float()
+        tilt = ctypes.c_float()
+        self.lib.desk_hardware_motion_get_position(ctypes.byref(pan), ctypes.byref(tilt))
+        self.assertAlmostEqual(pan.value, 55.0, places=1)
+        self.assertAlmostEqual(tilt.value, 125.0, places=1)
+
     def test_motion_clamping_constraints(self) -> None:
         """Verifies angles outside mechanical bounds are clamped correctly."""
         # Pan max limit 180, tilt max limit 140

@@ -526,7 +526,13 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     /* Motion control: ctrl.motion.move / motion.move / ctrl.motion.set_target */
     if (strstr(json_in, "motion.move") != NULL || strstr(json_in, "motion.set_target") != NULL) {
         float pan = json_parse_float(json_in, "pan_deg", -999.0f);
+        if (pan < -900.0f) {
+            pan = json_parse_float(json_in, "pan", -999.0f);
+        }
         float tilt = json_parse_float(json_in, "tilt_deg", -999.0f);
+        if (tilt < -900.0f) {
+            tilt = json_parse_float(json_in, "tilt", -999.0f);
+        }
         int32_t duration = json_parse_int(json_in, "duration_ms", 400);
 
         if (pan < -900.0f) pan = desk_hardware_get_pan();

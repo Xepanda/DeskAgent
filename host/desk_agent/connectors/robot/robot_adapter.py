@@ -338,6 +338,23 @@ class RobotAdapter:
             "duration_ms": duration_ms,
         }
 
+    def send_motion_stop(self, emergency: bool = False) -> dict[str, Any]:
+        """Stops physical motion on robot gimbal."""
+        cmd = {
+            "type": "ctrl.motion.stop",
+            "data": {
+                "emergency": bool(emergency),
+            },
+        }
+        res = self.send_command(cmd, timeout=2.0)
+        confirmed = res.get("code") == 0 or (res.get("type") == "sys.ack" and res.get("code") in (None, 0))
+        return {
+            "status": "completed" if confirmed else "failed",
+            "stopped": confirmed,
+            "confirmed": confirmed,
+            "emergency": emergency,
+        }
+
     def send_announcement(self, event_type: str, payload: dict[str, Any]) -> bool:
         """
         Dispatches announcement / alert to robot speaker and expression screen.
