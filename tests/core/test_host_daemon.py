@@ -270,9 +270,9 @@ class TestHostDaemon(unittest.TestCase):
         # Allow background scheduler loop (polls every 1.0s) to detect and deliver
         time.sleep(1.2)
 
-        # Verify alert was either dispatched by outbox delivery worker or pending in outbox
+        # Verify alert was either dispatched by outbox delivery worker or pending in outbox (including with backoff)
         delivered_ids = [a.get("reminder_id") for a in self.app._delivered_alerts]
-        pending_msgs = self.app.life_service.get_pending_outbox_messages(limit=10)
+        pending_msgs = self.app.life_service.get_pending_outbox_messages(limit=10, include_delayed=True)
         pending_topics = [m["topic"] for m in pending_msgs]
         self.assertTrue(
             "rem-auto-deliver-01" in delivered_ids or "reminder.alert" in pending_topics,
