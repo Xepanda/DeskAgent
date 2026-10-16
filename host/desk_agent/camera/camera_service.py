@@ -211,15 +211,16 @@ class CameraViewerService:
             except Exception as exc:
                 logger.error("Error executing camera teardown callback: %s", exc)
 
-    def push_frame(self, jpeg_data: bytes) -> None:
+    def push_frame(self, jpeg_data: bytes, is_hardware: bool = False) -> None:
         """
-        Receives captured JPEG frame from device hardware.
+        Receives captured JPEG frame from device hardware or fallback pipeline.
         Only stores the latest frame if an active lease exists.
         """
         with self._lock:
             if self.is_lease_valid():
                 self._latest_jpeg = jpeg_data
                 self._latest_frame_time = time.time()
+                self._is_hardware_frame = is_hardware
                 self._frame_seq += 1
 
     def get_latest_frame(self, client_id: str) -> Optional[dict[str, Any]]:
@@ -245,12 +246,17 @@ class CameraViewerService:
                     "frame_age_ms": age_ms,
                     "is_stale": True,
                     "is_masked": True,
+                    "source": "stale_mask",
+                    "is_hardware": False,
                 }
 
+            is_hw = getattr(self, "_is_hardware_frame", False)
             return {
                 "frame_seq": self._frame_seq,
                 "jpeg_data": self._latest_jpeg,
                 "frame_age_ms": age_ms,
                 "is_stale": False,
                 "is_masked": False,
+                "source": "hardware_sensor" if is_hw else "synthetic_pipeline",
+                "is_hardware": is_hw,
             }

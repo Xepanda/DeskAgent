@@ -577,12 +577,26 @@ def start_companion_server(
                     op = req.get("operation")
                     args = req.get("arguments", {})
 
-                    if op == "codex.submit":
+                    if op in ("codex.submit", "codex.submit_turn"):
+                        task_id = args.get("task_id") or f"tsk-{uuid.uuid4().hex[:8]}"
                         res = companion.submit_task(
-                            task_id=args["task_id"],
+                            task_id=task_id,
                             workspace_alias=args["workspace_alias"],
                             prompt=args["prompt"],
                             model=args.get("model"),
+                        )
+                    elif op in ("codex.get_status", "codex.get", "codex.get_task"):
+                        res = companion.get_task_status(args["task_id"])
+                    elif op in ("codex.respond_approval", "codex.decide_approval"):
+                        decision = args["decision"]
+                        # Map approve <-> accept for complete cross-client compatibility
+                        if decision == "accept":
+                            decision = "approve"
+                        res = companion.respond_approval(
+                            approval_id=args["approval_id"],
+                            task_id=args["task_id"],
+                            decision=decision,
+                            reason=args.get("reason"),
                         )
                     elif op == "codex.append":
                         res = companion.append_task(args["task_id"], args["text"])
@@ -596,22 +610,25 @@ def start_companion_server(
                             command_or_path=args["command_or_path"],
                             description=args["description"],
                         )
-                    elif op == "codex.respond_approval":
-                        res = companion.respond_approval(
-                            approval_id=args["approval_id"],
-                            task_id=args["task_id"],
-                            decision=args["decision"],
-                            reason=args.get("reason"),
-                        )
-                    elif op == "codex.get_status" or op == "codex.get":
-                        res = companion.get_task_status(args["task_id"])
+                    elif op in ("codex.list_workspaces", "workspaces.list"):
+                        res = {"workspaces": list(companion.workspaces.keys())}
                     else:
                         raise ValueError(f"Unknown operation: {op}")
 
-                    resp_data = {"success": True, "result": res}
+                    resp_data = {
+                        "status": "succeeded",
+                        "success": True,
+                        "request_id": req.get("request_id"),
+                        "result": res,
+                    }
                     self.send_response(200)
                 except Exception as e:
-                    resp_data = {"success": False, "error": str(e)}
+                    resp_data = {
+                        "status": "failed",
+                        "success": False,
+                        "request_id": req.get("request_id") if 'req' in locals() else None,
+                        "error": {"code": "COMPANION_ERROR", "message": str(e)},
+                    }
                     self.send_response(400)
 
                 self.send_header("Content-Type", "application/json")

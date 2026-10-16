@@ -71,10 +71,16 @@ class RemoteCodexCompanionClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                if data.get("status") == "succeeded":
+                if data.get("status") == "succeeded" or data.get("success") is True:
                     return data.get("result", {})
                 err = data.get("error", {})
-                raise RuntimeError(f"Windows Companion error ({err.get('code')}): {err.get('message')}")
+                if isinstance(err, dict):
+                    err_msg = err.get("message", "Unknown error")
+                    err_code = err.get("code", "ERROR")
+                else:
+                    err_msg = str(err)
+                    err_code = "ERROR"
+                raise RuntimeError(f"Windows Companion error ({err_code}): {err_msg}")
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 raise PermissionError("Authentication failed with Windows Companion") from exc
@@ -169,6 +175,13 @@ class DeskAgentHostApp:
 
     def _deliver_robot_announcement(self, title: str, reminder_id: str, occurrence_id: str) -> bool:
         """Dispatches reminder alert to robot announcement channel or event stream."""
+        if not self._announcement_channel:
+            logger.warning(
+                "No active robot announcement channel registered; alert for reminder '%s' (id=%s) remains pending",
+                title, reminder_id
+            )
+            return False
+
         logger.info("Broadcasting robot audio reminder: '%s' (reminder_id=%s)", title, reminder_id)
         alert_payload = {
             "reminder_id": reminder_id,
@@ -176,15 +189,15 @@ class DeskAgentHostApp:
             "title": title,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
-        self._delivered_alerts.append(alert_payload)
 
-        if self._announcement_channel:
-            try:
-                return self._announcement_channel("reminder.alert", alert_payload)
-            except Exception as e:
-                logger.warning("Announcement channel returned error: %s", e)
-                return False
-        return True
+        try:
+            delivered = bool(self._announcement_channel("reminder.alert", alert_payload))
+            if delivered:
+                self._delivered_alerts.append(alert_payload)
+            return delivered
+        except Exception as e:
+            logger.warning("Announcement channel returned error: %s", e)
+            return False
 
     def _delivery_loop(self) -> None:
         """Consumes outbox messages and reliably delivers to robot announcement channels with retry."""
@@ -447,29 +460,66 @@ class DeskAgentHostApp:
         released = self.camera_service.release_lease(client_id)
         return ResponseEnvelope.create_success(req.request_id, {"released": released})
 
+    def register_robot_hardware_client(self, client: Any) -> None:
+        """Registers the connected robot hardware / SDK bridge client."""
+        self._robot_client = client
+
+    def has_robot_hardware_connected(self) -> bool:
+        """Checks if physical robot hardware link is actively connected."""
+        return getattr(self, "_robot_client", None) is not None
+
     def _handle_motion_move(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
         pan = float(args.get("pan", 90.0))
         tilt = float(args.get("tilt", 120.0))
+        duration_ms = int(args.get("duration_ms", 500))
 
         # Enforce physical mechanical limit clamping (Pan 0..180, Tilt 100..140)
         clamped_pan = max(0.0, min(180.0, pan))
         clamped_tilt = max(100.0, min(140.0, tilt))
 
-        # Update dynamic camera overlay coordinates
+        # Update coordinate model in camera service
         self.camera_service.update_motion_coordinates(clamped_pan, clamped_tilt)
 
-        return ResponseEnvelope.create_success(
-            req.request_id,
-            {
-                "status": "completed",
-                "executed": True,
-                "state_confirmed": True,
-                "pan": clamped_pan,
-                "tilt": clamped_tilt,
-                "duration_ms": args.get("duration_ms", 500),
-            },
-        )
+        # Check if physical robot hardware link is actively connected
+        if self.has_robot_hardware_connected():
+            try:
+                ack = self._robot_client.send_motion_move(clamped_pan, clamped_tilt, duration_ms)
+                confirmed = bool(ack.get("confirmed", True)) if isinstance(ack, dict) else True
+                return ResponseEnvelope.create_success(
+                    req.request_id,
+                    {
+                        "status": "completed" if confirmed else "in_progress",
+                        "executed": True,
+                        "state_confirmed": confirmed,
+                        "hardware_link": "connected",
+                        "pan": clamped_pan,
+                        "tilt": clamped_tilt,
+                        "duration_ms": duration_ms,
+                    },
+                )
+            except Exception as exc:
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code="HARDWARE_ERROR",
+                    message=f"Failed to execute physical motion on robot: {exc}",
+                )
+        else:
+            # Standalone Host without physical robot connected:
+            # Transparently report simulated status, state_confirmed=False
+            return ResponseEnvelope.create_success(
+                req.request_id,
+                {
+                    "status": "simulated",
+                    "executed": False,
+                    "state_confirmed": False,
+                    "hardware_link": "disconnected",
+                    "reason": "NO_PHYSICAL_ROBOT_CONNECTED",
+                    "pan": clamped_pan,
+                    "tilt": clamped_tilt,
+                    "duration_ms": duration_ms,
+                },
+            )
 
 
 def make_request_handler(app: DeskAgentHostApp):

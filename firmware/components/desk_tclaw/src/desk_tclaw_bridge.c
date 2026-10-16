@@ -7,6 +7,15 @@
 #include "desk_hardware.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+static void desk_tclaw_format_iso8601(time_t t, char *out_buf, size_t buf_len)
+{
+    if (!out_buf || buf_len < 21) return;
+    struct tm tm_info;
+    gmtime_r(&t, &tm_info);
+    strftime(out_buf, buf_len, "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+}
 
 static desk_tclaw_state_t s_state = TCLAW_STATE_IDLE;
 static desk_tclaw_tool_dispatcher_t s_tool_dispatcher = NULL;
@@ -17,19 +26,33 @@ static void *s_stream_user_data = NULL;
 
 static int s_turn_count = 0;
 static char s_last_response[1024] = "";
+static char s_tuya_session_id[128] = "";
+static char s_current_pending_tool[128] = "";
 
 int desk_tclaw_init(void)
 {
     s_state = TCLAW_STATE_IDLE;
-    s_tool_dispatcher = NULL;
-    s_dispatcher_user_data = NULL;
-    s_speech_stream_cb = NULL;
-    s_stream_user_data = NULL;
     s_turn_count = 0;
     s_last_response[0] = '\0';
+    s_current_pending_tool[0] = '\0';
+    s_speech_stream_cb = NULL;
+    s_stream_user_data = NULL;
 
     desk_hardware_display_set_expression("idle", "Ready");
     return 0;
+}
+
+void desk_tclaw_reset(void)
+{
+    s_state = TCLAW_STATE_IDLE;
+    s_turn_count = 0;
+    s_last_response[0] = '\0';
+    s_current_pending_tool[0] = '\0';
+    s_speech_stream_cb = NULL;
+    s_stream_user_data = NULL;
+    s_tool_dispatcher = NULL;
+    s_dispatcher_user_data = NULL;
+    s_tuya_session_id[0] = '\0';
 }
 
 int desk_tclaw_start(void)
@@ -119,24 +142,29 @@ int desk_tclaw_trigger_tool_call(const char *request_id, const char *operation, 
     desk_hardware_display_set_expression("thinking", "Calling external tool...");
 
     if (s_tool_dispatcher) {
+        time_t now = time(NULL);
+        if (now < 1700000000) {
+            now = 1792100000;
+        }
+        char expires_at[32];
+        desk_tclaw_format_iso8601(now + 60, expires_at, sizeof(expires_at));
+
         char env[2048];
         snprintf(env, sizeof(env),
                  "{\"schema_version\":\"1.0.0\","
                  "\"request_id\":\"%s\","
                  "\"operation\":\"%s\","
                  "\"arguments\":%s,"
-                 "\"expires_at\":\"2026-10-15T23:59:59Z\"}",
+                 "\"expires_at\":\"%s\"}",
                  request_id,
                  operation,
-                 arguments_json ? arguments_json : "{}");
+                 arguments_json ? arguments_json : "{}",
+                 expires_at);
 
         return s_tool_dispatcher(env, s_dispatcher_user_data);
     }
     return 0;
 }
-
-static char s_tuya_session_id[128] = "";
-static char s_current_pending_tool[128] = "";
 
 int desk_tclaw_tuya_session_start(const char *session_id)
 {
@@ -237,9 +265,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
             break;
 
         case TUYA_DIALOGUE_EVT_SESSION_END:
-            if (s_state == TCLAW_STATE_SPEAKING) {
-                desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
-            }
+            desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
             s_turn_count++;
             s_state = TCLAW_STATE_IDLE;
             s_current_pending_tool[0] = '\0';
@@ -247,9 +273,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
             break;
 
         case TUYA_DIALOGUE_EVT_ERROR:
-            if (s_state == TCLAW_STATE_SPEAKING) {
-                desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
-            }
+            desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
             s_state = TCLAW_STATE_IDLE;
             desk_hardware_display_set_expression("idle", event->error_msg ? event->error_msg : "Error");
             break;
@@ -272,9 +296,7 @@ int desk_tclaw_tuya_send_tool_result(const char *session_id, const char *tool_na
 
 int desk_tclaw_tuya_session_stop(void)
 {
-    if (s_state == TCLAW_STATE_SPEAKING) {
-        desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
-    }
+    desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
     s_state = TCLAW_STATE_IDLE;
     s_tuya_session_id[0] = '\0';
     s_current_pending_tool[0] = '\0';
@@ -304,8 +326,14 @@ int desk_tclaw_inject_text(const char *user_prompt)
         return desk_tclaw_trigger_tool_call(req_id, "ha.call_service",
                                             "{\"domain\":\"light\",\"service\":\"turn_on\",\"entity_id\":\"light.desk_lamp\"}");
     } else if (strstr(user_prompt, "remind") != NULL) {
-        return desk_tclaw_trigger_tool_call(req_id, "life.create_reminder",
-                                            "{\"title\":\"desk reminder\",\"remind_at\":\"2026-10-15T20:00:00Z\"}");
+        time_t now = time(NULL);
+        if (now < 1700000000) now = 1792100000;
+        char remind_at[32];
+        desk_tclaw_format_iso8601(now + 3600, remind_at, sizeof(remind_at));
+        char remind_args[256];
+        snprintf(remind_args, sizeof(remind_args),
+                 "{\"title\":\"desk reminder\",\"remind_at\":\"%s\"}", remind_at);
+        return desk_tclaw_trigger_tool_call(req_id, "life.create_reminder", remind_args);
     } else if (strstr(user_prompt, "camera") != NULL || strstr(user_prompt, "snapshot") != NULL) {
         return desk_tclaw_trigger_tool_call(req_id, "camera.capture", "{\"timeout_ms\":2000}");
     } else if (strstr(user_prompt, "codex") != NULL || strstr(user_prompt, "review") != NULL) {

@@ -55,6 +55,31 @@ typedef void (*desk_camera_frame_cb_t)(const uint8_t *jpeg_buf,
                                        void *user_data);
 
 /**
+ * @brief Board-level Peripheral Driver Operations (BSP HAL Driver Table).
+ */
+typedef struct {
+    const char *driver_name;
+    int (*init)(void);
+    int (*audio_record_read)(int16_t *pcm_buf, size_t samples, size_t *read_samples);
+    int (*audio_play_pcm)(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
+    int (*motion_move)(float pan_deg, float tilt_deg, uint32_t duration_ms);
+    int (*motion_stop)(bool emergency);
+    int (*camera_capture)(uint8_t *out_buf, size_t max_len, size_t *out_len);
+    int (*display_expression)(const char *preset_name, const char *status_text);
+    int (*deinit)(void);
+} desk_board_driver_ops_t;
+
+/**
+ * @brief Register custom board driver operations table.
+ */
+int desk_hardware_register_driver_ops(const desk_board_driver_ops_t *ops);
+
+/**
+ * @brief Get currently active board driver operations table.
+ */
+const desk_board_driver_ops_t *desk_hardware_get_driver_ops(void);
+
+/**
  * @brief Initialize all board hardware peripherals and resource arbiter.
  */
 int desk_hardware_init(void);

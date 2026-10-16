@@ -115,6 +115,71 @@ static size_t mcu_frame_pack_motion(uint8_t msg_id, const uint8_t *payload, uint
     return 12 + payload_len + 2;
 }
 
+static const desk_board_driver_ops_t *s_board_driver_ops = NULL;
+
+static int default_driver_init(void) { return 0; }
+static int default_driver_audio_read(int16_t *pcm_buf, size_t samples, size_t *read_samples)
+{
+    (void)pcm_buf; (void)samples;
+    *read_samples = 0;
+    return 0;
+}
+static int default_driver_audio_play(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz)
+{
+    (void)pcm_buf; (void)samples; (void)sample_rate_hz;
+    return 0;
+}
+static int default_driver_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms)
+{
+    (void)pan_deg; (void)tilt_deg; (void)duration_ms;
+    return 0;
+}
+static int default_driver_motion_stop(bool emergency)
+{
+    (void)emergency;
+    return 0;
+}
+static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len)
+{
+    (void)out_buf; (void)max_len; (void)out_len;
+    return -1;
+}
+static int default_driver_display_expression(const char *preset_name, const char *status_text)
+{
+    (void)preset_name; (void)status_text;
+    return 0;
+}
+static int default_driver_deinit(void) { return 0; }
+
+static const desk_board_driver_ops_t s_default_esp32_driver_ops = {
+    .driver_name = "esp32s3_desk_bsp_v1",
+    .init = default_driver_init,
+    .audio_record_read = default_driver_audio_read,
+    .audio_play_pcm = default_driver_audio_play,
+    .motion_move = default_driver_motion_move,
+    .motion_stop = default_driver_motion_stop,
+    .camera_capture = default_driver_camera_capture,
+    .display_expression = default_driver_display_expression,
+    .deinit = default_driver_deinit,
+};
+
+int desk_hardware_register_driver_ops(const desk_board_driver_ops_t *ops)
+{
+    if (s_board_driver_ops && s_board_driver_ops->deinit) {
+        s_board_driver_ops->deinit();
+    }
+    s_board_driver_ops = ops ? ops : &s_default_esp32_driver_ops;
+    if (s_board_driver_ops && s_board_driver_ops->init) {
+        s_board_driver_ops->init();
+    }
+    return 0;
+}
+
+const desk_board_driver_ops_t *desk_hardware_get_driver_ops(void)
+{
+    return s_board_driver_ops;
+}
+
 static void default_mcu_uart_sender(const uint8_t *frame_data, size_t frame_len, void *user_data)
 {
     (void)user_data;
@@ -126,6 +191,7 @@ static void default_mcu_uart_sender(const uint8_t *frame_data, size_t frame_len,
 int desk_hardware_init(void)
 {
     desk_arbiter_init();
+    desk_hardware_register_driver_ops(&s_default_esp32_driver_ops);
     s_current_pan = 90.0f;
     s_current_tilt = 120.0f;
     s_mcu_seq = 0;
@@ -252,6 +318,9 @@ int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_
     if (s_audio_play_cb && pcm_buf && samples > 0) {
         s_audio_play_cb(pcm_buf, samples, sample_rate_hz, s_audio_play_user_data);
     }
+    if (s_board_driver_ops && s_board_driver_ops->audio_play_pcm && pcm_buf && samples > 0) {
+        s_board_driver_ops->audio_play_pcm(pcm_buf, samples, sample_rate_hz);
+    }
     return 0;
 }
 
@@ -310,6 +379,9 @@ int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duratio
     if (s_mcu_tx_cb) {
         s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
     }
+    if (s_board_driver_ops && s_board_driver_ops->motion_move) {
+        s_board_driver_ops->motion_move(pan_deg, tilt_deg, duration_ms);
+    }
 
     if (need_release) {
         desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
@@ -330,6 +402,9 @@ int desk_hardware_motion_stop(bool emergency)
     s_last_mcu_frame_len = mcu_frame_pack_motion(MCU_MOTION_MSG_SERVO_STOP, payload, sizeof(payload), s_last_mcu_frame);
     if (s_mcu_tx_cb) {
         s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
+    }
+    if (s_board_driver_ops && s_board_driver_ops->motion_stop) {
+        s_board_driver_ops->motion_stop(emergency);
     }
 
     desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
@@ -404,6 +479,9 @@ int desk_hardware_display_set_expression(const char *preset_name, const char *st
     if (status_text) {
         strncpy(s_current_status, status_text, sizeof(s_current_status) - 1);
         s_current_status[sizeof(s_current_status) - 1] = '\0';
+    }
+    if (s_board_driver_ops && s_board_driver_ops->display_expression) {
+        s_board_driver_ops->display_expression(preset_name, status_text);
     }
     return 0;
 }

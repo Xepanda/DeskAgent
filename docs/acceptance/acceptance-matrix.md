@@ -1,9 +1,9 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V2.2.0  
+> 文档版本：V2.3.0  
 > 责任 Agent：A7 系统集成与交付验证  
-> 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见  
-> 状态：**全模块生产级接入与协议闭环完成，87 项全量自动化测试全部 PASS (100% OK)**
+> 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见 (P1 阻塞整改)  
+> 状态：**全模块生产级协议闭环与 G1 互通完成，88 项全量自动化测试全部 PASS (100% OK)**
 
 ---
 
@@ -13,10 +13,10 @@
 
 | 证据层级 | 验收范围与含义 | 当前结论 | 关键依据与测试输出 | 绝对不能代表什么 |
 | :--- | :--- | :---: | :--- | :--- |
-| **Level 1：公开源码 / 契约标准** | JSON Schema (Draft 2020-12)、25 个 fixtures、13 个稳定错误码、接口映射表 | **100% PASS** | `contracts/validator/validate.py` 深度校验通过 | 不能代表物理板卡具备该 capability 或在线部署成功 |
-| **Level 2：模拟 PoC / 契约检查** | C 固件硬件链路与驱动报文、SDK 小端协议与配对套接字、Python 核心路由与调度器、HA/Codex/Camera 闭环 | **100% PASS** | `Ran 87 tests in 4.921s -> OK`<br/>C 固件原生可执行文件执行通过 | 不能代表物理机嵌入式网络环境、声学杂音或真实云端延迟达标 |
+| **Level 1：公开源码 / 契约标准** | JSON Schema (Draft 2020-12)、25 个 fixtures、13 个稳定错误码、动态 ISO 8601 时钟契约 | **100% PASS** | `contracts/validator/validate.py` 深度校验通过 | 不能代表物理板卡具备该 capability 或在线部署成功 |
+| **Level 2：模拟 PoC / 契约检查** | C 固件硬件链路与驱动报文、SDK 小端协议与动态配对 Token、Python 核心路由与调度器、HA/Codex/Camera 闭环 | **100% PASS** | `Ran 88 tests in 5.663s -> OK`<br/>C 固件原生可执行文件执行通过 | 不能代表物理机嵌入式网络环境、声学杂音或真实云端延迟达标 |
 | **Level 3：单项硬件 / 节点实测** | 泰山派 Linux ARM 守护进程、Windows Companion 进程通信、ESP32-S3 物理单板 | **规范就绪 (待实板)** | `deploy/edge/` 与 `deploy/windows/` 脚本及生产配置完备 | 不能代表系统端到端链路长期无丢包或无故障运行 |
-| **Level 4：端到端闭环与恢复验收** | 真实语音唤醒→Tuya云端→外部MCP工具→HA/Codex/Life执行→语音播报闭环，断网/断电恢复 | **待物理台架** | 接口时序与端到端模拟链路 100% 连通（见 Section 2.3） | 不能代表所有未知硬件改版或不可控生产环境的质量担保 |
+| **Level 4：端到端闭环与恢复验收** | 真实语音唤醒→Tuya云端→外部MCP工具→HA/Codex/Life执行→语音播报闭环，断网/断电恢复 | **G1 模拟闭环通过 (待台架)** | `test_g1_official_sdk_and_tuya_interop.py` 验证通过 | 不能代表所有未知硬件改版或不可控生产环境的质量担保 |
 
 ---
 
@@ -52,20 +52,22 @@
     Target: ESP32-S3 | Baseline: IDF v5.4 
   ========================================
   [BOOT] Hardware drivers & Resource Arbiter initialized.
+  [BOOT] TClaw Core Dialogue Engine initialized.
   [BOOT] WatcheRobot SDK Protocol Bridge initialized.
   [BOOT] TClaw <-> SDK Bridge MCP Tool Channels connected.
   [BOOT] WatcheRobot SDK TCP Server listening on 0.0.0.0:37020
   [BOOT] WatcheRobot SDK UDP Pairing Server listening on 0.0.0.0:37021
   [BOOT] TClaw Dialogue Engine & Tuya Cloud Session started successfully.
+  [BOOT] Persistent firmware background polling worker task started.
   [READY] Desk Agent R1 Ready for Voice & SDK Operations.
   ```
 
-### 2.3 Level 2: 全量自动化单元测试与集成测试 (87 项用例全部 PASS)
+### 2.3 Level 2: 全量自动化单元测试与集成测试 (88 项用例全部 PASS)
 - **验证命令**：`python3 -m unittest discover -s tests -t . -p "test_*.py"`
 - **实际执行结果**：
   ```text
   ----------------------------------------------------------------------
-  Ran 87 tests in 4.921s
+  Ran 88 tests in 5.663s
 
   OK
   ```
@@ -75,12 +77,12 @@
 | 测试套件 | 用例数 | 覆盖核心能力与去占位要点 |
 | :--- | :---: | :--- |
 | **`tests/firmware_contract/`** | 9 | 1. 仲裁器 5 级优先级抢占与释放<br/>2. 相机租约锁定 TClaw 机头转动追踪<br/>3. 云台电机机械物理极限钳制 (0..180°, 100..140°)<br/>4. 屏幕表情与状态文本存取<br/>5. TClaw 状态机与音频独占生命周期<br/>6. 用户触摸/语音打断 (Interrupt/Barge-in)<br/>7. MCP 工具 RequestEnvelope 派发与动态结果接入<br/>8. 多轮对话上下文与动态流式 Token 回调<br/>9. Tuya Cloud 语音对话会话生命周期与音频流喂入 |
-| **`tests/sdk_contract/`** | 22 | 1. 100% 对齐官方 WSPK 小端序 `<4sBBHII` (16B) 封包解析与 14B 遗留读兼容<br/>2. UDP 37021 `watcher_lan_pairing_v1` 配对服务（`pair.request` / `pair.accept` 64B Token）<br/>3. `sys.client.hello` 握手与 `role=hardware` Opus 音频协商<br/>4. 非阻塞 `0.0.0.0` TCP Socket 服务驱动与连接管理<br/>5. 云台动态角度入参解析与物理限位安全<br/>6. 资源仲裁忙时拒收并返回 409 `RESOURCE_BUSY`<br/>7. 相机租约互斥冲突拦截与释放<br/>8. 未知命令严格返回 404 `UNKNOWN_OPERATION`<br/>9. 触摸事件封装符合 `envelope_event.json` 标准 Schema |
+| **`tests/sdk_contract/`** | 22 | 1. 100% 对齐官方 WSPK 小端序 `<4sBBHII` (16B) 封包解析与 14B 遗留读兼容<br/>2. UDP 37021 `watcher_lan_pairing_v1` 配对服务（动态生成 64B Hex Token 并强制认证）<br/>3. `sys.client.hello` 握手与 `role=hardware` Opus 音频协商<br/>4. 非阻塞 `0.0.0.0` TCP Socket 服务驱动与连接管理<br/>5. 云台动态角度入参解析与物理限位安全<br/>6. 资源仲裁忙时拒收并返回 409 `RESOURCE_BUSY`<br/>7. 相机租约互斥冲突拦截与释放<br/>8. 未知命令严格返回 404 `UNKNOWN_OPERATION`<br/>9. 触摸事件封装符合 `envelope_event.json` 标准 Schema |
 | **`tests/camera/`** | 3 | 1. 单客户端互斥租约仲裁（并发抢占拒绝）<br/>2. 超时过期自动释放与黑帧遮盖（防旧画面冒充实时流）<br/>3. 租约释放回调触发底层资源注销 |
 | **`tests/companion/`** | 9 | 1. 生产模式缺失可执行文件真实报错（无伪成功）<br/>2. 工作区别名白名单与路径逃逸（Path Traversal）防御<br/>3. 真实 JSON-RPC stdio 客户端驱动与多线程按服务端请求 `id` 唤醒与响应<br/>4. 支持 Codex app-server 标准 `thread/start` 及 `thread/create` 映射<br/>5. 审批项目严格绑定与上下文一致性校验<br/>6. 默认监听 `127.0.0.1` 配合 Bearer Token 401 拦截 |
 | **`tests/connectors/`** | 6 | 1. 生产模式未配置凭据真实抛错（不伪造返回）<br/>2. 实体域与服务白名单校验（仅放行合规设备）<br/>3. 两阶段状态确认机制（`accepted` 与 `state_confirmed` 解耦）<br/>4. 真实 HTTP 通信轮询与状态扭转 |
 | **`tests/core/`** | 28 | 1. SQLite WAL 事务持久化保证零丢失<br/>2. 提醒创建、推迟(Snooze)与完成状态彻底解耦<br/>3. 开机追赶与到期轮次精准筛选<br/>4. 持久化发件箱（Outbox）出入队与去重<br/>5. 便签创建、全文检索与分页<br/>6. 后台 `ReminderScheduler` 自动轮询到期 occurrence，触发 ringing 状态扭转并投递 `reminder.alert` outbox 消息<br/>7. 宿主守护进程 HTTP RPC 端到端分发（集成 Codex 路由、相机帧流抓取、默认回环绑定与 401 鉴权拦截） |
-| **`tests/e2e/`** | 6 | 1. 跨模块信封路由、幂等性去重与过期毫秒级拦截<br/>2. HA 领域指令执行与观察状态一致性闭环<br/>3. 生活服务持久化与服务重启恢复<br/>4. Codex 任务提交流程与敏感操作审批闭环<br/>5. 相机租约互斥与帧时效性检测<br/>6. 固件发起到 Host 路由与提醒后台到期投递全链路闭环 |
+| **`tests/e2e/`** | 7 | 1. 跨模块信封路由、幂等性去重与过期毫秒级拦截<br/>2. HA 领域指令执行与观察状态一致性闭环<br/>3. 生活服务持久化与服务重启恢复<br/>4. Codex 任务提交流程与敏感操作审批闭环<br/>5. 相机租约互斥与帧时效性检测<br/>6. 固件发起到 Host 路由与提醒后台到期投递全链路闭环<br/>7. **G1 关口验收**：`test_g1_official_sdk_and_tuya_interop.py` 完整验证 Tuya 云对话运行中，官方 Python SDK 动态配对、Token 401 拦截校验、同时操控云台舵机与 WSPK 媒体流通讯 |
 | **`tests/test_p1_gaps_verification.py`** | 4 | 1. 泰山派远程调用 Windows Codex Companion 客户端分发与审批确认<br/>2. 提醒发件箱后台消费 Worker 投递到机器人音频通道与重试机制<br/>3. HA 实体与服务白名单拦截、状态对账与状态变更订阅回调<br/>4. 相机动态 FrameCapturePipeline 抓取与动态云台坐标叠加验证 |
 
 ---
@@ -89,13 +91,15 @@
 
 | 架构规范项 | 改造前问题 (占位/伪实现) | 改造后生产实现 (真实接入) |
 | :--- | :--- | :--- |
-| **A1 硬件驱动** | 录音不足时合成 440Hz 波形、扬声器无输出、云台只改内存、相机固定字节 | 彻底移除 440Hz 伪音频合成，真实反馈空缓冲区；注册 `default_mcu_uart_sender` 真实生成/发射 STM32 二进制帧（0xA5/0x5A/CRC16）；扬声器 PCM 播放驱动真实写入；连续动态 JPEG 帧流注入与解析 |
+| **A1 硬件驱动** | 录音不足时合成 440Hz 波形、扬声器无输出、云台只改内存、相机固定字节 | 彻底移除 440Hz 伪音频合成，真实反馈空缓冲区；实现 `desk_board_driver_ops_t` 抽象，注册生产级 ESP32-S3 BSP 驱动钩子；真实生成/发射 STM32 二进制帧（0xA5/0x5A/CRC16）；扬声器 PCM 播放驱动真实写入；连续动态 JPEG 帧流注入与解析 |
 | **A1 Tuya 对话** | 固定返回 "Processed response" 或固定关键词匹配 | 真实 Tuya Cloud IoT 语音会话状态机（`desk_tclaw_tuya_session_start`, `desk_tclaw_tuya_handle_cloud_event`），多轮流式 Token 回调，LLM 动态 Tool Call 派发，并将结果组织回送云端继续合成 |
-| **A2 SDK 兼容** | 自定义回环 TCP，未在启动入口运行，无 UDP 37021 配对服务 | 启动入口自动启动监听 `0.0.0.0:37020` TCP 服务与 `0.0.0.0:37021` UDP 配对服务，小端序 `<4sBBHII` WSPK 封包，对齐官方 `watcher_lan_pairing_v1` 协议 |
-| **A3 生活服务** | 内存字典易失，无后台调度器自动到期播报 | SQLite WAL 事务表持久化、开机追赶自愈、`ReminderScheduler` 自动轮询到期扭转 ringing、`_delivery_loop` 消费 Outbox 真实投递机器人语音播报并记录失败重试 |
+| **A2 SDK 兼容** | 自定义回环 TCP，未在启动入口运行，无 UDP 37021 配对服务，静态硬编码 Token | 启动入口按序启动监听 `0.0.0.0:37020` TCP 服务与 `0.0.0.0:37021` UDP 配对服务；动态生成 64 字节随机 session_token，并在 `sys.client.hello` 严格比对（非法 Token 返回 401 AUTH_FAILED）；小端序 `<4sBBHII` WSPK 封包，对齐官方 `watcher_lan_pairing_v1` 协议 |
+| **A3 生活服务** | 内存字典易失，无后台调度器自动到期播报，无物理通道也标记送达 | SQLite WAL 事务表持久化、开机追赶自愈、`ReminderScheduler` 自动轮询到期扭转 ringing；`_deliver_robot_announcement` 严格核查机器人播报通道，通道离线时保留 pending 并持续重试，杜绝虚报送达 |
 | **A4 HA 接入** | 固定返回 mock 数据；无事件订阅与对账 | 实体与服务级严格白名单校验、`reconcile_states()` 状态快照对账、`subscribe_state_changes()` 变更事件订阅监听 |
-| **A5 Codex** | 部署到泰山派时尝试本地启动 Codex；审批未按请求 ID 回应 | Host 支持 `RemoteCodexCompanionClient` 远程调用 Windows Companion；后台线程严格按服务端请求 `id` 回应审批；双向映射 thread/turn 到 `task_id` |
-| **A6 相机服务** | 纯静态遮盖，前端无实时抓帧链路 | `FrameCapturePipeline` 动态抓取（带时间戳、序号与云台坐标叠加）；云台返回真实确认状态；前端网页支持 Token 输入并持久化到 `localStorage`，携带 Bearer Token 跨机拉帧 |
+| **A5 Codex** | 部署到泰山派时尝试本地启动 Codex；两端 RPC 方法名/返回字段不匹配 | Host 支持 `RemoteCodexCompanionClient` 远程调用 Windows Companion；两端协议对齐并兼容双别名（`submit`/`submit_turn`、`get`/`get_task`、`respond_approval`/`decide_approval`）与双字段（`status: "succeeded"` / `success: True`）；后台线程严格按服务端请求 `id` 回应审批 |
+| **A6 相机服务** | 纯静态遮盖，虚报硬件转头确认 | `FrameCapturePipeline` 动态抓取并在元数据中诚实标注 `hardware_sensor` vs `synthetic_pipeline`；云台控制在无实体机器人连接时诚实返回 `executed: False, state_confirmed: False, reason: "NO_PHYSICAL_ROBOT_CONNECTED"`；前端网页支持 Token 输入并持久化到 `localStorage`，携带 Bearer Token 跨机拉帧 |
+| **固件启动顺序** | 固件启动先注册工具回调再调 init 清空回调，只轮询一次就退出 | 严格重构启动顺序：`desk_hardware_init` -> `desk_tclaw_init` -> `desk_sdk_bridge_init` -> 注册工具回调 -> 启动 TCP/UDP 服务 -> `desk_tclaw_start` -> 启动常驻 FreeRTOS / pthread 后台轮询 Worker (`desk_firmware_start_background_task`) |
+| **动态时钟契约** | `expires_at` 写死 `2026-10-15T23:59:59Z` 导致请求一律判定超时 | 实现 `desk_tclaw_format_iso8601` 与 `desk_sdk_format_iso8601`，基于当前时钟动态计算 `now + ttl` 有效期与事件发生时间戳 |
 | **ESP-IDF 构建** | 缺少标准组件注册与构建入口 | 补充 `firmware/main/CMakeLists.txt`、`sdkconfig.defaults` (ESP32-S3 octal PSRAM, 16MB Flash) 与 `partitions.csv`，CMake 编译全部通过 |
 
 ---

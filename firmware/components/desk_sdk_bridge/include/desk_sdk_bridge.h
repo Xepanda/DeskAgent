@@ -189,9 +189,39 @@ int desk_sdk_pairing_server_stop(void);
 int desk_sdk_pairing_server_get_port(void);
 
 /**
+ * @brief Set dynamic pairing token manually (or pass NULL to auto-generate).
+ */
+int desk_sdk_bridge_set_pairing_token(const char *token);
+
+/**
+ * @brief Get currently active pairing session token.
+ */
+int desk_sdk_bridge_get_pairing_token(char *token, size_t max_len);
+
+/**
+ * @brief Enable or disable mandatory pairing token authentication check on sys.client.hello.
+ */
+void desk_sdk_bridge_set_auth_required(bool required);
+
+/**
  * @brief Poll all active firmware communication channels (TCP SDK and UDP pairing).
  */
 int desk_firmware_poll(int timeout_ms);
+
+/**
+ * @brief Start persistent background worker task driving desk_firmware_poll.
+ */
+int desk_firmware_start_background_task(void);
+
+/**
+ * @brief Stop persistent background worker task.
+ */
+void desk_firmware_stop_background_task(void);
+
+/**
+ * @brief Check if background worker task is running.
+ */
+bool desk_firmware_is_background_task_running(void);
 
 #ifdef __cplusplus
 }

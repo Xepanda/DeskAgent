@@ -121,13 +121,20 @@ class TestTClawDialogue(unittest.TestCase):
         cls.lib.desk_tclaw_tuya_session_stop.restype = ctypes.c_int
         cls.lib.desk_tclaw_tuya_session_stop.argtypes = []
 
+        cls.lib.desk_tclaw_reset.restype = None
+        cls.lib.desk_tclaw_reset.argtypes = []
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
 
     def setUp(self) -> None:
         self.lib.desk_hardware_init()
+        self.lib.desk_tclaw_reset()
         self.lib.desk_tclaw_init()
+
+    def tearDown(self) -> None:
+        self.lib.desk_tclaw_reset()
 
     def test_initial_state_is_idle(self) -> None:
         """Verifies initial state is IDLE and audio playback is unowned."""

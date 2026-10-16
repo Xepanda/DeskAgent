@@ -16,6 +16,15 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <errno.h>
+#include <time.h>
+
+static void desk_sdk_format_iso8601(time_t t, char *out_buf, size_t buf_len)
+{
+    if (!out_buf || buf_len < 21) return;
+    struct tm tm_info;
+    gmtime_r(&t, &tm_info);
+    strftime(out_buf, buf_len, "%Y-%m-%dT%H:%M:%SZ", &tm_info);
+}
 
 static bool s_client_connected = false;
 static uint32_t s_event_seq = 0;
@@ -23,6 +32,48 @@ static desk_sdk_outbound_send_cb_t s_outbound_cb = NULL;
 static void *s_outbound_user_data = NULL;
 static desk_sdk_tool_response_cb_t s_tool_response_cb = NULL;
 static void *s_tool_response_user_data = NULL;
+
+static char s_active_pairing_token[65] = "";
+static bool s_auth_required = false;
+static bool s_paired = false;
+
+static void generate_dynamic_token(char *out_buf, size_t max_len)
+{
+    static const char hex_chars[] = "0123456789abcdef";
+    uint64_t t = (uint64_t)time(NULL);
+    for (size_t i = 0; i < 64 && i < max_len - 1; i++) {
+        out_buf[i] = hex_chars[(rand() ^ (uint8_t)(t >> (i % 8)) ^ (uint8_t)(i * 31)) & 0x0F];
+    }
+    out_buf[64 < max_len ? 64 : max_len - 1] = '\0';
+}
+
+int desk_sdk_bridge_set_pairing_token(const char *token)
+{
+    if (token && strlen(token) > 0) {
+        strncpy(s_active_pairing_token, token, sizeof(s_active_pairing_token) - 1);
+        s_active_pairing_token[sizeof(s_active_pairing_token) - 1] = '\0';
+    } else {
+        generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
+    }
+    s_paired = true;
+    return 0;
+}
+
+int desk_sdk_bridge_get_pairing_token(char *token, size_t max_len)
+{
+    if (!token || max_len == 0) return -1;
+    if (s_active_pairing_token[0] == '\0') {
+        generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
+    }
+    strncpy(token, s_active_pairing_token, max_len - 1);
+    token[max_len - 1] = '\0';
+    return 0;
+}
+
+void desk_sdk_bridge_set_auth_required(bool required)
+{
+    s_auth_required = required;
+}
 
 /* Socket Server State */
 static int s_listen_fd = -1;
@@ -114,6 +165,9 @@ void desk_sdk_bridge_reset(void)
 {
     s_client_connected = false;
     s_event_seq = 0;
+    s_active_pairing_token[0] = '\0';
+    s_paired = false;
+    s_auth_required = false;
 }
 
 bool desk_sdk_bridge_is_connected(void)
@@ -240,8 +294,11 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
         strncpy(daemon_id, "daemon-pair-01", sizeof(daemon_id) - 1);
     }
 
-    /* Fixed valid session token for paired session */
-    static const char s_session_token[] = "f84a1e16ce6f35f14d167f227a93ea93d1a9c4d9eb5517112030f2839d57ae4b";
+    /* Use active dynamic session token or generate fresh token */
+    if (s_active_pairing_token[0] == '\0') {
+        generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
+    }
+    s_paired = true;
 
     snprintf(udp_out, max_out_len,
              "{\"type\":\"pair.accept\","
@@ -259,8 +316,8 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
              req_id,
              daemon_id,
              strlen(target_mode) > 0 ? target_mode : "python_sdk",
-             s_session_token,
-             s_session_token);
+             s_active_pairing_token,
+             s_active_pairing_token);
 
     return 0;
 }
@@ -272,6 +329,31 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
 
     /* Handshake: sys.client.hello */
     if (strstr(json_in, "sys.client.hello") != NULL) {
+        char provided_token[128] = "";
+        json_parse_str(json_in, "session_token", provided_token, sizeof(provided_token));
+        if (provided_token[0] == '\0') {
+            json_parse_str(json_in, "token", provided_token, sizeof(provided_token));
+        }
+
+        /* Enforce pairing token authentication check */
+        if (s_auth_required || (s_paired && s_active_pairing_token[0] != '\0')) {
+            if (provided_token[0] == '\0' || strcmp(provided_token, s_active_pairing_token) != 0) {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":401,\"error\":{"
+                         "\"code\":\"AUTH_FAILED\","
+                         "\"message\":\"Invalid pairing session token\"}}");
+                return 0;
+            }
+        } else if (provided_token[0] != '\0' && s_active_pairing_token[0] != '\0') {
+            if (strcmp(provided_token, s_active_pairing_token) != 0) {
+                snprintf(out_buf, max_out_len,
+                         "{\"type\":\"sys.nack\",\"code\":401,\"error\":{"
+                         "\"code\":\"AUTH_FAILED\","
+                         "\"message\":\"Invalid pairing session token\"}}");
+                return 0;
+            }
+        }
+
         s_client_connected = true;
 
         char role[32] = "";
@@ -421,6 +503,11 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
     if (!event_type || !payload_json) return -1;
     s_event_seq++;
 
+    time_t now = time(NULL);
+    if (now < 1700000000) now = 1792100000;
+    char ts[32];
+    desk_sdk_format_iso8601(now, ts, sizeof(ts));
+
     char event_buf[2048];
     snprintf(event_buf, sizeof(event_buf),
              "{\"schema_version\":\"1.0.0\","
@@ -428,11 +515,12 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
              "\"sequence\":%u,"
              "\"sequence_scope\":\"device:esp32s3\","
              "\"type\":\"%s\","
-             "\"timestamp\":\"2026-10-15T10:00:00Z\","
+             "\"timestamp\":\"%s\","
              "\"payload\":%s}",
              s_event_seq * 0x13579bdf,
              s_event_seq,
              event_type,
+             ts,
              payload_json);
 
     if (s_outbound_cb) {
@@ -472,6 +560,11 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
     }
 
     s_event_seq++;
+    time_t now = time(NULL);
+    if (now < 1700000000) now = 1792100000;
+    char ts[32];
+    desk_sdk_format_iso8601(now, ts, sizeof(ts));
+
     char formatted[2048];
     snprintf(formatted, sizeof(formatted),
              "{\"schema_version\":\"1.0.0\","
@@ -479,16 +572,18 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
              "\"sequence\":%u,"
              "\"sequence_scope\":\"device:esp32s3\","
              "\"type\":\"resource.touch_event\","
-             "\"timestamp\":\"2026-10-15T10:00:00Z\","
+             "\"timestamp\":\"%s\","
              "\"payload\":{"
              "\"target\":\"%s\","
              "\"action\":\"%s\","
-             "\"timestamp\":\"2026-10-15T10:00:00Z\""
+             "\"timestamp\":\"%s\""
              "}}",
              s_event_seq * 0x13579bdf,
              s_event_seq,
+             ts,
              target_str,
-             action_str);
+             action_str,
+             ts);
 
     if (out_event_json && max_len > 0) {
         strncpy(out_event_json, formatted, max_len - 1);
@@ -770,3 +865,66 @@ int desk_firmware_poll(int timeout_ms)
     desk_sdk_pairing_server_poll(half);
     return 0;
 }
+
+#ifdef ESP_PLATFORM
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+static TaskHandle_t s_worker_task_handle = NULL;
+static void firmware_worker_task(void *pvParameters)
+{
+    (void)pvParameters;
+    while (s_worker_task_handle != NULL) {
+        desk_firmware_poll(20);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    vTaskDelete(NULL);
+}
+int desk_firmware_start_background_task(void)
+{
+    if (s_worker_task_handle != NULL) return 0;
+    BaseType_t ret = xTaskCreate(firmware_worker_task, "desk_poll_worker", 4096, NULL, 5, &s_worker_task_handle);
+    return ret == pdPASS ? 0 : -1;
+}
+void desk_firmware_stop_background_task(void)
+{
+    s_worker_task_handle = NULL;
+}
+bool desk_firmware_is_background_task_running(void)
+{
+    return s_worker_task_handle != NULL;
+}
+#else
+#include <pthread.h>
+#include <unistd.h>
+static pthread_t s_worker_thread;
+static volatile bool s_worker_running = false;
+static void *firmware_worker_thread(void *arg)
+{
+    (void)arg;
+    while (s_worker_running) {
+        desk_firmware_poll(20);
+        usleep(10000);
+    }
+    return NULL;
+}
+int desk_firmware_start_background_task(void)
+{
+    if (s_worker_running) return 0;
+    s_worker_running = true;
+    if (pthread_create(&s_worker_thread, NULL, firmware_worker_thread, NULL) != 0) {
+        s_worker_running = false;
+        return -1;
+    }
+    return 0;
+}
+void desk_firmware_stop_background_task(void)
+{
+    if (!s_worker_running) return;
+    s_worker_running = false;
+    pthread_join(s_worker_thread, NULL);
+}
+bool desk_firmware_is_background_task_running(void)
+{
+    return s_worker_running;
+}
+#endif

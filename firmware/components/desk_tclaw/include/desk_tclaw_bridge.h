@@ -30,6 +30,11 @@ typedef int (*desk_tclaw_tool_dispatcher_t)(const char *request_envelope_json, v
 int desk_tclaw_init(void);
 
 /**
+ * @brief Reset TClaw dialogue state and clear callbacks.
+ */
+void desk_tclaw_reset(void);
+
+/**
  * @brief Start TClaw voice dialogue task.
  */
 int desk_tclaw_start(void);
