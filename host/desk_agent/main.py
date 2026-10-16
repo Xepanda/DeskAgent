@@ -130,10 +130,15 @@ class DeskAgentHostApp:
         # Database and Services
         db_path = Path(self.config.get("storage", {}).get("db_path", "/var/lib/desk-agent/life_service.db"))
         self.life_service = LifeService(db_path)
+        ha_cfg = self.config.get("home_assistant", {})
         self.ha_connector = HAConnector(
-            base_url=self.config.get("home_assistant", {}).get("base_url", "http://homeassistant.local:8123"),
-            access_token=self.config.get("home_assistant", {}).get("access_token"),
-            allowed_domains=self.config.get("home_assistant", {}).get("allowed_domains"),
+            base_url=ha_cfg.get("base_url", "http://homeassistant.local:8123"),
+            access_token=ha_cfg.get("access_token"),
+            allowed_domains=ha_cfg.get("allowed_domains"),
+            allowed_entities=ha_cfg.get("allowed_entities"),
+            denied_entities=ha_cfg.get("denied_entities"),
+            allowed_services=ha_cfg.get("allowed_services"),
+            denied_services=ha_cfg.get("denied_services"),
         )
         cam_cfg = self.config.get("camera", {})
         self.camera_service = CameraViewerService(

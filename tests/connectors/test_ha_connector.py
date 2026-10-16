@@ -456,6 +456,231 @@ class TestHAConnector(unittest.TestCase):
         stop_sub()
         ha.close()
 
+    # -------------------------------------------------------------------------
+    # 6. Target Attributes Verification & Security Permissions Injection Tests
+    # -------------------------------------------------------------------------
+    def test_execute_service_attribute_mismatch_unconfirmed(self) -> None:
+        """When state matches expected_state but attribute does not match, state_confirmed must be False."""
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                return 200, {
+                    "entity_id": "light.desk",
+                    "state": "on",
+                    "attributes": {"brightness": 100},
+                }
+            return 500, None
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        # Calling via execute_service with parameters indicating target brightness
+        res = ha.execute_service(
+            entity_id="light.desk",
+            action="turn_on",
+            parameters={"brightness": 200},
+            wait_for_state={"expected_state": "on", "timeout_ms": 100},
+        )
+
+        self.assertTrue(res["accepted"])
+        self.assertFalse(res["state_confirmed"])
+        self.assertEqual(res["observed_state"], "on")
+
+    def test_execute_service_attribute_transition_confirmed(self) -> None:
+        """When state and attributes transition to target during polling, state_confirmed becomes True."""
+        call_count = 0
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            nonlocal call_count
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                call_count += 1
+                if call_count == 1:
+                    # Initial state: on, but brightness transitioning (100)
+                    return 200, {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 100}}
+                else:
+                    # Polled state: reached target brightness (200)
+                    return 200, {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 200}}
+            return 500, None
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        res = ha.execute_service(
+            entity_id="light.desk",
+            action="turn_on",
+            parameters={"brightness": 200},
+            wait_for_state={"expected_state": "on", "timeout_ms": 1000},
+        )
+
+        self.assertTrue(res["accepted"])
+        self.assertTrue(res["state_confirmed"])
+        self.assertEqual(res["observed_state"], "on")
+
+    def test_execute_service_explicit_expected_attributes(self) -> None:
+        """Explicit expected_attributes in wait_for_state overrides check_parameters inference."""
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                return 200, {
+                    "entity_id": "climate.ac",
+                    "state": "cool",
+                    "attributes": {"temperature": 24.0, "fan_mode": "auto"},
+                }
+            return 500, None
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        # Target temperature matches (24.0), fan_mode in parameters ignored because expected_attributes specified
+        res = ha.execute_service(
+            entity_id="climate.ac",
+            action="set_temperature",
+            parameters={"temperature": 24.0, "fan_mode": "high"},
+            wait_for_state={
+                "expected_state": "cool",
+                "expected_attributes": {"temperature": 24.0},
+                "timeout_ms": 200,
+            },
+        )
+        self.assertTrue(res["accepted"])
+        self.assertTrue(res["state_confirmed"])
+
+    def test_execute_service_numeric_tolerance(self) -> None:
+        """Numeric attributes support small tolerance (e.g. brightness +-2, temperature +-0.5)."""
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                return 200, {
+                    "entity_id": "light.desk",
+                    "state": "on",
+                    "attributes": {"brightness": 201},  # 201 is within +-2 of target 200
+                }
+            return 500, None
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        res = ha.execute_service(
+            entity_id="light.desk",
+            action="turn_on",
+            parameters={"brightness": 200},
+            wait_for_state={"expected_state": "on", "timeout_ms": 100},
+        )
+        self.assertTrue(res["accepted"])
+        self.assertTrue(res["state_confirmed"])
+
+    def test_execute_service_check_parameters_disabled(self) -> None:
+        """When check_parameters is False, attribute differences do not block confirmation."""
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                return 200, {
+                    "entity_id": "light.desk",
+                    "state": "on",
+                    "attributes": {"brightness": 50},
+                }
+            return 500, None
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        res = ha.execute_service(
+            entity_id="light.desk",
+            action="turn_on",
+            parameters={"brightness": 200},
+            wait_for_state={"expected_state": "on", "check_parameters": False, "timeout_ms": 100},
+        )
+        self.assertTrue(res["accepted"])
+        self.assertTrue(res["state_confirmed"])
+
+    def test_execute_mock_mode_attribute_check(self) -> None:
+        """In mock mode, expected_attributes mismatch reports state_confirmed=False."""
+        ha = HAConnector(mock_mode=True)
+        # Expected brightness 255 but parameters set brightness to 200
+        res = ha.execute_service(
+            entity_id="light.desk",
+            action="turn_on",
+            parameters={"brightness": 200},
+            wait_for_state={"expected_state": "on", "expected_attributes": {"brightness": 255}},
+        )
+        self.assertTrue(res["accepted"])
+        self.assertFalse(res["state_confirmed"])
+
+        # Expected brightness 200 matches parameters
+        res_ok = ha.execute_service(
+            entity_id="light.desk",
+            action="turn_on",
+            parameters={"brightness": 200},
+            wait_for_state={"expected_state": "on", "expected_attributes": {"brightness": 200}},
+        )
+        self.assertTrue(res_ok["accepted"])
+        self.assertTrue(res_ok["state_confirmed"])
+
+    def test_ha_security_boundaries_from_config(self) -> None:
+        """HAConnector initialized with allowed/denied services and entities enforces boundaries."""
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            allowed_services=["light.turn_on", "light.turn_off"],
+            denied_services=["switch.turn_on"],
+            denied_entities=["light.restricted_desk"],
+            mock_mode=True,
+        )
+
+        # Denied entity
+        self.assertFalse(ha.is_entity_allowed("light.restricted_desk"))
+        with self.assertRaises(PermissionError):
+            ha.execute_service("light.restricted_desk", "turn_on")
+
+        # Denied service
+        self.assertFalse(ha.is_service_allowed("switch", "turn_on"))
+        with self.assertRaises(PermissionError):
+            ha.execute_service("switch.heater", "turn_on")
+
+        # Service not in allowed_services
+        self.assertFalse(ha.is_service_allowed("fan", "turn_on"))
+        with self.assertRaises(PermissionError):
+            ha.execute_service("fan.ceiling", "turn_on")
+
+        # Allowed service & entity
+        self.assertTrue(ha.is_entity_allowed("light.desk"))
+        self.assertTrue(ha.is_service_allowed("light", "turn_on"))
+        res = ha.execute_service("light.desk", "turn_on")
+        self.assertTrue(res["accepted"])
+
+    def test_desk_agent_host_app_config_injection(self) -> None:
+        """DeskAgentHostApp wires allowed_services, denied_services, and denied_entities into HAConnector."""
+        import tempfile
+        from pathlib import Path
+        from host.desk_agent.main import DeskAgentHostApp
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg_file = Path(tmp_dir) / "config.json"
+            db_path = Path(tmp_dir) / "test.db"
+            cfg_data = {
+                "storage": {"db_path": str(db_path)},
+                "robot": {"enabled": False},
+                "home_assistant": {
+                    "base_url": "mock://ha.local:8123",
+                    "access_token": "test-token",
+                    "allowed_domains": ["light", "switch"],
+                    "allowed_services": ["light.turn_on", "switch.turn_on"],
+                    "denied_services": ["switch.turn_off"],
+                    "denied_entities": ["light.restricted_vault"],
+                },
+            }
+            cfg_file.write_text(json.dumps(cfg_data))
+
+            app = DeskAgentHostApp(config_path=str(cfg_file))
+            try:
+                self.assertEqual(app.ha_connector.allowed_services, {"light.turn_on", "switch.turn_on"})
+                self.assertEqual(app.ha_connector.denied_services, {"switch.turn_off"})
+                self.assertEqual(app.ha_connector.denied_entities, {"light.restricted_vault"})
+
+                # Verify permissions are enforced through app's ha_connector
+                self.assertFalse(app.ha_connector.is_service_allowed("switch", "turn_off"))
+                self.assertFalse(app.ha_connector.is_entity_allowed("light.restricted_vault"))
+                self.assertTrue(app.ha_connector.is_service_allowed("light", "turn_on"))
+            finally:
+                app.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+
