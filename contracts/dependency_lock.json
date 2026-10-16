@@ -1,0 +1,137 @@
+{
+  "schema_version": "1.0.0",
+  "locked_at": "2026-10-16T10:50:00Z",
+  "locked_by": "A0 Lead Architecture & Protocol Orchestrator",
+  "gate_state": {
+    "current_gate": "G0_FROZEN",
+    "next_gate": "G1_PHYSICAL_BENCH",
+    "level_1_contracts": "100% PASS",
+    "level_2_simulation": "100% PASS",
+    "level_3_physical_node": "PENDING_HARDWARE",
+    "level_4_end_to_end": "PENDING_HARDWARE"
+  },
+  "repositories": {
+    "desk_agent_main": {
+      "path": "/home/maidang/DeskAgent",
+      "repository_url": "https://github.com/Xepanda/DeskAgent",
+      "branch": "main",
+      "commit": "6d863c2",
+      "worktree_status": "clean",
+      "role": "Central project monorepo (contracts, host, companion, tests)"
+    },
+    "tuya_tclaw": {
+      "path": "/home/maidang/.gemini/antigravity-cli/brain/49ffa309-8e24-433a-a0da-2c22b3c125ea/scratch/tclaw-repo",
+      "repository_url": "https://github.com/tuya/TClaw.git",
+      "branch": "master",
+      "commit": "88bd37378f1d106fcc1175e61b368222cc8fabda",
+      "worktree_status": "dirty (untracked .share/ directory protected)",
+      "role": "Robot core firmware framework (Tuya cloud voice dialogue, MCP tools)"
+    },
+    "watcherobot_embedded_sdk": {
+      "path": "/home/maidang/.gemini/antigravity-cli/brain/cb82573a-ba9b-42ea-a6be-405983e79f69/scratch/watcherobot_public",
+      "repository_url": "https://github.com/orulink-ai/WatcheRobot-public.git",
+      "branch": "detached HEAD",
+      "tag": "watche-v0.1.2",
+      "commit": "646a977bfd76a8516ae505fda2331b81e1049b87",
+      "worktree_status": "clean",
+      "role": "SenseCAP Watcher embedded board HAL (audio, camera, LCD, STM32 MCU link)"
+    },
+    "watcherobot_python_sdk": {
+      "path": "/home/maidang/.gemini/antigravity-cli/brain/cb82573a-ba9b-42ea-a6be-405983e79f69/scratch/watcherobot_python_sdk",
+      "repository_url": "https://github.com/orulink-ai/WatcheRobot_python_sdk.git",
+      "branch": "detached HEAD",
+      "tag": "v0.1.11",
+      "commit": "8bc13967a06ef073459be47e930ff43ef37ee8fb",
+      "worktree_status": "clean",
+      "role": "Official Python SDK protocol reference (UDP 37021 pairing, TCP 37020 WSPK framing)"
+    },
+    "tuyaopen_sdk": {
+      "path": "/home/share/samba/ePanda/TuyaOpen",
+      "repository_url": "https://github.com/tuya/TuyaOpen.git",
+      "branch": "master",
+      "commit": "ec8aa7cb",
+      "bundled_esp_idf": "v5.4",
+      "worktree_status": "dirty (untracked Tuya-vuln-report.7z protected)",
+      "role": "TuyaOpen baseline SDK and ESP-IDF 5.4 build environment"
+    }
+  },
+  "target_hardware": {
+    "board": "Seeed SenseCAP Watcher / WatcheRobot Dev Kit",
+    "mcu": "Espressif ESP32-S3-WROOM-1 / N16R8 (8MB Octal PSRAM, 16MB SPI Flash)",
+    "body_coprocessor": {
+      "mcu": "STM32",
+      "uart_port": 2,
+      "tx_gpio": 19,
+      "rx_gpio": 20,
+      "baud_rate": 921600,
+      "protocol": "COBS framing + CRC16"
+    },
+    "audio_codec": {
+      "dac": "ES8311",
+      "adc": "ES7210",
+      "i2s_port": 0,
+      "mclk_gpio": 10,
+      "sclk_gpio": 11,
+      "lrck_gpio": 12,
+      "dsin_gpio": 15,
+      "dout_gpio": 16,
+      "i2c_port": 0,
+      "sda_gpio": 47,
+      "scl_gpio": 48,
+      "pa_power_io_expander_pin": 12
+    },
+    "display": {
+      "panel": "412x412 Circular LCD",
+      "controller": "SPD2010",
+      "interface": "QSPI (SPI3_HOST)",
+      "pclk_gpio": 7,
+      "data0_gpio": 9,
+      "data1_gpio": 1,
+      "data2_gpio": 14,
+      "data3_gpio": 13,
+      "cs_gpio": 45,
+      "backlight_pwm_gpio": 8,
+      "power_io_expander_pin": 9
+    },
+    "touch": {
+      "controller": "SPD2010 Capacitive Touch",
+      "i2c_port": 1,
+      "sda_gpio": 39,
+      "scl_gpio": 38,
+      "int_io_expander_pin": 5
+    },
+    "camera": {
+      "coprocessor": "Himax HX6538",
+      "spi_host": 2,
+      "sclk_gpio": 4,
+      "mosi_gpio": 5,
+      "miso_gpio": 6,
+      "cs_gpio": 21,
+      "sync_io_expander_pin": 6,
+      "rst_io_expander_pin": 7,
+      "flasher_uart_port": 1,
+      "flasher_tx_gpio": 17,
+      "flasher_rx_gpio": 18,
+      "flasher_baud_rate": 921600
+    },
+    "peripherals": {
+      "io_expander": "PCA95xx 16-bit on I2C0 (0x20)",
+      "roller_knob_a_gpio": 41,
+      "roller_knob_b_gpio": 42,
+      "roller_knob_button_io_expander_pin": 3,
+      "rgb_led_gpio": 40,
+      "battery_adc_channel": "ADC1_CHANNEL_2 (GPIO 3, divider ratio 82k:20k)",
+      "rtc": "PCF8563 on I2C0 (0x51)"
+    }
+  },
+  "single_connection_invariants": {
+    "device_network_owner": "RobotAdapter / WatcheRobot Runtime",
+    "ports": {
+      "robot_pairing_udp": 37021,
+      "robot_stream_tcp": 37020,
+      "host_http_rpc": 8088,
+      "companion_http_rpc": 8765
+    },
+    "duplicate_connection_daemons_allowed": false
+  }
+}

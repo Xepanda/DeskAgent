@@ -1,5 +1,11 @@
 {
   "device_id": "desk-agent-r1-taishanpi-01",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8088,
+    "comment": "Default loopback 127.0.0.1 for local security. Change to 0.0.0.0 only when accessing Web Console across LAN and ensure auth_token is set."
+  },
+  "auth_token": "REPLACE_WITH_STRONG_SHARED_TOKEN_OR_LEAVE_EMPTY_FOR_LOCAL_ONLY",
   "storage": {
     "db_path": "/var/lib/desk-agent/life_service.db"
   },
@@ -16,17 +22,27 @@
       "scene",
       "input_boolean"
     ],
-    "state_poll_timeout_ms": 5000
+    "state_poll_timeout_ms": 5000,
+    "subscribe_events": true,
+    "poll_interval_sec": 2.0
   },
   "camera": {
     "default_lease_ms": 10000,
     "max_lease_ms": 60000,
-    "stale_threshold_ms": 2000,
-    "http_port": 8088
+    "stale_threshold_ms": 2000
   },
   "codex_companion": {
     "endpoint": "http://192.168.1.100:8765/rpc",
+    "auth_token": "REPLACE_WITH_WINDOWS_COMPANION_SECRET_TOKEN",
     "timeout_ms": 15000
+  },
+  "robot": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "tcp_port": 37020,
+    "udp_port": 37021,
+    "auto_pair": true,
+    "reconnect_interval": 2.0
   },
   "firmware_bridge": {
     "serial_port": "/dev/ttyUSB0",

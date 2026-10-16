@@ -67,6 +67,13 @@
         "task_id": { "type": "string" }
       }
     },
+    "codex_get_pending_approvals_args": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "task_id": { "type": "string" }
+      }
+    },
     "codex_respond_approval_args": {
       "type": "object",
       "required": ["approval_id", "decision", "task_id"],

@@ -55,6 +55,15 @@
         "occurrence_id": { "type": "string" }
       }
     },
+    "reminder_stop_ringing_args": {
+      "type": "object",
+      "required": ["reminder_id"],
+      "additionalProperties": false,
+      "properties": {
+        "reminder_id": { "type": "string" },
+        "occurrence_id": { "type": "string" }
+      }
+    },
     "note_create_args": {
       "type": "object",
       "required": ["title", "content"],

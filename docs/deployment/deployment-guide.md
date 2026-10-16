@@ -1,33 +1,38 @@
 # Desk Agent R1 部署与运维指南 (Deployment & Operations Guide)
 
-本文档面向运维工程师与系统总管家，提供 Desk Agent R1 在各环境（嵌入式机器人、泰山派 Linux 宿主、Windows Companion）的部署、配置、验证与故障回退方案。
+本文档面向运维工程师与系统总管家，提供 Desk Agent R1 在各环境（嵌入式机器人、泰山派 Linux 宿主、Windows Companion）的部署、配置、启动参数、监听地址与故障回退方案。
 
 ---
 
-## 1. 架构环境拓扑
+## 1. 架构环境拓扑与网络拓扑
 
 ```
-+------------------------------------------------------------------+
-|                   Desk Agent R1 硬件机器人                       |
-|   (ESP32-S3 | IDF v5.4 | TClaw 核心对话 + WatcheRobot SDK 兼容)  |
-+---------------------------------+--------------------------------+
-                                  | Wi-Fi / LAN RPC
-                                  v
-+------------------------------------------------------------------+
-|               泰山派 RK3566 (Ubuntu/Debian Linux)                |
-|  - Desk Agent Host Service (Python 3.10+)                        |
-|  - SQLite WAL (提醒、闹钟、便签持久化)                           |
-|  - HA Connector (局域网直连 Home Assistant REST/WS)             |
-|  - Camera Leased Service & Web Console (端口 8088)              |
-+---------------------------------+--------------------------------+
-                                  | 局域网 HTTP RPC
-                                  v
-+------------------------------------------------------------------+
-|            Windows 开发机 (Windows 11 / PowerShell 7)            |
-|  - Windows Codex Companion (端口 8765)                           |
-|  - 本地工作区隔离白名单映射 (D:\ePanda\DeskAgent 等)              |
-|  - Codex CLI / Turn 会话执行与审批流交互                          |
-+------------------------------------------------------------------+
++-------------------------------------------------------------------------------+
+|                      Desk Agent R1 硬件机器人 (ESP32-S3)                       |
+|  - 架构: ESP-IDF v5.4 | 双核 Xtensa LX7 @ 240MHz | 16MB Flash | 8MB Octal PSRAM |
+|  - TClaw 主框架: Tuya Cloud 语音对话、MCP 工具派发、Audio/Motion/Camera 仲裁   |
+|  - SDK 桥接: UDP 37021 (CSPRNG 配对发现), TCP 37020 (全双工控制与 WSPK 媒体通道) |
++---------------------------------------+---------------------------------------+
+                                        | Wi-Fi 局域网 TCP/UDP (37020/37021)
+                                        v
++-------------------------------------------------------------------------------+
+|                    泰山派 RK3566 (Ubuntu 22.04 / Debian 12)                   |
+|  - Desk Agent Host Service (Python 3.10+)                                     |
+|  - 默认监听地址: 127.0.0.1:8088 (跨设备 Web 查看时显式配置 0.0.0.0:8088 + Token) |
+|  - SQLite WAL 持久化: /var/lib/desk-agent/life_service.db                      |
+|  - HA Connector: 局域网连接 Home Assistant (REST API + WebSocket 状态订阅)      |
+|  - Camera Leased Service: 局域网单帧 JPEG 租约、时效验证与黑帧遮盖防冒充        |
+|  - 集中 Router: 接收 TClaw 工具请求信封，异步调度并回传执行结果                 |
++---------------------------------------+---------------------------------------+
+                                        | 局域网 HTTP RPC (8765 端口 + Bearer Token)
+                                        v
++-------------------------------------------------------------------------------+
+|                  Windows 开发机 (Windows 11 / PowerShell 7)                   |
+|  - Windows Codex Companion (Python 3.10+)                                     |
+|  - 默认监听地址: 127.0.0.1:8765 (跨机被泰山派调用时配置 0.0.0.0:8765 + Token) |
+|  - 本地工作区白名单映射: epanda-desk-agent -> D:\ePanda\DeskAgent 等           |
+|  - Codex CLI / app-server stdio JSON-RPC 双向驱动与敏感操作人工审批           |
++-------------------------------------------------------------------------------+
 ```
 
 ---
@@ -36,11 +41,11 @@
 
 ### 2.1 环境准备
 - 操作系统: Ubuntu 22.04 LTS aarch64 或 Debian 12 aarch64
-- Python 版本: >= 3.10
+- Python 版本: >= 3.10 (推荐 Python 3.11)
 - 安装系统依赖:
   ```bash
   sudo apt-get update
-  sudo apt-get install -y python3 python3-venv python3-pip sqlite3
+  sudo apt-get install -y python3 python3-venv python3-pip sqlite3 curl
   ```
 
 ### 2.2 安装应用
@@ -52,20 +57,35 @@ sudo chown -R deskagent:deskagent /var/lib/desk-agent /opt/desk-agent
 # 复制发布代码至 /opt/desk-agent
 sudo cp -r host /opt/desk-agent/
 sudo cp -r contracts /opt/desk-agent/
+sudo cp -r requirements.txt /opt/desk-agent/
 
 # 创建 Python 虚拟环境并安装依赖
 sudo -u deskagent python3 -m venv /opt/desk-agent/venv
 sudo -u deskagent /opt/desk-agent/venv/bin/pip install --upgrade pip
-sudo -u deskagent /opt/desk-agent/venv/bin/pip install requests jsonschema
+sudo -u deskagent /opt/desk-agent/venv/bin/pip install -r /opt/desk-agent/requirements.txt
 ```
 
-### 2.3 配置与启动
+### 2.3 配置与启动参数说明
+Host 守护进程支持以下命令行参数与配置文件选项：
+
+- **命令行参数**：
+  - `--config`, `-c`: 指定配置文件绝对路径（默认自动搜索 `/etc/desk-agent/config.json` 或 `./config.json`）。
+  - `--port`, `-p`: 显式覆盖 HTTP 监听端口（优先级高于配置文件）。
+- **网络监听地址与鉴权安全策略**：
+  - **默认绑定回环**：代码默认绑定 `127.0.0.1:8088`，实现本机安全隔离。
+  - **跨设备访问**：若需从局域网手机/PC 浏览器打开 Web 控制台或接收远程请求，必须在配置中将 `server.host` 显式设为 `0.0.0.0`，并配置全局 `auth_token`。
+  - **鉴权支持方式**：开启 Token 后，客户端可通过以下任一方式传递凭据：
+    1. HTTP 报头：`Authorization: Bearer <AUTH_TOKEN>`
+    2. HTTP 报头：`X-Desk-Agent-Token: <AUTH_TOKEN>`
+    3. URL Query 参数：`?token=<AUTH_TOKEN>`（用于浏览器 `<img src="...">` 标签拉流）
+
 ```bash
-# 复制配置文件
+# 复制配置文件模板
 sudo cp deploy/edge/config.example.json /etc/desk-agent/config.json
 sudo chmod 600 /etc/desk-agent/config.json
 sudo chown deskagent:deskagent /etc/desk-agent/config.json
-# 编辑配置，填入 HA Access Token 等必要信息
+
+# 编辑配置：填入 HA Token、Windows Companion 地址与 Token
 sudo nano /etc/desk-agent/config.json
 
 # 安装并启动 systemd 服务
@@ -80,13 +100,13 @@ sudo journalctl -u desk-agent -f
 ```
 
 ### 2.4 回退方案 (Rollback)
-如果更新版本异常，执行回退：
+如果更新版本异常，执行快速回退：
 ```bash
 sudo systemctl stop desk-agent
 sudo cp -r /opt/desk-agent.bak/* /opt/desk-agent/
 sudo systemctl restart desk-agent
 ```
-数据库文件保持位于 `/var/lib/desk-agent/life_service.db`，由 SQLite WAL 保证向前/向后事务兼容。
+数据库文件保持位于 `/var/lib/desk-agent/life_service.db`，由 SQLite WAL 模式保证向前/向后事务兼容与崩溃安全。
 
 ---
 
@@ -94,8 +114,9 @@ sudo systemctl restart desk-agent
 
 ### 3.1 环境要求
 - Windows 10 / 11 64-bit
-- Python 3.10+
-- OpenAI Codex CLI 或兼容环境
+- Python >= 3.10
+- OpenAI Codex CLI 或兼容环境（可正常执行 `codex` 命令）
+- PowerShell 7 (或 Windows PowerShell 5.1)
 
 ### 3.2 配置与运行
 1. 进入项目根目录 `companion/`。
@@ -103,36 +124,49 @@ sudo systemctl restart desk-agent
    ```powershell
    Copy-Item deploy\windows\companion-config.example.json deploy\windows\companion-config.json
    ```
-3. 在 `companion-config.json` 中配置安全白名单工作区路径（例如将 `epanda-desk-agent` 映射为实际目录 `D:\ePanda\DeskAgent`）。
+3. 在 `companion-config.json` 中配置安全参数：
+   - `host`: 默认回环 `127.0.0.1`。需供泰山派跨局域网访问时设置为 `0.0.0.0`。
+   - `port`: 默认 `8765`。
+   - `auth_token`: **跨局域网暴露时强制设置强密钥**，防止未经授权的远程执行。
+   - `registered_workspaces`: 严格配置白名单别名（例如将 `epanda-desk-agent` 映射为实际目录 `D:\ePanda\DeskAgent`，严禁外部传入原始盘符路径）。
 4. 运行 Companion 服务：
    ```powershell
    powershell -ExecutionPolicy Bypass -File deploy\windows\run-companion.ps1
    ```
-5. 服务将绑定在 `0.0.0.0:8765` 监听来自泰山派的 Codex 任务请求。
+5. 防火墙配置：若设置为 `0.0.0.0`，在 Windows 高级安全防火墙中放行 TCP 8765 端口入站规则（仅限家庭/受信任子网）。
 
 ---
 
 ## 4. ESP32-S3 机器人固件构建与烧录
 
 ### 4.1 工具链基线
-- ESP-IDF: **v5.4**
-- 目标芯片: **ESP32-S3-WROOM-1** (16MB Flash, 8MB PSRAM)
-- TuyaOpen SDK: 接入基准
+- 芯片型号: **ESP32-S3-WROOM-1 / N16R8** (16MB SPI Flash, 8MB Octal PSRAM)
+- 固件依赖基线: **ESP-IDF v5.4**（TuyaOpen 官方支持环境）
+- Python 编译工具链环境: Python 3.10 ~ 3.12 (ESP-IDF 5.4 官方要求)
 
-### 4.2 本地编译测试（Linux Host 模拟器）
-项目内置了 Linux C 模拟构建环境，用于在无需物理芯片时验证仲裁器与协议状态机：
+### 4.2 本地原生仿真编译测试（Linux Host 模拟器，Level 2）
+项目内置了 Linux C 模拟构建环境，用于在无需物理芯片时验证资源仲裁器、WSPK 封包与 Tuya 云状态机协议逻辑：
 ```bash
 cmake -B firmware/build -S firmware
 cmake --build firmware/build
-./firmware/build/desk_agent_firmware_test
+# 运行单元自测与轮询任务
+./firmware/build/desk_agent_firmware_test --poll
 ```
 
-### 4.3 物理设备编译与烧录（ESP-IDF）
+### 4.3 物理设备编译与烧录（ESP-IDF，Level 3 待现场实测）
+> [!IMPORTANT]
+> 烧录与物理实测需当次明确授权。主机环境必须先激活匹配的 Python 3.10~3.12 ESP-IDF v5.4 虚拟环境。
+
 ```bash
 cd firmware
+# 导出 IDF 工具链环境
+. $IDF_PATH/export.sh
+
+# 设置目标芯片并构建
 idf.py set-target esp32s3
 idf.py build
-# 烧录固件至物理设备
+
+# 烧录固件至物理设备并观察串口启动日志
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
@@ -144,6 +178,8 @@ idf.py -p /dev/ttyUSB0 flash monitor
 |---|---|---|---|
 | 宿主进程状态 | `systemctl is-active desk-agent` | `active` | 检查 `/var/log/journal` 日志，重启服务 |
 | 数据库一致性 | `sqlite3 /var/lib/desk-agent/life_service.db "PRAGMA integrity_check;"` | `ok` | 若损坏使用 `.recover` 从 WAL 恢复 |
-| 相机租约服务 | `curl http://localhost:8088/api/camera/frame` | 返回 403 (未持有效租约) 或 JPEG | 检查租约超时配置 |
-| HA 连通性 | 发送 `ha.get_state` 请求 | 响应 `SUCCEEDED` | 检查局域网网络路由与 Token 有效期 |
-| Codex Companion | `curl http://<win-ip>:8765/health` | `{"status":"ok"}` | 检查 Windows 防火墙 8765 端口入站规则 |
+| 宿主健康检查 | `curl -s http://127.0.0.1:8088/health` | `{"status":"ok"}` | 检查服务是否挂起或端口占用 |
+| 相机租约服务 | `curl -s http://127.0.0.1:8088/api/camera/frame` | 返回 403 (未持有效租约) 或 JPEG | 检查租约超时配置及摄像头硬件采集源 |
+| HA 连通性 | 发送 `ha.get_state` 请求 | 响应 `succeeded` | 检查局域网网络路由与 Long-lived Token 有效期 |
+| Codex Companion | `curl -s http://<win-ip>:8765/health` | `{"status":"ok"}` | 检查 Windows 服务是否存活及防火墙入站规则 |
+| 机器人 SDK 连接 | 检查 Host 日志 `Connected to Robot SDK Bridge` | 已连接 | 检查机器人 Wi-Fi IP 与 UDP 37021 / TCP 37020 端口 |
