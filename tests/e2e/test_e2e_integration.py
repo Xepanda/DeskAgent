@@ -6,6 +6,7 @@ HA execution with state confirmation, Codex task lifecycle, and Camera lease arb
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,8 +15,21 @@ from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, Respo
 from host.desk_agent.core.router import Router
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
-from companion.src.codex_companion import CodexCompanion
+from companion.src.codex_companion import CodexCompanion, JsonRpcTransport
 from host.desk_agent.camera.camera_service import CameraViewerService
+
+
+class E2EMockCodexTransport(JsonRpcTransport):
+    def send_request(self, method: str, params: dict) -> dict:
+        if method == "initialize":
+            return {"serverInfo": {"name": "MockCodexServer", "version": "1.0.0"}}
+        elif method == "thread/start":
+            return {"thread_id": "thr_e2e_001"}
+        elif method == "turn/start":
+            return {"turn_id": "turn_e2e_001", "state": "running"}
+        elif method == "turn/approval/respond":
+            return {"status": "applied"}
+        return {}
 
 
 class TestDeskAgentE2E(unittest.TestCase):
@@ -25,7 +39,10 @@ class TestDeskAgentE2E(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "test_desk_agent.db"
         self.life_service = LifeService(self.db_path)
         self.ha_connector = HAConnector()
-        self.codex_companion = CodexCompanion()
+        self.codex_companion = CodexCompanion(
+            allowed_workspaces={"epanda-desk-agent": os.path.realpath(self.temp_dir.name)},
+            transport=E2EMockCodexTransport(),
+        )
         self.camera_service = CameraViewerService()
 
         # Register router handlers
@@ -36,6 +53,7 @@ class TestDeskAgentE2E(unittest.TestCase):
         self.router.register("codex.respond_approval", self._handle_codex_approval)
 
     def tearDown(self) -> None:
+        self.life_service.close()
         self.temp_dir.cleanup()
 
     def _handle_ha_get_state(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -154,6 +172,7 @@ class TestDeskAgentE2E(unittest.TestCase):
         restarted_service.complete_reminder("rem-standup-01")
         item_done = restarted_service.get_reminder("rem-standup-01")
         self.assertEqual(item_done["status"], "completed")
+        restarted_service.close()
 
     def test_codex_companion_task_and_approval_flow(self) -> None:
         # Submit task
@@ -221,6 +240,46 @@ class TestDeskAgentE2E(unittest.TestCase):
         # Release lease
         self.assertTrue(self.camera_service.release_lease("client-web-01"))
         self.assertFalse(self.camera_service.is_lease_valid())
+
+    def test_firmware_to_host_tool_call_flow(self) -> None:
+        """
+        Verifies end-to-end tool call dispatch flow:
+        Simulated firmware envelope arrives -> Host Router routes -> Service processes -> Dynamic response returned.
+        Also verifies reminder creation followed by due occurrence evaluation and ringing outbox dispatch.
+        """
+        # 1. Firmware requests reminder creation via Router
+        req_rem = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-fw-rem-01",
+            operation="reminder.create",
+            arguments={
+                "reminder_id": "rem-fw-01",
+                "title": "Drink warm water",
+                "due_at": "2026-10-15T09:00:00Z",
+                "priority": "high",
+            },
+            expires_at="2030-01-01T00:00:00Z",
+        )
+        resp_rem = self.router.dispatch(req_rem)
+        self.assertEqual(resp_rem.status, ResponseStatus.SUCCEEDED)
+        self.assertEqual(resp_rem.result["reminder_id"], "rem-fw-01")
+
+        # 2. Verify reminder is retrieved and occurrence is generated
+        due_items = self.life_service.get_due_occurrences("2026-10-15T09:30:00Z")
+        self.assertEqual(len(due_items), 1)
+        occ = due_items[0]
+        self.assertEqual(occ["reminder_id"], "rem-fw-01")
+
+        # 3. Mark occurrence ringing and queue proactive notification outbox message
+        self.life_service.mark_occurrence_ringing(occ["occurrence_id"])
+        self.life_service.queue_outbox_message(
+            topic="reminder.alert",
+            payload={"occurrence_id": occ["occurrence_id"], "reminder_id": "rem-fw-01", "title": "Drink warm water"},
+        )
+        outbox = self.life_service.get_pending_outbox_messages(limit=5)
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(outbox[0]["topic"], "reminder.alert")
+        self.assertEqual(outbox[0]["payload"]["reminder_id"], "rem-fw-01")
 
 
 if __name__ == "__main__":

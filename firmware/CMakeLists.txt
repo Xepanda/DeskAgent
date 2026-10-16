@@ -26,12 +26,15 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/components/desk_tclaw/src/desk_tclaw_bridge.c
     )
 
+    find_package(Threads REQUIRED)
+
     add_library(desk_sdk_bridge STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/components/desk_sdk_bridge/src/desk_sdk_bridge.c
     )
+    target_link_libraries(desk_sdk_bridge PRIVATE Threads::Threads)
 
     add_executable(desk_agent_firmware_test
         ${CMAKE_CURRENT_SOURCE_DIR}/main/src/app_main.c
     )
-    target_link_libraries(desk_agent_firmware_test PRIVATE desk_hardware desk_tclaw desk_sdk_bridge)
+    target_link_libraries(desk_agent_firmware_test PRIVATE desk_hardware desk_tclaw desk_sdk_bridge Threads::Threads)
 endif()
