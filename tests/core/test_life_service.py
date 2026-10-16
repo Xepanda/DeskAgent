@@ -210,6 +210,142 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(len(pending_outbox), 1)
         new_instance.close()
 
+    # -------------------------------------------------------------------------
+    # 7. Recurrence Rules & Automatic Next Occurrence
+    # -------------------------------------------------------------------------
+    def test_repeat_rule_daily_auto_occurrence(self) -> None:
+        """Verifies daily repeating reminder automatically creates next pending occurrence upon ringing."""
+        self.service.create_reminder(
+            reminder_id="rem-repeat-daily",
+            title="Daily Standup",
+            due_at="2026-10-15T09:30:00Z",
+            repeat_rule="daily",
+        )
+
+        due = self.service.get_due_occurrences("2026-10-15T10:00:00Z")
+        self.assertEqual(len(due), 1)
+        occ0 = due[0]
+        self.assertEqual(occ0["reminder_id"], "rem-repeat-daily")
+
+        # Ring occurrence 0 -> must automatically generate next occurrence for +1 day
+        self.service.mark_occurrence_ringing(occ0["occurrence_id"])
+
+        all_occs = self.service.get_all_occurrences("rem-repeat-daily")
+        self.assertEqual(len(all_occs), 2)
+
+        # Occurrence 0 is ringing
+        self.assertEqual(all_occs[0]["state"], "ringing")
+
+        # Occurrence 1 is pending for next day at 09:30:00Z
+        occ1 = all_occs[1]
+        self.assertEqual(occ1["state"], "pending")
+        self.assertEqual(occ1["scheduled_at"], "2026-10-16T09:30:00Z")
+
+        # Reminder due_at is updated to next day
+        rem = self.service.get_reminder("rem-repeat-daily")
+        self.assertEqual(rem["due_at"], "2026-10-16T09:30:00Z")
+
+    def test_repeat_rule_interval_and_weekly(self) -> None:
+        """Verifies interval:30 and weekly recurrence calculation."""
+        # Interval: 30 minutes
+        self.service.create_reminder(
+            reminder_id="rem-repeat-interval",
+            title="Drink Water",
+            due_at="2026-10-15T10:00:00Z",
+            repeat_rule="interval:30",
+        )
+        due = self.service.get_due_occurrences("2026-10-15T10:05:00Z")
+        self.service.mark_occurrence_ringing(due[0]["occurrence_id"])
+        occs = self.service.get_all_occurrences("rem-repeat-interval")
+        self.assertEqual(len(occs), 2)
+        self.assertEqual(occs[1]["scheduled_at"], "2026-10-15T10:30:00Z")
+
+        # Weekly
+        self.service.create_reminder(
+            reminder_id="rem-repeat-weekly",
+            title="Weekly Review",
+            due_at="2026-10-15T10:00:00Z",
+            repeat_rule="weekly",
+        )
+        due_wk = self.service.get_due_occurrences("2026-10-15T10:05:00Z")
+        self.service.mark_occurrence_ringing(due_wk[0]["occurrence_id"])
+        occs_wk = self.service.get_all_occurrences("rem-repeat-weekly")
+        self.assertEqual(len(occs_wk), 2)
+        self.assertEqual(occs_wk[1]["scheduled_at"], "2026-10-22T10:00:00Z")
+
+    # -------------------------------------------------------------------------
+    # 8. Missed Reminder Catch-up & Expiry Policy
+    # -------------------------------------------------------------------------
+    def test_missed_reminder_catchup_flag(self) -> None:
+        """Verifies reminders scheduled long in the past during power off are flagged with is_catchup."""
+        # 1. Past due reminder from 4 hours ago (power off scenario)
+        self.service.create_reminder(
+            reminder_id="rem-missed-01",
+            title="Missed Alert",
+            due_at="2026-10-15T06:00:00Z",
+        )
+        # 2. Freshly due reminder from 10 seconds ago
+        self.service.create_reminder(
+            reminder_id="rem-fresh-01",
+            title="Fresh Alert",
+            due_at="2026-10-15T09:59:50Z",
+        )
+
+        due = self.service.get_due_occurrences("2026-10-15T10:00:00Z")
+        due_map = {item["reminder_id"]: item for item in due}
+
+        self.assertTrue(due_map["rem-missed-01"]["is_catchup"])
+        self.assertGreater(due_map["rem-missed-01"]["delay_seconds"], 14000)
+
+        self.assertFalse(due_map["rem-fresh-01"]["is_catchup"])
+        self.assertLess(due_map["rem-fresh-01"]["delay_seconds"], 60)
+
+    # -------------------------------------------------------------------------
+    # 9. Online SQLite Backup & Restore
+    # -------------------------------------------------------------------------
+    def test_online_sqlite_backup_and_restore(self) -> None:
+        """Verifies atomic online backup and full restore of LifeService database."""
+        self.service.create_reminder("rem-bk-01", "Backup Item 1", "2026-10-15T12:00:00Z")
+        self.service.create_note("note-bk-01", "Backup Note", "Important Content")
+
+        backup_file = Path(self.temp_dir.name) / "life_backup.db"
+        self.service.backup(backup_file)
+        self.assertTrue(backup_file.exists())
+        self.assertGreater(backup_file.stat().st_size, 0)
+
+        # Mutate current DB
+        self.service.delete_reminder("rem-bk-01")
+        self.assertIsNone(self.service.get_reminder("rem-bk-01"))
+
+        # Restore from backup
+        self.service.restore(backup_file)
+        restored = self.service.get_reminder("rem-bk-01")
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored["title"], "Backup Item 1")
+
+    # -------------------------------------------------------------------------
+    # 10. Outbox Exponential Backoff & Dead-Letter State
+    # -------------------------------------------------------------------------
+    def test_outbox_backoff_and_dead_letter(self) -> None:
+        """Verifies repeated outbox delivery failure transitions to dead-letter 'failed' state."""
+        msg_id = self.service.enqueue_outbox("test.failing.event", {"target": "robot"})
+
+        for i in range(1, 5):
+            self.service.record_outbox_failure(msg_id, "Channel unavailable", max_retries=5, backoff_seconds=5)
+            # Immediate worker query excludes it due to backoff
+            active_ready = self.service.get_pending_outbox()
+            self.assertEqual(len(active_ready), 0, "Backoff must delay immediate retry")
+
+            # Query including delayed shows message with incremented retry count
+            pending = self.service.get_pending_outbox(include_delayed=True)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["retry_count"], i)
+
+        # 5th failure -> state becomes failed
+        self.service.record_outbox_failure(msg_id, "Channel unavailable", max_retries=5, backoff_seconds=5)
+        pending_after = self.service.get_pending_outbox(include_delayed=True)
+        self.assertEqual(len(pending_after), 0, "Failed message must transition out of pending state into failed")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -218,7 +218,9 @@ class DeskAgentHostApp:
         """Registers external robot audio / TTS speaker delivery channel."""
         self._announcement_channel = channel
 
-    def _deliver_robot_announcement(self, title: str, reminder_id: str, occurrence_id: str) -> bool:
+    def _deliver_robot_announcement(
+        self, title: str, reminder_id: str, occurrence_id: str, is_catchup: bool = False
+    ) -> bool:
         """Dispatches reminder alert to robot announcement channel or event stream."""
         if not self._announcement_channel:
             logger.warning(
@@ -227,11 +229,15 @@ class DeskAgentHostApp:
             )
             return False
 
-        logger.info("Broadcasting robot audio reminder: '%s' (reminder_id=%s)", title, reminder_id)
+        logger.info(
+            "Broadcasting robot audio reminder: '%s' (reminder_id=%s, is_catchup=%s)",
+            title, reminder_id, is_catchup
+        )
         alert_payload = {
             "reminder_id": reminder_id,
             "occurrence_id": occurrence_id,
             "title": title,
+            "is_catchup": is_catchup,
             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
@@ -260,12 +266,16 @@ class DeskAgentHostApp:
                         title = payload.get("title", "Reminder")
                         rem_id = payload.get("reminder_id", "")
                         occ_id = payload.get("occurrence_id", "")
-                        success = self._deliver_robot_announcement(title, rem_id, occ_id)
+                        is_catchup = bool(payload.get("is_catchup", False))
+                        success = self._deliver_robot_announcement(title, rem_id, occ_id, is_catchup=is_catchup)
                         if success:
                             self.life_service.mark_outbox_dispatched(outbox_id)
                             logger.info("Outbox alert %s successfully dispatched to robot audio", outbox_id)
                         else:
-                            self.life_service.record_outbox_failure(outbox_id, "Delivery channel busy or rejected")
+                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                            self.life_service.record_outbox_failure(
+                                outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
+                            )
                     else:
                         self.life_service.mark_outbox_dispatched(outbox_id)
             except Exception as e:
@@ -281,7 +291,11 @@ class DeskAgentHostApp:
                     break
                 due = self.life_service.get_due_occurrences()
                 for occ in due:
-                    logger.info("Delivering due reminder: %s (id=%s)", occ.get("title"), occ.get("occurrence_id"))
+                    is_catchup = bool(occ.get("is_catchup", False))
+                    logger.info(
+                        "Delivering due reminder: %s (id=%s, catchup=%s)",
+                        occ.get("title"), occ.get("occurrence_id"), is_catchup
+                    )
                     self.life_service.mark_occurrence_ringing(occ["occurrence_id"])
                     self.life_service.queue_outbox_message(
                         topic="reminder.alert",
@@ -289,6 +303,8 @@ class DeskAgentHostApp:
                             "occurrence_id": occ["occurrence_id"],
                             "reminder_id": occ["reminder_id"],
                             "title": occ.get("title", ""),
+                            "scheduled_at": occ.get("scheduled_at", ""),
+                            "is_catchup": is_catchup,
                         },
                     )
             except Exception as e:

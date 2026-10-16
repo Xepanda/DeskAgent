@@ -15,9 +15,57 @@ import json
 import sqlite3
 import threading
 import uuid
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
+
+
+def compute_next_occurrence(current_iso: str, repeat_rule: str, timezone_str: str = "Asia/Shanghai") -> Optional[str]:
+    """Computes the next ISO 8601 UTC timestamp based on repeat rule."""
+    if not repeat_rule:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(current_iso.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    rule = repeat_rule.strip().lower()
+
+    if rule in ("daily", "freq=daily"):
+        next_dt = dt + timedelta(days=1)
+    elif rule in ("weekly", "freq=weekly"):
+        next_dt = dt + timedelta(days=7)
+    elif rule in ("hourly", "freq=hourly"):
+        next_dt = dt + timedelta(hours=1)
+    elif rule == "weekdays":
+        weekday = dt.weekday()
+        if weekday < 4:  # Mon-Thu -> next day
+            next_dt = dt + timedelta(days=1)
+        elif weekday == 4:  # Friday -> Monday (+3 days)
+            next_dt = dt + timedelta(days=3)
+        elif weekday == 5:  # Saturday -> Monday (+2 days)
+            next_dt = dt + timedelta(days=2)
+        else:  # Sunday -> Monday (+1 day)
+            next_dt = dt + timedelta(days=1)
+    elif rule.startswith("interval:"):
+        try:
+            mins = int(rule.split(":", 1)[1])
+            next_dt = dt + timedelta(minutes=mins)
+        except ValueError:
+            return None
+    elif "interval=" in rule and "minutely" in rule:
+        try:
+            part = [p for p in rule.split(";") if p.startswith("interval=")][0]
+            mins = int(part.split("=")[1])
+            next_dt = dt + timedelta(minutes=mins)
+        except (IndexError, ValueError):
+            return None
+    else:
+        return None
+
+    return next_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class LifeService:
@@ -83,9 +131,14 @@ class LifeService:
                 state TEXT NOT NULL DEFAULT 'pending',
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                dispatched_at TEXT
+                dispatched_at TEXT,
+                next_retry_at TEXT
             );
             """)
+            try:
+                conn.execute("ALTER TABLE outbox ADD COLUMN next_retry_at TEXT;")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
     @staticmethod
@@ -204,8 +257,13 @@ class LifeService:
     # Occurrence Scheduling & Ringing Control (Decoupled)
     # =========================================================================
 
-    def get_due_occurrences(self, now_iso: Optional[str] = None) -> list[dict[str, Any]]:
+    def get_due_occurrences(self, now_iso: Optional[str] = None, max_catchup_hours: Optional[int] = None) -> list[dict[str, Any]]:
         threshold = now_iso or self._now_utc_str()
+        try:
+            now_dt = datetime.fromisoformat(threshold.replace("Z", "+00:00"))
+        except Exception:
+            now_dt = datetime.now(timezone.utc)
+
         with self._lock, self._get_connection() as conn:
             rows = conn.execute(
                 """
@@ -217,6 +275,38 @@ class LifeService:
                 ORDER BY o.scheduled_at ASC
                 """,
                 (threshold,),
+            ).fetchall()
+
+            due_list = []
+            for r in rows:
+                item = dict(r)
+                try:
+                    sched_dt = datetime.fromisoformat(item["scheduled_at"].replace("Z", "+00:00"))
+                    delay_sec = max(0.0, (now_dt - sched_dt).total_seconds())
+                except Exception:
+                    delay_sec = 0.0
+
+                # Check if expired beyond maximum catchup threshold if specified
+                if max_catchup_hours is not None and delay_sec > max_catchup_hours * 3600:
+                    conn.execute(
+                        "UPDATE occurrences SET state = 'expired' WHERE occurrence_id = ?",
+                        (item["occurrence_id"],),
+                    )
+                    continue
+
+                item["is_catchup"] = delay_sec > 120.0  # More than 2 minutes delayed = catchup
+                item["delay_seconds"] = delay_sec
+                due_list.append(item)
+
+            conn.commit()
+            return due_list
+
+    def get_all_occurrences(self, reminder_id: str) -> list[dict[str, Any]]:
+        """Returns all occurrences for a reminder ordered by scheduled_at."""
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM occurrences WHERE reminder_id = ? ORDER BY scheduled_at ASC",
+                (reminder_id,),
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -230,13 +320,28 @@ class LifeService:
             conn.commit()
 
     def mark_occurrence_ringing(self, occurrence_id: str) -> None:
-        """Transitions occurrence state from pending to ringing and updates reminder status."""
+        """Transitions occurrence state from pending to ringing and updates reminder status.
+        If the reminder has a repeat rule, automatically generates the next pending occurrence.
+        """
         now_str = self._now_utc_str()
         with self._lock, self._get_connection() as conn:
-            row = conn.execute("SELECT reminder_id FROM occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+            row = conn.execute(
+                """
+                SELECT o.occurrence_id, o.reminder_id, o.scheduled_at,
+                       r.repeat_rule, r.status as rem_status
+                FROM occurrences o
+                JOIN reminders r ON o.reminder_id = r.reminder_id
+                WHERE o.occurrence_id = ?
+                """,
+                (occurrence_id,),
+            ).fetchone()
             if not row:
                 raise KeyError(f"Occurrence '{occurrence_id}' not found")
+
             reminder_id = row["reminder_id"]
+            scheduled_at = row["scheduled_at"]
+            repeat_rule = row["repeat_rule"]
+
             conn.execute(
                 "UPDATE occurrences SET state = 'ringing' WHERE occurrence_id = ?",
                 (occurrence_id,),
@@ -245,6 +350,34 @@ class LifeService:
                 "UPDATE reminders SET status = 'ringing', updated_at = ? WHERE reminder_id = ?",
                 (now_str, reminder_id),
             )
+
+            # Auto-schedule next occurrence for repeating reminder if not already scheduled
+            if repeat_rule and row["rem_status"] != "cancelled":
+                pending_count = conn.execute(
+                    "SELECT COUNT(*) FROM occurrences WHERE reminder_id = ? AND state = 'pending'",
+                    (reminder_id,),
+                ).fetchone()[0]
+
+                if pending_count == 0:
+                    next_due = compute_next_occurrence(scheduled_at, repeat_rule)
+                    if next_due:
+                        try:
+                            next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
+                        except Exception:
+                            next_ts = int(time.time())
+                        next_occ_id = f"occ-{reminder_id}-{next_ts}"
+                        conn.execute(
+                            """
+                            INSERT INTO occurrences (occurrence_id, reminder_id, scheduled_at, state)
+                            VALUES (?, ?, ?, 'pending')
+                            """,
+                            (next_occ_id, reminder_id, next_due),
+                        )
+                        conn.execute(
+                            "UPDATE reminders SET due_at = ?, updated_at = ? WHERE reminder_id = ?",
+                            (next_due, now_str, reminder_id),
+                        )
+
             conn.commit()
 
     def stop_ringing(self, occurrence_id: str) -> dict[str, Any]:
@@ -342,11 +475,22 @@ class LifeService:
 
         return outbox_id
 
-    def get_pending_outbox(self) -> list[dict[str, Any]]:
+    def get_pending_outbox(self, now_iso: Optional[str] = None, include_delayed: bool = False) -> list[dict[str, Any]]:
+        now_str = now_iso or self._now_utc_str()
         with self._lock, self._get_connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC"
-            ).fetchall()
+            if include_delayed:
+                rows = conn.execute(
+                    "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM outbox
+                    WHERE state = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                    ORDER BY created_at ASC
+                    """,
+                    (now_str,),
+                ).fetchall()
             result = []
             for r in rows:
                 item = dict(r)
@@ -363,17 +507,33 @@ class LifeService:
             )
             conn.commit()
 
-    def record_outbox_failure(self, outbox_id: str, error_message: str, max_retries: int = 5) -> None:
-        """Records an outbox delivery failure, increments retry count, and marks failed if max retries exceeded."""
+    def record_outbox_failure(
+        self,
+        outbox_id: str,
+        error_message: str,
+        max_retries: int = 5,
+        backoff_seconds: Optional[int] = None,
+    ) -> None:
+        """Records an outbox delivery failure, increments retry count, applies optional backoff, and marks failed if max retries exceeded."""
+        now = datetime.now(timezone.utc)
         with self._lock, self._get_connection() as conn:
             row = conn.execute("SELECT retry_count FROM outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
             if not row:
                 return
             new_retries = row["retry_count"] + 1
-            new_state = "failed" if new_retries >= max_retries else "pending"
+            if new_retries >= max_retries:
+                new_state = "failed"
+                next_retry = None
+            else:
+                new_state = "pending"
+                if backoff_seconds is not None and backoff_seconds > 0:
+                    next_retry = (now + timedelta(seconds=backoff_seconds)).isoformat().replace("+00:00", "Z")
+                else:
+                    next_retry = None
+
             conn.execute(
-                "UPDATE outbox SET retry_count = ?, state = ? WHERE outbox_id = ?",
-                (new_retries, new_state, outbox_id),
+                "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? WHERE outbox_id = ?",
+                (new_retries, new_state, next_retry, outbox_id),
             )
             conn.commit()
 
@@ -381,13 +541,24 @@ class LifeService:
         """Alias for enqueue_outbox with topic-oriented signature."""
         return self.enqueue_outbox(event_type=topic, payload=payload)
 
-    def get_pending_outbox_messages(self, limit: int = 100) -> list[dict[str, Any]]:
+    def get_pending_outbox_messages(self, limit: int = 100, now_iso: Optional[str] = None, include_delayed: bool = False) -> list[dict[str, Any]]:
         """Returns pending outbox entries with 'topic' field populated."""
+        now_str = now_iso or self._now_utc_str()
         with self._lock, self._get_connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if include_delayed:
+                rows = conn.execute(
+                    "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM outbox
+                    WHERE state = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                    ORDER BY created_at ASC LIMIT ?
+                    """,
+                    (now_str, limit),
+                ).fetchall()
             result = []
             for r in rows:
                 item = dict(r)
@@ -395,6 +566,43 @@ class LifeService:
                 item["payload"] = json.loads(item.pop("payload_json", "{}"))
                 result.append(item)
             return result
+
+    # =========================================================================
+    # Online Backup & Restore
+    # =========================================================================
+
+    def backup(self, target_path: str | Path) -> str:
+        """Performs a transaction-safe SQLite online backup to the specified file path."""
+        target_str = str(target_path)
+        Path(target_str).parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            src_conn = self._get_connection()
+            backup_conn = sqlite3.connect(target_str)
+            try:
+                src_conn.backup(backup_conn)
+            finally:
+                backup_conn.close()
+        return target_str
+
+    def restore(self, source_path: str | Path) -> bool:
+        """Restores database from an online backup file."""
+        source_str = str(source_path)
+        if not Path(source_str).exists():
+            raise FileNotFoundError(f"Backup file '{source_str}' not found")
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+            src_conn = sqlite3.connect(source_str)
+            dest_conn = sqlite3.connect(self.db_path)
+            try:
+                src_conn.backup(dest_conn)
+            finally:
+                src_conn.close()
+                dest_conn.close()
+            # Reopen connection
+            self._get_connection()
+        return True
 
     # =========================================================================
     # Notes API
