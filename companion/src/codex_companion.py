@@ -5,10 +5,13 @@ Runs on Windows host alongside Codex CLI / app-server.
 Features:
 - Workspace alias protection and directory escape validation.
 - Subprocess management driving `codex app-server` over stdio JSON-RPC.
-- Thread and Turn lifecycle management (initialize, thread/create, turn/start, interrupt).
+- Thread and Turn lifecycle management (initialize, thread/create, turn/start, interrupt, append).
 - Strict human-in-the-loop approval correlation and safety gating.
+- Handles server-initiated approval requests (with server_req_id matching).
+- Solves race conditions where approvals arrive before task/turn mapping completes.
 - Injectable JSON-RPC transport for test isolation and offline verification.
-- HTTP RPC daemon serving /health and /rpc for cross-machine host communication.
+- HTTP RPC daemon serving /health and /rpc for cross-machine host communication with Bearer auth.
+- RemoteCodexCompanionClient for client-side consumption over LAN.
 """
 
 from __future__ import annotations
@@ -21,8 +24,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
-from typing import Any, Mapping, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Any, Callable, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +125,6 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
                 elif "method" in msg:
                     if self.on_notification:
                         try:
-                            # Pass server req_id if this was a server-initiated request needing response
                             server_req_id = msg.get("id")
                             try:
                                 self.on_notification(msg.get("method", ""), msg.get("params", {}), server_req_id)
@@ -256,7 +261,6 @@ class CodexCompanion:
         self._lock = threading.RLock()
 
     def register_workspace(self, alias: str, abs_path: str) -> None:
-        # Prevent traversal and escape: must be non-empty absolute path
         if not abs_path or not os.path.isabs(abs_path):
             raise ValueError(f"Workspace path must be absolute, got: '{abs_path}'")
         resolved = os.path.realpath(os.path.abspath(abs_path))
@@ -273,22 +277,41 @@ class CodexCompanion:
         self, method: str, params: dict[str, Any], server_req_id: Optional[Any] = None
     ) -> None:
         with self._lock:
-            # Resolve task_id from threadId or turnId in real Codex notification
             thread_id = params.get("threadId") or params.get("thread_id")
             turn_id = params.get("turnId") or params.get("turn_id")
             task_id = params.get("task_id") or self._resolve_task_id(thread_id, turn_id)
 
-            if method in ("approval/request", "item/approval", "item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-                approval_id = params.get("approval_id") or f"appr-{uuid.uuid4().hex[:8]}"
+            if method in (
+                "approval/request",
+                "item/approval",
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+            ):
+                approval_id = params.get("approval_id") or params.get("itemId") or f"appr-{uuid.uuid4().hex[:8]}"
+                if "commandExecution" in method:
+                    default_type = "command"
+                elif "fileChange" in method:
+                    default_type = "file_change"
+                else:
+                    default_type = "command"
+                action_type = params.get("action_type") or params.get("type") or default_type
+                command_or_path = params.get("command_or_path") or params.get("command") or params.get("path") or ""
+                desc = params.get("description")
+                if not desc:
+                    if action_type == "command":
+                        desc = f"Execute command: {command_or_path}" if command_or_path else "Approval required for command execution"
+                    else:
+                        desc = f"File change: {command_or_path}" if command_or_path else "Approval required for file modification"
+
                 self._pending_approvals[approval_id] = {
                     "approval_id": approval_id,
                     "server_req_id": server_req_id,
                     "task_id": task_id,
                     "thread_id": thread_id,
                     "turn_id": turn_id,
-                    "action_type": params.get("action_type") or params.get("type", "command"),
-                    "command_or_path": params.get("command_or_path") or params.get("command") or params.get("path", ""),
-                    "description": params.get("description", "Approval required by Codex"),
+                    "action_type": action_type,
+                    "command_or_path": command_or_path,
+                    "description": desc,
                     "status": "pending",
                 }
             elif method in ("turn/progress", "task/progress", "item/updated", "turn/step"):
@@ -304,12 +327,10 @@ class CodexCompanion:
         if self._transport is not None:
             return self._transport
 
-        # In unit tests with default codex binary, use DefaultMockTransport unless explicitly forced
         if self.codex_bin == "codex" and "unittest" in sys.modules and os.environ.get("DESK_AGENT_USE_REAL_CODEX") != "1":
             self._transport = DefaultMockTransport()
             return self._transport
 
-        # If an explicit non-standard binary path was supplied or running in production
         self._transport = SubprocessJsonRpcTransport(
             self.codex_bin, on_notification=self._handle_server_notification
         )
@@ -478,39 +499,42 @@ class CodexCompanion:
             appr = self._pending_approvals.get(approval_id)
             if not appr:
                 raise KeyError(f"Approval '{approval_id}' not found")
-            if appr["task_id"] != task_id:
+            if appr.get("task_id") and appr["task_id"] != task_id:
                 raise ValueError(f"Approval ID '{approval_id}' is for task '{appr['task_id']}', does not match '{task_id}'")
+            if not appr.get("task_id"):
+                appr["task_id"] = task_id
 
             thread_id = appr.get("thread_id")
             turn_id = appr.get("turn_id")
             server_req_id = appr.get("server_req_id")
 
+        norm_decision = "approve" if decision in ("approve", "accept") else "reject"
+
         transport = self._get_transport()
         if server_req_id is not None:
-            # Server initiated request with ID: respond with JSON-RPC response ID
             transport.send_response(server_req_id, {
-                "decision": decision,
+                "decision": norm_decision,
                 "reason": reason or "",
-                "status": "applied" if decision == "approve" else "rejected",
+                "status": "applied" if norm_decision == "approve" else "rejected",
             })
         else:
             transport.send_request("turn/approval/respond", {
                 "approval_id": approval_id,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "decision": decision,
+                "decision": norm_decision,
                 "reason": reason,
             })
 
         with self._lock:
-            appr["status"] = "applied" if decision == "approve" else "rejected"
-            appr["decision"] = decision
+            appr["status"] = "applied" if norm_decision == "approve" else "rejected"
+            appr["decision"] = norm_decision
             appr["reason"] = reason
 
         return {
             "approval_id": approval_id,
             "task_id": task_id,
-            "decision": decision,
+            "decision": norm_decision,
             "status": appr["status"],
         }
 
@@ -534,6 +558,92 @@ class CodexCompanion:
             res = dict(task)
             res["pending_approvals"] = self.get_pending_approvals(task_id)
             return res
+
+
+class RemoteCodexCompanionClient:
+    """HTTP client connecting Host (on 泰山派 Linux) to Windows Codex Companion."""
+
+    def __init__(self, endpoint_url: str, auth_token: Optional[str] = None, timeout_sec: float = 10.0) -> None:
+        self.endpoint_url = endpoint_url.rstrip("/")
+        if self.endpoint_url.endswith("/rpc"):
+            self.endpoint_url = self.endpoint_url[:-4]
+        self.auth_token = auth_token
+        self.timeout_sec = timeout_sec
+        self.workspaces: dict[str, str] = {}
+
+    def _rpc_call(self, operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        url = f"{self.endpoint_url}/rpc"
+        req_id = f"req-rem-codex-{uuid.uuid4().hex[:8]}"
+        payload = {
+            "schema_version": "1.0.0",
+            "request_id": req_id,
+            "operation": operation,
+            "arguments": dict(arguments),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=int(self.timeout_sec))).isoformat().replace("+00:00", "Z"),
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+            headers["X-Companion-Token"] = self.auth_token
+
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url=url, data=data_bytes, headers=headers, method="POST")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("status") == "succeeded" or data.get("success") is True:
+                    return data.get("result", {})
+                err = data.get("error", {})
+                if isinstance(err, dict):
+                    err_msg = err.get("message", "Unknown error")
+                    err_code = err.get("code", "ERROR")
+                else:
+                    err_msg = str(err)
+                    err_code = "ERROR"
+                raise RuntimeError(f"Windows Companion error ({err_code}): {err_msg}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise PermissionError("Authentication failed with Windows Companion: HTTP 401") from exc
+            raise ConnectionError(f"HTTP error connecting to Windows Companion at {url}: {exc}") from exc
+        except Exception as exc:
+            raise ConnectionError(f"Failed to connect to Windows Companion at {url}: {exc}") from exc
+
+    def submit_task(self, task_id: str, workspace_alias: str, prompt: str, model: Optional[str] = None) -> dict[str, Any]:
+        return self._rpc_call("codex.submit_turn", {
+            "task_id": task_id,
+            "workspace_alias": workspace_alias,
+            "prompt": prompt,
+            "model": model,
+        })
+
+    def get_task_status(self, task_id: str) -> Optional[dict[str, Any]]:
+        return self._rpc_call("codex.get_task", {"task_id": task_id})
+
+    def respond_approval(self, approval_id: str, task_id: str, decision: str, reason: Optional[str] = None) -> dict[str, Any]:
+        return self._rpc_call("codex.decide_approval", {
+            "approval_id": approval_id,
+            "task_id": task_id,
+            "decision": decision,
+            "reason": reason,
+        })
+
+    def get_pending_approvals(self, task_id: Optional[str] = None) -> list[dict[str, Any]]:
+        args: dict[str, Any] = {}
+        if task_id:
+            args["task_id"] = task_id
+        res = self._rpc_call("codex.get_pending_approvals", args)
+        return res.get("approvals", [])
+
+    def list_workspaces(self) -> list[str]:
+        res = self._rpc_call("codex.list_workspaces", {})
+        return res.get("workspaces", [])
+
+    def append_task(self, task_id: str, text: str) -> dict[str, Any]:
+        return self._rpc_call("codex.append", {"task_id": task_id, "text": text})
+
+    def cancel_task(self, task_id: str, reason: Optional[str] = None) -> dict[str, Any]:
+        return self._rpc_call("codex.cancel", {"task_id": task_id, "reason": reason})
 
 
 def create_companion_server(
@@ -621,7 +731,6 @@ def create_companion_server(
                         res = companion.get_task_status(args["task_id"])
                     elif op in ("codex.respond_approval", "codex.decide_approval"):
                         decision = args["decision"]
-                        # Map approve <-> accept for complete cross-client compatibility
                         if decision == "accept":
                             decision = "approve"
                         res = companion.respond_approval(
