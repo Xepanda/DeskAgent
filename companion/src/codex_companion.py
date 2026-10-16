@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -28,9 +29,68 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Union
 
 logger = logging.getLogger(__name__)
+
+KNOWN_DECISION_KEYWORDS = {
+    "accept", "acceptforsession", "decline", "cancel", "approved", "denied", "abort", "approve", "reject"
+}
+
+
+def normalize_decision_for_schema(action_type: str, decision: Any, reason: str = "") -> Any:
+    """Aligns decision with codex-cli 0.161.0 schema specification.
+
+    - CommandExecutionRequestApprovalResponse: "accept" | "acceptForSession" | "decline" | "cancel"
+    - ApplyPatchApprovalResponse: "approved" | {"denied": {"rejection": ...}} | "abort"
+    """
+    is_patch = action_type in ("file_change", "apply_patch", "patch", "file")
+
+    if is_patch:
+        if isinstance(decision, dict):
+            return decision
+        dec_str = str(decision).strip()
+        if dec_str in ("approved", "approve", "accept"):
+            return "approved"
+        elif dec_str in ("abort", "cancel"):
+            return "abort"
+        elif dec_str in ("denied", "reject", "decline"):
+            return {"denied": {"rejection": reason or ""}}
+        else:
+            if "approve" in dec_str.lower() or "accept" in dec_str.lower():
+                return "approved"
+            return {"denied": {"rejection": reason or ""}}
+    else:
+        if isinstance(decision, dict):
+            decision = decision.get("decision", "accept")
+        dec_str = str(decision).strip()
+        if dec_str in ("accept", "acceptForSession", "cancel", "decline"):
+            return dec_str
+        elif dec_str == "approve":
+            return "accept"
+        elif dec_str in ("reject", "denied"):
+            return "decline"
+        elif dec_str == "abort":
+            return "cancel"
+        else:
+            if "approve" in dec_str.lower() or "accept" in dec_str.lower():
+                return "accept"
+            return "decline"
+
+
+def _resolve_approval_args(
+    task_id: Optional[str],
+    decision: Optional[Union[str, dict[str, Any]]],
+    reason: Optional[str],
+) -> tuple[Optional[str], Any, Optional[str]]:
+    """Flexibly handles (approval_id, task_id, decision, reason) and (approval_id, decision, reason)."""
+    if decision is None:
+        return None, task_id, reason
+    if isinstance(task_id, (str, dict)):
+        if isinstance(task_id, dict) or (isinstance(task_id, str) and task_id.lower() in KNOWN_DECISION_KEYWORDS):
+            if isinstance(decision, str) and decision.lower() not in KNOWN_DECISION_KEYWORDS:
+                return None, task_id, decision
+    return task_id, decision, reason
 
 
 class JsonRpcTransport(abc.ABC):
@@ -242,6 +302,7 @@ class CodexCompanion:
         registered_workspaces: Optional[dict[str, str]] = None,
         codex_bin: str = "codex",
         transport: Optional[JsonRpcTransport] = None,
+        db_path: Optional[str] = None,
     ) -> None:
         raw_workspaces = allowed_workspaces or registered_workspaces or {
             "epanda-desk-agent": os.path.realpath("."),
@@ -259,6 +320,223 @@ class CodexCompanion:
         self._thread_to_task: dict[str, str] = {}
         self._turn_to_task: dict[str, str] = {}
         self._lock = threading.RLock()
+
+        if db_path is None:
+            if "unittest" in sys.modules and os.environ.get("DESK_AGENT_USE_REAL_CODEX") != "1":
+                self.db_path = ":memory:"
+            else:
+                base_dir = os.path.expanduser("~/.deskagent")
+                os.makedirs(base_dir, exist_ok=True)
+                self.db_path = os.path.join(base_dir, "codex_companion.db")
+        else:
+            if db_path != ":memory:":
+                parent = os.path.dirname(os.path.abspath(db_path))
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+            self.db_path = db_path
+
+        self._conn: Optional[sqlite3.Connection] = None
+        self._init_db()
+        self._load_from_db()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON;")
+            if self.db_path != ":memory:":
+                self._conn.execute("PRAGMA journal_mode = WAL;")
+        return self._conn
+
+    def _init_db(self) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                thread_id TEXT,
+                turn_id TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                alias TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                prompt TEXT,
+                model TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS approvals (
+                approval_id TEXT PRIMARY KEY,
+                task_id TEXT,
+                thread_id TEXT,
+                turn_id TEXT,
+                request_data TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                decision TEXT,
+                created_at TEXT NOT NULL
+            );
+            """)
+            conn.commit()
+
+    def _load_from_db(self) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.cursor()
+
+            # Load tasks
+            cur.execute("SELECT task_id, thread_id, turn_id, status, alias, cwd, prompt, model, created_at, updated_at FROM tasks")
+            for row in cur.fetchall():
+                tid = row["task_id"]
+                th_id = row["thread_id"] or ""
+                tu_id = row["turn_id"] or ""
+                self._tasks[tid] = {
+                    "task_id": tid,
+                    "workspace_alias": row["alias"],
+                    "target_dir": row["cwd"],
+                    "thread_id": th_id,
+                    "turn_id": tu_id,
+                    "prompt": row["prompt"] or "",
+                    "model": row["model"] or "gpt-5-codex",
+                    "state": row["status"],
+                    "status": row["status"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                if th_id:
+                    self._thread_to_task[th_id] = tid
+                if tu_id:
+                    self._turn_to_task[tu_id] = tid
+
+            # Load approvals
+            cur.execute("SELECT approval_id, task_id, thread_id, turn_id, request_data, status, decision, created_at FROM approvals")
+            for row in cur.fetchall():
+                aid = row["approval_id"]
+                req_data: dict[str, Any] = {}
+                if row["request_data"]:
+                    try:
+                        req_data = json.loads(row["request_data"])
+                    except Exception:
+                        pass
+
+                dec_val = row["decision"]
+                if dec_val and isinstance(dec_val, str) and dec_val.startswith("{"):
+                    try:
+                        dec_val = json.loads(dec_val)
+                    except Exception:
+                        pass
+
+                task_id = row["task_id"] or req_data.get("task_id", "")
+                thread_id = row["thread_id"] or req_data.get("thread_id", "")
+                turn_id = row["turn_id"] or req_data.get("turn_id", "")
+
+                self._pending_approvals[aid] = {
+                    "approval_id": aid,
+                    "server_req_id": req_data.get("server_req_id"),
+                    "task_id": task_id,
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "action_type": req_data.get("action_type", "command"),
+                    "command_or_path": req_data.get("command_or_path", ""),
+                    "description": req_data.get("description", ""),
+                    "status": row["status"],
+                    "decision": dec_val,
+                    "reason": req_data.get("reason", ""),
+                    "created_at": row["created_at"],
+                }
+
+    def _persist_task(self, task: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        created_at = task.get("created_at") or now
+        task["created_at"] = created_at
+        task["updated_at"] = now
+        with self._lock:
+            conn = self._get_connection()
+            conn.execute(
+                """
+                INSERT INTO tasks (task_id, thread_id, turn_id, status, alias, cwd, prompt, model, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    thread_id=excluded.thread_id,
+                    turn_id=excluded.turn_id,
+                    status=excluded.status,
+                    alias=excluded.alias,
+                    cwd=excluded.cwd,
+                    prompt=excluded.prompt,
+                    model=excluded.model,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    task["task_id"],
+                    task.get("thread_id", ""),
+                    task.get("turn_id", ""),
+                    task.get("status") or task.get("state", "running"),
+                    task.get("workspace_alias", ""),
+                    task.get("target_dir", ""),
+                    task.get("prompt", ""),
+                    task.get("model", ""),
+                    created_at,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def _persist_approval(self, appr: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        created_at = appr.get("created_at") or now
+        appr["created_at"] = created_at
+        req_data = {
+            "action_type": appr.get("action_type", ""),
+            "command_or_path": appr.get("command_or_path", ""),
+            "description": appr.get("description", ""),
+            "server_req_id": appr.get("server_req_id"),
+            "reason": appr.get("reason", ""),
+        }
+        decision_val = appr.get("decision")
+        if isinstance(decision_val, dict):
+            decision_str = json.dumps(decision_val)
+        else:
+            decision_str = str(decision_val) if decision_val is not None else None
+
+        with self._lock:
+            conn = self._get_connection()
+            conn.execute(
+                """
+                INSERT INTO approvals (approval_id, task_id, thread_id, turn_id, request_data, status, decision, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(approval_id) DO UPDATE SET
+                    task_id=excluded.task_id,
+                    thread_id=excluded.thread_id,
+                    turn_id=excluded.turn_id,
+                    request_data=excluded.request_data,
+                    status=excluded.status,
+                    decision=excluded.decision
+                """,
+                (
+                    appr["approval_id"],
+                    appr.get("task_id", ""),
+                    appr.get("thread_id", ""),
+                    appr.get("turn_id", ""),
+                    json.dumps(req_data),
+                    appr.get("status", "pending"),
+                    decision_str,
+                    created_at,
+                ),
+            )
+            conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._transport is not None:
+                try:
+                    self._transport.close()
+                except Exception:
+                    pass
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
 
     def register_workspace(self, alias: str, abs_path: str) -> None:
         if not abs_path or not os.path.isabs(abs_path):
@@ -303,7 +581,7 @@ class CodexCompanion:
                     else:
                         desc = f"File change: {command_or_path}" if command_or_path else "Approval required for file modification"
 
-                self._pending_approvals[approval_id] = {
+                appr_dict = {
                     "approval_id": approval_id,
                     "server_req_id": server_req_id,
                     "task_id": task_id,
@@ -314,14 +592,19 @@ class CodexCompanion:
                     "description": desc,
                     "status": "pending",
                 }
+                self._pending_approvals[approval_id] = appr_dict
+                self._persist_approval(appr_dict)
             elif method in ("turn/progress", "task/progress", "item/updated", "turn/step"):
                 if task_id and task_id in self._tasks:
                     self._tasks[task_id]["progress"] = params.get("progress") or params.get("message") or "in_progress"
                     self._tasks[task_id]["state"] = "running"
+                    self._tasks[task_id]["status"] = "running"
+                    self._persist_task(self._tasks[task_id])
             elif method in ("turn/completed", "task/completed", "turn/finished"):
                 if task_id and task_id in self._tasks:
                     self._tasks[task_id]["status"] = "completed"
                     self._tasks[task_id]["state"] = "completed"
+                    self._persist_task(self._tasks[task_id])
 
     def _get_transport(self) -> JsonRpcTransport:
         if self._transport is not None:
@@ -336,18 +619,27 @@ class CodexCompanion:
         )
         return self._transport
 
+    def initialize(self) -> dict[str, Any]:
+        """Performs JSON-RPC initialize handshake with Codex app-server."""
+        with self._lock:
+            if not self._initialized:
+                transport = self._get_transport()
+                resp = transport.send_request(
+                    "initialize",
+                    {
+                        "clientInfo": {"name": "desk-agent-companion", "version": "0.1.0"},
+                        "capabilities": {},
+                    },
+                )
+                if resp is None or (isinstance(resp, dict) and "error" in resp):
+                    raise ConnectionError(f"Codex app-server initialization failed: {resp}")
+                self._initialized = True
+                return resp
+            return {"capabilities": {}}
+
     def _ensure_initialized(self) -> None:
         if not self._initialized:
-            transport = self._get_transport()
-            transport.send_request(
-                "initialize",
-                {
-                    "clientInfo": {"name": "DeskAgentCompanion", "version": "1.0.0"},
-                    "client_name": "DeskAgentCompanion",
-                    "version": "1.0.0",
-                },
-            )
-            self._initialized = True
+            self.initialize()
 
     def submit_task(
         self,
@@ -414,7 +706,8 @@ class CodexCompanion:
             for appr in self._pending_approvals.values():
                 if not appr.get("task_id") and (appr.get("turn_id") == turn_id or appr.get("thread_id") == thread_id):
                     appr["task_id"] = task_id
-            self._tasks[task_id] = {
+                    self._persist_approval(appr)
+            task_dict = {
                 "task_id": task_id,
                 "workspace_alias": workspace_alias,
                 "target_dir": target_dir,
@@ -423,7 +716,10 @@ class CodexCompanion:
                 "prompt": prompt,
                 "model": model or "gpt-5-codex",
                 "state": state,
+                "status": state,
             }
+            self._tasks[task_id] = task_dict
+            self._persist_task(task_dict)
 
         return {
             "task_id": task_id,
@@ -434,6 +730,7 @@ class CodexCompanion:
         }
 
     def append_task(self, task_id: str, text: str) -> dict[str, Any]:
+        self._ensure_initialized()
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
@@ -445,9 +742,12 @@ class CodexCompanion:
 
         with self._lock:
             task["state"] = "running"
+            task["status"] = "running"
+            self._persist_task(task)
         return {"task_id": task_id, "appended": True}
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> dict[str, Any]:
+        self._ensure_initialized()
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
@@ -456,10 +756,15 @@ class CodexCompanion:
             turn_id = task["turn_id"]
 
         transport = self._get_transport()
-        transport.send_request("turn/interrupt", {"thread_id": thread_id, "turn_id": turn_id, "reason": reason})
+        params: dict[str, Any] = {"threadId": thread_id, "turnId": turn_id}
+        if reason:
+            params["reason"] = reason
+        transport.send_request("turn/interrupt", params)
 
         with self._lock:
             task["state"] = "cancelled"
+            task["status"] = "cancelled"
+            self._persist_task(task)
         return {"task_id": task_id, "turn_id": turn_id, "status": "cancelled", "reason": reason}
 
     def request_approval(
@@ -476,7 +781,7 @@ class CodexCompanion:
             thread_id = task["thread_id"] if task else "unknown"
             turn_id = task["turn_id"] if task else "unknown"
 
-            self._pending_approvals[approval_id] = {
+            appr_dict = {
                 "approval_id": approval_id,
                 "task_id": task_id,
                 "thread_id": thread_id,
@@ -486,56 +791,71 @@ class CodexCompanion:
                 "description": description,
                 "status": "pending",
             }
+            self._pending_approvals[approval_id] = appr_dict
+            self._persist_approval(appr_dict)
         return self._pending_approvals[approval_id]
 
     def respond_approval(
         self,
         approval_id: str,
-        task_id: str,
-        decision: str,
+        task_id: Optional[str] = None,
+        decision: Optional[Union[str, dict[str, Any]]] = None,
         reason: Optional[str] = None,
     ) -> dict[str, Any]:
+        resolved_task_id, resolved_decision, resolved_reason = _resolve_approval_args(task_id, decision, reason)
+
         with self._lock:
             appr = self._pending_approvals.get(approval_id)
             if not appr:
                 raise KeyError(f"Approval '{approval_id}' not found")
-            if appr.get("task_id") and appr["task_id"] != task_id:
-                raise ValueError(f"Approval ID '{approval_id}' is for task '{appr['task_id']}', does not match '{task_id}'")
-            if not appr.get("task_id"):
-                appr["task_id"] = task_id
+            if resolved_task_id:
+                if appr.get("task_id") and appr["task_id"] != resolved_task_id:
+                    raise ValueError(f"Approval ID '{approval_id}' is for task '{appr['task_id']}', does not match '{resolved_task_id}'")
+                if not appr.get("task_id"):
+                    appr["task_id"] = resolved_task_id
 
+            actual_task_id = appr.get("task_id") or ""
+            action_type = appr.get("action_type", "command")
             thread_id = appr.get("thread_id")
             turn_id = appr.get("turn_id")
             server_req_id = appr.get("server_req_id")
 
-        norm_decision = "approve" if decision in ("approve", "accept") else "reject"
+        target_decision = normalize_decision_for_schema(action_type, resolved_decision, resolved_reason or "")
+
+        if target_decision in ("accept", "acceptForSession", "approved"):
+            status_val = "applied"
+        elif target_decision in ("cancel", "abort"):
+            status_val = "cancelled"
+        else:
+            status_val = "rejected"
 
         transport = self._get_transport()
         if server_req_id is not None:
             transport.send_response(server_req_id, {
-                "decision": norm_decision,
-                "reason": reason or "",
-                "status": "applied" if norm_decision == "approve" else "rejected",
+                "decision": target_decision,
             })
         else:
             transport.send_request("turn/approval/respond", {
                 "approval_id": approval_id,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "decision": norm_decision,
-                "reason": reason,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "decision": target_decision,
+                "reason": resolved_reason or "",
             })
 
         with self._lock:
-            appr["status"] = "applied" if norm_decision == "approve" else "rejected"
-            appr["decision"] = norm_decision
-            appr["reason"] = reason
+            appr["status"] = status_val
+            appr["decision"] = target_decision
+            appr["reason"] = resolved_reason
+            self._persist_approval(appr)
 
         return {
             "approval_id": approval_id,
-            "task_id": task_id,
-            "decision": norm_decision,
-            "status": appr["status"],
+            "task_id": actual_task_id,
+            "decision": target_decision,
+            "status": status_val,
         }
 
     def get_pending_approvals(self, task_id: Optional[str] = None) -> list[dict[str, Any]]:
@@ -651,6 +971,7 @@ def create_companion_server(
     port: int = 8765,
     host: str = "127.0.0.1",
     auth_token: Optional[str] = None,
+    db_path: Optional[str] = None,
 ):
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from socketserver import ThreadingMixIn
@@ -666,12 +987,14 @@ def create_companion_server(
                 host = cfg.get("host", host)
                 codex_bin = cfg.get("codex_bin", codex_bin)
                 auth_token = cfg.get("auth_token", auth_token)
+                db_path = cfg.get("db_path", db_path)
         except Exception as e:
             logger.warning("Failed to load config %s: %s", config_path, e)
 
     companion = CodexCompanion(
         allowed_workspaces=registered_aliases if registered_aliases else None,
         codex_bin=codex_bin,
+        db_path=db_path,
     )
 
     class CompanionHandler(BaseHTTPRequestHandler):
@@ -730,13 +1053,10 @@ def create_companion_server(
                     elif op in ("codex.get_status", "codex.get", "codex.get_task"):
                         res = companion.get_task_status(args["task_id"])
                     elif op in ("codex.respond_approval", "codex.decide_approval"):
-                        decision = args["decision"]
-                        if decision == "accept":
-                            decision = "approve"
                         res = companion.respond_approval(
                             approval_id=args["approval_id"],
-                            task_id=args["task_id"],
-                            decision=decision,
+                            task_id=args.get("task_id"),
+                            decision=args["decision"],
                             reason=args.get("reason"),
                         )
                     elif op == "codex.append":
