@@ -108,6 +108,67 @@ class TestCameraService(unittest.TestCase):
         # Non-owner cannot release
         self.assertFalse(cam.release_lease("user-other"))
 
+    # -------------------------------------------------------------------------
+    # 3. Hardware Grounding & Synthetic Disabling Tests
+    # -------------------------------------------------------------------------
+    def test_pipeline_without_hardware_source_produces_no_fake_frames_when_synthetic_disabled(self) -> None:
+        """Confirms that with allow_synthetic=False (default), missing hardware produces NO fake frames."""
+        cam = CameraViewerService(
+            default_lease_ms=1000,
+            auto_start_pipeline=True,
+            allow_synthetic=False,
+        )
+        cam.acquire_lease("viewer-clean", lease_ms=1000)
+        time.sleep(0.12)
+        frame = cam.get_latest_frame("viewer-clean")
+        self.assertIsNone(frame, "Must NOT produce fake synthetic frames when hardware is missing and synthetic is disabled")
+        cam.pipeline.stop()
+
+    def test_pipeline_with_hardware_source_produces_hardware_frame(self) -> None:
+        """Confirms that hardware sensor source produces frames marked is_hardware=True and source='hardware_sensor'."""
+        cam = CameraViewerService(
+            default_lease_ms=1000,
+            auto_start_pipeline=False,
+            allow_synthetic=False,
+        )
+        real_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xd9"
+        cam.set_hardware_frame_source(lambda: real_jpeg)
+        cam.acquire_lease("viewer-hw", lease_ms=1000)
+        cam.pipeline.start(cam.push_frame)
+        time.sleep(0.12)
+        cam.pipeline.stop()
+
+        frame = cam.get_latest_frame("viewer-hw")
+        self.assertIsNotNone(frame)
+        self.assertTrue(frame["is_hardware"])
+        self.assertEqual(frame["source"], "hardware_sensor")
+        self.assertEqual(frame["jpeg_data"], real_jpeg)
+
+    def test_ingest_robot_frame_directly(self) -> None:
+        """Confirms ingest_robot_frame tags the frame as hardware sensor."""
+        cam = CameraViewerService(default_lease_ms=1000)
+        cam.acquire_lease("viewer-ingest", lease_ms=1000)
+        robot_bytes = b"real_robot_camera_frame_data"
+        cam.ingest_robot_frame(robot_bytes)
+
+        frame = cam.get_latest_frame("viewer-ingest")
+        self.assertIsNotNone(frame)
+        self.assertTrue(frame["is_hardware"])
+        self.assertEqual(frame["source"], "hardware_sensor")
+        self.assertEqual(frame["jpeg_data"], robot_bytes)
+
+    def test_motion_coordinates_clamping(self) -> None:
+        """Confirms gimbal pan and tilt coordinates are physically clamped to 0..180 and 100..140."""
+        cam = CameraViewerService()
+        cam.update_motion_coordinates(-30.0, 190.0)
+        self.assertEqual(cam.pipeline._current_pan, 0.0)
+        self.assertEqual(cam.pipeline._current_tilt, 140.0)
+
+        cam.update_motion_coordinates(200.0, 80.0)
+        self.assertEqual(cam.pipeline._current_pan, 180.0)
+        self.assertEqual(cam.pipeline._current_tilt, 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
