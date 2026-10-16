@@ -301,6 +301,50 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
     return 0;
 }
 
+static uint16_t s_camera_session_id = 100;
+static uint32_t s_camera_seq = 0;
+static uint16_t s_mic_session_id = 200;
+
+int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
+                                     uint8_t flags,
+                                     uint16_t stream_id,
+                                     uint32_t sequence,
+                                     const uint8_t *payload,
+                                     size_t payload_len)
+{
+    if (payload_len > DESK_WSPK_MAX_PAYLOAD_SIZE) return -2;
+
+    uint8_t stack_buf[DESK_WSPK_HEADER_SIZE + 4096];
+    uint8_t *heap_buf = NULL;
+    uint8_t *target_buf = stack_buf;
+    size_t target_size = sizeof(stack_buf);
+
+    if (DESK_WSPK_HEADER_SIZE + payload_len > sizeof(stack_buf)) {
+        target_size = DESK_WSPK_HEADER_SIZE + payload_len;
+        heap_buf = (uint8_t *)malloc(target_size);
+        if (!heap_buf) return -1;
+        target_buf = heap_buf;
+    }
+
+    size_t packed_len = 0;
+    int rc = desk_sdk_bridge_pack_media_frame(frame_type, flags, stream_id, sequence,
+                                              payload, payload_len, target_buf, target_size, &packed_len);
+    if (rc == 0) {
+        if (s_client_fd >= 0) {
+            ssize_t ret = write(s_client_fd, target_buf, packed_len);
+            (void)ret;
+        }
+        if (s_outbound_cb) {
+            s_outbound_cb((const char *)target_buf, packed_len, s_outbound_user_data);
+        }
+    }
+
+    if (heap_buf) {
+        free(heap_buf);
+    }
+    return rc;
+}
+
 /* UDP Pairing (watcher_lan_pairing_v1 on port 37021) */
 int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len)
 {
@@ -333,24 +377,44 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
     }
     s_paired = true;
 
-    snprintf(udp_out, max_out_len,
-             "{\"type\":\"pair.accept\","
-             "\"status\":\"accepted\","
-             "\"device_id\":\"desk_agent_r1\","
-             "\"port\":%d,"
-             "\"protocol\":\"watcher-lan-pairing\","
-             "\"version\":\"1.0\","
-             "\"request_id\":\"%s\","
-             "\"daemon_instance_id\":\"%s\","
-             "\"target_mode\":\"%s\","
-             "\"token\":\"%s\","
-             "\"session_token\":\"%s\"}",
-             s_bound_port > 0 ? s_bound_port : 37020,
-             req_id,
-             daemon_id,
-             strlen(target_mode) > 0 ? target_mode : "python_sdk",
-             s_active_pairing_token,
-             s_active_pairing_token);
+    char proto[64] = "";
+    json_parse_str(udp_in, "protocol", proto, sizeof(proto));
+
+    /* Strict official watcher-lan-pairing protocol check per PairAccept contract */
+    if (strcmp(proto, "watcher-lan-pairing") == 0) {
+        snprintf(udp_out, max_out_len,
+                 "{\"type\":\"pair.accept\","
+                 "\"protocol\":\"watcher-lan-pairing\","
+                 "\"version\":\"1.0\","
+                 "\"request_id\":\"%s\","
+                 "\"daemon_instance_id\":\"%s\","
+                 "\"target_mode\":\"%s\","
+                 "\"session_token\":\"%s\"}",
+                 req_id,
+                 daemon_id,
+                 strlen(target_mode) > 0 ? target_mode : "python_sdk",
+                 s_active_pairing_token);
+    } else {
+        snprintf(udp_out, max_out_len,
+                 "{\"type\":\"pair.accept\","
+                 "\"status\":\"accepted\","
+                 "\"device_id\":\"desk_agent_r1\","
+                 "\"port\":%d,"
+                 "\"protocol\":\"%s\","
+                 "\"version\":\"1.0\","
+                 "\"request_id\":\"%s\","
+                 "\"daemon_instance_id\":\"%s\","
+                 "\"target_mode\":\"%s\","
+                 "\"token\":\"%s\","
+                 "\"session_token\":\"%s\"}",
+                 s_bound_port > 0 ? s_bound_port : 37020,
+                 strlen(proto) > 0 ? proto : "watcher_lan_pairing_v1",
+                 req_id,
+                 daemon_id,
+                 strlen(target_mode) > 0 ? target_mode : "python_sdk",
+                 s_active_pairing_token,
+                 s_active_pairing_token);
+    }
 
     return 0;
 }
@@ -424,6 +488,21 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
+    /* System SDK ready get: sys.sdk.ready.get */
+    if (strstr(json_in, "sys.sdk.ready.get") != NULL) {
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
+                 "\"role\":\"device\","
+                 "\"protocol_version\":\"1.0\","
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 DESK_SDK_CAP_INPUTS,
+                 DESK_SDK_CAP_MOTION,
+                 DESK_SDK_CAP_CAMERA,
+                 DESK_SDK_CAP_AUDIO_STREAM,
+                 DESK_SDK_CAP_EXPRESSION);
+        return 0;
+    }
+
     /* Heartbeat: sys.ping */
     if (strstr(json_in, "sys.ping") != NULL) {
         snprintf(out_buf, max_out_len,
@@ -431,17 +510,20 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    /* Motion control: ctrl.motion.move / motion.move */
-    if (strstr(json_in, "motion.move") != NULL) {
-        float pan = json_parse_float(json_in, "pan_deg", 90.0f);
-        float tilt = json_parse_float(json_in, "tilt_deg", 120.0f);
-        int32_t duration = json_parse_int(json_in, "duration_ms", 500);
+    /* Motion control: ctrl.motion.move / motion.move / ctrl.motion.set_target */
+    if (strstr(json_in, "motion.move") != NULL || strstr(json_in, "motion.set_target") != NULL) {
+        float pan = json_parse_float(json_in, "pan_deg", -999.0f);
+        float tilt = json_parse_float(json_in, "tilt_deg", -999.0f);
+        int32_t duration = json_parse_int(json_in, "duration_ms", 400);
+
+        if (pan < -900.0f) pan = desk_hardware_get_pan();
+        if (tilt < -900.0f) tilt = desk_hardware_get_tilt();
 
         if (pan < DESK_MOTION_PAN_MIN_DEG) pan = DESK_MOTION_PAN_MIN_DEG;
         if (pan > DESK_MOTION_PAN_MAX_DEG) pan = DESK_MOTION_PAN_MAX_DEG;
         if (tilt < DESK_MOTION_TILT_MIN_DEG) tilt = DESK_MOTION_TILT_MIN_DEG;
         if (tilt > DESK_MOTION_TILT_MAX_DEG) tilt = DESK_MOTION_TILT_MAX_DEG;
-        if (duration < 100) duration = 100;
+        if (duration < 50) duration = 50;
         if (duration > 5000) duration = 5000;
 
         desk_arbiter_status_t arb = desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE, 50);
@@ -474,6 +556,13 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         desk_hardware_motion_stop(false);
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"succeeded\"}}");
+        return 0;
+    }
+
+    /* Motion action play: ctrl.motion.action.play */
+    if (strstr(json_in, "motion.action.play") != NULL) {
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"job_id\":1,\"status\":\"succeeded\"}}");
         return 0;
     }
 
@@ -512,6 +601,76 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         desk_arbiter_camera_release_lease(client_id);
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"succeeded\"}}");
+        return 0;
+    }
+
+    /* Camera capture: ctrl.camera.capture / camera.capture / ctrl.camera.capture_with_feedback */
+    if (strstr(json_in, "camera.capture") != NULL) {
+        size_t max_jpeg = 65536;
+        uint8_t *jpeg_buf = (uint8_t *)malloc(max_jpeg);
+        if (!jpeg_buf) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",\"code\":500,\"error\":{"
+                     "\"code\":\"OUT_OF_MEMORY\","
+                     "\"message\":\"Cannot allocate buffer for camera capture\"}}");
+            return 0;
+        }
+
+        size_t jpeg_len = 0;
+        int cap_rc = desk_hardware_camera_capture_jpeg(jpeg_buf, max_jpeg, &jpeg_len, 1000);
+        if (cap_rc != DESK_HW_OK || jpeg_len == 0) {
+            free(jpeg_buf);
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",\"code\":409,\"error\":{"
+                     "\"code\":\"RESOURCE_BUSY\","
+                     "\"message\":\"Camera frame unavailable\"}}");
+            return 0;
+        }
+
+        s_camera_session_id = (s_camera_session_id % 65534) + 1;
+        s_camera_seq++;
+
+        /* Send ACK carrying positive session_id */
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"session_id\":%u}}",
+                 (unsigned int)s_camera_session_id);
+
+        /* Send WSPK media frame (FRAME_IMAGE = 3) */
+        desk_sdk_bridge_send_media_frame(DESK_WSPK_TYPE_IMAGE, 0, s_camera_session_id, s_camera_seq,
+                                         jpeg_buf, jpeg_len);
+        free(jpeg_buf);
+        return 0;
+    }
+
+    /* Microphone open / close: ctrl.microphone.open / ctrl.microphone.close */
+    if (strstr(json_in, "ctrl.microphone.open") != NULL) {
+        int rate = json_parse_int(json_in, "sample_rate_hz", 16000);
+        desk_hardware_audio_record_start((uint32_t)rate);
+        s_mic_session_id = (s_mic_session_id % 65534) + 1;
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"session_id\":%u}}",
+                 (unsigned int)s_mic_session_id);
+        return 0;
+    }
+
+    if (strstr(json_in, "ctrl.microphone.close") != NULL) {
+        desk_hardware_audio_record_stop();
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"status\":\"succeeded\"}}");
+        return 0;
+    }
+
+    /* Expression audio follow: ctrl.expression.audio_follow */
+    if (strstr(json_in, "expression.audio_follow") != NULL) {
+        bool enabled = (strstr(json_in, "\"enabled\":true") != NULL || strstr(json_in, "\"enabled\": true") != NULL);
+        if (enabled) {
+            desk_hardware_display_set_expression("speaking", "Audio Follow Active");
+        } else {
+            desk_hardware_display_set_expression("idle", "Ready");
+        }
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"enabled\":%s}}",
+                 enabled ? "true" : "false");
         return 0;
     }
 
