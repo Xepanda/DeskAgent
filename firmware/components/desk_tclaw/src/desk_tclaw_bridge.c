@@ -28,6 +28,11 @@ static int s_turn_count = 0;
 static char s_last_response[1024] = "";
 static char s_tuya_session_id[128] = "";
 static char s_current_pending_tool[128] = "";
+static tuya_cloud_connection_state_t s_tuya_conn_state = TUYA_CLOUD_DISCONNECTED;
+static char s_tuya_endpoint[128] = "";
+static char s_tuya_device_id[64] = "";
+static char s_tuya_token[128] = "";
+static char s_last_tool_result[1024] = "";
 
 int desk_tclaw_init(void)
 {
@@ -37,6 +42,7 @@ int desk_tclaw_init(void)
     s_current_pending_tool[0] = '\0';
     s_speech_stream_cb = NULL;
     s_stream_user_data = NULL;
+    s_last_tool_result[0] = '\0';
 
     desk_hardware_display_set_expression("idle", "Ready");
     return 0;
@@ -53,6 +59,11 @@ void desk_tclaw_reset(void)
     s_tool_dispatcher = NULL;
     s_dispatcher_user_data = NULL;
     s_tuya_session_id[0] = '\0';
+    s_tuya_conn_state = TUYA_CLOUD_DISCONNECTED;
+    s_tuya_endpoint[0] = '\0';
+    s_tuya_device_id[0] = '\0';
+    s_tuya_token[0] = '\0';
+    s_last_tool_result[0] = '\0';
 }
 
 int desk_tclaw_start(void)
@@ -166,6 +177,51 @@ int desk_tclaw_trigger_tool_call(const char *request_id, const char *operation, 
     return 0;
 }
 
+int desk_tclaw_tuya_session_connect(const char *endpoint, const char *device_id, const char *token)
+{
+    if (!endpoint || !device_id || !token) return -1;
+    if (strlen(endpoint) == 0 || strlen(device_id) == 0 || strlen(token) == 0) return -1;
+
+    s_tuya_conn_state = TUYA_CLOUD_CONNECTING;
+
+    strncpy(s_tuya_endpoint, endpoint, sizeof(s_tuya_endpoint) - 1);
+    s_tuya_endpoint[sizeof(s_tuya_endpoint) - 1] = '\0';
+
+    strncpy(s_tuya_device_id, device_id, sizeof(s_tuya_device_id) - 1);
+    s_tuya_device_id[sizeof(s_tuya_device_id) - 1] = '\0';
+
+    strncpy(s_tuya_token, token, sizeof(s_tuya_token) - 1);
+    s_tuya_token[sizeof(s_tuya_token) - 1] = '\0';
+
+    s_tuya_conn_state = TUYA_CLOUD_CONNECTED;
+    desk_tclaw_tuya_session_start(NULL);
+    return 0;
+}
+
+int desk_tclaw_tuya_session_disconnect(void)
+{
+    desk_tclaw_tuya_session_stop();
+    s_tuya_conn_state = TUYA_CLOUD_DISCONNECTED;
+    return 0;
+}
+
+int desk_tclaw_tuya_session_reconnect(void)
+{
+    if (s_tuya_endpoint[0] == '\0' || s_tuya_device_id[0] == '\0') {
+        s_tuya_conn_state = TUYA_CLOUD_ERROR;
+        return -1;
+    }
+    s_tuya_conn_state = TUYA_CLOUD_RECONNECTING;
+    s_tuya_conn_state = TUYA_CLOUD_CONNECTED;
+    desk_tclaw_tuya_session_start(NULL);
+    return 0;
+}
+
+tuya_cloud_connection_state_t desk_tclaw_tuya_session_get_connection_state(void)
+{
+    return s_tuya_conn_state;
+}
+
 int desk_tclaw_tuya_session_start(const char *session_id)
 {
     if (session_id && strlen(session_id) > 0) {
@@ -191,6 +247,10 @@ int desk_tclaw_tuya_session_feed_audio(const uint8_t *pcm_data, size_t len)
 
     if (s_tuya_session_id[0] == '\0') {
         desk_tclaw_tuya_session_start(NULL);
+    }
+
+    if (s_tuya_conn_state == TUYA_CLOUD_CONNECTED) {
+        s_tuya_conn_state = TUYA_CLOUD_STREAMING;
     }
 
     if (s_state == TCLAW_STATE_IDLE) {
@@ -290,7 +350,20 @@ int desk_tclaw_tuya_send_tool_result(const char *session_id, const char *tool_na
     /* Feeds back tool execution result to active Tuya cloud dialogue session */
     (void)session_id;
     (void)tool_name;
-    (void)result_json;
+    if (result_json) {
+        strncpy(s_last_tool_result, result_json, sizeof(s_last_tool_result) - 1);
+        s_last_tool_result[sizeof(s_last_tool_result) - 1] = '\0';
+    } else {
+        s_last_tool_result[0] = '\0';
+    }
+    return 0;
+}
+
+int desk_tclaw_tuya_get_last_tool_result(char *out_buf, size_t max_len)
+{
+    if (!out_buf || max_len == 0) return -1;
+    strncpy(out_buf, s_last_tool_result, max_len - 1);
+    out_buf[max_len - 1] = '\0';
     return 0;
 }
 
@@ -300,6 +373,9 @@ int desk_tclaw_tuya_session_stop(void)
     s_state = TCLAW_STATE_IDLE;
     s_tuya_session_id[0] = '\0';
     s_current_pending_tool[0] = '\0';
+    if (s_tuya_conn_state == TUYA_CLOUD_STREAMING) {
+        s_tuya_conn_state = TUYA_CLOUD_CONNECTED;
+    }
     desk_hardware_display_set_expression("idle", "Ready");
     return 0;
 }

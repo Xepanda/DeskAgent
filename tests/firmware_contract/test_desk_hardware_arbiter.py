@@ -35,6 +35,15 @@ DESK_ARBITER_ERR_BUSY = 1
 DESK_ARBITER_ERR_INVALID = 2
 DESK_ARBITER_ERR_TIMEOUT = 3
 
+# Hardware Error codes matching desk_hardware.h
+DESK_HW_OK = 0
+DESK_HW_ERR_INVALID_ARG = -1
+DESK_HW_ERR_UNAVAILABLE = -2
+DESK_HW_ERR_TIMEOUT = -3
+DESK_HW_ERR_IO = -4
+DESK_HW_ERR_BUSY = -5
+DESK_HW_ERR_STALL = -6
+
 # Touch enums matching desk_hardware.h
 DESK_TOUCH_TARGET_BACKTOUCH = 0
 DESK_TOUCH_TARGET_SCREENTOUCH = 1
@@ -168,6 +177,21 @@ class TestDeskHardwareArbiter(unittest.TestCase):
 
         cls.lib.desk_hardware_inject_touch_event.restype = ctypes.c_int
         cls.lib.desk_hardware_inject_touch_event.argtypes = [ctypes.c_int, ctypes.c_int]
+
+        cls.lib.desk_hardware_set_strict_mode.restype = None
+        cls.lib.desk_hardware_set_strict_mode.argtypes = [ctypes.c_bool]
+
+        cls.lib.desk_hardware_is_strict_mode.restype = ctypes.c_bool
+        cls.lib.desk_hardware_is_strict_mode.argtypes = []
+
+        cls.lib.desk_hardware_camera_has_frame.restype = ctypes.c_bool
+        cls.lib.desk_hardware_camera_has_frame.argtypes = []
+
+        cls.lib.desk_hardware_get_pan.restype = ctypes.c_float
+        cls.lib.desk_hardware_get_pan.argtypes = []
+
+        cls.lib.desk_hardware_get_tilt.restype = ctypes.c_float
+        cls.lib.desk_hardware_get_tilt.argtypes = []
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -387,3 +411,43 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.assertEqual(len(received_events), 2)
         self.assertEqual(received_events[0], (DESK_TOUCH_TARGET_BACKTOUCH, DESK_TOUCH_ACTION_SHORT_PRESS))
         self.assertEqual(received_events[1], (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP))
+
+    def test_uninitialized_camera_capture_fails_without_synthetic_picture(self) -> None:
+        """Verifies camera capture returns DESK_HW_ERR_UNAVAILABLE (-2) when no real sensor/frame is present."""
+        self.assertFalse(self.lib.desk_hardware_camera_has_frame())
+        cap_buf = ctypes.create_string_buffer(128)
+        cap_len = ctypes.c_size_t()
+        rc = self.lib.desk_hardware_camera_capture_jpeg(cap_buf, 128, ctypes.byref(cap_len), 100)
+        self.assertEqual(rc, DESK_HW_ERR_UNAVAILABLE, "Uninitialized camera capture must fail with DESK_HW_ERR_UNAVAILABLE")
+
+        # After injecting a valid frame, capture succeeds
+        test_frame = b"\xFF\xD8\xFF\xDBREAL_SENSOR_FRAME\xFF\xD9"
+        self.lib.desk_hardware_camera_inject_frame(test_frame, len(test_frame), 1000)
+        self.assertTrue(self.lib.desk_hardware_camera_has_frame())
+        rc = self.lib.desk_hardware_camera_capture_jpeg(cap_buf, 128, ctypes.byref(cap_len), 100)
+        self.assertEqual(rc, DESK_HW_OK)
+        self.assertEqual(bytes(cap_buf.raw[:cap_len.value]), test_frame)
+
+    def test_strict_hardware_mode_enforcement(self) -> None:
+        """Verifies strict hardware mode rejects operations requiring physical hardware when missing."""
+        self.assertFalse(self.lib.desk_hardware_is_strict_mode())
+        self.lib.desk_hardware_set_strict_mode(True)
+        self.assertTrue(self.lib.desk_hardware_is_strict_mode())
+
+        # In strict mode without physical UART fd, motion move fails with DESK_HW_ERR_UNAVAILABLE
+        rc = self.lib.desk_hardware_motion_move_to(ctypes.c_float(90.0), ctypes.c_float(120.0), 300)
+        self.assertEqual(rc, DESK_HW_ERR_UNAVAILABLE)
+
+        # Disabling strict mode allows mocked/loopback motion execution
+        self.lib.desk_hardware_set_strict_mode(False)
+        rc2 = self.lib.desk_hardware_motion_move_to(ctypes.c_float(90.0), ctypes.c_float(120.0), 300)
+        self.assertEqual(rc2, DESK_HW_OK)
+
+    def test_position_getters(self) -> None:
+        """Verifies pan and tilt direct getters."""
+        self.lib.desk_hardware_motion_move_to(ctypes.c_float(60.0), ctypes.c_float(130.0), 200)
+        pan = self.lib.desk_hardware_get_pan()
+        tilt = self.lib.desk_hardware_get_tilt()
+        self.assertAlmostEqual(pan, 60.0, places=1)
+        self.assertAlmostEqual(tilt, 130.0, places=1)
+

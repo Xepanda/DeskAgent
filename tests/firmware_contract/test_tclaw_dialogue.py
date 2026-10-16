@@ -20,6 +20,13 @@ TCLAW_STATE_THINKING = 2
 TCLAW_STATE_SPEAKING = 3
 TCLAW_STATE_TOOL_CALLING = 4
 
+TUYA_CLOUD_DISCONNECTED = 0
+TUYA_CLOUD_CONNECTING = 1
+TUYA_CLOUD_CONNECTED = 2
+TUYA_CLOUD_STREAMING = 3
+TUYA_CLOUD_RECONNECTING = 4
+TUYA_CLOUD_ERROR = 5
+
 DESK_RES_AUDIO_PLAYBACK = 0
 DESK_OWNER_NONE = 0
 DESK_OWNER_TCLAW_VOICE = 2
@@ -106,6 +113,18 @@ class TestTClawDialogue(unittest.TestCase):
         cls.lib.desk_tclaw_get_turn_count.argtypes = []
 
         # Tuya Cloud Dialogue Session API
+        cls.lib.desk_tclaw_tuya_session_connect.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_session_connect.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+
+        cls.lib.desk_tclaw_tuya_session_disconnect.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_session_disconnect.argtypes = []
+
+        cls.lib.desk_tclaw_tuya_session_reconnect.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_session_reconnect.argtypes = []
+
+        cls.lib.desk_tclaw_tuya_session_get_connection_state.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_session_get_connection_state.argtypes = []
+
         cls.lib.desk_tclaw_tuya_session_start.restype = ctypes.c_int
         cls.lib.desk_tclaw_tuya_session_start.argtypes = [ctypes.c_char_p]
 
@@ -117,6 +136,9 @@ class TestTClawDialogue(unittest.TestCase):
 
         cls.lib.desk_tclaw_tuya_send_tool_result.restype = ctypes.c_int
         cls.lib.desk_tclaw_tuya_send_tool_result.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+
+        cls.lib.desk_tclaw_tuya_get_last_tool_result.restype = ctypes.c_int
+        cls.lib.desk_tclaw_tuya_get_last_tool_result.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
 
         cls.lib.desk_tclaw_tuya_session_stop.restype = ctypes.c_int
         cls.lib.desk_tclaw_tuya_session_stop.argtypes = []
@@ -287,4 +309,44 @@ class TestTClawDialogue(unittest.TestCase):
         self.assertEqual(rc_stop, 0)
         self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_IDLE)
         self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_NONE)
+
+    def test_tuya_cloud_connection_state_machine(self) -> None:
+        """Verifies Tuya Cloud session connection state machine: DISCONNECTED -> CONNECTED -> STREAMING -> RECONNECTING."""
+        # Initial state is DISCONNECTED
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
+
+        # Connect with credentials
+        rc = self.lib.desk_tclaw_tuya_session_connect(b"wss://tuya.cloud/voice", b"dev-watcher-01", b"secret-token")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_CONNECTED)
+        self.assertTrue(len(self.lib.desk_tclaw_tuya_get_session_id()) > 0)
+
+        # Feed audio transitions to STREAMING
+        fake_pcm = b"\x00\x20" * 16
+        self.lib.desk_tclaw_tuya_session_feed_audio(fake_pcm, len(fake_pcm))
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_STREAMING)
+
+        # Disconnect transitions to DISCONNECTED
+        self.lib.desk_tclaw_tuya_session_disconnect()
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
+
+        # Reconnect restores connection
+        rc_rec = self.lib.desk_tclaw_tuya_session_reconnect()
+        self.assertEqual(rc_rec, 0)
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_CONNECTED)
+
+    def test_tuya_tool_result_recording(self) -> None:
+        """Verifies tool results sent back to Tuya session are preserved in context."""
+        rc = self.lib.desk_tclaw_tuya_send_tool_result(
+            b"sess-123",
+            b"ha.turn_on",
+            b'{"status": "success", "brightness": 255}',
+        )
+        self.assertEqual(rc, 0)
+
+        res_buf = ctypes.create_string_buffer(256)
+        rc_get = self.lib.desk_tclaw_tuya_get_last_tool_result(res_buf, 256)
+        self.assertEqual(rc_get, 0)
+        self.assertEqual(res_buf.value.decode("utf-8"), '{"status": "success", "brightness": 255}')
+
 
