@@ -328,3 +328,38 @@
 6. 必须保持泰山派跨机访问 Windows Companion 的**可配置**能力（合法令牌下正常工作）。
 7. **严禁**对外暴露 Codex app-server 本身（仅暴露 Companion 的 `/health` 与 `/rpc`）。
 
+### 6.6 第二轮补充裁决 (V2.1.0 追加)
+
+**R6：`STATE_UNCONFIRMED` 主动确认窗口 —— 暂不实现，登记为 CR-002。**
+§6.1 表中"ACK 已受理但确认窗口内观测不到物理状态 → `unknown` + `STATE_UNCONFIRMED`"要求 Host 主动等待物理完成事件。
+但当前 `sys.ack` **不携带** `job_id` / `operation_id`，ACK 与 `resource.motion.completed` 事件之间**无关联字段**，
+无法在不新增接口的前提下实现该窗口。故本轮裁决：
+- 已受理未确认 → 终态 `accepted` + `state_confirmed: false`（**不得**报 `succeeded`/`completed`）；
+- 主动确认窗口的实现依赖 ACK→完成事件关联，作为接口缺口登记于 **CR-002**；
+- Host 侧保留 `STATE_UNCONFIRMED` 的**透传**处理，以备固件将来直接返回该码。
+
+**R7：机器人硬件链路断开 → `failed` + `UPSTREAM_UNAVAILABLE`。**
+机器人 SDK 桥接连路不可达时，请求**未能下发**，终态必须为 `failed`（而非 `unknown`——Host 明确知道失败原因），
+错误码 `UPSTREAM_UNAVAILABLE`，`retryable: true`（链路恢复后可重试）。
+说明：`contracts/error_codes.json` 中该码的既有描述列举的是 HA Core / Tuya 云端 / Codex app-server；
+将机器人桥接链路纳入同一语义（"上游/对端不可达"）为 A0 认可的解释，**不修改错误码定义本身**。
+
+**R8：Windows Companion 启动安全 —— 认可 A5 的从严解读。**
+A5 在 §6.5 基础上采取了四项更严格的处理，A0 **全部认可**并纳入契约：
+1. 占位令牌在**回环地址下同样拒绝**（提交进仓库的占位值永远不是真实凭据）；
+2. 非回环监听要求令牌**至少 16 字符**（`MIN_LAN_AUTH_TOKEN_LENGTH = 16`）；
+3. 显式指定的 `--config` 路径不存在时**拒绝启动**（不再静默忽略）；
+4. 新增 `--check-config` 自检入口（仅输出 `{status, host, port, loopback_only, auth_required}`，**绝不回显令牌**）。
+
+**R9：`desk_sdk_bridge_set_pairing_token()` 仅设置凭据，不得置 `s_paired`。**
+`s_paired` 语义为"已有客户端成功完成配对"，**只能**由经过校验的配对握手置位（§6.4）。
+Provisioning 接口置位配对状态属于"未经验证即进入已配对状态"的反模式，即使该路径当前不可从网络触达，也必须纠正。
+
+**R10：本轮不予修复、留待后续裁决的既有问题（记录在案，不属本任务范围）。**
+1. 错误码词汇漂移：`RESOURCE_ERROR`、`HARDWARE_ERROR`、`OUT_OF_MEMORY`、`INVALID_ARGUMENTS`、`AUTH_FAILED`
+   不在 `contracts/error_codes.json` 的 13 个冻结码内（应分别对应 `HARDWARE_FAULT` / `INVALID_ARGUMENT` / `UNAUTHORIZED`）。
+   修改会影响其他 owner 的测试，需单独裁决。
+2. `camera.capture` 将驱动采集失败映射为 409 `RESOURCE_BUSY`，语义上应为 `HARDWARE_FAULT`。
+3. §6.1 的一般性 ACK 层级规则（设备侧成功 ACK 一律为"已受理"）已由 A2 一致应用于
+   `motion.action.play`、`camera.acquire`、`camera.release`、`microphone.close`、`expression.play/set`，A0 认可。
+
