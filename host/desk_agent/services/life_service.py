@@ -16,50 +16,67 @@ import sqlite3
 import threading
 import uuid
 import time
+import zoneinfo
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 
-def compute_next_occurrence(current_iso: str, repeat_rule: str, timezone_str: str = "Asia/Shanghai") -> Optional[str]:
-    """Computes the next ISO 8601 UTC timestamp based on repeat rule."""
+def compute_next_occurrence(
+    current_iso: str,
+    repeat_rule: str,
+    tz_name: Optional[str] = None,
+    timezone_str: Optional[str] = None,
+) -> Optional[str]:
+    """Computes the next ISO 8601 UTC timestamp based on repeat rule and timezone."""
     if not repeat_rule:
         return None
 
     try:
         dt = datetime.fromisoformat(current_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
+    target_tz_str = tz_name or timezone_str
+    target_tz = timezone.utc
+    if target_tz_str:
+        try:
+            target_tz = zoneinfo.ZoneInfo(target_tz_str)
+        except Exception:
+            target_tz = timezone.utc
+
+    local_dt = dt.astimezone(target_tz)
     rule = repeat_rule.strip().lower()
 
     if rule in ("daily", "freq=daily"):
-        next_dt = dt + timedelta(days=1)
+        next_dt = local_dt + timedelta(days=1)
     elif rule in ("weekly", "freq=weekly"):
-        next_dt = dt + timedelta(days=7)
+        next_dt = local_dt + timedelta(days=7)
     elif rule in ("hourly", "freq=hourly"):
-        next_dt = dt + timedelta(hours=1)
+        next_dt = local_dt + timedelta(hours=1)
     elif rule == "weekdays":
-        weekday = dt.weekday()
+        weekday = local_dt.weekday()
         if weekday < 4:  # Mon-Thu -> next day
-            next_dt = dt + timedelta(days=1)
+            next_dt = local_dt + timedelta(days=1)
         elif weekday == 4:  # Friday -> Monday (+3 days)
-            next_dt = dt + timedelta(days=3)
+            next_dt = local_dt + timedelta(days=3)
         elif weekday == 5:  # Saturday -> Monday (+2 days)
-            next_dt = dt + timedelta(days=2)
+            next_dt = local_dt + timedelta(days=2)
         else:  # Sunday -> Monday (+1 day)
-            next_dt = dt + timedelta(days=1)
+            next_dt = local_dt + timedelta(days=1)
     elif rule.startswith("interval:"):
         try:
             mins = int(rule.split(":", 1)[1])
-            next_dt = dt + timedelta(minutes=mins)
+            next_dt = local_dt + timedelta(minutes=mins)
         except ValueError:
             return None
     elif "interval=" in rule and "minutely" in rule:
         try:
             part = [p for p in rule.split(";") if p.startswith("interval=")][0]
             mins = int(part.split("=")[1])
-            next_dt = dt + timedelta(minutes=mins)
+            next_dt = local_dt + timedelta(minutes=mins)
         except (IndexError, ValueError):
             return None
     else:
@@ -75,6 +92,12 @@ class LifeService:
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
+    def __enter__(self) -> LifeService:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
     def _get_connection(self) -> sqlite3.Connection:
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -88,8 +111,10 @@ class LifeService:
         """Closes the underlying SQLite database connection."""
         with self._lock:
             if self._conn is not None:
-                self._conn.close()
-                self._conn = None
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
 
     def _init_db(self) -> None:
         with self._lock, self._get_connection() as conn:
@@ -328,7 +353,7 @@ class LifeService:
             row = conn.execute(
                 """
                 SELECT o.occurrence_id, o.reminder_id, o.scheduled_at,
-                       r.repeat_rule, r.status as rem_status
+                       r.repeat_rule, r.timezone, r.status as rem_status
                 FROM occurrences o
                 JOIN reminders r ON o.reminder_id = r.reminder_id
                 WHERE o.occurrence_id = ?
@@ -341,6 +366,7 @@ class LifeService:
             reminder_id = row["reminder_id"]
             scheduled_at = row["scheduled_at"]
             repeat_rule = row["repeat_rule"]
+            rem_tz = row["timezone"] if "timezone" in row.keys() else "Asia/Shanghai"
 
             conn.execute(
                 "UPDATE occurrences SET state = 'ringing' WHERE occurrence_id = ?",
@@ -359,7 +385,7 @@ class LifeService:
                 ).fetchone()[0]
 
                 if pending_count == 0:
-                    next_due = compute_next_occurrence(scheduled_at, repeat_rule)
+                    next_due = compute_next_occurrence(scheduled_at, repeat_rule, tz_name=rem_tz)
                     if next_due:
                         try:
                             next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
@@ -379,6 +405,103 @@ class LifeService:
                         )
 
             conn.commit()
+
+    def trigger_occurrence_to_outbox(
+        self,
+        occurrence_id: str,
+        topic: str = "reminder.alert",
+        is_catchup: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Transitions occurrence state to ringing, updates reminder status,
+        computes and schedules next pending occurrence if recurring, and creates outbox record.
+        All executed within a SINGLE SQLite transaction committed once.
+        """
+        now_str = self._now_utc_str()
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT o.occurrence_id, o.reminder_id, o.scheduled_at, o.state as occ_state,
+                       r.title, r.repeat_rule, r.timezone, r.status as rem_status
+                FROM occurrences o
+                JOIN reminders r ON o.reminder_id = r.reminder_id
+                WHERE o.occurrence_id = ?
+                """,
+                (occurrence_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            reminder_id = row["reminder_id"]
+            scheduled_at = row["scheduled_at"]
+            repeat_rule = row["repeat_rule"]
+            title = row["title"]
+            rem_tz = row["timezone"] if "timezone" in row.keys() else "Asia/Shanghai"
+
+            conn.execute(
+                "UPDATE occurrences SET state = 'ringing' WHERE occurrence_id = ?",
+                (occurrence_id,),
+            )
+            conn.execute(
+                "UPDATE reminders SET status = 'ringing', updated_at = ? WHERE reminder_id = ?",
+                (now_str, reminder_id),
+            )
+
+            # Auto-schedule next occurrence for repeating reminder if not already scheduled
+            if repeat_rule and row["rem_status"] != "cancelled":
+                pending_count = conn.execute(
+                    "SELECT COUNT(*) FROM occurrences WHERE reminder_id = ? AND state = 'pending'",
+                    (reminder_id,),
+                ).fetchone()[0]
+
+                if pending_count == 0:
+                    next_due = compute_next_occurrence(scheduled_at, repeat_rule, tz_name=rem_tz)
+                    if next_due:
+                        try:
+                            next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
+                        except Exception:
+                            next_ts = int(time.time())
+                        next_occ_id = f"occ-{reminder_id}-{next_ts}"
+                        conn.execute(
+                            """
+                            INSERT INTO occurrences (occurrence_id, reminder_id, scheduled_at, state)
+                            VALUES (?, ?, ?, 'pending')
+                            """,
+                            (next_occ_id, reminder_id, next_due),
+                        )
+                        conn.execute(
+                            "UPDATE reminders SET due_at = ?, updated_at = ? WHERE reminder_id = ?",
+                            (next_due, now_str, reminder_id),
+                        )
+
+            outbox_id = f"outbox-{uuid.uuid4().hex[:12]}"
+            payload = {
+                "occurrence_id": occurrence_id,
+                "reminder_id": reminder_id,
+                "title": title,
+                "scheduled_at": scheduled_at,
+                "is_catchup": is_catchup,
+            }
+            payload_str = json.dumps(payload, ensure_ascii=False)
+            conn.execute(
+                """
+                INSERT INTO outbox (outbox_id, event_type, payload_json, state, retry_count, created_at)
+                VALUES (?, ?, ?, 'pending', 0, ?)
+                """,
+                (outbox_id, topic, payload_str, now_str),
+            )
+
+            conn.commit()
+
+        return {
+            "outbox_id": outbox_id,
+            "occurrence_id": occurrence_id,
+            "reminder_id": reminder_id,
+            "topic": topic,
+            "payload": payload,
+            "scheduled_at": scheduled_at,
+            "is_catchup": is_catchup,
+        }
 
     def stop_ringing(self, occurrence_id: str) -> dict[str, Any]:
         """

@@ -27,10 +27,11 @@ class TestHostDaemon(unittest.TestCase):
         # Initialize App
         cls.app = DeskAgentHostApp(config_path=str(cfg_file))
 
-        # Start HTTP server on ephemeral port (8099)
-        cls.port = 8099
+        # Start HTTP server on an ephemeral port so concurrent suite runs
+        # (and any other process) can never collide on a fixed port.
         handler = make_request_handler(cls.app)
-        cls.server = ThreadedHTTPServer(("127.0.0.1", cls.port), handler)
+        cls.server = ThreadedHTTPServer(("127.0.0.1", 0), handler)
+        cls.port = cls.server.server_address[1]
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
         time.sleep(0.1)
@@ -215,11 +216,16 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data["status"], "succeeded")
             self.assertTrue(data["result"]["granted"])
 
+        # Wait briefly for capture pipeline to produce first frame
+        time.sleep(0.15)
+
         # 2. Fetch live frame
         frame_req = Request(f"http://127.0.0.1:{self.port}/api/camera/frame?client_id=web-viewer-01")
         with urlopen(frame_req) as frame_resp:
             self.assertEqual(frame_resp.status, 200)
             self.assertEqual(frame_resp.headers.get("Content-Type"), "image/jpeg")
+            self.assertIsNotNone(frame_resp.headers.get("X-Frame-Source"))
+            self.assertIn(frame_resp.headers.get("X-Frame-Hardware"), ("0", "1"))
             raw_jpeg = frame_resp.read()
             self.assertTrue(raw_jpeg.startswith(b"\xff\xd8"))
 
@@ -279,6 +285,299 @@ class TestHostDaemon(unittest.TestCase):
             f"Alert must be processed: delivered={delivered_ids}, pending={pending_topics}",
         )
 
+    def test_scheduler_loop_uses_atomic_trigger(self) -> None:
+        """Verifies scheduler loop triggers due reminders via atomic trigger_occurrence_to_outbox."""
+        called_occs = []
+        original_trigger = getattr(self.app.life_service, "trigger_occurrence_to_outbox", None)
+
+        def spy_trigger(occurrence_id, topic="reminder.alert", is_catchup=False):
+            called_occs.append(occurrence_id)
+            if original_trigger:
+                return original_trigger(occurrence_id, topic=topic, is_catchup=is_catchup)
+            return None
+
+        self.app.life_service.trigger_occurrence_to_outbox = spy_trigger
+        try:
+            self.app.life_service.create_reminder(
+                reminder_id="rem-atomic-sched-01",
+                title="Atomic Sched Alert",
+                due_at="2020-01-01T00:00:00Z",
+            )
+            # Wait for scheduler loop to pick it up
+            time.sleep(1.2)
+            self.assertTrue(len(called_occs) >= 1, "Scheduler loop must call trigger_occurrence_to_outbox")
+        finally:
+            if original_trigger:
+                self.app.life_service.trigger_occurrence_to_outbox = original_trigger
+            elif hasattr(self.app.life_service, "trigger_occurrence_to_outbox"):
+                delattr(self.app.life_service, "trigger_occurrence_to_outbox")
+
+    def test_robot_tool_request_dispatched_to_router(self) -> None:
+        """Verifies Host processes tool request from robot dialogue engine and sends response back."""
+        # 1. Wrapped format
+        wrapped_req = {
+            "type": "tool.request",
+            "data": {
+                "schema_version": "1.0.0",
+                "request_id": "req-tclaw-router-01",
+                "operation": "reminder.create",
+                "arguments": {
+                    "reminder_id": "rem-tclaw-bridge-01",
+                    "title": "Drink Coffee",
+                    "due_at": "2026-10-16T16:00:00Z",
+                },
+                "expires_at": "2030-01-01T00:00:00Z",
+            },
+        }
+
+        sent_responses: list[dict] = []
+        if self.app.robot_adapter:
+            original_send = self.app.robot_adapter.send_tool_response
+            self.app.robot_adapter.send_tool_response = lambda resp: sent_responses.append(resp) or True
+        else:
+            class DummyAdapter:
+                def send_tool_response(self, resp):
+                    sent_responses.append(resp)
+                    return True
+            self.app.robot_adapter = DummyAdapter()
+            original_send = None
+
+        try:
+            self.app._on_robot_tool_request(wrapped_req)
+            self.assertEqual(len(sent_responses), 1)
+            resp = sent_responses[0]
+            self.assertEqual(resp["request_id"], "req-tclaw-router-01")
+            self.assertEqual(resp["status"], "succeeded")
+            self.assertEqual(resp["result"]["reminder_id"], "rem-tclaw-bridge-01")
+
+            # Check reminder actually exists in life service
+            rem = self.app.life_service.get_reminder("rem-tclaw-bridge-01")
+            self.assertIsNotNone(rem)
+            self.assertEqual(rem["title"], "Drink Coffee")
+
+            # 2. Direct envelope format
+            direct_req = {
+                "schema_version": "1.0.0",
+                "request_id": "req-tclaw-router-02",
+                "operation": "ha.get_state",
+                "arguments": {"entity_id": "light.living_room"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            self.app._on_robot_tool_request(direct_req)
+            self.assertEqual(len(sent_responses), 2)
+            resp2 = sent_responses[1]
+            self.assertEqual(resp2["request_id"], "req-tclaw-router-02")
+            self.assertEqual(resp2["status"], "succeeded")
+        finally:
+            if original_send and self.app.robot_adapter:
+                self.app.robot_adapter.send_tool_response = original_send
+
+    def test_motion_move_with_pan_deg_and_tilt_deg(self) -> None:
+        """Verifies resource.motion.move accepts pan_deg/tilt_deg as well as pan/tilt and updates coordinates.
+
+        A firmware ACK only proves the command was accepted, so the envelope must
+        report ``accepted`` (never ``succeeded``) and must not carry the removed
+        host-invented ``executed`` field (interfaces.md 6.1).
+        """
+        dispatched: list[tuple[float, float, int]] = []
+
+        class MockRobotClient:
+            is_connected = True
+
+            def send_motion_move(self, pan: float, tilt: float, duration_ms: int = 500):
+                dispatched.append((pan, tilt, duration_ms))
+                return {
+                    "status": "accepted",
+                    "accepted": True,
+                    "state_confirmed": False,
+                    "error_code": None,
+                    "retryable": False,
+                    "pan": pan,
+                    "tilt": tilt,
+                    "duration_ms": duration_ms,
+                }
+
+        original_client = self.app._robot_client
+        self.app._robot_client = MockRobotClient()
+        try:
+            # 1. Using pan_deg and tilt_deg
+            move_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-motion-deg-01",
+                "operation": "resource.motion.move",
+                "arguments": {
+                    "pan_deg": 45.0,
+                    "tilt_deg": 115.0,
+                    "duration_ms": 300,
+                },
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            req = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(move_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "accepted")
+                res = data["result"]
+                self.assertNotIn("executed", res, "`executed` is not a contract field and must be removed")
+                self.assertTrue(res["accepted"])
+                self.assertFalse(res["state_confirmed"])
+                self.assertEqual(res["pan"], 45.0)
+                self.assertEqual(res["tilt"], 115.0)
+                self.assertEqual(self.app.camera_service.pipeline._current_pan, 45.0)
+                self.assertEqual(self.app.camera_service.pipeline._current_tilt, 115.0)
+
+            # 2. Using fallback pan and tilt keys
+            move_fallback = {
+                "schema_version": "1.0.0",
+                "request_id": "req-motion-fallback-01",
+                "operation": "resource.motion.move",
+                "arguments": {
+                    "pan": 75.0,
+                    "tilt": 125.0,
+                    "duration_ms": 250,
+                },
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            req2 = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(move_fallback).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req2) as resp2:
+                data2 = json.loads(resp2.read().decode())
+                self.assertEqual(data2["status"], "accepted")
+                res2 = data2["result"]
+                self.assertEqual(res2["pan"], 75.0)
+                self.assertEqual(res2["tilt"], 125.0)
+                self.assertEqual(self.app.camera_service.pipeline._current_pan, 75.0)
+                self.assertEqual(self.app.camera_service.pipeline._current_tilt, 125.0)
+        finally:
+            self.app._robot_client = original_client
+
+    def test_motion_move_route_disconnected_is_not_reported_as_success(self) -> None:
+        """Without a hardware link, resource.motion.move must not fabricate a success."""
+        move_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-motion-move-nolink-01",
+            "operation": "resource.motion.move",
+            "arguments": {"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 200},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(move_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertNotEqual(data["status"], "succeeded")
+            self.assertEqual(data["status"], "failed")
+            self.assertEqual(data["error"]["code"], "UPSTREAM_UNAVAILABLE")
+            self.assertTrue(data["error"]["retryable"])
+            self.assertNotIn("result", data)
+            self.assertEqual(data["error"]["details"]["reason"], "NO_PHYSICAL_ROBOT_CONNECTED")
+
+    def test_motion_stop_route_disconnected(self) -> None:
+        """Verifies resource.motion.stop reports UPSTREAM_UNAVAILABLE instead of a simulated success."""
+        stop_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-motion-stop-01",
+            "operation": "resource.motion.stop",
+            "arguments": {"emergency": True},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(stop_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertNotEqual(data["status"], "succeeded")
+            self.assertEqual(data["status"], "failed")
+            self.assertEqual(data["error"]["code"], "UPSTREAM_UNAVAILABLE")
+            self.assertTrue(data["error"]["retryable"])
+            self.assertNotIn("result", data)
+            self.assertEqual(data["error"]["details"]["reason"], "NO_PHYSICAL_ROBOT_CONNECTED")
+            self.assertEqual(data["error"]["details"]["hardware_link"], "disconnected")
+
+    def test_motion_stop_route_connected(self) -> None:
+        """Verifies resource.motion.stop reports `accepted` (not a fabricated completion) when connected."""
+        called_args = []
+
+        class MockRobotClient:
+            is_connected = True
+
+            def send_motion_stop(self, emergency: bool = False):
+                called_args.append(emergency)
+                return {
+                    "status": "accepted",
+                    "accepted": True,
+                    "state_confirmed": False,
+                    "error_code": None,
+                    "retryable": False,
+                    "emergency": emergency,
+                }
+
+        original_client = self.app._robot_client
+        self.app._robot_client = MockRobotClient()
+        try:
+            stop_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-motion-stop-02",
+                "operation": "resource.motion.stop",
+                "arguments": {"emergency": False},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            req = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(stop_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "accepted")
+                res = data["result"]
+                self.assertTrue(res["accepted"])
+                self.assertFalse(res["state_confirmed"])
+                self.assertEqual(res["hardware_link"], "connected")
+                self.assertNotIn("executed", res)
+                self.assertEqual(called_args, [False])
+        finally:
+            self.app._robot_client = original_client
+
+    def test_robot_adapter_send_motion_stop(self) -> None:
+        """Verifies RobotAdapter.send_motion_stop sends ctrl.motion.stop and reports an accepted outcome."""
+        from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
+
+        adapter = RobotAdapter(auto_pair=False)
+        sent_cmds = []
+
+        def mock_send(cmd, timeout=2.0):
+            sent_cmds.append(cmd)
+            return {"type": "sys.ack", "code": 0, "data": {"status": "accepted", "accepted": True}}
+
+        adapter.send_command = mock_send
+        res = adapter.send_motion_stop(emergency=True)
+
+        self.assertEqual(len(sent_cmds), 1)
+        self.assertEqual(sent_cmds[0]["type"], "ctrl.motion.stop")
+        self.assertEqual(sent_cmds[0]["data"]["emergency"], True)
+        self.assertEqual(res["status"], "accepted")
+        self.assertTrue(res["accepted"])
+        self.assertFalse(res["state_confirmed"])
+        self.assertIsNone(res["error_code"])
+        self.assertTrue(res["emergency"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

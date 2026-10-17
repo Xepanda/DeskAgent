@@ -193,6 +193,30 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         cls.lib.desk_hardware_get_tilt.restype = ctypes.c_float
         cls.lib.desk_hardware_get_tilt.argtypes = []
 
+        cls.lib.desk_hardware_format_stm32_motion_packet.restype = ctypes.c_int
+        cls.lib.desk_hardware_format_stm32_motion_packet.argtypes = [
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+
+        cls.lib.desk_hardware_format_stm32_stop_packet.restype = ctypes.c_int
+        cls.lib.desk_hardware_format_stm32_stop_packet.argtypes = [
+            ctypes.c_bool,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+
+        cls.lib.desk_hardware_set_display_initialized.restype = None
+        cls.lib.desk_hardware_set_display_initialized.argtypes = [ctypes.c_bool]
+
+        cls.lib.desk_hardware_is_display_initialized.restype = ctypes.c_bool
+        cls.lib.desk_hardware_is_display_initialized.argtypes = []
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
@@ -450,4 +474,72 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         tilt = self.lib.desk_hardware_get_tilt()
         self.assertAlmostEqual(pan, 60.0, places=1)
         self.assertAlmostEqual(tilt, 130.0, places=1)
+
+    def test_display_arbiter_and_strict_mode_enforcement(self) -> None:
+        """Verifies display arbiter preemption and strict mode display hardware enforcement."""
+        # 1. Display UI arbiter preemption
+        rc = self.lib.desk_arbiter_acquire(DESK_RES_DISPLAY_UI, DESK_OWNER_SDK_REMOTE, 0)
+        self.assertEqual(rc, DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_DISPLAY_UI), DESK_OWNER_SDK_REMOTE)
+
+        # TCLAW_VOICE preempts SDK_REMOTE on display
+        rc2 = self.lib.desk_arbiter_acquire(DESK_RES_DISPLAY_UI, DESK_OWNER_TCLAW_VOICE, 0)
+        self.assertEqual(rc2, DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_DISPLAY_UI), DESK_OWNER_TCLAW_VOICE)
+
+        # SDK_REMOTE cannot preempt TCLAW_VOICE
+        rc3 = self.lib.desk_arbiter_acquire(DESK_RES_DISPLAY_UI, DESK_OWNER_SDK_REMOTE, 0)
+        self.assertEqual(rc3, DESK_ARBITER_ERR_BUSY)
+
+        self.lib.desk_arbiter_release(DESK_RES_DISPLAY_UI, DESK_OWNER_TCLAW_VOICE)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_DISPLAY_UI), DESK_OWNER_NONE)
+
+        # 2. Strict hardware mode display enforcement
+        self.lib.desk_hardware_set_strict_mode(True)
+        self.lib.desk_hardware_set_display_initialized(False)
+
+        rc_disp = self.lib.desk_hardware_display_set_expression(b"alert", b"Hardware Check")
+        self.assertEqual(rc_disp, DESK_HW_ERR_UNAVAILABLE, "Uninitialized display must fail in strict mode")
+
+        # After initializing display hardware, expression succeeds in strict mode
+        self.lib.desk_hardware_set_display_initialized(True)
+        rc_disp_ok = self.lib.desk_hardware_display_set_expression(b"alert", b"Hardware Check")
+        self.assertEqual(rc_disp_ok, DESK_HW_OK)
+
+        self.lib.desk_hardware_set_strict_mode(False)
+
+    def test_motion_packet_formatting_and_arbiter_lifecycle(self) -> None:
+        """Verifies STM32 motion move and stop binary packet formatting and arbiter release."""
+        # 1. Format motion move packet
+        buf = ctypes.create_string_buffer(64)
+        out_len = ctypes.c_size_t()
+        rc = self.lib.desk_hardware_format_stm32_motion_packet(
+            ctypes.c_float(75.0), ctypes.c_float(115.0), 250, buf, 64, ctypes.byref(out_len)
+        )
+        self.assertEqual(rc, DESK_HW_OK)
+        self.assertEqual(out_len.value, 23)
+        raw = bytes(buf.raw[:23])
+        self.assertEqual(raw[0], 0xA5)
+        self.assertEqual(raw[1], 0x5A)
+        self.assertEqual(raw[2], 0x01)  # proto version
+        self.assertEqual(raw[3], 0x02)  # motion class
+        self.assertEqual(raw[4], 0x01)  # servo move msg
+
+        # 2. Format motion stop packet
+        rc_stop = self.lib.desk_hardware_format_stm32_stop_packet(
+            True, buf, 64, ctypes.byref(out_len)
+        )
+        self.assertEqual(rc_stop, DESK_HW_OK)
+        self.assertEqual(out_len.value, 16)
+        raw_stop = bytes(buf.raw[:16])
+        self.assertEqual(raw_stop[0], 0xA5)
+        self.assertEqual(raw_stop[1], 0x5A)
+        self.assertEqual(raw_stop[4], 0x02)  # stop msg
+
+        # 3. Motion arbiter lifecycle on stop
+        self.lib.desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE, 0)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_SDK_REMOTE)
+        self.lib.desk_hardware_motion_stop(False)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_NONE)
+
 

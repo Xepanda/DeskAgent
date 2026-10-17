@@ -128,6 +128,12 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             ctypes.c_size_t,
         ]
 
+        cls.lib.desk_sdk_bridge_set_pairing_code.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_set_pairing_code.argtypes = [ctypes.c_char_p]
+
+        cls.lib.desk_sdk_bridge_is_pairing_code_configured.restype = ctypes.c_bool
+        cls.lib.desk_sdk_bridge_is_pairing_code_configured.argtypes = []
+
         cls.lib.desk_sdk_bridge_register_outbound.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_register_outbound.argtypes = [OUTBOUND_CB, ctypes.c_void_p]
 
@@ -149,6 +155,10 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.lib.desk_hardware_init()
         self.lib.desk_tclaw_init()
         self.lib.desk_sdk_bridge_init()
+        # The device-side expected pairing code must be provisioned explicitly;
+        # without it pairing is fail-closed (interfaces.md 6.4 / CR-001).
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
 
     def _exec_command(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")
@@ -185,6 +195,41 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(parsed_msg.target_mode, "python_sdk")
         self.assertEqual(len(parsed_msg.session_token), 64)
         self.assertTrue(all(c in "0123456789abcdef" for c in parsed_msg.session_token))
+
+    def test_official_udp_pairing_rejected_when_unprovisioned(self) -> None:
+        """Fail-closed: an unprovisioned device must not answer with pair.accept."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        official_pair_req = PairRequest(
+            request_id="21a9dbf05ea3443480e62076f79a3b12",
+            daemon_instance_id="f730f29e670c49f7a3320c4314eb9805",
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+        )
+        wire_bytes = encode_udp_message(official_pair_req)
+
+        out_buf = ctypes.create_string_buffer(1024)
+        rc = self.lib.desk_sdk_bridge_process_pairing_udp(wire_bytes, out_buf, 1024)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out_buf.value, b"", "no pairing response may be emitted")
+
+    def test_official_udp_pairing_rejected_on_wrong_code(self) -> None:
+        """A mismatching pairing_code must not yield a PairAccept."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+
+        official_pair_req = PairRequest(
+            request_id="21a9dbf05ea3443480e62076f79a3b12",
+            daemon_instance_id="f730f29e670c49f7a3320c4314eb9805",
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+        )
+        out_buf = ctypes.create_string_buffer(1024)
+        rc = self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(official_pair_req), out_buf, 1024)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(out_buf.value, b"")
 
     def test_official_hardware_hello_with_token(self) -> None:
         """Verifies sys.client.hello with role=hardware carrying session_token succeeds and returns negotiated parameters."""
@@ -262,7 +307,10 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         })
         self.assertEqual(resp["type"], "sys.ack")
         self.assertEqual(resp["code"], 0)
-        self.assertEqual(resp["data"]["status"], "succeeded")
+        # A device ACK only means "accepted" (interfaces.md 6.1); physical
+        # completion is signalled by the resource.motion.completed event.
+        self.assertEqual(resp["data"]["status"], "accepted")
+        self.assertTrue(resp["data"]["accepted"])
         self.assertAlmostEqual(resp["data"]["pan_deg"], 125.0, places=1)
         self.assertAlmostEqual(resp["data"]["tilt_deg"], 115.0, places=1)
 
@@ -337,7 +385,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             "data": {"session_id": session_id, "command_id": "cmd-mic-close-01"},
         })
         self.assertEqual(resp_close["type"], "sys.ack")
-        self.assertEqual(resp_close["data"]["status"], "succeeded")
+        self.assertEqual(resp_close["data"]["status"], "accepted")
 
     def test_official_expression_audio_follow(self) -> None:
         """Verifies ctrl.expression.audio_follow toggling."""
@@ -362,7 +410,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             "data": {"pan_deg": 40, "tilt_deg": 120, "command_id": "cmd-parallel-01"},
         })
         self.assertEqual(resp_motion["type"], "sys.ack")
-        self.assertEqual(resp_motion["data"]["status"], "succeeded")
+        self.assertEqual(resp_motion["data"]["status"], "accepted")
 
         # 3. TClaw finishes speech turn
         self.lib.desk_tclaw_interrupt()

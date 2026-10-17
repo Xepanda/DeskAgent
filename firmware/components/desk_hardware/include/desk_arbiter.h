@@ -43,6 +43,9 @@ typedef enum {
     DESK_RES_MAX
 } desk_resource_type_t;
 
+#define DESK_OWNER_SDK_CLIENT   DESK_OWNER_SDK_REMOTE
+#define DESK_RES_DISPLAY        DESK_RES_DISPLAY_UI
+
 /**
  * @brief Arbitration status codes.
  */

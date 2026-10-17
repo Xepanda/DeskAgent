@@ -63,6 +63,59 @@ DEFAULT_DENIED_SERVICES = frozenset({
 
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 
+KNOWN_ATTRIBUTE_KEYS = frozenset({
+    "brightness",
+    "color_temp",
+    "color_temp_kelvin",
+    "rgb_color",
+    "xy_color",
+    "hs_color",
+    "temperature",
+    "target_temperature",
+    "target_temp_high",
+    "target_temp_low",
+    "percentage",
+    "volume_level",
+    "is_volume_muted",
+    "fan_mode",
+    "preset_mode",
+    "swing_mode",
+    "humidity",
+    "position",
+})
+
+
+def _compare_attribute_value(key: str, observed: Any, expected: Any) -> bool:
+    if observed == expected:
+        return True
+
+    # Collections (e.g. list/tuple equality)
+    if isinstance(observed, (list, tuple)) and isinstance(expected, (list, tuple)):
+        return list(observed) == list(expected)
+
+    # Numeric comparison with tolerances
+    try:
+        if not isinstance(observed, bool) and not isinstance(expected, bool):
+            obs_num = float(observed)
+            exp_num = float(expected)
+            if key in ("brightness", "color_temp", "color_temp_kelvin", "percentage"):
+                return abs(obs_num - exp_num) <= 2
+            elif key in ("temperature", "target_temperature", "target_temp_high", "target_temp_low"):
+                return abs(obs_num - exp_num) <= 0.5
+            elif key in ("volume_level",):
+                return abs(obs_num - exp_num) <= 0.05
+            else:
+                return abs(obs_num - exp_num) <= 1e-4
+    except (ValueError, TypeError):
+        pass
+
+    # String comparison (case-insensitive strip)
+    if isinstance(observed, str) and isinstance(expected, str):
+        return observed.strip().lower() == expected.strip().lower()
+
+    return False
+
+
 # Type alias for HTTP transport handler: (method, url, headers, payload, timeout) -> (status_code, response_data)
 HttpTransport = Callable[[str, str, Mapping[str, str], Optional[Mapping[str, Any]], float], tuple[int, Any]]
 
@@ -505,6 +558,35 @@ class HAConnector:
                     allowed_list.append(st)
         return allowed_list
 
+    @staticmethod
+    def _is_state_confirmed(
+        current_st: Mapping[str, Any],
+        expected_state: Optional[str],
+        expected_attributes: Optional[Mapping[str, Any]],
+    ) -> bool:
+        """
+        Confirms observed entity state against expectations.
+        Requires both state (if expected_state provided) and all attributes (if expected_attributes provided) to match.
+        """
+        if expected_state is None and not expected_attributes:
+            return False
+
+        if expected_state is not None:
+            if current_st.get("state") != expected_state:
+                return False
+
+        if expected_attributes:
+            obs_attrs = current_st.get("attributes")
+            if not isinstance(obs_attrs, dict):
+                return False
+            for attr_key, exp_val in expected_attributes.items():
+                if attr_key not in obs_attrs:
+                    return False
+                if not _compare_attribute_value(attr_key, obs_attrs[attr_key], exp_val):
+                    return False
+
+        return True
+
     def execute(
         self,
         entity_id: str,
@@ -518,6 +600,7 @@ class HAConnector:
         - Separates accepted service call (`accepted`) from observed state (`state_confirmed`).
         - Polls entity state up to `timeout_ms` when `wait_for_state` is provided,
           leveraging real-time WebSocket state notification for instant confirmation when available.
+        - Verifies both target state and target attributes (explicit or inferred from parameters).
         - Returns structured result conforming to `domain_ha.json` contract.
         """
         if not self.is_entity_allowed(entity_id):
@@ -533,21 +616,33 @@ class HAConnector:
         if parameters:
             body.update(parameters)
 
+        # Resolve target state and attributes confirmation requirements
+        expected_state: Optional[str] = None
+        expected_attributes: Optional[dict[str, Any]] = None
+        if wait_for_state is not None:
+            expected_state = wait_for_state.get("expected_state")
+            if "expected_attributes" in wait_for_state and wait_for_state["expected_attributes"] is not None:
+                expected_attributes = dict(wait_for_state["expected_attributes"])
+            elif wait_for_state.get("check_parameters", True) and parameters:
+                filtered = {k: v for k, v in parameters.items() if k in KNOWN_ATTRIBUTE_KEYS}
+                if filtered:
+                    expected_attributes = filtered
+
         # Handle mock mode or unconfigured daemon test
         if self.mock_mode or (self._is_default_unconfigured and "unittest" in sys.modules):
             target_state = "on" if "turn_on" in action else "off" if "turn_off" in action else "active"
-            if wait_for_state and "expected_state" in wait_for_state:
-                target_state = wait_for_state["expected_state"]
+            if expected_state is not None:
+                target_state = expected_state
 
             current = self.get_state(entity_id)
             current["state"] = target_state
             if parameters:
-                current["attributes"].update(parameters)
+                current.setdefault("attributes", {}).update(parameters)
             self._mock_states[entity_id] = current
 
             state_confirmed = False
-            if wait_for_state:
-                state_confirmed = (current["state"] == wait_for_state.get("expected_state"))
+            if wait_for_state is not None:
+                state_confirmed = self._is_state_confirmed(current, expected_state, expected_attributes)
 
             return {
                 "entity_id": entity_id,
@@ -565,8 +660,7 @@ class HAConnector:
         observed_state: Optional[str] = None
         state_confirmed = False
 
-        if wait_for_state and "expected_state" in wait_for_state:
-            expected = wait_for_state["expected_state"]
+        if wait_for_state is not None and (expected_state is not None or expected_attributes):
             timeout_ms = wait_for_state.get("timeout_ms", 2000)
             deadline = time.time() + (timeout_ms / 1000.0)
 
@@ -574,7 +668,7 @@ class HAConnector:
             try:
                 current_st = self.get_state(entity_id)
                 observed_state = current_st.get("state")
-                if observed_state == expected:
+                if self._is_state_confirmed(current_st, expected_state, expected_attributes):
                     return {
                         "entity_id": entity_id,
                         "action": action,
@@ -598,7 +692,7 @@ class HAConnector:
                 try:
                     current_st = self.get_state(entity_id)
                     observed_state = current_st.get("state")
-                    if observed_state == expected:
+                    if self._is_state_confirmed(current_st, expected_state, expected_attributes):
                         state_confirmed = True
                         break
                 except Exception as poll_err:
@@ -619,6 +713,19 @@ class HAConnector:
             "observed_state": observed_state,
             "state_confirmed": state_confirmed,
         }
+
+    def execute_service(
+        self,
+        entity_id: str,
+        action: str,
+        parameters: Optional[dict[str, Any]] = None,
+        wait_for_state: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """
+        Executes a service call on Home Assistant and verifies observed state.
+        Alias for execute adhering to Desk Agent R1 interface conventions.
+        """
+        return self.execute(entity_id, action, parameters=parameters, wait_for_state=wait_for_state)
 
     def close(self) -> None:
         """Stops background threads and cleans up WebSocket connection."""

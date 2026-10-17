@@ -125,6 +125,10 @@ int desk_hardware_get_last_mcu_frame(uint8_t *out_buf, size_t max_len, size_t *o
 int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms);
 int desk_hardware_motion_stop(bool emergency);
 int desk_hardware_motion_get_position(float *out_pan, float *out_tilt);
+int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint32_t duration_ms,
+                                             uint8_t *out_buf, size_t max_len, size_t *out_len);
+int desk_hardware_format_stm32_stop_packet(bool emergency,
+                                           uint8_t *out_buf, size_t max_len, size_t *out_len);
 
 /* Camera API */
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
@@ -137,6 +141,8 @@ int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len);
 /* Display & Expression API */
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text);
 int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len, char *out_status, size_t max_status_len);
+void desk_hardware_set_display_initialized(bool init);
+bool desk_hardware_is_display_initialized(void);
 
 /* Input Event Subscription */
 int desk_hardware_register_input_cb(desk_touch_event_cb_t cb, void *user_data);

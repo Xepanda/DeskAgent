@@ -123,6 +123,19 @@ class TestCodexCompanion(unittest.TestCase):
         cancel_res = companion.cancel_task("tsk-turn-01", reason="User requested interrupt")
         self.assertEqual(cancel_res["status"], "cancelled")
 
+        # Verify initialize request structure aligned with codex-cli 0.161.0
+        init_call = next(m for m in sent_messages if m["method"] == "initialize")
+        self.assertEqual(init_call["params"].get("clientInfo", {}).get("name"), "desk-agent-companion")
+        self.assertEqual(init_call["params"].get("clientInfo", {}).get("version"), "0.1.0")
+        self.assertEqual(init_call["params"].get("capabilities"), {})
+
+        # Verify turn/interrupt used camelCase params without snake_case
+        interrupt_call = next(m for m in sent_messages if m["method"] == "turn/interrupt")
+        self.assertEqual(interrupt_call["params"].get("threadId"), "thr-real-8888")
+        self.assertEqual(interrupt_call["params"].get("turnId"), "trn-real-9999")
+        self.assertNotIn("thread_id", interrupt_call["params"])
+        self.assertNotIn("turn_id", interrupt_call["params"])
+
     # -------------------------------------------------------------------------
     # 4. Approval Correlation Lifecycle
     # -------------------------------------------------------------------------
@@ -172,10 +185,10 @@ class TestCodexCompanion(unittest.TestCase):
             task_id="tsk-appr-01",
             decision="approve",
         )
-        self.assertEqual(resp["decision"], "approve")
+        self.assertEqual(resp["decision"], "accept")
         self.assertEqual(resp["status"], "applied")
         self.assertEqual(len(sent_approvals), 1)
-        self.assertEqual(sent_approvals[0]["decision"], "approve")
+        self.assertEqual(sent_approvals[0]["decision"], "accept")
 
     # -------------------------------------------------------------------------
     # 5. Stdio Transport ID Matching & Asynchronous Notifications
@@ -267,10 +280,12 @@ class TestCodexCompanion(unittest.TestCase):
         import urllib.request
         from companion.src.codex_companion import create_companion_server
 
-        port = 18765
         token = "test-auth-token-12345"
 
-        server = create_companion_server(port=port, host="127.0.0.1", auth_token=token)
+        # Bind an ephemeral port (0) and read back the OS-assigned one so that
+        # concurrent full-suite runs cannot collide on a fixed port.
+        server = create_companion_server(port=0, host="127.0.0.1", auth_token=token)
+        port = server.server_address[1]
         srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
         srv_thread.start()
         time.sleep(0.1)
@@ -345,15 +360,14 @@ class TestCodexCompanion(unittest.TestCase):
             decision="accept",
             reason="User confirmed in dialog",
         )
-        self.assertEqual(res["decision"], "approve")
+        self.assertEqual(res["decision"], "accept")
         self.assertEqual(res["status"], "applied")
 
         # Verify transport sent response with id=88
         self.assertEqual(len(mock_transport.sent_responses), 1)
         resp_sent = mock_transport.sent_responses[0]
         self.assertEqual(resp_sent["id"], 88)
-        self.assertEqual(resp_sent["result"]["decision"], "approve")
-        self.assertEqual(resp_sent["result"]["status"], "applied")
+        self.assertEqual(resp_sent["result"]["decision"], "accept")
 
     # -------------------------------------------------------------------------
     # 8. Approval Race Condition Resolution (Approval before Task Mapping)
@@ -412,10 +426,12 @@ class TestCodexCompanion(unittest.TestCase):
         """Verifies RemoteCodexCompanionClient operations over LAN HTTP RPC."""
         from companion.src.codex_companion import create_companion_server, RemoteCodexCompanionClient
 
-        port = 18766
         token = "secret-client-token-999"
 
-        server = create_companion_server(port=port, host="127.0.0.1", auth_token=token)
+        # Bind an ephemeral port (0) and read back the OS-assigned one so that
+        # concurrent full-suite runs cannot collide on a fixed port.
+        server = create_companion_server(port=0, host="127.0.0.1", auth_token=token)
+        port = server.server_address[1]
         srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
         srv_thread.start()
         time.sleep(0.1)
@@ -460,6 +476,197 @@ class TestCodexCompanion(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    # -------------------------------------------------------------------------
+    # 10. Approval Schema Enums Mapping (Command & Patch)
+    # -------------------------------------------------------------------------
+    def test_approval_schema_enums_mapping_command_and_patch(self) -> None:
+        """Verifies CommandExecutionRequestApprovalResponse and ApplyPatchApprovalResponse align with Codex 0.161.0 schema."""
+        mock_transport = DefaultMockTransport()
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=mock_transport,
+        )
+
+        sub_res = companion.submit_task("tsk-enum-01", "test-project", "make build")
+        thread_id = sub_res["thread_id"]
+        turn_id = sub_res["turn_id"]
+
+        # 1. Command approval: legacy "approve" -> "accept"
+        companion.request_approval("appr-cmd-01", "tsk-enum-01", "command", "make install", "install deps")
+        res1 = companion.respond_approval(approval_id="appr-cmd-01", task_id="tsk-enum-01", decision="approve")
+        self.assertEqual(res1["decision"], "accept")
+        self.assertEqual(res1["status"], "applied")
+
+        # 2. Command approval: legacy "reject" -> "decline"
+        companion.request_approval("appr-cmd-02", "tsk-enum-01", "command", "rm -rf /", "destructive rm")
+        res2 = companion.respond_approval(approval_id="appr-cmd-02", decision="reject")
+        self.assertEqual(res2["decision"], "decline")
+        self.assertEqual(res2["status"], "rejected")
+
+        # 3. Command approval: direct "acceptForSession" and "cancel"
+        companion.request_approval("appr-cmd-03", "tsk-enum-01", "command", "git pull", "git pull")
+        res3 = companion.respond_approval(approval_id="appr-cmd-03", decision="acceptForSession")
+        self.assertEqual(res3["decision"], "acceptForSession")
+        self.assertEqual(res3["status"], "applied")
+
+        companion.request_approval("appr-cmd-04", "tsk-enum-01", "command", "cargo run", "cargo run")
+        res4 = companion.respond_approval(approval_id="appr-cmd-04", decision="cancel")
+        self.assertEqual(res4["decision"], "cancel")
+
+        # 4. Patch approval: legacy "approve" -> "approved"
+        companion.request_approval("appr-patch-01", "tsk-enum-01", "file_change", "src/main.py", "add feature")
+        res5 = companion.respond_approval(approval_id="appr-patch-01", decision="approve")
+        self.assertEqual(res5["decision"], "approved")
+        self.assertEqual(res5["status"], "applied")
+
+        # 5. Patch approval: legacy "reject" -> {"denied": {"rejection": reason}}
+        companion.request_approval("appr-patch-02", "tsk-enum-01", "file_change", "config.json", "update secret")
+        res6 = companion.respond_approval(
+            approval_id="appr-patch-02",
+            decision="reject",
+            reason="Do not edit secret keys in config",
+        )
+        self.assertEqual(res6["decision"], {"denied": {"rejection": "Do not edit secret keys in config"}})
+        self.assertEqual(res6["status"], "rejected")
+
+        # 6. Patch approval: direct "abort"
+        companion.request_approval("appr-patch-03", "tsk-enum-01", "apply_patch", "patch.diff", "apply patch")
+        res7 = companion.respond_approval(approval_id="appr-patch-03", decision="abort")
+        self.assertEqual(res7["decision"], "abort")
+
+    # -------------------------------------------------------------------------
+    # 11. SQLite Persistence & Reload Across Companion Restarts
+    # -------------------------------------------------------------------------
+    def test_sqlite_persistence_across_companion_restarts(self) -> None:
+        """Verifies tasks and approvals persist to SQLite and survive process restarts."""
+        db_file = os.path.join(self.temp_dir.name, "companion_persisted.db")
+
+        # Instance 1: Create tasks and approvals
+        comp1 = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+
+        res_task = comp1.submit_task("tsk-persist-100", "test-project", "npm run test:unit")
+        thread_id = res_task["thread_id"]
+        turn_id = res_task["turn_id"]
+
+        # Register approvals
+        comp1.request_approval("appr-persist-cmd", "tsk-persist-100", "command", "npm install", "install deps")
+        comp1.request_approval("appr-persist-file", "tsk-persist-100", "file_change", "src/index.js", "modify index")
+
+        # Respond to cmd approval
+        comp1.respond_approval("appr-persist-cmd", "tsk-persist-100", "accept")
+
+        # Simulate turn progress
+        comp1._handle_server_notification("turn/progress", {"threadId": thread_id, "turnId": turn_id, "progress": "step 3 of 5"})
+
+        comp1.close()
+
+        # Instance 2: Reload from same database
+        comp2 = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+
+        # Task must be recovered
+        task_st = comp2.get_task_status("tsk-persist-100")
+        self.assertIsNotNone(task_st)
+        self.assertEqual(task_st["task_id"], "tsk-persist-100")
+        self.assertEqual(task_st["thread_id"], thread_id)
+        self.assertEqual(task_st["turn_id"], turn_id)
+        self.assertEqual(task_st["workspace_alias"], "test-project")
+        self.assertEqual(task_st["target_dir"], self.workspace_dir)
+
+        # Only pending approvals returned by get_pending_approvals
+        pending = comp2.get_pending_approvals("tsk-persist-100")
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["approval_id"], "appr-persist-file")
+        self.assertEqual(pending[0]["action_type"], "file_change")
+        self.assertEqual(pending[0]["command_or_path"], "src/index.js")
+
+        # Applied approval state was preserved
+        appr_cmd = comp2._pending_approvals.get("appr-persist-cmd")
+        self.assertIsNotNone(appr_cmd)
+        self.assertEqual(appr_cmd["status"], "applied")
+        self.assertEqual(appr_cmd["decision"], "accept")
+
+        # Instance 2 responds to pending file change approval with rejection
+        resp_file = comp2.respond_approval(
+            "appr-persist-file",
+            "tsk-persist-100",
+            "reject",
+            reason="Security review rejected changes",
+        )
+        self.assertEqual(resp_file["decision"], {"denied": {"rejection": "Security review rejected changes"}})
+        self.assertEqual(resp_file["status"], "rejected")
+
+        # Cancel task
+        comp2.cancel_task("tsk-persist-100", reason="Done testing")
+        comp2.close()
+
+        # Instance 3: Verify updated states persisted
+        comp3 = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+
+        task_st3 = comp3.get_task_status("tsk-persist-100")
+        self.assertIsNotNone(task_st3)
+        self.assertEqual(task_st3["status"], "cancelled")
+
+        pending3 = comp3.get_pending_approvals("tsk-persist-100")
+        self.assertEqual(len(pending3), 0)
+
+        appr_file3 = comp3._pending_approvals.get("appr-persist-file")
+        self.assertIsNotNone(appr_file3)
+        self.assertEqual(appr_file3["status"], "rejected")
+        self.assertEqual(appr_file3["decision"], {"denied": {"rejection": "Security review rejected changes"}})
+
+        comp3.close()
+
+    # -------------------------------------------------------------------------
+    # 12. turn/interrupt CamelCase Schema Validation
+    # -------------------------------------------------------------------------
+    def test_cancel_task_turn_interrupt_camel_case_schema(self) -> None:
+        """Verifies turn/interrupt passes strict camelCase threadId and turnId parameters."""
+        sent_calls: list[dict[str, Any]] = []
+
+        class InterceptTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                sent_calls.append({"method": method, "params": dict(params)})
+                if method == "initialize":
+                    return {"capabilities": {}}
+                elif method in ("thread/create", "thread/start"):
+                    return {"thread_id": "thr-interrupt-123"}
+                elif method == "turn/start":
+                    return {"turn_id": "trn-interrupt-456", "state": "running"}
+                elif method == "turn/interrupt":
+                    return {"interrupted": True}
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=InterceptTransport(),
+        )
+
+        companion.submit_task("tsk-inter-01", "test-project", "sleep 100")
+        companion.cancel_task("tsk-inter-01", reason="Timed out")
+
+        interrupt_calls = [c for c in sent_calls if c["method"] == "turn/interrupt"]
+        self.assertEqual(len(interrupt_calls), 1)
+        params = interrupt_calls[0]["params"]
+        self.assertEqual(params["threadId"], "thr-interrupt-123")
+        self.assertEqual(params["turnId"], "trn-interrupt-456")
+        self.assertEqual(params["reason"], "Timed out")
+        self.assertNotIn("thread_id", params)
+        self.assertNotIn("turn_id", params)
+
+        companion.close()
 
 
 if __name__ == "__main__":

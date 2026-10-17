@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import weakref
 
 
 # Arbiter Constants (per desk_arbiter.h)
@@ -111,6 +112,65 @@ class DeskBoardDriverOps(ctypes.Structure):
         ("display_expression", DRIVER_DISPLAY_CB),
         ("deinit", ctypes.c_void_p),
     ]
+
+
+# Per-socket line remainder buffers for `_recv_line`. `socket.socket` has no
+# `__dict__`, so the remainder is held in a weak-keyed store (identity-based,
+# auto-cleaned when a socket is collected).
+_LINE_BUFFERS: "weakref.WeakKeyDictionary[socket.socket, str]" = weakref.WeakKeyDictionary()
+
+
+def _recv_line(sock: socket.socket, timeout: float = 2.0) -> str:
+    """Reads exactly ONE newline-terminated line from `sock`, accumulating
+    across `recv()` calls.
+
+    The firmware writes a response as the JSON payload and the terminating
+    ``"\\n"`` in TWO separate ``send()`` calls
+    (``desk_sdk_socket_send_line`` in desk_sdk_bridge.c), so a single
+    ``recv()`` is NOT guaranteed to return a whole line -- under load the two
+    segments can arrive separately and one ``recv()`` may return only the
+    ``"\\n"``. A single-``recv()``-per-line assumption therefore parses an
+    empty string and raises ``json.decoder.JSONDecodeError``.
+
+    This helper loops on ``recv()``, appending to a per-socket buffer until a
+    ``"\\n"`` is seen, and carries any remainder (a following line already
+    buffered) forward for the next call. It has a bounded deadline, so a
+    genuinely silent peer raises ``TimeoutError`` instead of hanging forever.
+
+    Returns the line with the trailing newline (and surrounding whitespace)
+    stripped. Raises ``TimeoutError`` on deadline, ``ConnectionError`` if the
+    peer closes before a complete line arrives.
+    """
+    # Per-socket remainder buffer. `socket.socket` has no `__dict__`, so the
+    # remainder is held in a weak-keyed store (identity-based, auto-cleaned).
+    buf = _LINE_BUFFERS.get(sock, "")
+    deadline = time.time() + timeout
+    prev_timeout = sock.gettimeout()
+    try:
+        while "\n" not in buf:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"no complete line received within {timeout}s (partial={buf!r})")
+            sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                raise TimeoutError(
+                    f"no complete line received within {timeout}s (partial={buf!r})")
+            if not chunk:
+                raise ConnectionError(
+                    "peer closed the connection before a complete line arrived")
+            buf += chunk.decode("utf-8", errors="replace")
+    finally:
+        try:
+            sock.settimeout(prev_timeout)
+        except OSError:
+            pass
+
+    line, remainder = buf.split("\n", 1)
+    _LINE_BUFFERS[sock] = remainder
+    return line.strip()
 
 
 class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
@@ -198,6 +258,11 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
         cls.lib.desk_sdk_bridge_set_auth_required.restype = None
         cls.lib.desk_sdk_bridge_set_auth_required.argtypes = [ctypes.c_bool]
 
+        # interfaces.md 6.4 / CR-001: the device-side expected pairing code must
+        # be explicitly provisioned; pairing is fail-closed without it.
+        cls.lib.desk_sdk_bridge_set_pairing_code.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_set_pairing_code.argtypes = [ctypes.c_char_p]
+
         cls.lib.desk_sdk_bridge_get_pairing_token.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_get_pairing_token.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
 
@@ -252,6 +317,9 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
         self.lib.desk_tclaw_init()
         self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
+        # interfaces.md 6.4: provision the expected pairing code so the official
+        # UDP pairing flow can succeed (otherwise it is fail-closed by design).
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
 
     def tearDown(self) -> None:
         self.lib.desk_firmware_stop_background_task()
@@ -329,6 +397,9 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "request_id": "pair-g1-001",
             "daemon_instance_id": "sdk-daemon-g1",
             "target_mode": "python_sdk",
+            # interfaces.md 6.4: the official pairing contract requires a
+            # 6-digit pairing_code; without it the device stays fail-closed.
+            "pairing_code": "123456",
         }
         udp_client.sendto(json.dumps(pair_req).encode("utf-8"), ("127.0.0.1", udp_port))
         data, _ = udp_client.recvfrom(4096)
@@ -350,7 +421,7 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "data": {"role": "desktop", "token": "invalid_bogus_token_12345"},
         }
         sock_invalid.sendall((json.dumps(invalid_hello) + "\n").encode("utf-8"))
-        raw_resp = sock_invalid.recv(4096).decode("utf-8").strip()
+        raw_resp = _recv_line(sock_invalid)
         sock_invalid.close()
 
         resp_invalid = json.loads(raw_resp)
@@ -367,7 +438,7 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "data": {"role": "desktop", "token": session_token},
         }
         sock_sdk.sendall((json.dumps(valid_hello) + "\n").encode("utf-8"))
-        raw_hello_ack = sock_sdk.recv(4096).decode("utf-8").strip()
+        raw_hello_ack = _recv_line(sock_sdk)
         ack_hello = json.loads(raw_hello_ack)
         self.assertEqual(ack_hello.get("type"), "sys.ack")
         self.assertEqual(ack_hello.get("code"), 0)
@@ -391,10 +462,13 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "data": {"pan_deg": 135.0, "tilt_deg": 115.0, "duration_ms": 600},
         }
         sock_sdk.sendall((json.dumps(motion_cmd) + "\n").encode("utf-8"))
-        raw_motion_ack = sock_sdk.recv(4096).decode("utf-8").strip()
+        raw_motion_ack = _recv_line(sock_sdk)
         ack_motion = json.loads(raw_motion_ack)
         self.assertEqual(ack_motion.get("type"), "sys.ack")
-        self.assertEqual(ack_motion.get("data", {}).get("status"), "succeeded")
+        # interfaces.md 6.1: a firmware ACK means "accepted" (dispatched to the
+        # driver), never "succeeded".
+        self.assertEqual(ack_motion.get("data", {}).get("status"), "accepted")
+        self.assertTrue(ack_motion.get("data", {}).get("accepted"))
 
         # Verify physical angle updated and driver was invoked
         pan = ctypes.c_float()

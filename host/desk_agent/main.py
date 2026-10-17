@@ -130,10 +130,15 @@ class DeskAgentHostApp:
         # Database and Services
         db_path = Path(self.config.get("storage", {}).get("db_path", "/var/lib/desk-agent/life_service.db"))
         self.life_service = LifeService(db_path)
+        ha_cfg = self.config.get("home_assistant", {})
         self.ha_connector = HAConnector(
-            base_url=self.config.get("home_assistant", {}).get("base_url", "http://homeassistant.local:8123"),
-            access_token=self.config.get("home_assistant", {}).get("access_token"),
-            allowed_domains=self.config.get("home_assistant", {}).get("allowed_domains"),
+            base_url=ha_cfg.get("base_url", "http://homeassistant.local:8123"),
+            access_token=ha_cfg.get("access_token"),
+            allowed_domains=ha_cfg.get("allowed_domains"),
+            allowed_entities=ha_cfg.get("allowed_entities"),
+            denied_entities=ha_cfg.get("denied_entities"),
+            allowed_services=ha_cfg.get("allowed_services"),
+            denied_services=ha_cfg.get("denied_services"),
         )
         cam_cfg = self.config.get("camera", {})
         self.camera_service = CameraViewerService(
@@ -178,6 +183,7 @@ class DeskAgentHostApp:
             )
             self.register_robot_hardware_client(self.robot_adapter)
             self.register_announcement_channel(self.robot_adapter.send_announcement)
+            self.robot_adapter.register_tool_request_handler(self._on_robot_tool_request)
             self.robot_adapter.start()
 
         # HA State Subscription
@@ -250,6 +256,42 @@ class DeskAgentHostApp:
             logger.warning("Announcement channel returned error: %s", e)
             return False
 
+    def _on_robot_tool_request(self, raw_msg: dict[str, Any]) -> None:
+        """Handles tool requests from robot TClaw dialogue engine and routes them."""
+        try:
+            if not isinstance(raw_msg, dict):
+                logger.warning("Invalid raw tool request format from robot: %s", raw_msg)
+                return
+
+            if raw_msg.get("type") == "tool.request" and isinstance(raw_msg.get("data"), dict):
+                env_dict = dict(raw_msg["data"])
+            else:
+                env_dict = dict(raw_msg)
+
+            if "request_id" not in env_dict or "operation" not in env_dict:
+                logger.warning("Tool request missing required fields: %s", raw_msg)
+                return
+
+            if "expires_at" not in env_dict:
+                # Default 60s expiration if omitted by firmware
+                env_dict["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+
+            req = RequestEnvelope.from_dict(env_dict)
+            resp = self.router.dispatch(req)
+            if self.robot_adapter:
+                self.robot_adapter.send_tool_response(resp.to_dict())
+        except Exception as exc:
+            logger.exception("Failed to process tool request from robot: %s", exc)
+            if isinstance(raw_msg, dict):
+                req_id = raw_msg.get("request_id") or (raw_msg.get("data", {}).get("request_id") if isinstance(raw_msg.get("data"), dict) else None)
+                if req_id and self.robot_adapter:
+                    err_resp = ResponseEnvelope.create_error(
+                        request_id=req_id,
+                        code="INTERNAL_ERROR",
+                        message=str(exc),
+                    )
+                    self.robot_adapter.send_tool_response(err_resp.to_dict())
+
     def _delivery_loop(self) -> None:
         """Consumes outbox messages and reliably delivers to robot announcement channels with retry."""
         while not self._scheduler_stop.is_set():
@@ -296,16 +338,10 @@ class DeskAgentHostApp:
                         "Delivering due reminder: %s (id=%s, catchup=%s)",
                         occ.get("title"), occ.get("occurrence_id"), is_catchup
                     )
-                    self.life_service.mark_occurrence_ringing(occ["occurrence_id"])
-                    self.life_service.queue_outbox_message(
+                    self.life_service.trigger_occurrence_to_outbox(
+                        occurrence_id=occ["occurrence_id"],
                         topic="reminder.alert",
-                        payload={
-                            "occurrence_id": occ["occurrence_id"],
-                            "reminder_id": occ["reminder_id"],
-                            "title": occ.get("title", ""),
-                            "scheduled_at": occ.get("scheduled_at", ""),
-                            "is_catchup": is_catchup,
-                        },
+                        is_catchup=is_catchup,
                     )
             except Exception as e:
                 if not self._scheduler_stop.is_set():
@@ -395,6 +431,7 @@ class DeskAgentHostApp:
         self.router.register("resource.camera.acquire", self._handle_camera_acquire)
         self.router.register("resource.camera.release", self._handle_camera_release)
         self.router.register("resource.motion.move", self._handle_motion_move)
+        self.router.register("resource.motion.stop", self._handle_motion_stop)
 
     def _handle_ha_get_state(self, req: RequestEnvelope) -> ResponseEnvelope:
         entity_id = req.arguments["entity_id"]
@@ -560,10 +597,58 @@ class DeskAgentHostApp:
             return bool(client.is_connected)
         return True
 
+    # Frozen contract vocabulary for motion outcomes (contracts/error_codes.json,
+    # interfaces.md 6.1). Firmware `sys.ack` means "accepted", never "completed".
+    _MOTION_ERROR_CODES = frozenset({
+        "HARDWARE_FAULT",
+        "OPERATION_TIMEOUT",
+        "RESOURCE_BUSY",
+        "UPSTREAM_UNAVAILABLE",
+        "STATE_UNCONFIRMED",
+    })
+    _MOTION_ERROR_MESSAGES = {
+        "HARDWARE_FAULT": "Robot hardware driver reported a fault while executing the motion command",
+        "OPERATION_TIMEOUT": "No response was received from the robot within the motion timeout window",
+        "RESOURCE_BUSY": "Robot hardware resource is held by another owner; arbitration refused the command",
+        "UPSTREAM_UNAVAILABLE": "Robot hardware link is disconnected or unreachable",
+        "STATE_UNCONFIRMED": "Command was accepted but the physical state could not be confirmed",
+    }
+
+    @classmethod
+    def _motion_outcome(cls, ack: Any) -> tuple[str, bool, bool, Optional[str], bool]:
+        """Normalizes a robot adapter motion result into the contract vocabulary.
+
+        Returns ``(status, accepted, state_confirmed, error_code, retryable)``
+        where ``status`` is one of ``accepted`` | ``failed`` | ``unknown``.
+
+        An ACK only ever proves acceptance, so a legacy ``completed``/``succeeded``
+        claim from the hardware link is deliberately downgraded to ``accepted``
+        and never surfaces as a success (interfaces.md 6.1 R1).
+        """
+        if not isinstance(ack, dict):
+            return "unknown", False, False, "OPERATION_TIMEOUT", True
+
+        raw_status = str(ack.get("status", "")).lower()
+        accepted = bool(ack.get("accepted", False))
+        state_confirmed = bool(ack.get("state_confirmed", False))
+        error_code = ack.get("error_code")
+        retryable = bool(ack.get("retryable", False))
+
+        if raw_status in ("failed", "unknown"):
+            if error_code not in cls._MOTION_ERROR_CODES:
+                error_code = "HARDWARE_FAULT" if raw_status == "failed" else "OPERATION_TIMEOUT"
+            return raw_status, False, state_confirmed, error_code, retryable
+
+        if raw_status in ("accepted", "completed", "succeeded", "in_progress") or accepted:
+            return "accepted", True, state_confirmed, None, False
+
+        # Unrecognized shape: do not guess success.
+        return "unknown", False, state_confirmed, "OPERATION_TIMEOUT", True
+
     def _handle_motion_move(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
-        pan = float(args.get("pan", 90.0))
-        tilt = float(args.get("tilt", 120.0))
+        pan = float(args.get("pan_deg", args.get("pan", 90.0)))
+        tilt = float(args.get("tilt_deg", args.get("tilt", 120.0)))
         duration_ms = int(args.get("duration_ms", 500))
 
         # Enforce physical mechanical limit clamping (Pan 0..180, Tilt 100..140)
@@ -573,45 +658,113 @@ class DeskAgentHostApp:
         # Update coordinate model in camera service
         self.camera_service.update_motion_coordinates(clamped_pan, clamped_tilt)
 
-        # Check if physical robot hardware link is actively connected
-        if self.has_robot_hardware_connected():
-            try:
-                ack = self._robot_client.send_motion_move(clamped_pan, clamped_tilt, duration_ms)
-                confirmed = bool(ack.get("confirmed", True)) if isinstance(ack, dict) else True
-                return ResponseEnvelope.create_success(
-                    req.request_id,
-                    {
-                        "status": "completed" if confirmed else "in_progress",
-                        "executed": True,
-                        "state_confirmed": confirmed,
-                        "hardware_link": "connected",
-                        "pan": clamped_pan,
-                        "tilt": clamped_tilt,
-                        "duration_ms": duration_ms,
-                    },
-                )
-            except Exception as exc:
-                return ResponseEnvelope.create_error(
-                    req.request_id,
-                    code="HARDWARE_ERROR",
-                    message=f"Failed to execute physical motion on robot: {exc}",
-                )
-        else:
-            # Standalone Host without physical robot connected:
-            # Transparently report simulated status, state_confirmed=False
-            return ResponseEnvelope.create_success(
+        context = {
+            "pan": clamped_pan,
+            "tilt": clamped_tilt,
+            "duration_ms": duration_ms,
+        }
+
+        if not self.has_robot_hardware_connected():
+            # No hardware link: nothing was dispatched. Report the missing link
+            # honestly instead of a fabricated success.
+            return ResponseEnvelope.create_error(
                 req.request_id,
-                {
-                    "status": "simulated",
-                    "executed": False,
-                    "state_confirmed": False,
+                code="UPSTREAM_UNAVAILABLE",
+                message="No physical robot hardware link is connected; motion was not dispatched",
+                retryable=True,
+                details={
+                    **context,
                     "hardware_link": "disconnected",
                     "reason": "NO_PHYSICAL_ROBOT_CONNECTED",
-                    "pan": clamped_pan,
-                    "tilt": clamped_tilt,
-                    "duration_ms": duration_ms,
                 },
             )
+
+        try:
+            ack = self._robot_client.send_motion_move(clamped_pan, clamped_tilt, duration_ms)
+        except Exception as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="UPSTREAM_UNAVAILABLE",
+                message=f"Robot hardware link failed during motion dispatch: {exc}",
+                retryable=True,
+            )
+
+        status, accepted, state_confirmed, error_code, retryable = self._motion_outcome(ack)
+
+        if status in ("failed", "unknown"):
+            code = error_code or "HARDWARE_FAULT"
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code=code,
+                message=self._MOTION_ERROR_MESSAGES.get(code, "Robot motion command was not accepted"),
+                retryable=retryable,
+                details={**context, "hardware_link": "connected"},
+                status=ResponseStatus.UNKNOWN if status == "unknown" else ResponseStatus.FAILED,
+            )
+
+        # Firmware accepted the command. Physical completion is signalled
+        # separately by the `resource.motion.completed` event, so the terminal
+        # state here is `accepted` with state_confirmed left as reported.
+        return ResponseEnvelope.create_accepted(
+            req.request_id,
+            {
+                "status": "accepted",
+                "accepted": accepted,
+                "state_confirmed": state_confirmed,
+                "hardware_link": "connected",
+                **context,
+            },
+        )
+
+    def _handle_motion_stop(self, req: RequestEnvelope) -> ResponseEnvelope:
+        emergency = bool(req.arguments.get("emergency", False))
+
+        if not self.has_robot_hardware_connected():
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="UPSTREAM_UNAVAILABLE",
+                message="No physical robot hardware link is connected; stop was not dispatched",
+                retryable=True,
+                details={
+                    "emergency": emergency,
+                    "hardware_link": "disconnected",
+                    "reason": "NO_PHYSICAL_ROBOT_CONNECTED",
+                },
+            )
+
+        try:
+            ack = self._robot_client.send_motion_stop(emergency)
+        except Exception as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="UPSTREAM_UNAVAILABLE",
+                message=f"Robot hardware link failed during motion stop: {exc}",
+                retryable=True,
+            )
+
+        status, accepted, state_confirmed, error_code, retryable = self._motion_outcome(ack)
+
+        if status in ("failed", "unknown"):
+            code = error_code or "HARDWARE_FAULT"
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code=code,
+                message=self._MOTION_ERROR_MESSAGES.get(code, "Robot motion stop was not accepted"),
+                retryable=retryable,
+                details={"emergency": emergency, "hardware_link": "connected"},
+                status=ResponseStatus.UNKNOWN if status == "unknown" else ResponseStatus.FAILED,
+            )
+
+        return ResponseEnvelope.create_accepted(
+            req.request_id,
+            {
+                "status": "accepted",
+                "accepted": accepted,
+                "state_confirmed": state_confirmed,
+                "hardware_link": "connected",
+                "emergency": emergency,
+            },
+        )
 
 
 def make_request_handler(app: DeskAgentHostApp):
@@ -683,6 +836,8 @@ def make_request_handler(app: DeskAgentHostApp):
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
                 self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
+                self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
+                self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
                 self.end_headers()
                 self.wfile.write(frame_info["jpeg_data"])
             else:

@@ -120,20 +120,28 @@ sudo systemctl restart desk-agent
 
 ### 3.2 配置与运行
 1. 进入项目根目录 `companion/`。
-2. 复制配置模板：
+2. 复制配置模板（`run-companion.ps1` **不再自动复制**，必须显式执行）：
    ```powershell
    Copy-Item deploy\windows\companion-config.example.json deploy\windows\companion-config.json
    ```
+   > 模板默认 `host: 127.0.0.1` 且 `auth_token` 为空，即**默认仅回环、不对外暴露**。这是安全默认值，可直接使用。
 3. 在 `companion-config.json` 中配置安全参数：
    - `host`: 默认回环 `127.0.0.1`。需供泰山派跨局域网访问时设置为 `0.0.0.0`。
    - `port`: 默认 `8765`。
-   - `auth_token`: **跨局域网暴露时强制设置强密钥**，防止未经授权的远程执行。
+   - `auth_token`: **跨局域网暴露时强制设置强密钥**（**至少 16 字符**），防止未经授权的远程执行。
    - `registered_workspaces`: 严格配置白名单别名（例如将 `epanda-desk-agent` 映射为实际目录 `D:\ePanda\DeskAgent`，严禁外部传入原始盘符路径）。
-4. 运行 Companion 服务：
+4. **启动前自检（可选但推荐）**：
+   ```powershell
+   python -m companion.src.codex_companion --config deploy\windows\companion-config.json --check-config
+   ```
+   该命令仅打印 `{status, host, port, loopback_only, auth_required}`（**绝不回显 token**），校验通过返回 0，否则返回 2。
+5. 运行 Companion 服务：
    ```powershell
    powershell -ExecutionPolicy Bypass -File deploy\windows\run-companion.ps1
    ```
-5. 防火墙配置：若设置为 `0.0.0.0`，在 Windows 高级安全防火墙中放行 TCP 8765 端口入站规则（仅限家庭/受信任子网）。
+   > **fail-closed 强制校验**：当 `host` 为非回环地址时，若 `auth_token` 为空、过短（<16 字符）或为仓库中公开的占位令牌，
+   > 服务将**拒绝启动**并以非零码退出，**绝不静默降级为无鉴权监听**。
+6. 防火墙配置：若设置为 `0.0.0.0`，在 Windows 高级安全防火墙中放行 TCP 8765 端口入站规则（仅限家庭/受信任子网）。
 
 ---
 
