@@ -292,6 +292,12 @@ class RobotAdapterCorrelationTestCase(unittest.TestCase):
         adapter = RobotAdapter(auto_pair=False)
         adapter._sock = client_sock
         adapter._connected = True
+        # Let the adapter's own worker thread own recv(). Without it, concurrent
+        # send_command callers fall back to a shared blocking recv() on the same
+        # socket, and one waiter can drain a coalesced ACK segment that also
+        # belonged to another waiter.
+        adapter.start()
+        self.addCleanup(adapter.stop)
         self.addCleanup(firmware_sock.close)
         self.addCleanup(client_sock.close)
         return adapter, client_sock, firmware_sock
@@ -411,6 +417,68 @@ class RobotAdapterCorrelationTestCase(unittest.TestCase):
             {"type": "ctrl.motion.move", "request_id": "req-late-0002", "data": {}}, timeout=0.2
         )
         self.assertEqual(second["code"], 408, "stale ACK must not leak into a later request")
+
+    def _make_workerless_adapter(self) -> tuple[RobotAdapter, socket.socket, socket.socket]:
+        """Adapter with no receiver worker: forces send_command's fallback read path."""
+        client_sock, firmware_sock = socket.socketpair()
+        adapter = RobotAdapter(auto_pair=False)
+        adapter._sock = client_sock
+        adapter._connected = True
+        self.addCleanup(firmware_sock.close)
+        self.addCleanup(client_sock.close)
+        return adapter, client_sock, firmware_sock
+
+    def test_fallback_read_delivers_coalesced_acks_to_both_waiters(self) -> None:
+        """Without a worker thread, one coalesced segment must still satisfy both waiters."""
+        for iteration in range(25):
+            adapter, _client, firmware_sock = self._make_workerless_adapter()
+            results: dict[int, dict] = {}
+
+            def call(seq: int, _adapter: RobotAdapter = adapter) -> None:
+                results[seq] = _adapter.send_command(
+                    {
+                        "type": "ctrl.motion.move",
+                        "request_id": f"req-coal-{seq}",
+                        "data": {"seq": seq},
+                    },
+                    timeout=1.0,
+                )
+
+            t1 = threading.Thread(target=call, args=(1,))
+            t2 = threading.Thread(target=call, args=(2,))
+            t1.start()
+            t2.start()
+            time.sleep(0.03)  # let both waiters enter the fallback loop
+            coalesced = "".join(
+                json.dumps({
+                    "type": "sys.ack",
+                    "code": 0,
+                    "request_id": f"req-coal-{seq}",
+                    "data": {"status": "accepted", "seq": seq},
+                }) + "\n"
+                for seq in (1, 2)
+            )
+            firmware_sock.sendall(coalesced.encode("utf-8"))
+            t1.join(timeout=3.0)
+            t2.join(timeout=3.0)
+
+            self.assertIn(1, results, f"iteration {iteration}: waiter 1 was starved by the fallback reader")
+            self.assertIn(2, results, f"iteration {iteration}: waiter 2 was starved by the fallback reader")
+            self.assertEqual(results[1]["data"]["seq"], 1)
+            self.assertEqual(results[2]["data"]["seq"], 2)
+
+    def test_fallback_read_respects_deadline(self) -> None:
+        """The worker-less fallback must never block past the caller's deadline."""
+        adapter, _client, _firmware = self._make_workerless_adapter()
+        started = time.monotonic()
+        res = adapter.send_command(
+            {"type": "ctrl.motion.move", "request_id": "req-deadline-0001", "data": {}}, timeout=0.3
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(res["code"], 408)
+        self.assertEqual(res["status"], "timeout")
+        self.assertLess(elapsed, 1.5, "fallback read must respect the timeout budget")
 
     def test_late_ack_does_not_linger_in_pending_map(self) -> None:
         adapter, _client, _firmware = self._make_adapter()

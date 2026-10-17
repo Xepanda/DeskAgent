@@ -56,6 +56,9 @@ class RobotAdapter:
         # A response is only ever stored/delivered when its request_id belongs
         # to an active waiter (interfaces.md 6.2 rule 2 & 3).
         self._awaiting_ids: set[str] = set()
+        # Serialises socket reads taken by send_command()'s worker-less fallback
+        # so two waiters cannot split one coalesced ACK segment between them.
+        self._fallback_recv_lock = threading.Lock()
         self._req_counter = 0
         self._req_counter_lock = threading.Lock()
         self._event_listeners: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
@@ -331,10 +334,42 @@ class RobotAdapter:
 
                 worker_alive = bool(self._worker_thread and self._worker_thread.is_alive())
                 if not worker_alive and self._sock:
+                    # Fallback used only when the receiver worker thread is not
+                    # running. It must stay deadline-respecting: never issue an
+                    # unbounded blocking recv(), and serialise readers so two
+                    # waiters cannot split one coalesced ACK segment between
+                    # them (which would hang the loser past its deadline).
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    if not self._fallback_recv_lock.acquire(timeout=min(remaining, 0.05)):
+                        continue
                     try:
-                        rlist, _, _ = select.select([self._sock], [], [], 0.05)
-                        if rlist:
-                            data = self._sock.recv(4096)
+                        try:
+                            sock = self._sock
+                            if sock is None:
+                                continue
+                            slice_sec = max(0.01, min(remaining, 0.05))
+                            try:
+                                rlist, _, _ = select.select([sock], [], [], slice_sec)
+                            except Exception:
+                                rlist = []
+                            if not rlist:
+                                time.sleep(0.01)
+                                continue
+                            prev_timeout = sock.gettimeout()
+                            try:
+                                sock.settimeout(slice_sec)
+                                data = sock.recv(4096)
+                            except (socket.timeout, BlockingIOError):
+                                continue
+                            except Exception:
+                                data = b""
+                            finally:
+                                try:
+                                    sock.settimeout(prev_timeout)
+                                except OSError:
+                                    pass
                             if data:
                                 self._recv_buf += data.decode("utf-8", errors="replace")
                                 while "\n" in self._recv_buf:
@@ -346,10 +381,12 @@ class RobotAdapter:
                                 with self._lock:
                                     self._close_socket()
                                 break
-                        else:
+                        except Exception:
+                            # A fallback read must never raise: the caller still
+                            # owns its deadline and must receive the timeout shape.
                             time.sleep(0.01)
-                    except Exception:
-                        pass
+                    finally:
+                        self._fallback_recv_lock.release()
                 else:
                     time.sleep(0.02)
         finally:

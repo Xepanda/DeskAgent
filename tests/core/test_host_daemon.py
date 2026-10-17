@@ -27,10 +27,11 @@ class TestHostDaemon(unittest.TestCase):
         # Initialize App
         cls.app = DeskAgentHostApp(config_path=str(cfg_file))
 
-        # Start HTTP server on ephemeral port (8099)
-        cls.port = 8099
+        # Start HTTP server on an ephemeral port so concurrent suite runs
+        # (and any other process) can never collide on a fixed port.
         handler = make_request_handler(cls.app)
-        cls.server = ThreadedHTTPServer(("127.0.0.1", cls.port), handler)
+        cls.server = ThreadedHTTPServer(("127.0.0.1", 0), handler)
+        cls.port = cls.server.server_address[1]
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
         time.sleep(0.1)
