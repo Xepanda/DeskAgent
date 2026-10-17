@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import weakref
 
 
 # Arbiter Constants (per desk_arbiter.h)
@@ -111,6 +112,65 @@ class DeskBoardDriverOps(ctypes.Structure):
         ("display_expression", DRIVER_DISPLAY_CB),
         ("deinit", ctypes.c_void_p),
     ]
+
+
+# Per-socket line remainder buffers for `_recv_line`. `socket.socket` has no
+# `__dict__`, so the remainder is held in a weak-keyed store (identity-based,
+# auto-cleaned when a socket is collected).
+_LINE_BUFFERS: "weakref.WeakKeyDictionary[socket.socket, str]" = weakref.WeakKeyDictionary()
+
+
+def _recv_line(sock: socket.socket, timeout: float = 2.0) -> str:
+    """Reads exactly ONE newline-terminated line from `sock`, accumulating
+    across `recv()` calls.
+
+    The firmware writes a response as the JSON payload and the terminating
+    ``"\\n"`` in TWO separate ``send()`` calls
+    (``desk_sdk_socket_send_line`` in desk_sdk_bridge.c), so a single
+    ``recv()`` is NOT guaranteed to return a whole line -- under load the two
+    segments can arrive separately and one ``recv()`` may return only the
+    ``"\\n"``. A single-``recv()``-per-line assumption therefore parses an
+    empty string and raises ``json.decoder.JSONDecodeError``.
+
+    This helper loops on ``recv()``, appending to a per-socket buffer until a
+    ``"\\n"`` is seen, and carries any remainder (a following line already
+    buffered) forward for the next call. It has a bounded deadline, so a
+    genuinely silent peer raises ``TimeoutError`` instead of hanging forever.
+
+    Returns the line with the trailing newline (and surrounding whitespace)
+    stripped. Raises ``TimeoutError`` on deadline, ``ConnectionError`` if the
+    peer closes before a complete line arrives.
+    """
+    # Per-socket remainder buffer. `socket.socket` has no `__dict__`, so the
+    # remainder is held in a weak-keyed store (identity-based, auto-cleaned).
+    buf = _LINE_BUFFERS.get(sock, "")
+    deadline = time.time() + timeout
+    prev_timeout = sock.gettimeout()
+    try:
+        while "\n" not in buf:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"no complete line received within {timeout}s (partial={buf!r})")
+            sock.settimeout(remaining)
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                raise TimeoutError(
+                    f"no complete line received within {timeout}s (partial={buf!r})")
+            if not chunk:
+                raise ConnectionError(
+                    "peer closed the connection before a complete line arrived")
+            buf += chunk.decode("utf-8", errors="replace")
+    finally:
+        try:
+            sock.settimeout(prev_timeout)
+        except OSError:
+            pass
+
+    line, remainder = buf.split("\n", 1)
+    _LINE_BUFFERS[sock] = remainder
+    return line.strip()
 
 
 class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
@@ -361,7 +421,7 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "data": {"role": "desktop", "token": "invalid_bogus_token_12345"},
         }
         sock_invalid.sendall((json.dumps(invalid_hello) + "\n").encode("utf-8"))
-        raw_resp = sock_invalid.recv(4096).decode("utf-8").strip()
+        raw_resp = _recv_line(sock_invalid)
         sock_invalid.close()
 
         resp_invalid = json.loads(raw_resp)
@@ -378,7 +438,7 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "data": {"role": "desktop", "token": session_token},
         }
         sock_sdk.sendall((json.dumps(valid_hello) + "\n").encode("utf-8"))
-        raw_hello_ack = sock_sdk.recv(4096).decode("utf-8").strip()
+        raw_hello_ack = _recv_line(sock_sdk)
         ack_hello = json.loads(raw_hello_ack)
         self.assertEqual(ack_hello.get("type"), "sys.ack")
         self.assertEqual(ack_hello.get("code"), 0)
@@ -402,7 +462,7 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "data": {"pan_deg": 135.0, "tilt_deg": 115.0, "duration_ms": 600},
         }
         sock_sdk.sendall((json.dumps(motion_cmd) + "\n").encode("utf-8"))
-        raw_motion_ack = sock_sdk.recv(4096).decode("utf-8").strip()
+        raw_motion_ack = _recv_line(sock_sdk)
         ack_motion = json.loads(raw_motion_ack)
         self.assertEqual(ack_motion.get("type"), "sys.ack")
         # interfaces.md 6.1: a firmware ACK means "accepted" (dispatched to the

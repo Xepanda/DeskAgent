@@ -4,7 +4,7 @@
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证  
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见  
 > 状态：**G0 契约与基线冻结完成；Level 1 (契约/Schema) 与 Level 2 (软件协议与模拟互通 PoC、真实链路 E2E、跨模块 P1 回归门禁、真实 C 驱动跨层故障链路、故障注入与稳定性压测) 自动化测试全部 PASS (295 项用例 100% OK)；提供一键全量核验工具 `tools/verification/verify_all.sh` (8 阶段)；G1 真实关口与硬件接入待真机台架实测 (Level 3/4 Pending)**  
-> V3.3.0 变更：新增 A7 **真实固件跨层链路**证据 `tests/e2e/test_real_firmware_motion_fault_chain.py`（在真实编译 C 驱动中注入故障，经真实 C 协议桥接 → 真实 `RobotAdapter` → 真实 `DeskAgentHostApp`，断言**最外层响应信封**；并显式区分 direct C / real C protocol / Python fake-device / 全链路四类证据）；`verify_all.sh` 阶段 5 纳入该跨层链路；按实测校准全量用例数为 295 项、并按套件逐一校准（firmware_contract 30 / sdk_contract 73 / camera 9 / companion 40 / connectors 26 / core 61 / e2e 47 / 顶层 9）。  
+> V3.3.0 变更：新增 A7 **真实固件跨层链路**证据 `tests/e2e/test_real_firmware_motion_fault_chain.py`（在真实编译 C 驱动中注入故障，经真实 C 协议桥接 → 真实 `RobotAdapter` → 真实 `DeskAgentHostApp`，断言**最外层响应信封**；并显式区分 direct C / real C protocol / Python fake-device / 全链路四类证据）；修复 `tests/e2e/test_g1_official_sdk_and_tuya_interop.py` 的 TCP 分帧假设缺陷（新增 `_recv_line()` 跨 `recv()` 累积读取助手，替换三处单次 `recv()` 读整行）；`verify_all.sh` 阶段 5 纳入跨层链路；按实测校准全量用例数为 295 项、并按套件逐一校准（firmware_contract 30 / sdk_contract 73 / camera 9 / companion 40 / connectors 26 / core 61 / e2e 47 / 顶层 9）。  
 > V3.2.0 变更：新增 A7 跨模块 P1 回归门禁 `tests/e2e/test_p1_regression_gates.py`（PR #11 整改：驱动故障绝不伪成功、无 ACK 超时绝不报完成、乱序并发 ACK 不串线、超时后迟到 ACK 不污染新请求、真实 socket 流分帧、配对 fail-closed、Companion 局域网启动门禁、既有链路无回归）；`verify_all.sh` 由 7 阶段扩展为 8 阶段并将回归门禁纳入总控执行；校准全量用例数为实测 268 项（并发安全整改后复测）
 
 ---
@@ -77,7 +77,7 @@
   OK
   ```
 - **并发安全校验**：4 个全量套件并发执行 → 4/4 均为 `Ran 295 tests ... OK`，`Address already in use` 计数 0。
-  > 注：在 4 路并发**满载**下，`tests/e2e/test_g1_official_sdk_and_tuya_interop.py` 的单次阻塞式 `recv` 偶发受调度延迟影响而返回空串（**非** `Address already in use`，亦**非**本次新增模块引起；将新增模块临时移出后 4/4 通过）。该问题为既有测试的负载敏感性，已在交付报告中如实记录，本轮未修改。
+  > 注（已修复）：4 路并发**满载**下曾出现 `tests/e2e/test_g1_official_sdk_and_tuya_interop.py` 偶发 `JSONDecodeError`（**非** `Address already in use`）。**根因是该测试自身的 TCP 分帧假设缺陷**：固件 `desk_sdk_socket_send_line` 将 JSON 载荷与终止 `"\n"` 以**两次独立 `send()`** 发出，二者可能落在不同 TCP 段；该测试三处（旧 364/381/405 行）以**单次 `recv()` 即整行**的假设读取，当某次 `recv()` 只取到 `"\n"`（或其残留）时 `strip()` 得到空串并抛错。已在该文件内新增跨 `recv()` 累积、按 `"\n"` 切分并**前向携带余量**、带**有界超时**的 `_recv_line()` 读取助手，并替换全部三处调用（未使用 `sleep()`/异常重试/放宽超时等掩盖手段）。修复后按 3 轮 × 4 路并发复测 **12/12 OK**，`Address already in use` 计数 0。
 
 #### 测试子模块明细表：
 
