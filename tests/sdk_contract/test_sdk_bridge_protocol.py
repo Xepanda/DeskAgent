@@ -176,6 +176,12 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_hardware_set_strict_mode.restype = None
         cls.lib.desk_hardware_set_strict_mode.argtypes = [ctypes.c_bool]
 
+        cls.lib.desk_hardware_is_strict_mode.restype = ctypes.c_bool
+        cls.lib.desk_hardware_is_strict_mode.argtypes = []
+
+        cls.lib.desk_arbiter_get_owner.restype = ctypes.c_int
+        cls.lib.desk_arbiter_get_owner.argtypes = [ctypes.c_int]
+
         cls.lib.desk_hardware_set_display_initialized.restype = None
         cls.lib.desk_hardware_set_display_initialized.argtypes = [ctypes.c_bool]
 
@@ -343,8 +349,8 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         body.update(overrides)
         return json.dumps(body).encode("utf-8")
 
-    def _register_failing_motion_driver(self, move_rc: int, stop_rc: int) -> None:
-        """Install a board driver whose motion primitives always fail.
+    def _register_motion_driver(self, move_rc: int, stop_rc: int) -> None:
+        """Install a board driver whose motion primitives return the given codes.
 
         An MCU TX callback is registered too, so the hardware layer does not
         short-circuit on the host (no real UART) before reaching the driver.
@@ -370,6 +376,10 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self._driver_ops = ops
         self.assertEqual(self.lib.desk_hardware_register_mcu_tx_cb(on_mcu_tx, None), 0)
         self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops)), 0)
+
+    def _register_failing_motion_driver(self, move_rc: int, stop_rc: int) -> None:
+        """Install a board driver whose motion primitives always fail."""
+        self._register_motion_driver(move_rc, stop_rc)
 
     def _open_tcp_session(self):
         import socket
@@ -1217,7 +1227,11 @@ class TestSdkBridgeProtocol(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_motion_move_driver_failure_returns_hardware_fault_nack(self) -> None:
-        """A failing gimbal driver must produce sys.nack HARDWARE_FAULT, never code:0."""
+        """Strict-mode variant of the driver-failure contract; default-mode coverage
+        is in test_motion_move_driver_failure_default_mode_returns_hardware_fault_nack.
+
+        A failing gimbal driver must produce sys.nack HARDWARE_FAULT, never code:0.
+        """
         self._register_failing_motion_driver(DESK_HW_ERR_STALL, DESK_HW_OK)
         self.lib.desk_hardware_set_strict_mode(True)
 
@@ -1233,7 +1247,11 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertNotIn("data", resp, "a driver failure must not carry a success payload")
 
     def test_motion_stop_driver_failure_returns_hardware_fault_nack(self) -> None:
-        """A failing stop driver must produce sys.nack HARDWARE_FAULT, never stopped:true."""
+        """Strict-mode variant of the driver-failure contract; default-mode coverage
+        is in test_motion_stop_driver_failure_default_mode_returns_hardware_fault_nack.
+
+        A failing stop driver must produce sys.nack HARDWARE_FAULT, never stopped:true.
+        """
         self._register_failing_motion_driver(DESK_HW_OK, DESK_HW_ERR_STALL)
         self.lib.desk_hardware_set_strict_mode(True)
 
@@ -1259,6 +1277,195 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("data", {}).get("status"), "accepted")
         self.assertTrue(resp.get("data", {}).get("accepted"))
         self.assertNotEqual(resp.get("data", {}).get("status"), "succeeded")
+
+    # ------------------------------------------------------------------
+    # WP1b -- driver-failure contract at DEFAULT initialisation.
+    #
+    # Evidence type: real compiled C protocol tests. These drive the actual
+    # desk_sdk_bridge_process_command() entry point of the C shared library
+    # (not a direct C function test, and not a Python fake device).
+    #
+    # Why this block exists: the two WP1 tests above call
+    # desk_hardware_set_strict_mode(True), so they passed even while
+    # desk_hardware.c propagated a driver error ONLY under strict mode
+    # (fixed in 926c82a). A test that only passes because it flips a mode
+    # flag does not cover the shipped default configuration. These tests run
+    # at the default initialisation, i.e. with strict_mode == false.
+    # ------------------------------------------------------------------
+
+    def _assert_default_mode(self) -> None:
+        """Fail loudly if strict mode is not at its default (false)."""
+        self.assertFalse(
+            self.lib.desk_hardware_is_strict_mode(),
+            "this test must run at default init (strict_mode == false)",
+        )
+
+    def test_motion_move_driver_failure_default_mode_returns_hardware_fault_nack(self) -> None:
+        """Req 1/3/4: real C bridge test -- at default init (strict_mode == false),
+        a failing gimbal driver yields sys.nack 500 HARDWARE_FAULT, echoes the
+        original request_id, and carries no success data payload.
+
+        Default mode is deliberately NOT switched to strict here.
+        """
+        self._assert_default_mode()
+        self._register_failing_motion_driver(DESK_HW_ERR_STALL, DESK_HW_OK)
+
+        resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-default-fault-move",
+            "data": {"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 300},
+        })
+
+        # Req 3: never a success ack, never code:0, on a driver failure.
+        self.assertNotEqual(resp.get("type"), "sys.ack")
+        self.assertNotEqual(resp.get("code"), 0)
+        # Req 1: sys.nack / 500 / HARDWARE_FAULT.
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 500)
+        self.assertEqual(resp.get("error", {}).get("code"), "HARDWARE_FAULT")
+        # Req 1: no success data payload.
+        self.assertNotIn("data", resp, "a driver failure must not carry a success payload")
+        # Req 4: original request_id echoed.
+        self.assertEqual(resp.get("request_id"), "req-default-fault-move")
+
+    def test_motion_stop_driver_failure_default_mode_returns_hardware_fault_nack(self) -> None:
+        """Req 2/3/4: real C bridge test -- at default init (strict_mode == false),
+        a failing stop driver yields sys.nack 500 HARDWARE_FAULT and must not
+        report stopped:true. Default mode is NOT switched to strict here.
+        """
+        self._assert_default_mode()
+        self._register_failing_motion_driver(DESK_HW_OK, DESK_HW_ERR_STALL)
+
+        resp = self._process_cmd({
+            "type": "ctrl.motion.stop",
+            "request_id": "req-default-fault-stop",
+            "data": {"emergency": True},
+        })
+
+        # Req 3: never a success ack, never code:0.
+        self.assertNotEqual(resp.get("type"), "sys.ack")
+        self.assertNotEqual(resp.get("code"), 0)
+        # Req 2: sys.nack / 500 / HARDWARE_FAULT, no stopped:true.
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 500)
+        self.assertEqual(resp.get("error", {}).get("code"), "HARDWARE_FAULT")
+        self.assertIsNot(resp.get("data", {}).get("stopped"), True)
+        self.assertNotIn("data", resp, "a driver failure must not carry a success payload")
+        # Req 4: original request_id echoed.
+        self.assertEqual(resp.get("request_id"), "req-default-fault-stop")
+
+    def test_motion_driver_failure_default_mode_is_never_a_success_ack(self) -> None:
+        """Req 3: real C bridge test -- neither fault path may return code:0 or a
+        sys.ack in any form at default init (strict_mode == false). This is the
+        exact shape the pre-926c82a default-mode defect produced (accepted ack).
+        """
+        self._assert_default_mode()
+        self._register_failing_motion_driver(DESK_HW_ERR_STALL, DESK_HW_ERR_STALL)
+
+        for request_id, cmd in (
+            ("req-default-never-ack-move",
+             {"type": "ctrl.motion.move", "data": {"pan_deg": 10.0, "tilt_deg": 100.0, "duration_ms": 200}}),
+            ("req-default-never-ack-stop",
+             {"type": "ctrl.motion.stop", "data": {"emergency": False}}),
+        ):
+            payload = dict(cmd)
+            payload["request_id"] = request_id
+            resp = self._process_cmd(payload)
+            self.assertNotEqual(resp.get("type"), "sys.ack", f"{request_id}: must not be a success ack")
+            self.assertNotEqual(resp.get("code"), 0, f"{request_id}: must never report code:0")
+            self.assertIsNot(resp.get("data", {}).get("accepted"), True,
+                             f"{request_id}: must not claim accepted")
+            self.assertNotEqual(resp.get("data", {}).get("status"), "accepted",
+                                f"{request_id}: must not claim accepted status")
+
+    def test_motion_driver_failure_default_mode_preserves_request_id(self) -> None:
+        """Req 4: real C bridge test -- the echoed request_id equals the one sent,
+        across both default-mode fault paths and in the presence of an interleaved
+        successful command (no cross-talk between responses).
+        """
+        self._assert_default_mode()
+        self._register_failing_motion_driver(DESK_HW_ERR_STALL, DESK_HW_ERR_STALL)
+
+        # A healthy command first: proves correlation is not simply "last id wins".
+        ok = self._process_cmd({"type": "sys.sdk.ready.get", "request_id": "req-default-ok-0"})
+        self.assertEqual(ok.get("request_id"), "req-default-ok-0")
+
+        move_fault = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-default-correlate-move",
+            "data": {"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 300},
+        })
+        self.assertEqual(move_fault.get("request_id"), "req-default-correlate-move")
+        self.assertEqual(move_fault.get("type"), "sys.nack")
+
+        stop_fault = self._process_cmd({
+            "type": "ctrl.motion.stop",
+            "request_id": "req-default-correlate-stop",
+            "data": {"emergency": True},
+        })
+        self.assertEqual(stop_fault.get("request_id"), "req-default-correlate-stop")
+        self.assertEqual(stop_fault.get("type"), "sys.nack")
+
+    def test_motion_resource_reacquirable_after_default_mode_fault(self) -> None:
+        """Req 5: real C bridge test -- after a driver fault at default init, the
+        gimbal is released (arbiter owner back to NONE) and a subsequent motion
+        command through the same bridge succeeds with sys.ack code:0.
+
+        The arbiter-owner assertion is the discriminating check: a leaked
+        SDK_REMOTE lock would still let a same-owner re-acquire succeed, so the
+        bridge-level ack alone could not distinguish released from leaked.
+        """
+        self._assert_default_mode()
+        self._register_failing_motion_driver(DESK_HW_ERR_STALL, DESK_HW_OK)
+
+        fault = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-default-leak-fault",
+            "data": {"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 300},
+        })
+        self.assertEqual(fault.get("type"), "sys.nack")
+        self.assertEqual(fault.get("code"), 500)
+
+        # Direct C read of the arbiter state: the fault must not leak the lock.
+        self.assertEqual(
+            self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_NONE,
+            "the gimbal lock was leaked after a driver fault",
+        )
+
+        # Re-register the ops table with a healthy driver and drive the same
+        # bridge again: the resource is usable, not wedged.
+        self._register_motion_driver(DESK_HW_OK, DESK_HW_OK)
+        recovered = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-default-leak-recovered",
+            "data": {"pan_deg": 45.0, "tilt_deg": 115.0, "duration_ms": 200},
+        })
+        self.assertEqual(recovered.get("type"), "sys.ack")
+        self.assertEqual(recovered.get("code"), 0)
+        self.assertEqual(recovered.get("request_id"), "req-default-leak-recovered")
+        self.assertEqual(recovered.get("data", {}).get("status"), "accepted")
+
+    def test_motion_success_ack_is_accepted_not_succeeded_default_mode(self) -> None:
+        """Req 6 (CR-002 boundary): real C bridge test -- a succeeding move at
+        default init (strict_mode == false) yields sys.ack code:0 with
+        data.status == "accepted" and data.accepted == true, and must never
+        claim succeeded/completed.
+        """
+        self._assert_default_mode()
+
+        resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-default-accepted-only",
+            "data": {"pan_deg": 60.0, "tilt_deg": 110.0, "duration_ms": 200},
+        })
+        self.assertEqual(resp.get("type"), "sys.ack")
+        self.assertEqual(resp.get("code"), 0)
+        self.assertEqual(resp.get("data", {}).get("status"), "accepted")
+        self.assertTrue(resp.get("data", {}).get("accepted"))
+
+        raw = json.dumps(resp)
+        self.assertNotIn("succeeded", raw, "a device ack must not claim physical completion")
+        self.assertNotIn("completed", raw, "a device ack must not claim physical completion")
 
     # ------------------------------------------------------------------
     # WP2 -- request_id correlation
