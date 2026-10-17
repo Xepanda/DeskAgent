@@ -1,11 +1,12 @@
 # Desk Agent R1 公共契约与接口规范 (Interfaces & Contracts)
 
-> 文档版本：V2.0.0  
+> 文档版本：V2.1.0  
 > 责任 Agent：A0 架构与协议  
-> 状态：**G0 关口公共契约冻结 (Public Contracts Frozen)**  
+> 状态：**G0 关口公共契约冻结 (Public Contracts Frozen) + P1 修复补充裁决 (V2.1.0)**  
 > 配套 Schema：`contracts/schemas/`  
 > 配套 Fixtures：`contracts/fixtures/`  
-> 验证工具：`contracts/validator/validate.py`
+> 验证工具：`contracts/validator/validate.py`  
+> V2.1.0 变更：新增第 6 节「P1 修复契约补充裁决」，将此前隐含的 ACK 层级语义、请求关联、TCP 分帧与配对校验要求显式化。**未改变任何既有 wire 字段语义**，仅澄清与补充。
 
 ---
 
@@ -241,3 +242,89 @@
 | **L-08** | Web 浏览器 / 管理端 | Host 相机与控制台 (RK3566) | HTTP (端口 8088, Token 认证) | `resource.camera.acquire`, `GET /api/camera/frame`, `POST /api/rpc` | `tests/camera/test_camera_service.py` / `test_host_daemon.py` |
 | **L-09** | 官方 Python SDK (RK3566) | 固件 SDK 桥接器 (ESP32) | UDP 37021 (配对发现) + TCP 37020 (数据流) | `sys.client.hello`, `ctrl.motion.move`, `ctrl.expression.play`, `WSPK` 二进制音频帧 | `tests/sdk_contract/test_sdk_bridge_protocol.py` / `test_wspk_framing.py` |
 | **L-10** | 固件板级驱动 (ESP32) | STM32 身体微控制器 | UART2 (TX:19, RX:20, 921600) | `watche_hw_body_move`, `watche_hw_body_stop`, `position_request` | `firmware/build/desk_agent_firmware_test` (C 驱动层) / 真机台架 (A1 实测) |
+
+---
+
+## 6. P1 修复契约补充裁决 (V2.1.0 Rulings)
+
+本节由 A0 就 PR #11 审查发现的五类问题作出裁决。以下条款均**从既有冻结契约推导**，不引入新协议；仅将此前隐含的语义显式化。
+
+### 6.1 ACK 确认层级语义（对应工作包 1）
+
+**裁决 R1：设备侧 `sys.ack` 仅表示"已受理"，绝不表示"物理已达成"。**
+
+依据 §1.4 两阶段确认机制。设备 SDK 桥接层的成功 ACK 语义严格限定为：
+
+| 设备侧消息 | 语义 | 允许对应的响应终态 |
+| :--- | :--- | :--- |
+| `sys.ack code:0`（含 `data.accepted: true`） | 请求已通过校验、已取得仲裁、已下发驱动 | `accepted`（**不得**直接判定 `succeeded`） |
+| `sys.nack`（驱动返回失败） | 下发失败 | `failed` + `HARDWARE_FAULT` |
+| 无任何响应（超时） | 链路或设备无应答 | `unknown` + `OPERATION_TIMEOUT`（`retryable: true`） |
+| ACK 已受理但确认窗口内观测不到物理状态 | 已下发未确认 | `unknown` + `STATE_UNCONFIRMED`（§1.4.3） |
+
+**强制要求**：
+1. 固件 `ctrl.motion.move` / `ctrl.motion.stop` 分支**必须检查驱动返回值**；驱动非 `DESK_HW_OK` 时**严禁**返回 `code:0`，必须返回 `sys.nack` + `HARDWARE_FAULT`。
+2. 运动类成功 ACK 的 `data.status` **必须为 `"accepted"`**，并提供 `data.accepted: true`。原 `"succeeded"` 属夸大确认层级，予以废弃。
+   - 官方 SDK 侧影响评估：`WatcheRobot.set_target()` / `stop()` 经 `_command()` 仅校验 ACK 成功，**不读取 `data.status`**，故本变更不破坏官方 SDK 兼容性。
+3. 物理完成语义仍由既有 `resource.motion.completed` 事件（§4.2）承载。
+4. Host 侧**严禁**在未确认时报告 `executed: true`、`completed` 或 `succeeded`。
+   - `executed` 字段**不在** `contracts/schemas/` 任何 Schema 中，属 Host 侧自造字段；裁决**移除**，统一改用契约既有词汇：`accepted`、`state_confirmed`、`status`。
+5. 仲裁拒绝（`RESOURCE_BUSY`，HTTP/错误码 409）与断连（`UPSTREAM_UNAVAILABLE`）必须原样传播，不得被吞没为成功。
+
+### 6.2 请求关联（对应工作包 2）
+
+**裁决 R2：所有响应必须回传原 `request_id`；等待者只能消费属于自己的响应。**
+
+依据 §1.1。补充强制要求：
+
+1. 固件对**任何**携带 `request_id` 的请求，其 `sys.ack` / `sys.nack` **必须**原样回传该 `request_id`（握手类 `sys.client.hello` 除外）。
+2. `RobotAdapter.send_command` **禁止**消费无 `request_id` 的公共 `sys.ack` / `sys.nack`。仅允许按键 `request_id` 精确匹配消费。
+3. 超时后到达的迟到 ACK **必须**按 `request_id` 投递；若对应等待者已超时退出，该响应**不得**被任何其他等待者消费，应直接丢弃。
+4. `request_id` 在并发下必须唯一。禁止使用毫秒时间戳等低熵来源（同毫秒并发会碰撞）。Host 侧生成的 `request_id` 必须满足 §1.1 正则 `^[a-zA-Z0-9_-]+$`。
+5. **旧协议兼容**：若需兼容不回传 `request_id` 的旧设备，必须**显式协商**（能力位或配置开关）并**串行化**该链路上的请求；**严禁**静默回退到"消费任意 ACK"。
+
+### 6.3 TCP 流分帧（对应工作包 3）
+
+**裁决 R3：沿用既有换行分帧协议，不更换公共协议。**
+
+依据 §5 链路 L-09（TCP 37020 数据流）。补充强制要求：
+
+1. 接收侧**必须**维护跨 `read()` 调用的持久缓冲，按 `\n` 切分消息，正确处理：半包（消息被拆到多次 `read`）、粘包（一次 `read` 含多条消息）、单次多消息。
+2. 必须定义并强制**最大帧长**；超长帧必须丢弃并返回错误，且不得污染后续消息边界。
+3. 非法输入（非 JSON、无终止换行）必须丢弃且不破坏链路。
+4. 断连时必须**清空残留缓冲**，严禁残留字节与重连后的新消息拼接。
+5. 发送侧**必须**处理短写（`write()` 返回值小于请求长度时循环续写），严禁假设一次 `write` 完成，严禁以 `(void)` 丢弃返回值。
+6. WSPK 二进制媒体帧协议（`<4sBBHII`）**保持不变**。
+
+### 6.4 配对校验（对应工作包 4）
+
+**裁决 R4：官方 wire 契约已定义 `pairing_code` 字段与格式，但未定义校验失败的响应；本仓设备侧亦无配对码来源。故采取 fail-closed，并提交接口问题 CR-001。**
+
+依据外部锁定官方 SDK `watcherobot/runtime/daemon/pairing/protocol.py`（Level 1 证据）：
+
+- `pair.request` 字段集固定为 `{type, protocol, version, request_id, daemon_instance_id, pairing_code, target_mode, websocket_port}`，`pairing_code` 必须匹配 `^[0-9]{6}$`。
+- `pair.accept` 字段集固定为 `{type, protocol, version, request_id, daemon_instance_id, target_mode, session_token}`，`session_token` 必须为 64 位小写十六进制。
+- `pairing_code` 与 `session_token` 属 `_SENSITIVE_FIELDS`，**严禁**写入日志（须按官方 `redact_sensitive_fields` 规则脱敏）。
+- **官方契约未定义**"配对码错误"的响应类型：`pair.busy` 的 `reason` 仅允许字面量 `"device_session_active"`，无 `pair.reject` 等类型。
+
+**强制要求**：
+1. 设备侧必须校验 `pairing_code`：格式（6 位数字）与**与设备侧已配置的期望码精确匹配**。
+2. **校验通过前**，严禁置 `s_paired = true`，严禁生成或发放 `session_token`，严禁回复 `pair.accept`。
+3. 未配置期望配对码时，**必须 fail-closed**（不配对、不发 token）。设备侧期望码只能经显式**配置注入**（`desk_sdk_bridge_set_pairing_code()`），**严禁硬编码**生产配对码，**严禁**写入日志。
+4. 由于官方契约未定义校验失败响应，本阶段**不新增** wire 消息类型；失败时**不回复 `pair.accept`**（即不授予），并记录诊断日志（已脱敏）。
+5. 未定义项作为接口问题登记于 **CR-001**，由 A0 与产品/官方 SDK 方确认后再补齐失败响应语义。
+
+### 6.5 Windows Companion 启动安全（对应工作包 5）
+
+**裁决 R5：默认回环；跨机监听必须显式配置强令牌，且拒绝占位/空令牌。**
+
+依据 §4.4 与 AGENTS.md 第 5 节（严禁写入真实生产凭据）：
+
+1. 默认监听**必须**为 `127.0.0.1`。
+2. 当监听地址为非回环（如 `0.0.0.0`）时，**必须**要求显式配置非空、非占位的 `auth_token`；否则**拒绝启动**（fail-closed）。
+3. 空令牌、`None`、以及仓库中公开的示例占位令牌（如 `REPLACE_WITH_STRONG_SHARED_TOKEN_MATCHING_TAISHANPI_CONFIG`）**必须**被拒绝。
+4. `start-companion.ps1` / `run-companion.ps1` 等**所有**启动入口必须走同一校验路径；禁止"复制样例即暴露服务"。
+5. 校验失败时**必须**拒绝启动并给出明确错误，**严禁**静默降级为无鉴权监听。
+6. 必须保持泰山派跨机访问 Windows Companion 的**可配置**能力（合法令牌下正常工作）。
+7. **严禁**对外暴露 Codex app-server 本身（仅暴露 Companion 的 `/health` 与 `/rpc`）。
+
