@@ -620,28 +620,35 @@ int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duratio
         need_release = true;
     }
 
-    s_current_pan = pan_deg;
-    s_current_tilt = tilt_deg;
-
     desk_hardware_format_stm32_motion_packet(pan_deg, tilt_deg, duration_ms,
                                              s_last_mcu_frame, sizeof(s_last_mcu_frame), &s_last_mcu_frame_len);
     if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
         s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
     }
+
+    /* interfaces.md 6.1: a driver failure is never reported as success. The
+     * driver return value propagates unconditionally; it is NOT gated by
+     * s_strict_hardware_mode. */
+    int result = DESK_HW_OK;
     if (s_board_driver_ops && s_board_driver_ops->motion_move) {
-        int rc = s_board_driver_ops->motion_move(pan_deg, tilt_deg, duration_ms);
-        if (rc != DESK_HW_OK && s_strict_hardware_mode) {
-            if (need_release) {
-                desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
-            }
-            return rc;
-        }
+        result = s_board_driver_ops->motion_move(pan_deg, tilt_deg, duration_ms);
     }
 
+    /* The requested target only becomes the reported position once the driver
+     * has confirmed it. A failed move must leave the last successfully
+     * confirmed pose intact for desk_hardware_motion_get_position() /
+     * desk_hardware_get_pan() / desk_hardware_get_tilt(). */
+    if (result == DESK_HW_OK) {
+        s_current_pan = pan_deg;
+        s_current_tilt = tilt_deg;
+    }
+
+    /* Single release point for all exits after acquisition; release() is
+     * idempotent and only clears when current_owner == owner. */
     if (need_release) {
         desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
     }
-    return 0;
+    return result;
 }
 
 int desk_hardware_motion_stop(bool emergency)
@@ -659,10 +666,9 @@ int desk_hardware_motion_stop(bool emergency)
     desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
     desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
 
-    if (s_strict_hardware_mode && drv_rc != DESK_HW_OK) {
-        return drv_rc;
-    }
-    return DESK_HW_OK;
+    /* interfaces.md 6.1: propagate the driver failure unconditionally; the
+     * strict-mode flag must not gate error reporting. */
+    return drv_rc;
 }
 
 int desk_hardware_motion_get_position(float *out_pan, float *out_tilt)
