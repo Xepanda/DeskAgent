@@ -263,7 +263,7 @@ class TestLiveServerAuth(unittest.TestCase):
     def test_lan_strong_token_configuration_still_works_over_http(self) -> None:
         """A valid LAN token keeps the TaishanPi -> Windows Companion path working."""
         # The non-loopback binding itself is validated (never bound here) ...
-        settings = resolve_companion_settings(host="0.0.0.0", port=18765, auth_token=STRONG_TOKEN)
+        settings = resolve_companion_settings(host="0.0.0.0", port=0, auth_token=STRONG_TOKEN)
         self.assertEqual(settings["host"], "0.0.0.0")
         self.assertTrue(is_loopback_host("127.0.0.1"))
         # ... and the same token is what protects the RPC surface.

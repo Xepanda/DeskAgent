@@ -280,10 +280,12 @@ class TestCodexCompanion(unittest.TestCase):
         import urllib.request
         from companion.src.codex_companion import create_companion_server
 
-        port = 18765
         token = "test-auth-token-12345"
 
-        server = create_companion_server(port=port, host="127.0.0.1", auth_token=token)
+        # Bind an ephemeral port (0) and read back the OS-assigned one so that
+        # concurrent full-suite runs cannot collide on a fixed port.
+        server = create_companion_server(port=0, host="127.0.0.1", auth_token=token)
+        port = server.server_address[1]
         srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
         srv_thread.start()
         time.sleep(0.1)
@@ -424,10 +426,12 @@ class TestCodexCompanion(unittest.TestCase):
         """Verifies RemoteCodexCompanionClient operations over LAN HTTP RPC."""
         from companion.src.codex_companion import create_companion_server, RemoteCodexCompanionClient
 
-        port = 18766
         token = "secret-client-token-999"
 
-        server = create_companion_server(port=port, host="127.0.0.1", auth_token=token)
+        # Bind an ephemeral port (0) and read back the OS-assigned one so that
+        # concurrent full-suite runs cannot collide on a fixed port.
+        server = create_companion_server(port=0, host="127.0.0.1", auth_token=token)
+        port = server.server_address[1]
         srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
         srv_thread.start()
         time.sleep(0.1)
