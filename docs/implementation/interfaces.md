@@ -363,3 +363,17 @@ Provisioning 接口置位配对状态属于"未经验证即进入已配对状态
 3. §6.1 的一般性 ACK 层级规则（设备侧成功 ACK 一律为"已受理"）已由 A2 一致应用于
    `motion.action.play`、`camera.acquire`、`camera.release`、`microphone.close`、`expression.play/set`，A0 认可。
 
+**R11：`desk_sdk_bridge_set_pairing_token()` 必须校验凭据格式（`^[0-9a-f]{64}$`）。**
+配对路径会把已 provision 的凭据**原样**作为 `pair.accept.session_token` 下发，
+而官方契约要求该字段匹配 `^[0-9a-f]{64}$`（`_require_lower_hex(..., _LOWER_HEX_64)`）。
+若 provision 一个短值或非十六进制值，固件将产出**自身违反冻结 wire 契约**的 `pair.accept`
+（官方 SDK 的 `parse_udp_message` 会直接拒绝）。故裁决：
+- `set_pairing_token()` 必须校验入参格式，不合规（长度错误、含大写、非十六进制、空）一律返回 `-1` 且**不得**装载；
+- 仍然仅设置凭据、不置 `s_paired`（R9 不变）；
+- 该缺陷属 WP4"错误配对凭据必须拒绝"的范畴，故本轮修复。
+
+**R11 附：未决设计问题（不在本任务范围）。**
+配对路径复用**静态 provision 凭据**作为会话令牌，意味着跨会话复用同一 `session_token`，
+缺少前向保密性；更合理的做法是每次配对握手**新签发**一枚 CSPRNG 令牌。
+该变更会改变既有 API 语义，故本轮**不实现**，作为设计问题登记（并入 CR-001 一并裁决）。
+
