@@ -3,8 +3,8 @@
 # Desk Agent R1 - Master System Verification & Acceptance Suite
 # Enforces AGENTS.md Section 4 (Evidence Layering: Level 1 to Level 4)
 #
-# Runs all 7 verification phases. Phases 1-5, 7 are automated gates; phase 6 is
-# the physical-bench gap audit and deliberately reports Level 3/4 as
+# Runs all 8 verification phases. Phases 1-5, 7, 8 are automated gates; phase 6
+# is the physical-bench gap audit and deliberately reports Level 3/4 as
 # PENDING_HARDWARE rather than claiming a pass.
 # ==============================================================================
 set -euo pipefail
@@ -20,7 +20,7 @@ echo "Working directory: ${REPO_ROOT}"
 echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 echo ""
 
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 CURRENT_STEP=0
 
 step_pass() {
@@ -66,26 +66,35 @@ PYTHONPATH=. python3 -m unittest tests.e2e.test_real_chain_tclaw_to_host \
 step_pass "Tool request -> Host Router -> Life execution -> response returned over TCP, with no faked ACK"
 
 # ------------------------------------------------------------------------------
-# 5. Level 2: Edge Deployment Environment Verification
+# 5. Level 2: Cross-Module P1 Regression Gates (PR #11 remediation)
 # ------------------------------------------------------------------------------
 echo ""
-echo "--- Step 5: Edge Deployment Pre-Flight Checks (deploy/edge/) ---"
+echo "--- Step 5: Cross-Module P1 Regression Gates (interfaces.md 6.1-6.5) ---"
+PYTHONPATH=. python3 -m unittest tests.e2e.test_p1_regression_gates \
+  || step_fail "Cross-module P1 regression gates failed"
+step_pass "Driver failure/timeout never fake success; ACK correlation, TCP framing, pairing fail-closed, companion LAN gate all enforced"
+
+# ------------------------------------------------------------------------------
+# 6. Level 2: Edge Deployment Environment Verification
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Step 6: Edge Deployment Pre-Flight Checks (deploy/edge/) ---"
 bash deploy/edge/verify_edge.sh || step_fail "Edge deployment verification failed"
 step_pass "TaishanPi edge environment pre-flight checks passed (directories, permissions, toolchain, Python modules)"
 
 # ------------------------------------------------------------------------------
-# 6. Level 3 & Level 4: Physical Bench & Hardware Gap Audit
+# 7. Level 3 & Level 4: Physical Bench & Hardware Gap Audit
 # ------------------------------------------------------------------------------
 echo ""
-echo "--- Step 6: Hardware & Acceptance Matrix Audit (docs/acceptance/) ---"
+echo "--- Step 7: Hardware & Acceptance Matrix Audit (docs/acceptance/) ---"
 test -f docs/acceptance/acceptance-matrix.md || step_fail "acceptance-matrix.md missing"
 step_pass "Acceptance matrix and physical bench hardware requirements verified"
 
 # ------------------------------------------------------------------------------
-# 7. Level 1 & Level 4: Evidence Layering Anti-Overclaim Audit (AGENTS.md Sec.4)
+# 8. Level 1 & Level 4: Evidence Layering Anti-Overclaim Audit (AGENTS.md Sec.4)
 # ------------------------------------------------------------------------------
 echo ""
-echo "--- Step 7: Evidence Layering Anti-Overclaim Audit ---"
+echo "--- Step 8: Evidence Layering Anti-Overclaim Audit ---"
 MATRIX="docs/acceptance/acceptance-matrix.md"
 
 # The matrix must still declare the honest, un-achieved state of the physical
@@ -112,12 +121,13 @@ step_pass "Evidence layering intact: Level 3/4 remain PENDING_HARDWARE, no overc
 
 echo ""
 echo "========================================================================"
-echo -e "\033[0;32m  ALL 7 VERIFICATION PHASES COMPLETED SUCCESSFULLY (AUTOMATED GATES OK) \033[0m"
+echo -e "\033[0;32m  ALL 8 VERIFICATION PHASES COMPLETED SUCCESSFULLY (AUTOMATED GATES OK) \033[0m"
 echo "========================================================================"
 echo "Evidence Summary:"
 echo "  Level 1 (Contracts & Schemas):  100% PASS (JSON Schema draft 2020-12, fixtures, error codes)"
 echo "  Level 2 (Software Simulation):  100% PASS (All tests, C HAL, WSPK framing, SQLite WAL, RPC,"
-echo "                                             real chain TClaw -> SDK Bridge TCP -> Host -> device)"
+echo "                                             real chain TClaw -> SDK Bridge TCP -> Host -> device,"
+echo "                                             cross-module P1 regression gates)"
 echo "  Level 3 (Physical Node):        PENDING_HARDWARE (ESP32-S3 bench, Himax camera, audio codecs)"
 echo "  Level 4 (End-to-End Live):      PENDING_HARDWARE (Live Tuya Cloud IoT, LAN HA, Windows Codex)"
 echo ""

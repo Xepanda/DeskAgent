@@ -95,7 +95,15 @@ class TestP1FinalClosure(unittest.TestCase):
                                 break
                             cmd = json.loads(cmd_line)
                             received_commands.append(cmd)
-                            cmd_ack = {"type": "sys.ack", "code": 0, "data": {"status": "succeeded"}}
+                            # interfaces.md 6.2: echo the request_id so the
+                            # adapter's waiter can correlate the ACK. 6.1: a
+                            # firmware ACK means "accepted", never "succeeded".
+                            cmd_ack = {
+                                "type": "sys.ack",
+                                "code": 0,
+                                "request_id": cmd.get("request_id"),
+                                "data": {"status": "accepted", "accepted": True},
+                            }
                             conn.sendall((json.dumps(cmd_ack) + "\n").encode("utf-8"))
                         except socket.timeout:
                             continue
@@ -120,7 +128,10 @@ class TestP1FinalClosure(unittest.TestCase):
 
             # Send motion move
             motion_res = adapter.send_motion_move(pan=105.0, tilt=125.0, duration_ms=400)
-            self.assertTrue(motion_res.get("confirmed"))
+            # interfaces.md 6.1: an ACK means "accepted", not "confirmed"/"completed".
+            self.assertEqual(motion_res.get("status"), "accepted")
+            self.assertTrue(motion_res.get("accepted"))
+            self.assertFalse(motion_res.get("state_confirmed"))
 
             # Send announcement (reminder alert)
             delivered = adapter.send_announcement("reminder.alert", {"title": "Take Medicine", "reminder_id": "r1"})

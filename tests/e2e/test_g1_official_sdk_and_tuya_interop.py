@@ -198,6 +198,11 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
         cls.lib.desk_sdk_bridge_set_auth_required.restype = None
         cls.lib.desk_sdk_bridge_set_auth_required.argtypes = [ctypes.c_bool]
 
+        # interfaces.md 6.4 / CR-001: the device-side expected pairing code must
+        # be explicitly provisioned; pairing is fail-closed without it.
+        cls.lib.desk_sdk_bridge_set_pairing_code.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_set_pairing_code.argtypes = [ctypes.c_char_p]
+
         cls.lib.desk_sdk_bridge_get_pairing_token.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_get_pairing_token.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
 
@@ -252,6 +257,9 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
         self.lib.desk_tclaw_init()
         self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
+        # interfaces.md 6.4: provision the expected pairing code so the official
+        # UDP pairing flow can succeed (otherwise it is fail-closed by design).
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
 
     def tearDown(self) -> None:
         self.lib.desk_firmware_stop_background_task()
@@ -329,6 +337,9 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             "request_id": "pair-g1-001",
             "daemon_instance_id": "sdk-daemon-g1",
             "target_mode": "python_sdk",
+            # interfaces.md 6.4: the official pairing contract requires a
+            # 6-digit pairing_code; without it the device stays fail-closed.
+            "pairing_code": "123456",
         }
         udp_client.sendto(json.dumps(pair_req).encode("utf-8"), ("127.0.0.1", udp_port))
         data, _ = udp_client.recvfrom(4096)
@@ -394,7 +405,10 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
         raw_motion_ack = sock_sdk.recv(4096).decode("utf-8").strip()
         ack_motion = json.loads(raw_motion_ack)
         self.assertEqual(ack_motion.get("type"), "sys.ack")
-        self.assertEqual(ack_motion.get("data", {}).get("status"), "succeeded")
+        # interfaces.md 6.1: a firmware ACK means "accepted" (dispatched to the
+        # driver), never "succeeded".
+        self.assertEqual(ack_motion.get("data", {}).get("status"), "accepted")
+        self.assertTrue(ack_motion.get("data", {}).get("accepted"))
 
         # Verify physical angle updated and driver was invoked
         pan = ctypes.c_float()

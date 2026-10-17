@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -217,18 +218,25 @@ class FakeFirmwareTClaw:
                 self.announcements.append(msg.get("data", {}))
             self.announcement_event.set()
             if msg_type not in self.suppress_ack_for:
-                self._send_ack(conn, data={"status": "played"})
+                # interfaces.md 6.2 rule 1: the ACK must echo the original
+                # request_id, otherwise the Host's waiter cannot correlate it.
+                self._send_ack(conn, request_id=req_id,
+                               data={"status": "accepted", "accepted": True})
             return
 
         if msg_type in ("ctrl.motion.move", "ctrl.motion.stop"):
             with self._lock:
                 self.motion_commands.append(msg)
             if msg_type not in self.suppress_ack_for:
-                self._send_ack(conn, data={"status": "succeeded"})
+                # interfaces.md 6.1: a firmware ACK means "accepted" (dispatched
+                # to the driver), never "succeeded"/"completed".
+                self._send_ack(conn, request_id=req_id,
+                               data={"status": "accepted", "accepted": True})
             return
 
         if msg_type not in self.suppress_ack_for:
-            self._send_ack(conn, data={"status": "ok"})
+            self._send_ack(conn, request_id=req_id,
+                           data={"status": "accepted", "accepted": True})
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 5.0, interval: float = 0.02) -> bool:
@@ -353,20 +361,28 @@ class RealChainTestCase(unittest.TestCase):
     # ---------------------------------------------------------------------
     def test_motion_move_requires_real_firmware_ack_for_confirmation(self) -> None:
         """
-        resource.motion.move travels Host -> RobotAdapter -> firmware, and is only
-        reported state_confirmed when the firmware actually ACKs it.
+        resource.motion.move travels Host -> RobotAdapter -> firmware. A firmware
+        ACK only proves the command was *accepted* by the driver (interfaces.md
+        6.1); physical completion is a separate `resource.motion.completed` event
+        and is never asserted here.
         """
         resp = self.tool_request_roundtrip(
             "req-chain-motion-01", "resource.motion.move",
             {"pan_deg": 45.0, "tilt_deg": 110.0, "duration_ms": 300},
         )
 
-        self.assertEqual(resp.get("status"), "succeeded")
+        self.assertEqual(resp.get("status"), "accepted")
+        self.assertNotIn(resp.get("status"), ("succeeded", "completed"))
         result = resp["result"]
-        self.assertTrue(result["state_confirmed"], "Firmware ACKed, so motion must be confirmed")
+        self.assertTrue(result["accepted"], "Firmware ACKed, so the command was accepted")
+        self.assertFalse(
+            result["state_confirmed"],
+            "An ACK is acceptance, never physical confirmation (interfaces.md 6.1)",
+        )
         self.assertEqual(result["hardware_link"], "connected")
         self.assertEqual(result["pan"], 45.0)
         self.assertEqual(result["tilt"], 110.0)
+        self.assertNotIn("executed", result)
 
         # The firmware genuinely received the framed motion command.
         self.assertTrue(
@@ -384,6 +400,7 @@ class RealChainTestCase(unittest.TestCase):
             "req-chain-motion-clamp", "resource.motion.move",
             {"pan_deg": 999.0, "tilt_deg": -50.0},
         )
+        self.assertEqual(resp.get("status"), "accepted")
         result = resp["result"]
         self.assertEqual(result["pan"], 180.0)
         self.assertEqual(result["tilt"], 100.0)
@@ -394,7 +411,8 @@ class RealChainTestCase(unittest.TestCase):
     def test_withheld_firmware_ack_is_not_reported_as_success(self) -> None:
         """
         With the firmware deliberately silent, the Host must not claim the motion
-        succeeded. This is the chain-level guard against faked ACKs.
+        succeeded. This is the chain-level guard against faked ACKs: the timeout
+        surfaces as an `unknown` error envelope with no `result` at all.
         """
         self.firmware.suppress_ack_for.add("ctrl.motion.move")
 
@@ -404,14 +422,13 @@ class RealChainTestCase(unittest.TestCase):
             timeout=8.0,
         )
 
-        result = resp["result"]
-        self.assertFalse(
-            result["state_confirmed"],
-            "Without a firmware ACK the Host must report state_confirmed=False",
-        )
-        self.assertNotEqual(
-            result["status"], "completed",
-            "A withheld ACK must never surface as a completed motion",
+        self.assertEqual(resp.get("status"), "unknown")
+        self.assertNotIn(resp.get("status"), ("succeeded", "completed", "accepted"))
+        self.assertEqual(resp.get("error", {}).get("code"), "OPERATION_TIMEOUT")
+        self.assertTrue(resp["error"]["retryable"], "A timeout must be flagged retryable")
+        self.assertNotIn(
+            "result", resp,
+            "An unconfirmed motion must not carry a result claiming any physical state",
         )
 
     # ---------------------------------------------------------------------
@@ -422,6 +439,11 @@ class RealChainTestCase(unittest.TestCase):
         Proactive leg: a due reminder created over the chain is picked up by the
         real background scheduler, committed atomically to the outbox, delivered by
         the outbox worker, and announced on the robot's expression/audio channel.
+
+        This must be a *genuine* delivery: the announcement really reaches the
+        fake firmware (which ACKs it with the correct request_id), and the outbox
+        row is marked `dispatched` because delivery succeeded -- not because the
+        worker backed off after a rejected send.
         """
         # Already-due timestamp so the scheduler fires on its next poll.
         resp = self.tool_request_roundtrip(
@@ -440,16 +462,46 @@ class RealChainTestCase(unittest.TestCase):
         self.assertEqual(announcement.get("text"), "Stand up and stretch")
         self.assertEqual(announcement.get("payload", {}).get("reminder_id"), "rem-chain-due")
 
-        # Reminder state really advanced, and the outbox row was consumed.
-        reminder = self.app.life_service.get_reminder("rem-chain-due")
-        self.assertEqual(reminder["status"], "ringing")
+        # The Host only records a delivered alert when the announcement channel
+        # returned True -- i.e. the firmware genuinely ACKed the ctrl.expression.play.
         self.assertTrue(
             wait_until(
-                lambda: not self.app.life_service.get_pending_outbox_messages(limit=10),
+                lambda: any(a.get("reminder_id") == "rem-chain-due"
+                            for a in self.app._delivered_alerts),
                 timeout=5.0,
             ),
-            "Delivered outbox message must be marked dispatched, not left pending",
+            "Announcement was not confirmed as delivered by the Host (send_announcement returned False)",
         )
+
+        # Reminder state really advanced.
+        reminder = self.app.life_service.get_reminder("rem-chain-due")
+        self.assertEqual(reminder["status"], "ringing")
+
+        # The outbox row must end up `dispatched` with no retry recorded. A row
+        # that merely backed off would still be `pending` (with a future
+        # next_retry_at) -- asserting only "no *ready* pending row" would pass
+        # vacuously, so query the row state directly.
+        def outbox_row() -> Optional[dict[str, Any]]:
+            conn = sqlite3.connect(str(self.db_path))
+            try:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT state, retry_count, dispatched_at FROM outbox "
+                    "WHERE event_type = 'reminder.alert'"
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                return rows[0] if rows else None
+            finally:
+                conn.close()
+
+        self.assertTrue(
+            wait_until(lambda: (outbox_row() or {}).get("state") == "dispatched", timeout=5.0),
+            f"Outbox row must be dispatched after a successful delivery, got {outbox_row()}",
+        )
+        row = outbox_row()
+        self.assertEqual(row["state"], "dispatched")
+        self.assertEqual(row["retry_count"], 0, "A successful delivery must not record any retry")
+        self.assertIsNotNone(row["dispatched_at"])
 
     # ---------------------------------------------------------------------
     # 6. Error propagation back over the wire
