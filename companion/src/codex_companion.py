@@ -11,12 +11,17 @@ Features:
 - Solves race conditions where approvals arrive before task/turn mapping completes.
 - Injectable JSON-RPC transport for test isolation and offline verification.
 - HTTP RPC daemon serving /health and /rpc for cross-machine host communication with Bearer auth.
+  Startup is fail-closed (interfaces.md §6.5 / WP5): the default listener is loopback, and a
+  non-loopback host requires an explicitly configured strong shared token, otherwise the
+  Companion refuses to start. The Codex app-server itself is never exposed over the network.
 - RemoteCodexCompanionClient for client-side consumption over LAN.
 """
 
 from __future__ import annotations
 
 import abc
+import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -966,30 +971,247 @@ class RemoteCodexCompanionClient:
         return self._rpc_call("codex.cancel", {"task_id": task_id, "reason": reason})
 
 
+# ---------------------------------------------------------------------------
+# WP5 / interfaces.md §6.5 — Companion listener binding safety (Ruling R5)
+#
+# Ruling: the default listen host is loopback; a non-loopback listener (0.0.0.0,
+# a LAN address, ...) MUST be protected by an explicitly configured, non-empty,
+# non-placeholder auth_token, otherwise startup is refused (fail closed). The
+# listener never silently downgrades to an unauthenticated public service.
+#
+# Loopback behaviour (explicitly documented decision):
+#   - loopback + no token  -> allowed (local isolation, no auth), unchanged.
+#   - loopback + placeholder token -> refused: a repository-committed
+#     placeholder is never a real secret and must not become a live token.
+# ---------------------------------------------------------------------------
+
+DEFAULT_COMPANION_HOST = "127.0.0.1"
+
+#: Minimum length required for an auth_token when the listener is non-loopback.
+#: A "strong shared token" shorter than this is treated as misconfiguration.
+MIN_LAN_AUTH_TOKEN_LENGTH = 16
+
+#: Tokens that are published in this repository or are obvious "fill me in"
+#: markers. They can never be treated as a real shared secret.
+KNOWN_PLACEHOLDER_TOKENS = frozenset({
+    "replace_with_strong_shared_token_matching_taishanpi_config",
+    "replace_with_strong_shared_token_or_leave_empty_for_local_only",
+    "replace_with_strong_shared_token",
+    "replace_with_a_strong_shared_token",
+    "replace_with_your_token",
+    "replace_me",
+    "changeme",
+    "change_me",
+    "change-me",
+    "your_token_here",
+    "your-token-here",
+    "yourtoken",
+    "placeholder",
+    "placeholder_token",
+    "example",
+    "example_token",
+    "sample_token",
+    "test_token",
+    "secret",
+    "token",
+    "password",
+    "todo",
+    "tbd",
+    "xxx",
+    "none",
+    "null",
+    "undefined",
+})
+
+#: Case-insensitive prefixes that mark a value as a placeholder to be replaced.
+_PLACEHOLDER_PREFIXES = (
+    "REPLACE_WITH",
+    "REPLACE-",
+    "REPLACEWITH",
+    "REPLACE_ME",
+    "CHANGEME",
+    "CHANGE_ME",
+    "CHANGE-ME",
+    "YOUR_TOKEN",
+    "YOURTOKEN",
+    "PLACEHOLDER",
+    "EXAMPLE",
+    "SAMPLE",
+    "TODO",
+    "<",
+)
+
+#: Case-insensitive substrings anywhere in the value that mark it as a placeholder.
+_PLACEHOLDER_SUBSTRINGS = (
+    "REPLACE_WITH",
+    "REPLACE-ME",
+    "REPLACEME",
+    "CHANGEME",
+    "CHANGE_ME",
+    "PLACEHOLDER",
+)
+
+
+class CompanionConfigError(ValueError):
+    """Raised when the Companion listener configuration is unsafe to start.
+
+    Raised by :func:`validate_companion_binding`, :func:`resolve_companion_settings`,
+    :func:`create_companion_server` and :func:`start_companion_server` so that every
+    startup entry point (library, CLI, PowerShell launchers) fails closed.
+    """
+
+
+def is_loopback_host(host: Optional[str]) -> bool:
+    """Returns True only for hosts that cannot be reached from the LAN."""
+    if not isinstance(host, str):
+        return False
+    candidate = host.strip()
+    if not candidate:
+        return False
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if candidate.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        # Any other hostname (machine name, DNS name) is not provably loopback.
+        return False
+
+
+def is_placeholder_token(token: Optional[str]) -> bool:
+    """Returns True for empty/None tokens and for known or obvious placeholder tokens."""
+    if not isinstance(token, str):
+        return True
+    candidate = token.strip()
+    if not candidate:
+        return True
+    lowered = candidate.lower()
+    if lowered in KNOWN_PLACEHOLDER_TOKENS:
+        return True
+    upper = candidate.upper()
+    if upper.startswith(_PLACEHOLDER_PREFIXES):
+        return True
+    return any(marker in upper for marker in _PLACEHOLDER_SUBSTRINGS)
+
+
+def validate_companion_binding(host: Optional[str], auth_token: Optional[str]) -> None:
+    """Validates the effective (host, auth_token) pair for the Companion listener.
+
+    Fail-closed rules (interfaces.md §6.5):
+      * non-loopback host + empty/None/whitespace token -> CompanionConfigError;
+      * non-loopback host + placeholder token (incl. the repo example token) -> CompanionConfigError;
+      * non-loopback host + token shorter than MIN_LAN_AUTH_TOKEN_LENGTH -> CompanionConfigError;
+      * loopback host + empty/None token -> allowed (local isolation);
+      * loopback host + placeholder token -> CompanionConfigError (never a real secret);
+      * loopback host + any other explicit token -> allowed and enforced by the handler.
+    """
+    if auth_token is not None and not isinstance(auth_token, str):
+        raise CompanionConfigError(
+            f"Refusing to start: auth_token must be a string, got {type(auth_token).__name__}."
+        )
+
+    if is_loopback_host(host):
+        if auth_token is not None and auth_token.strip() and is_placeholder_token(auth_token):
+            raise CompanionConfigError(
+                "Refusing to start: auth_token is a known/obvious placeholder value "
+                "(e.g. the example token committed in this repository). Set a real strong "
+                "shared token, or leave auth_token empty to run loopback-only without auth."
+            )
+        return
+
+    if auth_token is None or not auth_token.strip():
+        raise CompanionConfigError(
+            f"Refusing to start: host '{host}' is not a loopback address and no auth_token is configured. "
+            "A non-loopback listener (e.g. 0.0.0.0) exposes the Codex Companion /rpc endpoint to the LAN, "
+            "so an explicit strong shared token is mandatory (interfaces.md §6.5). Refusing to start an "
+            "unauthenticated listener."
+        )
+
+    if is_placeholder_token(auth_token):
+        raise CompanionConfigError(
+            "Refusing to start: auth_token is a known/obvious placeholder value "
+            "(e.g. 'REPLACE_WITH_STRONG_SHARED_TOKEN_MATCHING_TAISHANPI_CONFIG' from the shipped example). "
+            "A publicly committed placeholder must never become a live LAN token. Configure a real strong "
+            "shared token on both the Windows Companion and the TaishanPi host."
+        )
+
+    if len(auth_token.strip()) < MIN_LAN_AUTH_TOKEN_LENGTH:
+        raise CompanionConfigError(
+            f"Refusing to start: auth_token is too short for a non-loopback listener "
+            f"(minimum {MIN_LAN_AUTH_TOKEN_LENGTH} characters). Generate a strong shared token, e.g. "
+            "`python -c \"import secrets; print(secrets.token_urlsafe(32))\"`."
+        )
+
+
+def resolve_companion_settings(
+    config_path: Optional[str] = None,
+    port: int = 8765,
+    host: str = DEFAULT_COMPANION_HOST,
+    auth_token: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Loads the config file (if any) and returns the validated effective settings.
+
+    All startup entry points funnel through this function so that the loopback /
+    strong-token rule of interfaces.md §6.5 cannot be bypassed by a caller.
+    Raises CompanionConfigError when the resulting binding is unsafe.
+    """
+    settings: dict[str, Any] = {
+        "port": port,
+        "host": host,
+        "auth_token": auth_token,
+        "db_path": db_path,
+        "registered_workspaces": {},
+        "codex_bin": "codex",
+    }
+
+    if config_path:
+        if not os.path.exists(config_path):
+            raise CompanionConfigError(
+                f"Refusing to start: companion config file not found: {config_path}. "
+                "Copy deploy/windows/companion-config.example.json to companion-config.json, then configure "
+                "host and auth_token explicitly."
+            )
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            raise CompanionConfigError(
+                f"Refusing to start: companion config {config_path} must contain a JSON object."
+            )
+        settings["registered_workspaces"] = cfg.get("registered_workspaces", {}) or {}
+        settings["port"] = cfg.get("port", settings["port"])
+        settings["host"] = cfg.get("host", settings["host"])
+        settings["codex_bin"] = cfg.get("codex_bin", settings["codex_bin"])
+        settings["auth_token"] = cfg.get("auth_token", settings["auth_token"])
+        settings["db_path"] = cfg.get("db_path", settings["db_path"])
+
+    validate_companion_binding(settings["host"], settings["auth_token"])
+    return settings
+
+
 def create_companion_server(
     config_path: Optional[str] = None,
     port: int = 8765,
-    host: str = "127.0.0.1",
+    host: str = DEFAULT_COMPANION_HOST,
     auth_token: Optional[str] = None,
     db_path: Optional[str] = None,
 ):
     from http.server import HTTPServer, BaseHTTPRequestHandler
     from socketserver import ThreadingMixIn
 
-    registered_aliases = {}
-    codex_bin = "codex"
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                registered_aliases = cfg.get("registered_workspaces", {})
-                port = cfg.get("port", port)
-                host = cfg.get("host", host)
-                codex_bin = cfg.get("codex_bin", codex_bin)
-                auth_token = cfg.get("auth_token", auth_token)
-                db_path = cfg.get("db_path", db_path)
-        except Exception as e:
-            logger.warning("Failed to load config %s: %s", config_path, e)
+    # WP5 / §6.5: validate the effective binding before anything is constructed.
+    # Raises CompanionConfigError (fail closed) instead of binding an exposed,
+    # unauthenticated listener.
+    settings = resolve_companion_settings(
+        config_path=config_path, port=port, host=host, auth_token=auth_token, db_path=db_path
+    )
+    registered_aliases = settings["registered_workspaces"]
+    port = settings["port"]
+    host = settings["host"]
+    codex_bin = settings["codex_bin"]
+    auth_token = settings["auth_token"]
+    db_path = settings["db_path"]
 
     companion = CodexCompanion(
         allowed_workspaces=registered_aliases if registered_aliases else None,
@@ -1006,14 +1228,18 @@ def create_companion_server(
             self.close_connection = True
 
         def _check_auth(self) -> bool:
+            # WP5 / §6.5: a non-loopback listener can never be constructed without a
+            # validated strong token (see validate_companion_binding), so an empty
+            # token only ever means "loopback-only, local isolation". Never return
+            # True for an unauthenticated non-loopback listener.
             if not auth_token:
-                return True
+                return is_loopback_host(host)
             auth_hdr = self.headers.get("Authorization", "")
             tok_hdr = self.headers.get("X-Companion-Token", "")
             if auth_hdr.startswith("Bearer "):
-                return auth_hdr[7:].strip() == auth_token
+                return hmac.compare_digest(auth_hdr[7:].strip(), auth_token)
             if tok_hdr:
-                return tok_hdr.strip() == auth_token
+                return hmac.compare_digest(tok_hdr.strip(), auth_token)
             return False
 
         def do_GET(self) -> None:
@@ -1112,11 +1338,19 @@ def create_companion_server(
 def start_companion_server(
     config_path: Optional[str] = None,
     port: int = 8765,
-    host: str = "127.0.0.1",
+    host: str = DEFAULT_COMPANION_HOST,
     auth_token: Optional[str] = None,
 ) -> None:
+    # WP5 / §6.5: same validation path as create_companion_server / the CLI, so a
+    # library caller cannot bypass the loopback-or-strong-token rule either.
+    settings = resolve_companion_settings(config_path=config_path, port=port, host=host, auth_token=auth_token)
     server = create_companion_server(config_path=config_path, port=port, host=host, auth_token=auth_token)
-    logger.info("Codex Companion server listening on %s:%s", host, port)
+    logger.info(
+        "Codex Companion server listening on %s:%s (auth %s)",
+        settings["host"],
+        settings["port"],
+        "enabled" if (settings["auth_token"] or "").strip() else "disabled (loopback only)",
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1130,5 +1364,30 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Desk Agent R1 Windows Codex Companion")
     parser.add_argument("--config", "-c", type=str, help="Path to companion-config.json")
     parser.add_argument("--port", "-p", type=int, default=8765, help="Port to listen on")
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate the effective listen host / auth_token and exit without starting the server "
+             "(interfaces.md §6.5). Exits 0 when the binding is safe, 2 when it is refused.",
+    )
     cli_args = parser.parse_args()
-    start_companion_server(config_path=cli_args.config, port=cli_args.port)
+    try:
+        resolved = resolve_companion_settings(config_path=cli_args.config, port=cli_args.port)
+    except CompanionConfigError as exc:
+        print(f"[companion] REFUSING TO START: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if cli_args.check_config:
+        # Never echo the token itself, only whether one is enforced.
+        print(json.dumps({
+            "status": "ok",
+            "host": resolved["host"],
+            "port": resolved["port"],
+            "loopback_only": is_loopback_host(resolved["host"]),
+            "auth_required": bool((resolved["auth_token"] or "").strip()),
+        }))
+        sys.exit(0)
+    try:
+        start_companion_server(config_path=cli_args.config, port=cli_args.port)
+    except CompanionConfigError as exc:
+        print(f"[companion] REFUSING TO START: {exc}", file=sys.stderr)
+        sys.exit(2)
