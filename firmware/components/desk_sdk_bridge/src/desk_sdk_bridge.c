@@ -148,15 +148,38 @@ static void generate_dynamic_token(char *out_buf, size_t max_len)
     out_buf[out_idx] = '\0';
 }
 
+/* True when the string matches ^[0-9a-f]{64}$ -- the official session_token
+ * format (_require_lower_hex(message, "session_token", _LOWER_HEX_64)). */
+static bool desk_sdk_is_lower_hex_64(const char *s)
+{
+    if (!s) return false;
+    for (size_t i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return s[64] == '\0';
+}
+
 int desk_sdk_bridge_set_pairing_token(const char *token)
 {
-    if (token && strlen(token) > 0) {
-        strncpy(s_active_pairing_token, token, sizeof(s_active_pairing_token) - 1);
-        s_active_pairing_token[sizeof(s_active_pairing_token) - 1] = '\0';
-    } else {
+    if (!token) {
+        /* No value supplied: mint a fresh credential (always 64 lowercase hex). */
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
+        return 0;
     }
-    s_paired = true;
+
+    /* R11: refuse any credential that could not legally appear in a pair.accept.
+     * Arming it would make the firmware emit a message the official SDK's own
+     * parse_udp_message() rejects. The previously armed credential is preserved. */
+    if (!desk_sdk_is_lower_hex_64(token)) {
+        return -1;
+    }
+
+    memcpy(s_active_pairing_token, token, sizeof(s_active_pairing_token));
+    /* R9 (interfaces.md 6.6): this provisioning entry point sets credential
+     * material ONLY. `s_paired` means "a client has successfully completed a
+     * pairing handshake" and may only be set by the validated pairing path in
+     * desk_sdk_bridge_process_pairing_udp() (interfaces.md 6.4). */
     return 0;
 }
 

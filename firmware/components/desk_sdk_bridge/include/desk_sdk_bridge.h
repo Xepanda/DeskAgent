@@ -256,7 +256,23 @@ int desk_sdk_pairing_server_stop(void);
 int desk_sdk_pairing_server_get_port(void);
 
 /**
- * @brief Set dynamic pairing token manually (or pass NULL to auto-generate).
+ * @brief Provision the active pairing session token (credential material only).
+ *
+ * The value is validated against the official `session_token` format
+ * `^[0-9a-f]{64}$` (64 lowercase hexadecimal characters) and REJECTED (-1) if it
+ * does not conform: a non-conforming credential would be echoed verbatim into
+ * `pair.accept`, producing a message the official SDK's `parse_udp_message()`
+ * refuses. A rejected call leaves any previously armed credential untouched.
+ *
+ * R9 (interfaces.md 6.6): this entry point sets credential material ONLY and
+ * MUST NOT mark the device as paired. `s_paired` means "a client has completed
+ * a pairing handshake" and is only set by the validated pairing path in
+ * desk_sdk_bridge_process_pairing_udp(). Enforcing a token on the handshake
+ * remains the job of desk_sdk_bridge_set_auth_required().
+ *
+ * @param token 64 lowercase hex characters matching `^[0-9a-f]{64}$`;
+ *              pass NULL to mint a fresh conforming random credential instead.
+ * @return 0 on success, -1 if `token` is non-NULL and does not conform.
  */
 int desk_sdk_bridge_set_pairing_token(const char *token);
 

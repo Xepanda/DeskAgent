@@ -18,6 +18,9 @@ import unittest
 # Mirror of DESK_SDK_MAX_FRAME_LEN in desk_sdk_bridge.h (interfaces.md 6.3.2).
 DESK_SDK_MAX_FRAME_LEN = 8192
 
+# A conforming session_token: exactly ^[0-9a-f]{64}$ (official wire contract).
+VALID_SESSION_TOKEN = "0123456789abcdef" * 4
+
 # Hardware error codes (desk_hardware.h)
 DESK_HW_OK = 0
 DESK_HW_ERR_STALL = -6
@@ -255,6 +258,9 @@ class TestSdkBridgeProtocol(unittest.TestCase):
 
         cls.lib.desk_sdk_bridge_set_auth_required.restype = None
         cls.lib.desk_sdk_bridge_set_auth_required.argtypes = [ctypes.c_bool]
+
+        cls.lib.desk_sdk_bridge_set_pairing_token.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_set_pairing_token.argtypes = [ctypes.c_char_p]
 
         cls.lib.desk_sdk_bridge_pack_media_frame.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_pack_media_frame.argtypes = [
@@ -1541,6 +1547,138 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         logged = read_captured(tmp)
         self.assertNotIn("123456", logged, "supplied pairing_code must never be logged")
         self.assertNotIn("654321", logged, "provisioned pairing_code must never be logged")
+
+    # ------------------------------------------------------------------
+    # R9 -- set_pairing_token() sets credentials only, never the paired state
+    # ------------------------------------------------------------------
+
+    def test_set_pairing_token_does_not_imply_paired_state(self) -> None:
+        """R9 (interfaces.md 6.6): provisioning a token must not mark the device paired.
+
+        `s_paired` is only set by a validated pairing handshake. The paired state
+        is not directly readable, so this asserts its wire-observable consequence:
+        with a credential provisioned but no validated pairing and no explicit
+        auth requirement, the handshake must not treat the client as a paired
+        session. (Before R9 the `s_paired` branch fired here and a token-less
+        hello was rejected with 401.)
+        """
+        self.assertEqual(
+            self.lib.desk_sdk_bridge_set_pairing_token(VALID_SESSION_TOKEN.encode("utf-8")), 0)
+        self.lib.desk_sdk_bridge_set_auth_required(False)
+        # Not paired: the paired-session branch cannot fire for a token-less hello.
+        resp = self._process_cmd({"type": "sys.client.hello", "data": {"role": "desktop"}})
+        self.assertEqual(resp.get("type"), "sys.ack",
+                         "a provisioned credential must not put the device in the paired state")
+        self.assertEqual(resp.get("code"), 0)
+
+        # The credential is nevertheless armed: a wrong token is still rejected.
+        resp_bad = self._process_cmd({
+            "type": "sys.client.hello",
+            "data": {"role": "desktop", "token": "wrong-token"},
+        })
+        self.assertEqual(resp_bad.get("type"), "sys.nack")
+        self.assertEqual(resp_bad.get("code"), 401)
+
+        # ... and the provisioned token itself is accepted.
+        resp_ok = self._process_cmd({
+            "type": "sys.client.hello",
+            "data": {"role": "desktop", "token": VALID_SESSION_TOKEN},
+        })
+        self.assertEqual(resp_ok.get("type"), "sys.ack")
+        self.assertEqual(resp_ok.get("code"), 0)
+
+    def test_set_pairing_token_does_not_grant_pairing_without_code_validation(self) -> None:
+        """R9: provisioning credentials cannot substitute for a validated pairing handshake."""
+        self.assertEqual(
+            self.lib.desk_sdk_bridge_set_pairing_token(VALID_SESSION_TOKEN.encode("utf-8")), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0, "a provisioned token must not bypass pairing-code validation")
+        self.assertEqual(reply, "", "no pair.accept / no session_token may be granted")
+
+        # The legitimate validated path is unaffected by R9. A pre-provisioned
+        # credential is reused verbatim (it is not re-minted), so this asserts
+        # the provisioned value is handed out only once validation passes.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        rc_ok, reply_ok = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc_ok, 0)
+        parsed = json.loads(reply_ok)
+        self.assertEqual(parsed["type"], "pair.accept")
+        self.assertEqual(parsed["session_token"], VALID_SESSION_TOKEN)
+
+    # ------------------------------------------------------------------
+    # R11 -- set_pairing_token() only accepts ^[0-9a-f]{64}$
+    # ------------------------------------------------------------------
+
+    def test_set_pairing_token_rejects_nonconforming_credentials(self) -> None:
+        """R11: a credential that cannot legally appear in pair.accept must be refused.
+
+        `pair.accept.session_token` is required by the official contract to match
+        `^[0-9a-f]{64}$`. Since a provisioned credential is echoed verbatim into
+        that field, any other value must be rejected at provisioning time rather
+        than arming the device to emit a contract-violating message.
+        """
+        valid = VALID_SESSION_TOKEN.encode("utf-8")
+        bad_inputs = [
+            b"short",                            # too short
+            b"",                                 # empty
+            b"0123456789abcdef" * 3,             # 48 chars
+            valid + b"a",                        # 65 chars
+            valid[:-1],                          # 63 chars
+            b"0123456789ABCDEF" * 4,             # 64 chars, uppercase
+            b"z" * 64,                           # 64 chars, non-hex
+            valid[:-1] + b"-",                   # 64 chars, trailing non-hex
+            b"0x" + valid[:-2],                  # 64 chars, non-hex prefix
+        ]
+        for bad in bad_inputs:
+            with self.subTest(token=bad[:20]):
+                self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_token(bad), -1,
+                                 "non-conforming credential must be refused")
+
+        # None of the rejected inputs armed the device: with no credential
+        # installed, a hello carrying an arbitrary token is not a mismatch.
+        resp = self._process_cmd({
+            "type": "sys.client.hello",
+            "data": {"role": "desktop", "token": "whatever-token"},
+        })
+        self.assertEqual(resp.get("type"), "sys.ack",
+                         "a refused credential must not arm the device")
+
+        # A conforming value is accepted and does arm the device.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_token(valid), 0)
+        resp_bad = self._process_cmd({
+            "type": "sys.client.hello",
+            "data": {"role": "desktop", "token": "wrong-token"},
+        })
+        self.assertEqual(resp_bad.get("type"), "sys.nack")
+        self.assertEqual(resp_bad.get("code"), 401)
+        resp_ok = self._process_cmd({
+            "type": "sys.client.hello",
+            "data": {"role": "desktop", "token": VALID_SESSION_TOKEN},
+        })
+        self.assertEqual(resp_ok.get("type"), "sys.ack")
+
+        # A later rejected call must not clobber the armed credential.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_token(b"short"), -1)
+        resp_still = self._process_cmd({
+            "type": "sys.client.hello",
+            "data": {"role": "desktop", "token": VALID_SESSION_TOKEN},
+        })
+        self.assertEqual(resp_still.get("type"), "sys.ack")
+
+    def test_provisioned_credential_yields_contract_valid_pair_accept(self) -> None:
+        """R11: the echoed pair.accept.session_token must satisfy ^[0-9a-f]{64}$."""
+        self.assertEqual(
+            self.lib.desk_sdk_bridge_set_pairing_token(VALID_SESSION_TOKEN.encode("utf-8")), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0)
+        token = json.loads(reply)["session_token"]
+        self.assertEqual(len(token), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in token))
 
 
 
