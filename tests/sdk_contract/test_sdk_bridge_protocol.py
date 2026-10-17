@@ -6,12 +6,21 @@ WSPK binary framing, input events, and bidirectional tool dispatch.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
+
+# Mirror of DESK_SDK_MAX_FRAME_LEN in desk_sdk_bridge.h (interfaces.md 6.3.2).
+DESK_SDK_MAX_FRAME_LEN = 8192
+
+# Hardware error codes (desk_hardware.h)
+DESK_HW_OK = 0
+DESK_HW_ERR_STALL = -6
 
 # Resource enum definitions matching desk_arbiter.h
 DESK_OWNER_NONE = 0
@@ -58,6 +67,50 @@ class DeskWspkHeader(ctypes.Structure):
 # Callback signatures
 OUTBOUND_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p)
 TOOL_RESP_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+
+# Board driver ops table (desk_hardware.h desk_board_driver_ops_t) for fault injection
+DRIVER_MOTION_MOVE_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_uint32)
+DRIVER_MOTION_STOP_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_bool)
+MCU_TX_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p)
+
+
+class DeskBoardDriverOps(ctypes.Structure):
+    _fields_ = [
+        ("driver_name", ctypes.c_char_p),
+        ("init", ctypes.c_void_p),
+        ("audio_record_read", ctypes.c_void_p),
+        ("audio_play_pcm", ctypes.c_void_p),
+        ("motion_move", DRIVER_MOTION_MOVE_CB),
+        ("motion_stop", DRIVER_MOTION_STOP_CB),
+        ("camera_capture", ctypes.c_void_p),
+        ("display_expression", ctypes.c_void_p),
+        ("deinit", ctypes.c_void_p),
+    ]
+
+
+@contextlib.contextmanager
+def capture_c_stdout():
+    """Capture C-level stdout (printf) by redirecting file descriptor 1."""
+    sys.stdout.flush()
+    libc = ctypes.CDLL(None)
+    libc.fflush(None)
+    saved_fd = os.dup(1)
+    tmp = tempfile.TemporaryFile()
+    os.dup2(tmp.fileno(), 1)
+    try:
+        yield tmp
+    finally:
+        # C stdio buffers to a non-tty, so flush before restoring fd 1.
+        libc.fflush(None)
+        sys.stdout.flush()
+        os.dup2(saved_fd, 1)
+        os.close(saved_fd)
+
+
+def read_captured(tmp) -> str:
+    tmp.flush()
+    tmp.seek(0)
+    return tmp.read().decode("utf-8", errors="replace")
 
 
 class TestSdkBridgeProtocol(unittest.TestCase):
@@ -178,6 +231,31 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             ctypes.c_size_t,
         ]
 
+        cls.lib.desk_sdk_bridge_set_pairing_code.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_set_pairing_code.argtypes = [ctypes.c_char_p]
+
+        cls.lib.desk_sdk_bridge_is_pairing_code_configured.restype = ctypes.c_bool
+        cls.lib.desk_sdk_bridge_is_pairing_code_configured.argtypes = []
+
+        cls.lib.desk_hardware_register_driver_ops.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_driver_ops.argtypes = [ctypes.POINTER(DeskBoardDriverOps)]
+
+        cls.lib.desk_hardware_camera_inject_frame.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_inject_frame.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+        ]
+
+        cls.lib.desk_hardware_register_mcu_tx_cb.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_mcu_tx_cb.argtypes = [MCU_TX_CB, ctypes.c_void_p]
+
+        cls.lib.desk_sdk_bridge_reset.restype = None
+        cls.lib.desk_sdk_bridge_reset.argtypes = []
+
+        cls.lib.desk_sdk_bridge_set_auth_required.restype = None
+        cls.lib.desk_sdk_bridge_set_auth_required.argtypes = [ctypes.c_bool]
+
         cls.lib.desk_sdk_bridge_pack_media_frame.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_pack_media_frame.argtypes = [
             ctypes.c_uint8,
@@ -227,6 +305,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
 
     def setUp(self) -> None:
         self.lib.desk_hardware_init()
+        self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
 
     def _process_cmd(self, cmd_dict: dict) -> dict:
@@ -235,6 +314,92 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         rc = self.lib.desk_sdk_bridge_process_command(cmd_str, out_buf, 4096)
         self.assertEqual(rc, 0, f"desk_sdk_bridge_process_command returned error code {rc}")
         return json.loads(out_buf.value.decode("utf-8"))
+
+    # -- helpers -----------------------------------------------------------
+
+    def _process_pairing(self, payload: bytes) -> tuple[int, str]:
+        """Returns (return_code, raw_reply_text). Reply text is "" on rejection."""
+        out_buf = ctypes.create_string_buffer(2048)
+        rc = self.lib.desk_sdk_bridge_process_pairing_udp(payload, out_buf, 2048)
+        return rc, out_buf.value.decode("utf-8")
+
+    def _official_pair_request(self, pairing_code: str, **overrides) -> bytes:
+        body = {
+            "type": "pair.request",
+            "protocol": "watcher-lan-pairing",
+            "version": "1.0",
+            "request_id": "21a9dbf05ea3443480e62076f79a3b12",
+            "daemon_instance_id": "f730f29e670c49f7a3320c4314eb9805",
+            "pairing_code": pairing_code,
+            "target_mode": "python_sdk",
+            "websocket_port": 8765,
+        }
+        body.update(overrides)
+        return json.dumps(body).encode("utf-8")
+
+    def _register_failing_motion_driver(self, move_rc: int, stop_rc: int) -> None:
+        """Install a board driver whose motion primitives always fail.
+
+        An MCU TX callback is registered too, so the hardware layer does not
+        short-circuit on the host (no real UART) before reaching the driver.
+        """
+        @DRIVER_MOTION_MOVE_CB
+        def on_move(pan, tilt, duration):
+            return move_rc
+
+        @DRIVER_MOTION_STOP_CB
+        def on_stop(emergency):
+            return stop_rc
+
+        @MCU_TX_CB
+        def on_mcu_tx(data, length, user_data):
+            return None
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"faulty_test_bsp"
+        ops.motion_move = on_move
+        ops.motion_stop = on_stop
+        # Keep references alive for the lifetime of the test.
+        self._driver_cbs = (on_move, on_stop, on_mcu_tx)
+        self._driver_ops = ops
+        self.assertEqual(self.lib.desk_hardware_register_mcu_tx_cb(on_mcu_tx, None), 0)
+        self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops)), 0)
+
+    def _open_tcp_session(self):
+        import socket
+
+        rc = self.lib.desk_sdk_socket_server_start(0)
+        self.assertEqual(rc, 0)
+        port = self.lib.desk_sdk_socket_server_get_port()
+        self.assertGreater(port, 1024)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(("127.0.0.1", port))
+        sock.settimeout(0.5)
+        self.lib.desk_sdk_socket_server_poll(100)
+        self.addCleanup(sock.close)
+        self.addCleanup(self.lib.desk_sdk_socket_server_stop)
+        return sock
+
+    def _pump(self, polls: int = 3, timeout_ms: int = 50) -> None:
+        for _ in range(polls):
+            self.lib.desk_sdk_socket_server_poll(timeout_ms)
+
+    @staticmethod
+    def _recv_lines(sock, timeout: float = 0.4) -> list[str]:
+        import socket as _socket
+
+        sock.settimeout(timeout)
+        buf = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        except _socket.timeout:
+            pass
+        return [line for line in buf.decode("utf-8", errors="replace").split("\n") if line.strip()]
 
     def test_handshake_hello_and_capabilities(self) -> None:
         """Verifies sys.client.hello negotiation and capabilities list."""
@@ -469,22 +634,19 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp_parsed["request_id"], "req-tclaw-9988")
 
     def test_udp_pairing_protocol_exchange(self) -> None:
-        """Verifies UDP pair.request handling and pair.accept generation per watcher_lan_pairing_v1."""
-        pair_req = json.dumps({
-            "type": "pair.request",
-            "protocol": "watcher-lan-pairing",
-            "version": "1.0",
-            "request_id": "21a9dbf05ea3443480e62076f79a3b12",
-            "daemon_instance_id": "f730f29e670c49f7a3320c4314eb9805",
-            "pairing_code": "123456",
-            "target_mode": "python_sdk",
-            "websocket_port": 8765,
-        })
-        out_buf = ctypes.create_string_buffer(1024)
-        rc = self.lib.desk_sdk_bridge_process_pairing_udp(pair_req.encode("utf-8"), out_buf, 1024)
-        self.assertEqual(rc, 0)
+        """Verifies UDP pair.request handling and pair.accept generation per watcher_lan_pairing_v1.
 
-        rsp = json.loads(out_buf.value.decode("utf-8"))
+        The expected pairing code must be provisioned explicitly (interfaces.md 6.4);
+        nothing is granted before it validates.
+        """
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0)
+        self.assertNotEqual(reply, "")
+
+        rsp = json.loads(reply)
         self.assertEqual(rsp["type"], "pair.accept")
         self.assertEqual(rsp["protocol"], "watcher-lan-pairing")
         self.assertEqual(rsp["version"], "1.0")
@@ -492,6 +654,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(rsp["daemon_instance_id"], "f730f29e670c49f7a3320c4314eb9805")
         self.assertEqual(rsp["target_mode"], "python_sdk")
         self.assertEqual(len(rsp["session_token"]), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in rsp["session_token"]))
 
     def test_hardware_hello_handshake_with_audio_negotiation(self) -> None:
         """Verifies sys.client.hello with role=hardware negotiates Opus audio uplink per contract."""
@@ -565,9 +728,9 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         # Poll server to accept client
         self.lib.desk_sdk_socket_server_poll(100)
 
-        # Send sys.ping over TCP
+        # Send sys.ping over TCP (newline-delimited framing, interfaces.md 6.3)
         ping_msg = json.dumps({"type": "sys.ping"}).encode("utf-8")
-        client_sock.sendall(ping_msg)
+        client_sock.sendall(ping_msg + b"\n")
 
         # Poll server to process command
         self.lib.desk_sdk_socket_server_poll(100)
@@ -578,14 +741,23 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp_json["type"], "sys.pong")
 
         # Send motion.move over TCP
-        move_msg = json.dumps({"type": "motion.move", "pan_deg": 110.0, "tilt_deg": 115.0, "duration_ms": 300}).encode("utf-8")
-        client_sock.sendall(move_msg)
+        move_msg = json.dumps({
+            "type": "motion.move",
+            "request_id": "req-live-move-01",
+            "pan_deg": 110.0,
+            "tilt_deg": 115.0,
+            "duration_ms": 300,
+        }).encode("utf-8")
+        client_sock.sendall(move_msg + b"\n")
         self.lib.desk_sdk_socket_server_poll(100)
 
         resp_move = client_sock.recv(1024).decode("utf-8").strip()
         resp_move_json = json.loads(resp_move)
         self.assertEqual(resp_move_json["type"], "sys.ack")
-        self.assertEqual(resp_move_json["data"]["status"], "succeeded")
+        # A device ACK means "accepted", never "succeeded" (interfaces.md 6.1).
+        self.assertEqual(resp_move_json["data"]["status"], "accepted")
+        self.assertTrue(resp_move_json["data"]["accepted"])
+        self.assertEqual(resp_move_json["request_id"], "req-live-move-01")
         self.assertEqual(resp_move_json["data"]["pan_deg"], 110.0)
 
         # Trigger event and verify socket receives it
@@ -602,6 +774,9 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         """Verifies UDP Pairing Discovery server (watcher_lan_pairing_v1) responds to pairing requests."""
         import socket
 
+        # Provision the device-side expected code first (fail-closed otherwise).
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+
         # Start UDP pairing server on ephemeral port
         rc = self.lib.desk_sdk_pairing_server_start(0)
         self.assertEqual(rc, 0)
@@ -617,6 +792,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             "type": "pair.request",
             "protocol": "watcher_lan_pairing_v1",
             "client_id": "test_py_sdk_runner",
+            "pairing_code": "123456",
             "timestamp": 1792000000,
         }).encode("utf-8")
 
@@ -637,6 +813,37 @@ class TestSdkBridgeProtocol(unittest.TestCase):
 
         client_udp.close()
         self.lib.desk_sdk_pairing_server_stop()
+
+    def test_udp_pairing_discovery_server_silent_when_code_unprovisioned(self) -> None:
+        """Fail-closed: with no provisioned code the server must not answer a pairing request."""
+        import socket
+
+        # The provisioned code deliberately survives a bridge reset, so clear it here.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        rc = self.lib.desk_sdk_pairing_server_start(0)
+        self.assertEqual(rc, 0)
+        udp_port = self.lib.desk_sdk_pairing_server_get_port()
+
+        client_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client_udp.settimeout(0.4)
+        try:
+            client_udp.sendto(
+                json.dumps({
+                    "type": "pair.request",
+                    "protocol": "watcher_lan_pairing_v1",
+                    "client_id": "test_py_sdk_runner",
+                    "pairing_code": "123456",
+                }).encode("utf-8"),
+                ("127.0.0.1", udp_port),
+            )
+            self.lib.desk_sdk_pairing_server_poll(100)
+            with self.assertRaises(socket.timeout, msg="unprovisioned device must not reply pair.accept"):
+                client_udp.recvfrom(2048)
+        finally:
+            client_udp.close()
+            self.lib.desk_sdk_pairing_server_stop()
 
     def test_socket_server_bind_any(self) -> None:
         """Verifies TCP socket server can bind to 0.0.0.0 via start_ex or start."""
@@ -876,7 +1083,8 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("type"), "sys.ack")
         self.assertEqual(resp.get("code"), 0)
         self.assertEqual(resp.get("request_id"), "req-play-alert-1")
-        self.assertEqual(resp.get("data", {}).get("status"), "succeeded")
+        self.assertEqual(resp.get("data", {}).get("status"), "accepted")
+        self.assertTrue(resp.get("data", {}).get("accepted"))
         self.assertEqual(resp.get("data", {}).get("preset"), "alert")
         self.assertEqual(resp.get("data", {}).get("text"), "Meeting Reminder")
 
@@ -949,7 +1157,8 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("type"), "sys.ack")
         self.assertEqual(resp.get("code"), 0)
         self.assertEqual(resp.get("request_id"), "req-motion-stop-1")
-        self.assertEqual(resp.get("data", {}).get("status"), "succeeded")
+        self.assertEqual(resp.get("data", {}).get("status"), "accepted")
+        self.assertTrue(resp.get("data", {}).get("accepted"))
         self.assertTrue(resp.get("data", {}).get("stopped"))
 
     def test_ctrl_expression_play_hardware_error_in_strict_mode(self) -> None:
@@ -996,6 +1205,342 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp2.get("data", {}).get("preset"), "happy")
 
         self.lib.desk_hardware_set_strict_mode(False)
+
+    # ------------------------------------------------------------------
+    # WP1 -- driver return values must never be reported as code:0
+    # ------------------------------------------------------------------
+
+    def test_motion_move_driver_failure_returns_hardware_fault_nack(self) -> None:
+        """A failing gimbal driver must produce sys.nack HARDWARE_FAULT, never code:0."""
+        self._register_failing_motion_driver(DESK_HW_ERR_STALL, DESK_HW_OK)
+        self.lib.desk_hardware_set_strict_mode(True)
+
+        resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-hw-fault-move",
+            "data": {"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 300},
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 500)
+        self.assertEqual(resp.get("request_id"), "req-hw-fault-move")
+        self.assertEqual(resp.get("error", {}).get("code"), "HARDWARE_FAULT")
+        self.assertNotIn("data", resp, "a driver failure must not carry a success payload")
+
+    def test_motion_stop_driver_failure_returns_hardware_fault_nack(self) -> None:
+        """A failing stop driver must produce sys.nack HARDWARE_FAULT, never stopped:true."""
+        self._register_failing_motion_driver(DESK_HW_OK, DESK_HW_ERR_STALL)
+        self.lib.desk_hardware_set_strict_mode(True)
+
+        resp = self._process_cmd({
+            "type": "ctrl.motion.stop",
+            "request_id": "req-hw-fault-stop",
+            "data": {"emergency": True},
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 500)
+        self.assertEqual(resp.get("request_id"), "req-hw-fault-stop")
+        self.assertEqual(resp.get("error", {}).get("code"), "HARDWARE_FAULT")
+
+    def test_motion_move_success_ack_is_accepted_not_succeeded(self) -> None:
+        """interfaces.md 6.1: a successful motion ACK means accepted, not succeeded."""
+        resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-accepted-level",
+            "data": {"pan_deg": 45.0, "tilt_deg": 115.0, "duration_ms": 200},
+        })
+        self.assertEqual(resp.get("type"), "sys.ack")
+        self.assertEqual(resp.get("code"), 0)
+        self.assertEqual(resp.get("data", {}).get("status"), "accepted")
+        self.assertTrue(resp.get("data", {}).get("accepted"))
+        self.assertNotEqual(resp.get("data", {}).get("status"), "succeeded")
+
+    # ------------------------------------------------------------------
+    # WP2 -- request_id correlation
+    # ------------------------------------------------------------------
+
+    def test_request_id_echoed_on_every_response(self) -> None:
+        """interfaces.md 6.2: every response echoes the request_id of its request."""
+        test_jpeg = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00CORRELATE\xFF\xD9"
+        self.lib.desk_hardware_camera_inject_frame(test_jpeg, len(test_jpeg), 12345)
+
+        cases = [
+            ("motion.move", "sys.ack", {"type": "ctrl.motion.move",
+                                        "data": {"pan_deg": 30.0, "tilt_deg": 120.0, "duration_ms": 200}}),
+            ("motion.stop", "sys.ack", {"type": "ctrl.motion.stop", "data": {"emergency": True}}),
+            ("motion.action.play", "sys.ack", {"type": "ctrl.motion.action.play", "data": {}}),
+            ("camera.acquire", "sys.ack", {"type": "ctrl.camera.acquire",
+                                           "data": {"client_id": "corr-client", "lease_duration_ms": 2000}}),
+            ("camera.release", "sys.ack", {"type": "ctrl.camera.release",
+                                           "data": {"client_id": "corr-client"}}),
+            ("camera.capture", "sys.ack", {"type": "ctrl.camera.capture", "data": {}}),
+            ("microphone.open", "sys.ack", {"type": "ctrl.microphone.open",
+                                            "data": {"sample_rate_hz": 16000}}),
+            ("microphone.close", "sys.ack", {"type": "ctrl.microphone.close", "data": {}}),
+            ("expression.play", "sys.ack", {"type": "ctrl.expression.play",
+                                            "data": {"preset": "idle", "text": "correlate"}}),
+            ("expression.audio_follow", "sys.ack", {"type": "ctrl.expression.audio_follow",
+                                                    "data": {"enabled": True}}),
+            ("sys.sdk.ready.get", "sys.ack", {"type": "sys.sdk.ready.get", "data": {}}),
+            ("sys.ping", "sys.pong", {"type": "sys.ping", "data": {}}),
+            ("unknown.operation", "sys.nack", {"type": "totally.unknown.operation", "data": {}}),
+        ]
+
+        for idx, (name, expected_type, cmd) in enumerate(cases):
+            req_id = f"req-correlate-{idx:02d}"
+            payload = dict(cmd)
+            payload["request_id"] = req_id
+            resp = self._process_cmd(payload)
+            self.assertEqual(resp.get("type"), expected_type, f"{name}: unexpected response type")
+            self.assertEqual(resp.get("request_id"), req_id, f"{name}: request_id was not echoed")
+
+    def test_hello_auth_failure_nack_echoes_request_id(self) -> None:
+        """The 401 nack must correlate to its request_id like any other response."""
+        self.lib.desk_sdk_bridge_set_auth_required(True)
+        self.addCleanup(self.lib.desk_sdk_bridge_set_auth_required, False)
+
+        resp = self._process_cmd({
+            "type": "sys.client.hello",
+            "request_id": "req-hello-401",
+            "data": {"role": "desktop", "token": "bogus"},
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 401)
+        self.assertEqual(resp.get("request_id"), "req-hello-401")
+
+    def test_arbiter_busy_nack_echoes_request_id(self) -> None:
+        """The 409 RESOURCE_BUSY nack must correlate to its request_id."""
+        rc = self.lib.desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE, 0)
+        self.assertEqual(rc, DESK_ARBITER_OK)
+        self.addCleanup(self.lib.desk_arbiter_release, DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE)
+
+        resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-busy-correlate",
+            "data": {"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 200},
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 409)
+        self.assertEqual(resp.get("error", {}).get("code"), "RESOURCE_BUSY")
+        self.assertEqual(resp.get("request_id"), "req-busy-correlate")
+
+    # ------------------------------------------------------------------
+    # WP3 -- TCP stream framing
+    # ------------------------------------------------------------------
+
+    def test_tcp_half_packet_reassembly(self) -> None:
+        """A frame split across two reads must be reassembled, not dropped."""
+        sock = self._open_tcp_session()
+        sock.sendall(b'{"type":"sys.pi')
+        self._pump(2)
+        self.assertEqual(self._recv_lines(sock, timeout=0.3), [],
+                         "an incomplete frame must not be processed")
+
+        sock.sendall(b'ng"}\n')
+        self._pump(2)
+        lines = self._recv_lines(sock)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["type"], "sys.pong")
+
+    def test_tcp_message_split_across_many_reads(self) -> None:
+        """A single message dribbled byte-group by byte-group must still parse."""
+        import time
+
+        sock = self._open_tcp_session()
+        msg = json.dumps({"type": "sys.sdk.ready.get", "request_id": "req-split-01"}) + "\n"
+        for i in range(0, len(msg), 7):
+            sock.sendall(msg[i:i + 7].encode("utf-8"))
+            time.sleep(0.005)
+            self._pump(2, timeout_ms=10)
+
+        lines = self._recv_lines(sock)
+        self.assertEqual(len(lines), 1, f"expected exactly one response, got {lines}")
+        parsed = json.loads(lines[0])
+        self.assertEqual(parsed["type"], "sys.ack")
+        self.assertEqual(parsed["request_id"], "req-split-01")
+
+    def test_tcp_multiple_messages_in_single_read(self) -> None:
+        """Two frames arriving in one TCP segment must both be processed."""
+        sock = self._open_tcp_session()
+        payload = (json.dumps({"type": "sys.ping"}) + "\n" +
+                   json.dumps({"type": "sys.sdk.ready.get"}) + "\n")
+        sock.sendall(payload.encode("utf-8"))
+        self._pump(3)
+
+        lines = self._recv_lines(sock)
+        self.assertEqual(len(lines), 2, f"expected two responses, got {lines}")
+        self.assertEqual(json.loads(lines[0])["type"], "sys.pong")
+        self.assertEqual(json.loads(lines[1])["type"], "sys.ack")
+
+    def test_tcp_oversized_frame_discarded_and_resynced(self) -> None:
+        """An over-long frame is dropped without corrupting the following message."""
+        sock = self._open_tcp_session()
+
+        oversized = b"{" + b"x" * (DESK_SDK_MAX_FRAME_LEN + 64)
+        sock.sendall(oversized + b"\n")
+        self._pump(24, timeout_ms=20)  # drain the whole oversized frame
+        self.assertEqual(self._recv_lines(sock, timeout=0.3), [],
+                         "an oversized frame must not be answered")
+
+        sock.sendall((json.dumps({"type": "sys.ping"}) + "\n").encode("utf-8"))
+        self._pump(3)
+        lines = self._recv_lines(sock)
+        self.assertEqual(len(lines), 1, f"expected only the post-overflow response, got {lines}")
+        self.assertEqual(json.loads(lines[0])["type"], "sys.pong")
+
+    def test_tcp_max_length_frame_still_accepted(self) -> None:
+        """A frame exactly at the limit is accepted (only longer frames are dropped)."""
+        sock = self._open_tcp_session()
+        # Pad a valid command with trailing spaces to reach exactly the limit.
+        base = json.dumps({"type": "sys.ping"})
+        padded = base + " " * (DESK_SDK_MAX_FRAME_LEN - len(base))
+        self.assertEqual(len(padded), DESK_SDK_MAX_FRAME_LEN)
+        sock.sendall(padded.encode("utf-8") + b"\n")
+        self._pump(12, timeout_ms=20)
+
+        lines = self._recv_lines(sock)
+        self.assertEqual(len(lines), 1, f"max-length frame must be accepted, got {lines}")
+        self.assertEqual(json.loads(lines[0])["type"], "sys.pong")
+
+    def test_tcp_garbage_input_does_not_break_link(self) -> None:
+        """Non-JSON lines are dropped and the connection stays usable."""
+        sock = self._open_tcp_session()
+        sock.sendall(b"this is definitely not json\n")
+        self._pump(2)
+        self.assertEqual(self._recv_lines(sock, timeout=0.3), [])
+
+        sock.sendall((json.dumps({"type": "sys.ping"}) + "\n").encode("utf-8"))
+        self._pump(2)
+        lines = self._recv_lines(sock)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["type"], "sys.pong")
+
+    def test_tcp_crlf_and_leading_whitespace_tolerated(self) -> None:
+        """CRLF framing and leading whitespace do not break frame detection."""
+        sock = self._open_tcp_session()
+        sock.sendall(b"   \r\n" + b'{"type":"sys.ping"}\r\n')
+        self._pump(3)
+
+        lines = self._recv_lines(sock)
+        self.assertEqual(len(lines), 1, f"expected exactly one response, got {lines}")
+        self.assertEqual(json.loads(lines[0])["type"], "sys.pong")
+
+    def test_tcp_residual_buffer_cleared_on_disconnect(self) -> None:
+        """Bytes left over from a dropped connection must not leak into the next one."""
+        import socket
+
+        sock1 = self._open_tcp_session()
+        sock1.sendall(b'{"type":"sys.pi')  # partial frame, never terminated
+        self._pump(2)
+        sock1.close()
+        self._pump(3)  # server observes EOF and must discard the partial frame
+
+        port = self.lib.desk_sdk_socket_server_get_port()
+        sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock2.connect(("127.0.0.1", port))
+        sock2.settimeout(0.4)
+        self.addCleanup(sock2.close)
+        self._pump(2)
+
+        # The abandoned tail must NOT complete a frame on the new connection.
+        sock2.sendall(b'ng"}\n')
+        self._pump(2)
+        self.assertEqual(self._recv_lines(sock2, timeout=0.3), [],
+                         "residual bytes leaked across a reconnect")
+
+        sock2.sendall((json.dumps({"type": "sys.ping"}) + "\n").encode("utf-8"))
+        self._pump(2)
+        lines = self._recv_lines(sock2)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0])["type"], "sys.pong")
+
+    # ------------------------------------------------------------------
+    # WP4 -- pairing code validation (fail-closed)
+    # ------------------------------------------------------------------
+
+    def test_pairing_rejected_when_no_code_provisioned(self) -> None:
+        """Fail-closed: without a provisioned code no pairing is ever granted."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "", "no pair.accept may be emitted when unprovisioned")
+
+    def test_pairing_rejected_on_wrong_code(self) -> None:
+        """A mismatching pairing code must not yield a session token."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_pairing_rejected_on_missing_code(self) -> None:
+        """A pair.request without a pairing_code must be rejected."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        req = json.loads(self._official_pair_request("123456").decode("utf-8"))
+        del req["pairing_code"]
+        rc, reply = self._process_pairing(json.dumps(req).encode("utf-8"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_pairing_rejected_on_malformed_code(self) -> None:
+        """Only ^[0-9]{6}$ is acceptable, even when it is a prefix/suffix of the real code."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        for bad in ["12345", "1234567", "12345a", "abcdef", "", "123 56", "-12345"]:
+            with self.subTest(code=bad):
+                rc, reply = self._process_pairing(self._official_pair_request(bad))
+                self.assertNotEqual(rc, 0, f"{bad!r} must be rejected")
+                self.assertEqual(reply, "")
+
+    def test_pairing_rejected_after_code_cleared(self) -> None:
+        """Clearing the provisioned code returns the device to fail-closed."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        rc_ok, reply_ok = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc_ok, 0)
+        self.assertEqual(json.loads(reply_ok)["type"], "pair.accept")
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_set_pairing_code_rejects_malformed_provisioning_input(self) -> None:
+        """Malformed provisioning input is refused and does not arm pairing."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        for bad in [b"abc123", b"12345", b"1234567", b"", b"12 456"]:
+            with self.subTest(code=bad):
+                if bad == b"":
+                    self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(bad), 0)
+                else:
+                    self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(bad), -1)
+                self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+    def test_pairing_logs_are_redacted(self) -> None:
+        """pairing_code and session_token must never appear in clear text in logs."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+
+        with capture_c_stdout() as tmp:
+            rc, reply = self._process_pairing(self._official_pair_request("123456"))
+            self.assertEqual(rc, 0)
+            token = json.loads(reply)["session_token"]
+
+        logged = read_captured(tmp)
+        self.assertIn("[redacted", logged, "expected a redacted diagnostic log line")
+        self.assertNotIn("123456", logged, "pairing_code must never be logged in clear text")
+        self.assertNotIn(token, logged, "session_token must never be logged in clear text")
+
+    def test_pairing_rejection_logs_are_redacted(self) -> None:
+        """Rejection diagnostics must redact the supplied pairing code."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+
+        with capture_c_stdout() as tmp:
+            rc, reply = self._process_pairing(self._official_pair_request("123456"))
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(reply, "")
+
+        logged = read_captured(tmp)
+        self.assertNotIn("123456", logged, "supplied pairing_code must never be logged")
+        self.assertNotIn("654321", logged, "provisioned pairing_code must never be logged")
 
 
 

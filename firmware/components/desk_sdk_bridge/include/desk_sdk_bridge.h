@@ -43,6 +43,33 @@ extern "C" {
 #define DESK_WSPK_TYPE_DATA        4
 #define DESK_WSPK_MAX_PAYLOAD_SIZE (128 * 1024) /* 128KB max to prevent OOM */
 
+/**
+ * @brief Maximum length (bytes, excluding the terminating '\n') of a single
+ *        newline-delimited JSON frame accepted on the TCP SDK channel.
+ *
+ * Per interfaces.md 6.3.2 the receive path MUST define and enforce a maximum
+ * frame length; an oversized frame is discarded and the reader resynchronises
+ * at the next '\n' without corrupting subsequent message boundaries.
+ * This limit applies to the JSON control channel only -- the WSPK binary media
+ * framing (<4sBBHII) is unaffected.
+ */
+#define DESK_SDK_MAX_FRAME_LEN 8192
+
+/**
+ * @brief Return codes for desk_sdk_bridge_process_pairing_udp().
+ *
+ * DESK_SDK_PAIRING_OK: the pairing code was validated and a pair.accept reply
+ *                      has been written to udp_out.
+ * DESK_SDK_PAIRING_REJECTED: fail-closed rejection (missing/unconfigured/
+ *                      malformed/mismatching pairing_code). No wire reply is
+ *                      produced; udp_out is left empty. Per interfaces.md 6.4
+ *                      the official contract defines no rejection message type
+ *                      (see CR-001), so the request is silently dropped.
+ */
+#define DESK_SDK_PAIRING_OK        0
+#define DESK_SDK_PAIRING_REJECTED  1
+#define DESK_SDK_PAIRING_ERR_ARG  (-1)
+
 #pragma pack(push, 1)
 typedef struct {
     char magic[4];          /* "WSPK" */
@@ -127,8 +154,36 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
 
 /**
  * @brief Process UDP pairing request (port 37021 protocol watcher_lan_pairing_v1).
+ *
+ * The request's `pairing_code` is validated (6 digits, exact match) against the
+ * device-side expected code provisioned via desk_sdk_bridge_set_pairing_code().
+ * Fail-closed: when no expected code is configured, or the code is malformed or
+ * mismatching, DESK_SDK_PAIRING_REJECTED is returned and udp_out is NOT written
+ * (no `pair.accept`, no `session_token`, no `s_paired`). See interfaces.md 6.4.
+ *
+ * @return DESK_SDK_PAIRING_OK on success, DESK_SDK_PAIRING_REJECTED on rejection,
+ *         DESK_SDK_PAIRING_ERR_ARG on invalid arguments.
  */
 int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len);
+
+/**
+ * @brief Provision the device-side expected pairing code (6 decimal digits).
+ *
+ * This is the ONLY authoritative source for the expected code; no production
+ * pairing code is ever hardcoded. The code is never logged (redacted per the
+ * official redact_sensitive_fields rule). Passing NULL (or an empty string)
+ * clears the configuration, which makes pairing fail-closed again.
+ *
+ * @param code 6-digit code matching ^[0-9]{6}$, or NULL/"" to clear.
+ * @return 0 on success, -1 if `code` is non-NULL and not exactly 6 digits.
+ */
+int desk_sdk_bridge_set_pairing_code(const char *code);
+
+/**
+ * @brief Report whether an expected pairing code has been provisioned.
+ * @return true if pairing can succeed, false if pairing is fail-closed.
+ */
+bool desk_sdk_bridge_is_pairing_code_configured(void);
 
 /**
  * @brief Process incoming JSON command from Python SDK client.
