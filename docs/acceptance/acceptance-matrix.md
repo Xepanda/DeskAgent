@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.0.0  
+> 文档版本：V3.1.0  
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证  
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见  
-> 状态：**G0 契约与基线冻结完成；Level 1 (契约/Schema) 与 Level 2 (软件协议与模拟互通 PoC、E2E 故障注入与稳定性压测) 自动化测试全部 PASS (130 项用例 100% OK)；提供一键全量核验工具 `tools/verification/verify_all.sh`；G1 真实关口与硬件接入待真机台架实测 (Level 3/4 Pending)**
+> 状态：**G0 契约与基线冻结完成；Level 1 (契约/Schema) 与 Level 2 (软件协议与模拟互通 PoC、真实链路 E2E、故障注入与稳定性压测) 自动化测试全部 PASS (172 项用例 100% OK)；提供一键全量核验工具 `tools/verification/verify_all.sh` (7 阶段)；G1 真实关口与硬件接入待真机台架实测 (Level 3/4 Pending)**  
+> V3.1.0 变更：新增 A7 真实链路端到端套件 `tests/e2e/test_real_chain_tclaw_to_host.py`（TClaw 工具请求 → SDK Bridge TCP → RobotAdapter → Host Router → Life 执行 → 结果原路回传设备），`verify_all.sh` 由 5 阶段扩展为 7 阶段并新增证据分层防夸大审计门禁
 
 ---
 
@@ -14,7 +15,7 @@
 | 证据层级 | 验收范围与含义 | 当前结论 | 关键依据与测试输出 | 绝对不能代表什么 |
 | :--- | :--- | :---: | :--- | :--- |
 | **Level 1：公开源码 / 契约标准** | JSON Schema (Draft 2020-12)、25 个 fixtures、13 个稳定错误码、动态 ISO 8601 时钟契约 | **100% PASS** | `contracts/validator/validate.py` 深度校验通过 | 不能代表物理板卡具备该 capability 或在线部署成功 |
-| **Level 2：模拟 PoC / 协议对齐** | C 固件硬件链路与驱动报文、SDK 小端协议与 CSPRNG 配对 Token、RobotAdapter 全双工适配器、Python 核心路由与调度器、HA 状态订阅与 Codex 审批查询、E2E 故障注入与 200 轮全系统稳定性压测 | **100% PASS** | `Ran 130 tests in 13.690s -> OK`<br/>`tools/verification/verify_all.sh` 5 大阶段 100% 通过<br/>C 固件原生可执行文件与静态库构建通过 | 不能代表物理机嵌入式网络环境、声学杂音或真实云端延迟达标 |
+| **Level 2：模拟 PoC / 协议对齐** | C 固件硬件链路与驱动报文、SDK 小端协议与 CSPRNG 配对 Token、RobotAdapter 全双工适配器、真实链路 E2E（设备工具请求经 TCP 贯通 Host 路由并原路回传）、Python 核心路由与调度器、HA 状态订阅与 Codex 审批查询、E2E 故障注入与 200 轮全系统稳定性压测 | **100% PASS** | `Ran 172 tests in 15.650s -> OK`<br/>`tools/verification/verify_all.sh` 7 大阶段 100% 通过<br/>C 固件原生可执行文件与静态库构建通过 | 不能代表物理机嵌入式网络环境、声学杂音或真实云端延迟达标 |
 | **Level 3：单项硬件 / 节点实测** | 泰山派 Linux ARM 守护进程、Windows Companion 进程通信、ESP32-S3 物理单板 | **未实测 (待现场实板)** | `deploy/edge/` 与 `deploy/windows/` 脚本及生产配置完备 | 不能代表系统端到端链路长期无丢包或无故障运行 |
 | **Level 4：端到端闭环与恢复验收** | 真实语音唤醒→Tuya云端→外部MCP工具→HA/Codex/Life执行→语音播报闭环，断网/断电恢复 | **未完成 (Pending 实体台架)** | 真实环境待具备 | 不能代表所有未知硬件改版或不可控生产环境的质量担保 |
 
@@ -65,12 +66,12 @@
   [100%] Built target desk_agent_firmware_test
   ```
 
-### 2.3 Level 2: 全量自动化单元测试与集成测试 (130 项用例全部 PASS)
+### 2.3 Level 2: 全量自动化单元测试与集成测试 (172 项用例全部 PASS)
 - **验证命令**：`PYTHONPATH=. python3 -m unittest discover -s tests -t . -p "test_*.py"`
 - **实际执行结果**：
   ```text
   ----------------------------------------------------------------------
-  Ran 130 tests in 13.690s
+  Ran 172 tests in 15.650s
 
   OK
   ```
@@ -79,14 +80,14 @@
 
 | 测试套件 | 用例数 | 覆盖核心能力与仿真要点 (Level 2) |
 | :--- | :---: | :--- |
-| **`tests/firmware_contract/`** | 9 | 1. 仲裁器 5 级优先级抢占与释放<br/>2. 相机租约锁定 TClaw 机头转动追踪<br/>3. 云台电机机械物理极限钳制 (0..180°, 100..140°)<br/>4. 屏幕表情与状态文本存取<br/>5. TClaw 状态机与音频独占生命周期<br/>6. 用户触摸/语音打断 (Interrupt/Barge-in)<br/>7. MCP 工具 RequestEnvelope 派发与动态结果接入<br/>8. 多轮对话上下文与动态流式 Token 回调<br/>9. Tuya Cloud 语音对话会话生命周期与音频流喂入仿真 |
-| **`tests/sdk_contract/`** | 22 | 1. 100% 对齐官方 WSPK 小端序 `<4sBBHII` (16B) 封包解析与 14B 遗留读兼容<br/>2. UDP 37021 `watcher_lan_pairing_v1` 配对服务（CSPRNG 64B Hex Token 并强制认证）<br/>3. `sys.client.hello` 握手与 `role=hardware` Opus 音频协商<br/>4. 非阻塞 `0.0.0.0` TCP Socket 服务驱动与连接管理<br/>5. 云台动态角度入参解析与物理限位安全<br/>6. 资源仲裁忙时拒收并返回 409 `RESOURCE_BUSY`<br/>7. 相机租约互斥冲突拦截与释放<br/>8. 未知命令严格返回 404 `UNKNOWN_OPERATION`<br/>9. 触摸事件封装符合 `envelope_event.json` 标准 Schema |
+| **`tests/firmware_contract/`** | 22 | 1. 仲裁器 5 级优先级抢占与释放<br/>2. 相机租约锁定 TClaw 机头转动追踪<br/>3. 云台电机机械物理极限钳制 (0..180°, 100..140°)<br/>4. 屏幕表情与状态文本存取<br/>5. TClaw 状态机与音频独占生命周期<br/>6. 用户触摸/语音打断 (Interrupt/Barge-in)<br/>7. MCP 工具 RequestEnvelope 派发与动态结果接入<br/>8. 多轮对话上下文与动态流式 Token 回调<br/>9. Tuya Cloud 语音对话会话生命周期与音频流喂入仿真 |
+| **`tests/sdk_contract/`** | 38 | 1. 100% 对齐官方 WSPK 小端序 `<4sBBHII` (16B) 封包解析与 14B 遗留读兼容<br/>2. UDP 37021 `watcher_lan_pairing_v1` 配对服务（CSPRNG 64B Hex Token 并强制认证）<br/>3. `sys.client.hello` 握手与 `role=hardware` Opus 音频协商<br/>4. 非阻塞 `0.0.0.0` TCP Socket 服务驱动与连接管理<br/>5. 云台动态角度入参解析与物理限位安全<br/>6. 资源仲裁忙时拒收并返回 409 `RESOURCE_BUSY`<br/>7. 相机租约互斥冲突拦截与释放<br/>8. 未知命令严格返回 404 `UNKNOWN_OPERATION`<br/>9. 触摸事件封装符合 `envelope_event.json` 标准 Schema<br/>10. ACK 超时严格返回 408 NACK 而非伪成功 `code: 0` |
 | **`tests/camera/`** | 9 | 1. 单客户端互斥租约仲裁（并发抢占拒绝返回 `RESOURCE_BUSY`）<br/>2. 超时过期自动释放与黑帧遮盖（防旧画面冒充实时流）<br/>3. 租约释放回调触发底层资源注销<br/>4. 硬件真实传感器与合成画面源精准标注（`is_hardware` / `source` 字段标签）<br/>5. 自动续租租约延长机制<br/>6. Web 控制台 Token 鉴权（Bearer、Header、Query 三通道）及云台安全角度操作 |
-| **`tests/companion/`** | 10 | 1. 生产模式缺失可执行文件真实报错（无伪成功）<br/>2. 工作区别名白名单与路径逃逸（Path Traversal）防御<br/>3. 真实 JSON-RPC stdio 客户端驱动与多线程按服务端请求 `id` 唤醒与响应<br/>4. 支持 Codex app-server 标准 `thread/start` 及 `thread/create` 映射<br/>5. 审批项目严格绑定与上下文一致性校验，消除 early-approval 竞态<br/>6. 默认监听 `127.0.0.1` 配合 Bearer Token 401 拦截<br/>7. `RemoteCodexCompanionClient` 远程 HTTP POST /rpc 代理调用及审批应答通道 |
-| **`tests/connectors/`** | 18 | 1. 生产模式未配置凭据真实抛错（不伪造返回）<br/>2. 实体域与服务黑白名单多级校验（放行合规设备，拦截锁/安防/更新等敏感域）<br/>3. 两阶段状态确认机制（`accepted` 与 `state_confirmed` 解耦）<br/>4. 真实 HTTP 通信轮询与状态扭转<br/>5. WebSocket `/api/websocket` 客户端鉴权握手与状态流式订阅<br/>6. 指数退避断网重连与状态对账消除状态漂移<br/>7. 双通道容灾（WebSocket 中断时平滑降级 REST 轮询）与 HTTP 429 限流退避 |
-| **`tests/core/`** | 28 | 1. SQLite WAL 事务持久化保证零丢失<br/>2. 提醒创建、推迟(Snooze)与完成状态彻底解耦<br/>3. 开机追赶与到期轮次精准筛选<br/>4. 持久化发件箱（Outbox）出入队与去重<br/>5. 便签创建、全文检索与分页<br/>6. 后台 `ReminderScheduler` 自动轮询到期 occurrence，触发 ringing 状态扭转并投递 `reminder.alert` outbox 消息<br/>7. 宿主守护进程 HTTP RPC 端到端分发（集成 Codex 路由、相机帧流抓取、默认回环绑定与 401 鉴权拦截） |
-| **`tests/e2e/`** | 12 | 1. 跨模块信封路由、幂等性去重与过期毫秒级拦截<br/>2. HA 领域指令执行与观察状态一致性闭环<br/>3. 生活服务持久化与服务重启恢复<br/>4. Codex 任务提交流程与敏感操作审批闭环<br/>5. 相机租约互斥与帧时效性检测<br/>6. 固件发起到 Host 路由与提醒后台到期投递全链路闭环<br/>7. **G1 软件协议仿真 (Level 2 PoC)**：`test_g1_official_sdk_and_tuya_interop.py`<br/>8. **A7 E2E 故障注入与网络自愈 (`test_e2e_fault_injection.py`)**：HA WebSocket 突发断连重连与状态对账自愈、进程异常退出与 SQLite WAL 崩溃恢复（到期提醒自动打上 `is_catchup=True` 追赶标记）、10 个高并发客户端争夺相机租约的绝对互斥仲裁、Router 高并发重复请求幂等缓存去重<br/>9. **A7 全系统长期稳定性压测 (`test_system_stability_stress.py`)**：200 轮跨域高频密集连续操作（50 提醒 + 50 HA 两阶段 + 50 Codex 任务/审批 + 50 相机拉流/续租），执行后校验 SQLite `PRAGMA integrity_check` 与 `foreign_key_check` 零损坏零外键违背 |
-| **`tests/test_p1_gaps_verification.py`** | 6 | 1. 泰山派远程调用 Windows Codex Companion 客户端分发与审批确认<br/>2. 提醒发件箱后台消费 Worker 投递到机器人音频通道与重试机制<br/>3. HA 实体与服务白名单拦截、状态对账与状态变更订阅回调<br/>4. 相机动态 FrameCapturePipeline 抓取与动态云台坐标叠加验证 |
+| **`tests/companion/`** | 13 | 1. 生产模式缺失可执行文件真实报错（无伪成功）<br/>2. 工作区别名白名单与路径逃逸（Path Traversal）防御<br/>3. 真实 JSON-RPC stdio 客户端驱动与多线程按服务端请求 `id` 唤醒与响应<br/>4. 支持 Codex app-server 标准 `thread/start` 及 `thread/create` 映射<br/>5. 审批项目严格绑定与上下文一致性校验，消除 early-approval 竞态<br/>6. 默认监听 `127.0.0.1` 配合 Bearer Token 401 拦截<br/>7. `RemoteCodexCompanionClient` 远程 HTTP POST /rpc 代理调用及审批应答通道<br/>8. 对齐 codex-cli 0.161.0 审批枚举与 `turn/interrupt` 驼峰字段 |
+| **`tests/connectors/`** | 26 | 1. 生产模式未配置凭据真实抛错（不伪造返回）<br/>2. 实体域与服务黑白名单多级校验（放行合规设备，拦截锁/安防/更新等敏感域）<br/>3. 两阶段状态确认机制（`accepted` 与 `state_confirmed` 解耦）<br/>4. 目标属性比对确认（亮度/色温等未达目标时 `state_confirmed=False`）<br/>5. 真实 HTTP 通信轮询与状态扭转<br/>6. WebSocket `/api/websocket` 客户端鉴权握手与状态流式订阅<br/>7. 指数退避断网重连与状态对账消除状态漂移<br/>8. 双通道容灾（WebSocket 中断时平滑降级 REST 轮询）与 HTTP 429 限流退避 |
+| **`tests/core/`** | 33 | 1. SQLite WAL 事务持久化保证零丢失<br/>2. 提醒创建、推迟(Snooze)与完成状态彻底解耦<br/>3. 开机追赶与到期轮次精准筛选<br/>4. 持久化发件箱（Outbox）出入队与去重<br/>5. 便签创建、全文检索与分页<br/>6. 后台 `ReminderScheduler` 自动轮询到期 occurrence，触发 ringing 状态扭转并投递 `reminder.alert` outbox 消息<br/>7. 宿主守护进程 HTTP RPC 端到端分发（集成 Codex 路由、相机帧流抓取、默认回环绑定与 401 鉴权拦截）<br/>8. 单事务原子触发（occurrence ringing / reminder ringing / 周期排程 / outbox 入队绝不脱节）<br/>9. 时区感知 (`zoneinfo`) 跨天与跨夏令时重复计算 |
+| **`tests/e2e/`** | 22 | 1. 跨模块信封路由、幂等性去重与过期毫秒级拦截<br/>2. HA 领域指令执行与观察状态一致性闭环<br/>3. 生活服务持久化与服务重启恢复<br/>4. Codex 任务提交流程与敏感操作审批闭环<br/>5. 相机租约互斥与帧时效性检测<br/>6. 固件发起到 Host 路由与提醒后台到期投递全链路闭环<br/>7. **G1 软件协议仿真 (Level 2 PoC)**：`test_g1_official_sdk_and_tuya_interop.py`<br/>8. **A7 E2E 故障注入与网络自愈 (`test_e2e_fault_injection.py`)**：HA WebSocket 突发断连重连与状态对账自愈、进程异常退出与 SQLite WAL 崩溃恢复（到期提醒自动打上 `is_catchup=True` 追赶标记）、10 个高并发客户端争夺相机租约的绝对互斥仲裁、Router 高并发重复请求幂等缓存去重<br/>9. **A7 全系统长期稳定性压测 (`test_system_stability_stress.py`)**：200 轮跨域高频密集连续操作（50 提醒 + 50 HA 两阶段 + 50 Codex 任务/审批 + 50 相机拉流/续租），执行后校验 SQLite `PRAGMA integrity_check` 与 `foreign_key_check` 零损坏零外键违背<br/>10. **A7 真实链路端到端 (`test_real_chain_tclaw_to_host.py`)**：起真实 `DeskAgentHostApp`（真实 RobotAdapter / Router / LifeService / 后台调度器与发件箱 Worker），对端以忠实伪固件复现 `desk_sdk_bridge` TCP 服务与 TClaw 对话引擎，严格按 C 固件线格式收发。覆盖：工具请求经 TCP 贯通 Host 路由并在 SQLite 真实落库、云台指令仅在固件真实 ACK 后判定 `state_confirmed`、**固件扣发 ACK 时绝不伪报成功**、到期提醒经调度器/发件箱回推 `ctrl.expression.play` 播报、未知操作与过期信封错误原路回传、脏数据不破坏链路、链路断开后自动重连并恢复链路 |
+| **`tests/test_p1_gaps_verification.py`** | 4 | 1. 泰山派远程调用 Windows Codex Companion 客户端分发与审批确认<br/>2. 提醒发件箱后台消费 Worker 投递到机器人音频通道与重试机制<br/>3. HA 实体与服务白名单拦截、状态对账与状态变更订阅回调<br/>4. 相机动态 FrameCapturePipeline 抓取与动态云台坐标叠加验证 |
 | **`tests/test_p1_final_closure.py`** | 5 | 1. CSPRNG 动态 Token 熵值与格式校验<br/>2. RobotAdapter TCP/UDP 握手、舵机运动控制与到期提醒音频播报通道投递<br/>3. Host 路由器 Codex 待审批查询（`codex.get_pending_approvals` / `codex.list_approvals`）<br/>4. Host 路由器 HA 状态迁移事件查询（`ha.list_changes`）<br/>5. 相机硬件传感器帧源接入与 `hardware_sensor` 标签识别 |
 
 ### 2.4 一键系统级验收套件 (`tools/verification/verify_all.sh`)
@@ -96,9 +97,31 @@
 ```
 - **阶段 1 (Level 1)**: 契约与 JSON Schema (Draft 2020-12) 深度校验 -> **PASS**
 - **阶段 2 (Level 2)**: C 固件原生 HAL 与 SDK Bridge 静态编译验证 -> **PASS**
-- **阶段 3 (Level 2)**: 130 项全量自动化测试套件执行（含 E2E 故障注入与稳定性压测） -> **PASS**
-- **阶段 4 (Level 2)**: 泰山派 Linux 边缘环境 Pre-flight 检查 -> **PASS**
-- **阶段 5 (Level 3/4)**: 物理单板与在线台架硬性约束审计 -> **PASS**
+- **阶段 3 (Level 2)**: 172 项全量自动化测试套件执行（含故障注入与稳定性压测） -> **PASS**
+- **阶段 4 (Level 2)**: 真实链路端到端验证（TClaw → SDK Bridge TCP → Host Router → Life 执行 → 结果回传设备） -> **PASS**
+- **阶段 5 (Level 2)**: 泰山派 Linux 边缘环境 Pre-flight 检查 -> **PASS**
+- **阶段 6 (Level 3/4)**: 物理单板与在线台架硬性约束审计 -> **PASS**（仅审计缺口清单完备性，不代表硬件已实测）
+- **阶段 7 (Level 1/4)**: 证据分层防夸大审计门禁 -> **PASS**（校验 Level 3/4 仍如实标记为未实测/未完成，且验收矩阵与真实链路套件保持同步）
+
+### 2.5 A7 真实链路端到端套件证据明细 (`tests/e2e/test_real_chain_tclaw_to_host.py`)
+
+- **验证命令**：`PYTHONPATH=. python3 -m unittest tests.e2e.test_real_chain_tclaw_to_host`
+- **实际执行结果**：
+  ```text
+  ----------------------------------------------------------------------
+  Ran 10 tests in 3.648s
+
+  OK
+  ```
+- **链路构造（真实组件，非 Mock 旁路）**：本套件实例化**真实** `DeskAgentHostApp`，其中包含真实 `RobotAdapter`（真实 TCP 客户端与非阻塞全双工收发线程）、真实 `Router`、真实 `LifeService`（真实 SQLite WAL 落库）、真实后台 `ReminderScheduler` 与发件箱投递 Worker；对端为忠实伪固件 `FakeFirmwareTClaw`，按 C 固件线格式复现 `desk_sdk_bridge` TCP Socket 服务与 TClaw 对话引擎（`sys.client.hello` 握手、裸 RequestEnvelope + `\n` 下行、`tool.response` 上行并回 `sys.ack`）。
+- **覆盖的真实链路断言**：
+  1. **贯通与真实落库**：设备下发 `reminder.create` → TCP → RobotAdapter → Host Router → `LifeService` 真实写入 SQLite；回传信封携带真实 `reminder_id`，并二次查库确认非回显桩；
+  2. **硬件通道确认**：`resource.motion.move` 经 RobotAdapter 下发 `ctrl.motion.move` 至固件，仅在固件真实回 ACK 时 `state_confirmed=True` 且 `hardware_link=connected`；
+  3. **防伪造 ACK**：固件**扣发** ACK 时，Host 必须 `state_confirmed=False` 且不得报 `completed`（该用例真实等待 2s 超时窗口后判定，非空跑）；
+  4. **主动播报回推**：到期提醒由真实调度器原子扭转 ringing 并入队 outbox，经投递 Worker 以 `ctrl.expression.play` 回推至设备播报，且 outbox 记录被标记为已投递；
+  5. **错误原路回传**：未知操作返回 `failed` 信封、过期信封返回 `error.code=EXPIRED` 且绝不落库；
+  6. **脏数据与断链韧性**：非 JSON 脏行不破坏链路；设备侧 TCP 突断后适配器自动重新握手并恢复链路。
+- **⚠️ 证据层级声明**：以上全部为 **Level 2（软件协议与模拟 PoC）**。伪固件在**本机进程内**以 Python 复现固件线格式，**并未**运行 ESP32-S3 固件、未连接 Tuya 云端、未接入局域网 Home Assistant、未联调 Windows Codex。**本套件不得被宣称为 G1 关口通过或 Level 3/4 实测。**
 
 ---
 
