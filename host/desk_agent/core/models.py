@@ -101,6 +101,24 @@ class ResponseEnvelope:
         )
 
     @classmethod
+    def create_accepted(
+        cls,
+        request_id: str,
+        result: Mapping[str, Any],
+        duration_ms: int = 0
+    ) -> ResponseEnvelope:
+        """Builds an `accepted` envelope: acknowledged upstream but NOT physically
+        confirmed (interfaces.md 1.4 / 6.1). Must never be reported as succeeded."""
+        return cls(
+            schema_version="1.0.0",
+            request_id=request_id,
+            status=ResponseStatus.ACCEPTED,
+            timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            result=result,
+            execution_duration_ms=duration_ms,
+        )
+
+    @classmethod
     def create_error(
         cls,
         request_id: str,
@@ -108,7 +126,8 @@ class ResponseEnvelope:
         message: str,
         retryable: bool = False,
         details: Optional[Mapping[str, Any]] = None,
-        duration_ms: int = 0
+        duration_ms: int = 0,
+        status: ResponseStatus = ResponseStatus.FAILED,
     ) -> ResponseEnvelope:
         err = {"code": code, "message": message, "retryable": retryable}
         if details:
@@ -116,7 +135,7 @@ class ResponseEnvelope:
         return cls(
             schema_version="1.0.0",
             request_id=request_id,
-            status=ResponseStatus.FAILED,
+            status=status,
             timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             error=err,
             execution_duration_ms=duration_ms,
