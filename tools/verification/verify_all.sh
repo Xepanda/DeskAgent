@@ -69,10 +69,15 @@ step_pass "Tool request -> Host Router -> Life execution -> response returned ov
 # 5. Level 2: Cross-Module P1 Regression Gates (PR #11 remediation)
 # ------------------------------------------------------------------------------
 echo ""
-echo "--- Step 5: Cross-Module P1 Regression Gates (interfaces.md 6.1-6.5) ---"
+echo "--- Step 5: Cross-Module P1 Regression Gates + Real-Firmware Motion-Fault Chain (interfaces.md 6.1-6.5) ---"
 PYTHONPATH=. python3 -m unittest tests.e2e.test_p1_regression_gates \
   || step_fail "Cross-module P1 regression gates failed"
-step_pass "Driver failure/timeout never fake success; ACK correlation, TCP framing, pairing fail-closed, companion LAN gate all enforced"
+# Final-P1 cross-layer chain: a fault injected in the REAL compiled C driver is
+# carried through the REAL C bridge protocol, the REAL RobotAdapter and the REAL
+# DeskAgentHostApp, and asserted on the OUTERMOST response envelope.
+PYTHONPATH=. python3 -m unittest tests.e2e.test_real_firmware_motion_fault_chain \
+  || step_fail "Real-firmware motion-fault cross-layer chain failed"
+step_pass "Driver failure/timeout never fake success; ACK correlation, TCP framing, pairing fail-closed, companion LAN gate, and the real-C-driver cross-layer motion-fault chain all enforced"
 
 # ------------------------------------------------------------------------------
 # 6. Level 2: Edge Deployment Environment Verification
@@ -127,7 +132,8 @@ echo "Evidence Summary:"
 echo "  Level 1 (Contracts & Schemas):  100% PASS (JSON Schema draft 2020-12, fixtures, error codes)"
 echo "  Level 2 (Software Simulation):  100% PASS (All tests, C HAL, WSPK framing, SQLite WAL, RPC,"
 echo "                                             real chain TClaw -> SDK Bridge TCP -> Host -> device,"
-echo "                                             cross-module P1 regression gates)"
+echo "                                             cross-module P1 regression gates,"
+echo "                                             real-C-driver -> C bridge -> Adapter -> Host cross-layer fault chain)"
 echo "  Level 3 (Physical Node):        PENDING_HARDWARE (ESP32-S3 bench, Himax camera, audio codecs)"
 echo "  Level 4 (End-to-End Live):      PENDING_HARDWARE (Live Tuya Cloud IoT, LAN HA, Windows Codex)"
 echo ""
