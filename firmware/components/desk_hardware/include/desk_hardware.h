@@ -230,6 +230,7 @@ bool desk_hardware_is_display_initialized(void);
 /* Input Event Subscription */
 int desk_hardware_register_input_cb(desk_touch_event_cb_t cb, void *user_data);
 int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_action_t action);
+int desk_hardware_feed_touch_event(desk_touch_target_t target, desk_touch_action_t action);
 
 /* Strict Hardware Mode & Status Inspection */
 void desk_hardware_set_strict_mode(bool strict);

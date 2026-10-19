@@ -17,9 +17,52 @@ import threading
 import uuid
 import time
 import zoneinfo
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, tzinfo
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
+
+
+class _FallbackEasternTz(tzinfo):
+    """Fallback for America/New_York when system tzdata is unavailable (e.g. bare Windows)."""
+
+    def utcoffset(self, dt: Optional[datetime]) -> timedelta:
+        if dt is None:
+            return timedelta(hours=-5)
+        # US Eastern DST: 2nd Sunday in March to 1st Sunday in November at 02:00 local standard time
+        y = dt.year
+        m1_w = datetime(y, 3, 1).weekday()
+        dst_start = datetime(y, 3, 1 + (6 - m1_w) % 7 + 7, 2, 0)
+        n1_w = datetime(y, 11, 1).weekday()
+        dst_end = datetime(y, 11, 1 + (6 - n1_w) % 7, 2, 0)
+        naive = dt.replace(tzinfo=None)
+        if dst_start <= naive < dst_end:
+            return timedelta(hours=-4)
+        return timedelta(hours=-5)
+
+    def dst(self, dt: Optional[datetime]) -> timedelta:
+        if self.utcoffset(dt) == timedelta(hours=-4):
+            return timedelta(hours=1)
+        return timedelta(0)
+
+    def tzname(self, dt: Optional[datetime]) -> str:
+        return "EDT" if self.dst(dt) else "EST"
+
+
+def _resolve_timezone(tz_name: Optional[str]) -> timezone | zoneinfo.ZoneInfo:
+    if not tz_name:
+        return timezone.utc
+    cleaned = tz_name.strip()
+    try:
+        return zoneinfo.ZoneInfo(cleaned)
+    except Exception:
+        lowered = cleaned.lower()
+        if lowered in ("america/new_york", "us/eastern", "est5edt"):
+            return _FallbackEasternTz()
+        elif lowered in ("asia/shanghai", "asia/chongqing", "prc"):
+            return timezone(timedelta(hours=8), "CST")
+        elif lowered in ("utc", "gmt"):
+            return timezone.utc
+        return timezone.utc
 
 
 def compute_next_occurrence(
@@ -40,12 +83,7 @@ def compute_next_occurrence(
         return None
 
     target_tz_str = tz_name or timezone_str
-    target_tz = timezone.utc
-    if target_tz_str:
-        try:
-            target_tz = zoneinfo.ZoneInfo(target_tz_str)
-        except Exception:
-            target_tz = timezone.utc
+    target_tz = _resolve_timezone(target_tz_str)
 
     local_dt = dt.astimezone(target_tz)
     rule = repeat_rule.strip().lower()

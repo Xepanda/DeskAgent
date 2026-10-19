@@ -248,6 +248,17 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data["status"], "succeeded")
             self.assertTrue(data["result"]["released"])
 
+    def test_snapshot_endpoint_retrieval(self) -> None:
+        """Verifies GET /snapshot returns fresh JPEG with anti-caching and frame headers."""
+        snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
+        with urlopen(snap_req) as snap_resp:
+            self.assertEqual(snap_resp.status, 200)
+            self.assertEqual(snap_resp.headers.get("Content-Type"), "image/jpeg")
+            self.assertIn("no-cache", snap_resp.headers.get("Cache-Control", ""))
+            self.assertIsNotNone(snap_resp.headers.get("X-Frame-Seq"))
+            raw_jpeg = snap_resp.read()
+            self.assertTrue(raw_jpeg.startswith(b"\xff\xd8"))
+
     def test_reminder_automatic_scheduler_delivery(self) -> None:
         """Verifies background ReminderScheduler automatically triggers ringing and outbox alert for due items."""
         # Create a reminder due 1 minute ago

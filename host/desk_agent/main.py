@@ -569,7 +569,8 @@ class DeskAgentHostApp:
     def _handle_camera_acquire(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")
         lease_ms = req.arguments.get("lease_duration_ms")
-        res = self.camera_service.acquire_lease(client_id, lease_ms)
+        target_fps = req.arguments.get("target_fps")
+        res = self.camera_service.acquire_lease(client_id, lease_ms, target_fps=target_fps)
         if not res["granted"]:
             return ResponseEnvelope.create_error(
                 req.request_id,
@@ -817,7 +818,14 @@ def make_request_handler(app: DeskAgentHostApp):
                     "device_id": app.config.get("device_id", "desk-agent-r1-host"),
                 }).encode()
                 self.wfile.write(resp)
-            elif self.path.startswith("/api/camera/frame"):
+            elif (
+                self.path == "/snapshot"
+                or self.path.startswith("/snapshot?")
+                or self.path == "/snapshot.jpg"
+                or self.path.startswith("/snapshot.jpg?")
+                or self.path.startswith("/api/camera/snapshot")
+                or self.path.startswith("/api/camera/frame")
+            ):
                 if not self._check_auth():
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
@@ -826,23 +834,46 @@ def make_request_handler(app: DeskAgentHostApp):
                     return
 
                 # Extract client_id from query params if present
-                client_id = "web-client"
+                client_id = None
                 if "?" in self.path:
                     query = self.path.split("?", 1)[1]
                     for param in query.split("&"):
                         if param.startswith("client_id="):
                             client_id = param.split("=", 1)[1]
 
-                frame_info = app.camera_service.get_latest_frame(client_id)
+                is_snapshot_path = (
+                    self.path == "/snapshot"
+                    or self.path.startswith("/snapshot?")
+                    or self.path == "/snapshot.jpg"
+                    or self.path.startswith("/snapshot.jpg?")
+                    or self.path.startswith("/api/camera/snapshot")
+                )
+
+                if is_snapshot_path:
+                    frame_info = app.camera_service.get_snapshot(client_id=client_id)
+                else:
+                    # /api/camera/frame strictly enforces existing lease ownership
+                    effective_id = client_id or "web-client"
+                    frame_info = app.camera_service.get_latest_frame(effective_id)
+
                 if not frame_info:
+                    is_busy = (
+                        app.camera_service.is_lease_valid()
+                        and client_id is not None
+                        and app.camera_service._active_lease_owner != client_id
+                    )
+                    err_code = "RESOURCE_BUSY" if is_busy else "NO_ACTIVE_LEASE"
                     self.send_response(403)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(b'{"error": "NO_ACTIVE_LEASE"}')
+                    self.wfile.write(json.dumps({"error": err_code}).encode())
                     return
 
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
                 self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
                 self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
                 self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))

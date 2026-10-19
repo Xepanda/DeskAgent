@@ -30,7 +30,22 @@ extern "C" {
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
 #define DESK_SDK_CAP_AUDIO_STREAM  "audio.stream"
+#define DESK_SDK_CAP_AUDIO_STREAM_ALT "audio_stream"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
+#define DESK_SDK_CAP_EXPRESSION_ALT "expression"
+#define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"
+
+/**
+ * @brief Pending request states in the asynchronous correlation table.
+ */
+typedef enum {
+    DESK_SDK_REQ_STATE_EMPTY = 0,
+    DESK_SDK_REQ_STATE_PENDING,
+    DESK_SDK_REQ_STATE_ACCEPTED,
+    DESK_SDK_REQ_STATE_COMPLETED,
+    DESK_SDK_REQ_STATE_FAILED,
+    DESK_SDK_REQ_STATE_TIMED_OUT
+} desk_sdk_req_state_t;
 
 /**
  * @brief WSPK Binary Framing Constants
@@ -328,6 +343,52 @@ void desk_firmware_stop_background_task(void);
  * @brief Check if background worker task is running.
  */
 bool desk_firmware_is_background_task_running(void);
+
+/**
+ * @brief Get high-water mark of background polling worker task (bytes remaining).
+ */
+uint32_t desk_firmware_background_task_stack_hwm(void);
+
+/**
+ * @brief Query number of currently tracked pending requests.
+ */
+int desk_sdk_bridge_get_pending_request_count(void);
+
+/**
+ * @brief Check if a request_id is currently tracked in the correlation table.
+ */
+bool desk_sdk_bridge_has_pending_request(const char *request_id);
+
+/**
+ * @brief Get the status of a tracked request_id.
+ * @param request_id Request identifier to find.
+ * @param out_status Buffer to receive status string.
+ * @param max_len Maximum length of out_status buffer.
+ * @return 0 on success, -1 if not found or invalid args.
+ */
+int desk_sdk_bridge_get_request_status(const char *request_id, char *out_status, size_t max_len);
+
+/**
+ * @brief Clear all entries in the request correlation table.
+ */
+int desk_sdk_bridge_clear_pending_requests(void);
+
+/**
+ * @brief Clean up expired requests in the correlation table exceeding timeout_ms.
+ * @param timeout_ms Timeout threshold in ms (0 to use per-entry timeout).
+ * @return Number of expired entries cleaned up.
+ */
+int desk_sdk_bridge_cleanup_expired_requests(uint32_t timeout_ms);
+
+/**
+ * @brief Get timestamp (seconds) of the last received heartbeat or valid command.
+ */
+uint32_t desk_sdk_bridge_get_last_heartbeat_time(void);
+
+/**
+ * @brief Check if client heartbeat is alive within timeout_sec.
+ */
+bool desk_sdk_bridge_is_heartbeat_alive(uint32_t timeout_sec);
 
 #ifdef __cplusplus
 }

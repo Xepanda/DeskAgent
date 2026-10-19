@@ -25,6 +25,9 @@ int desk_tclaw_runtime_init(void);
 /* Parses a real SDK bridge response and dispatches only a correlated result. */
 int desk_tclaw_runtime_handle_bridge_response(const char *response_json);
 
+/* Registers native DeskAgent MCP tools (ha.execute, codex.submit_turn, reminder.create) into ai_mcp_server */
+int desk_tclaw_runtime_register_mcp_tools(void);
+
 const desk_tclaw_runtime_stage_t *desk_tclaw_runtime_stages(unsigned *count);
 
 #ifdef __cplusplus

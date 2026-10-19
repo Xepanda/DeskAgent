@@ -3,6 +3,12 @@
 #include "esp_flash.h"
 #include "esp_partition.h"
 #include "esp_log.h"
+#if defined(__has_include)
+#if __has_include("esp_memory_utils.h")
+#include "esp_memory_utils.h"
+#define HAVE_ESP_MEMORY_UTILS 1
+#endif
+#endif
 #include <string.h>
 
 #define META_OFFSET 0x1fbf000u
@@ -35,6 +41,13 @@ static bool expected_partition(const char *name, uint32_t address, uint32_t size
 
 int desk_watcher_storage_init(void)
 {
+#if defined(HAVE_ESP_MEMORY_UTILS)
+    storage_marker_t stack_probe;
+    if (!esp_ptr_internal(&stack_probe)) {
+        ESP_LOGE("watcher_storage", "caller stack must reside in internal SRAM for cache-disabled flash ops");
+        return ESP_ERR_INVALID_STATE;
+    }
+#endif
     const esp_partition_t *existing=esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "tuya");
     if (existing) {
         const esp_partition_t *meta=esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "deskmeta");
@@ -90,7 +103,8 @@ int desk_watcher_storage_init(void)
         if (rc != ESP_OK) goto fail;
         if (!erased(chunk, sizeof(chunk))) { rc=ESP_ERR_INVALID_STATE; goto fail; }
     }
-    rc=esp_partition_write(metadata, 0, &expected, sizeof(expected));
+    storage_marker_t marker_to_write = expected;
+    rc=esp_partition_write(metadata, 0, &marker_to_write, sizeof(marker_to_write));
     if (rc != ESP_OK) goto fail;
     ESP_LOGI("watcher_storage", "new Tuya store reserved in verified erased 32MB flash tail");
     return ESP_OK;

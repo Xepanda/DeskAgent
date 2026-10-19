@@ -16,6 +16,11 @@
 #include "sys_bus.h"
 #include "tclaw_chat.h"
 #include "tools_register.h"
+#include "ai_mcp_server.h"
+#include "desk_sdk_bridge.h"
+#include "tal_api.h"
+#include "tal_event.h"
+#include "tal_time_service.h"
 #include "tuya_app_config.h"
 #include "im_config.h"
 #include "ws_server.h"
@@ -91,6 +96,206 @@ static bool response_text(const cJSON *object, const char *name, const char **ou
     return true;
 }
 
+static const char *__get_str_prop(const MCP_PROPERTY_LIST_T *props, const char *name)
+{
+    const MCP_PROPERTY_T *p = ai_mcp_property_list_find(props, name);
+    if (p && p->type == MCP_PROPERTY_TYPE_STRING && p->default_val.str_val) {
+        return p->default_val.str_val;
+    }
+    return NULL;
+}
+
+static OPERATE_RET __tool_ha_execute(const MCP_PROPERTY_LIST_T *properties,
+                                     MCP_RETURN_VALUE_T *ret_val,
+                                     void *user_data)
+{
+    (void)user_data;
+    const char *entity_id = __get_str_prop(properties, "entity_id");
+    const char *action = __get_str_prop(properties, "action");
+    const char *parameters = __get_str_prop(properties, "parameters");
+    if (!entity_id || !action) {
+        ai_mcp_return_value_set_str(ret_val, "Error: 'entity_id' and 'action' are required");
+        return OPRT_INVALID_PARM;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-ha-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "ha.execute");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "entity_id", entity_id);
+    cJSON_AddStringToObject(args, "action", action);
+    if (parameters && parameters[0] == '{') {
+        cJSON *p_json = cJSON_Parse(parameters);
+        if (p_json) {
+            cJSON_AddItemToObject(args, "parameters", p_json);
+        } else {
+            cJSON_AddStringToObject(args, "parameters", parameters);
+        }
+    }
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!env_str) {
+        ai_mcp_return_value_set_str(ret_val, "Error: out of memory");
+        return OPRT_MALLOC_FAILED;
+    }
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+
+    if (rc == 0) {
+        ai_mcp_return_value_set_str(ret_val,
+            "Home Assistant service call dispatched to host. Execution in progress.");
+        return OPRT_OK;
+    } else {
+        ai_mcp_return_value_set_str(ret_val, "Error: failed to dispatch to host bridge");
+        return OPRT_COM_ERROR;
+    }
+}
+
+static OPERATE_RET __tool_codex_submit(const MCP_PROPERTY_LIST_T *properties,
+                                       MCP_RETURN_VALUE_T *ret_val,
+                                       void *user_data)
+{
+    (void)user_data;
+    const char *prompt = __get_str_prop(properties, "prompt");
+    const char *workspace = __get_str_prop(properties, "workspace_alias");
+    if (!prompt || prompt[0] == '\0') {
+        ai_mcp_return_value_set_str(ret_val, "Error: 'prompt' parameter is required");
+        return OPRT_INVALID_PARM;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-codex-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "codex.submit_turn");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "prompt", prompt);
+    cJSON_AddStringToObject(args, "workspace_alias", (workspace && workspace[0]) ? workspace : "epanda-desk-agent");
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!env_str) {
+        ai_mcp_return_value_set_str(ret_val, "Error: out of memory");
+        return OPRT_MALLOC_FAILED;
+    }
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+
+    if (rc == 0) {
+        ai_mcp_return_value_set_str(ret_val,
+            "Task submitted to Codex Companion on PC. Result will be processed asynchronously.");
+        return OPRT_OK;
+    } else {
+        ai_mcp_return_value_set_str(ret_val, "Error: failed to dispatch to host bridge");
+        return OPRT_COM_ERROR;
+    }
+}
+
+static OPERATE_RET __tool_reminder_create(const MCP_PROPERTY_LIST_T *properties,
+                                         MCP_RETURN_VALUE_T *ret_val,
+                                         void *user_data)
+{
+    (void)user_data;
+    const char *title = __get_str_prop(properties, "title");
+    const char *due_time = __get_str_prop(properties, "due_time");
+    if (!title || title[0] == '\0') {
+        ai_mcp_return_value_set_str(ret_val, "Error: 'title' parameter is required");
+        return OPRT_INVALID_PARM;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-rem-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "reminder.create");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "title", title);
+    if (due_time && due_time[0]) {
+        cJSON_AddStringToObject(args, "due_time", due_time);
+    }
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!env_str) {
+        ai_mcp_return_value_set_str(ret_val, "Error: out of memory");
+        return OPRT_MALLOC_FAILED;
+    }
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+
+    if (rc == 0) {
+        ai_mcp_return_value_set_str(ret_val, "Reminder scheduled successfully on host.");
+        return OPRT_OK;
+    } else {
+        ai_mcp_return_value_set_str(ret_val, "Error: failed to dispatch to host bridge");
+        return OPRT_COM_ERROR;
+    }
+}
+
+int desk_tclaw_runtime_register_mcp_tools(void)
+{
+    OPERATE_RET rt = OPRT_OK;
+    PR_INFO("[TCLAW_RUNTIME] registering DeskAgent native MCP tools (ha.execute, codex.submit_turn, reminder.create)...");
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "ha_execute",
+        "Control smart home entities via Home Assistant (lights, switches, climate, covers, etc.).",
+        __tool_ha_execute,
+        NULL,
+        MCP_PROP_STR("entity_id", "Home Assistant entity identifier, e.g. 'light.desk' or 'switch.heater'"),
+        MCP_PROP_STR("action", "Action to perform, e.g. 'turn_on', 'turn_off', 'toggle'"),
+        MCP_PROP_STR_DEF("parameters", "Optional JSON parameters for service call", "{}")
+    ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "codex_submit_turn",
+        "Submit a coding instruction or development task to the Codex desktop companion.",
+        __tool_codex_submit,
+        NULL,
+        MCP_PROP_STR("prompt", "Development instruction or prompt for Codex assistant"),
+        MCP_PROP_STR_DEF("workspace_alias", "Target workspace alias", "epanda-desk-agent")
+    ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "reminder_create",
+        "Create a timed reminder or calendar alert on DeskAgent.",
+        __tool_reminder_create,
+        NULL,
+        MCP_PROP_STR("title", "Content or summary of the reminder"),
+        MCP_PROP_STR("due_time", "Target ISO-8601 timestamp for alert trigger")
+    ));
+
+    PR_INFO("[TCLAW_RUNTIME] native MCP tools registered successfully");
+    return OPRT_OK;
+}
+
+static OPERATE_RET __desk_mcp_tools_on_mqtt(void *data)
+{
+    (void)data;
+    return desk_tclaw_runtime_register_mcp_tools();
+}
+
 const desk_tclaw_runtime_stage_t *desk_tclaw_runtime_stages(unsigned *count)
 {
     if (count) *count = STAGE_COUNT;
@@ -130,6 +335,8 @@ int desk_tclaw_runtime_init(void)
     record_stage(STAGE_TOOL_REGISTRY,
                  rc == OPRT_OK ? DESK_TCLAW_RUNTIME_SUBSCRIBED : DESK_TCLAW_RUNTIME_FAILED, rc);
     if (rc != OPRT_OK && first_error == 0) first_error = rc;
+
+    tal_event_subscribe(EVENT_MQTT_CONNECTED, "desk_mcp_tools", __desk_mcp_tools_on_mqtt, SUBSCRIBE_TYPE_ONETIME);
 
 #if defined(ACP_CLIENT_STACK_SIZE)
     if (OPENCLAW_GATEWAY_TOKEN[0] == '\0' || OPENCLAW_GATEWAY_HOST[0] == '\0') {
@@ -234,5 +441,6 @@ const desk_tclaw_runtime_stage_t *desk_tclaw_runtime_stages(unsigned *count)
     if (count) *count = 0;
     return NULL;
 }
+int desk_tclaw_runtime_register_mcp_tools(void) { return 0; }
 
 #endif
