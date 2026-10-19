@@ -125,15 +125,23 @@ static void cmd_sys_version(int argc, char *argv[])
     printf("Desk Agent R1 Firmware v1.0.0 (ESP-IDF v5.4, ESP32-S3 QFN56 v0.2)\r\n");
 }
 
+extern uint32_t desk_app_task_stack_hwm(void);
 static void cmd_sys_heap(int argc, char *argv[])
 {
     (void)argc; (void)argv;
 #ifdef ESP_PLATFORM
     uint32_t free_sram = esp_get_free_internal_heap_size();
+    uint32_t largest_sram = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    uint32_t min_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     uint32_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     uint32_t total_free = esp_get_free_heap_size();
-    printf("Free Heap: %lu bytes (Internal SRAM: %lu, PSRAM: %lu)\r\n",
-           (unsigned long)total_free, (unsigned long)free_sram, (unsigned long)free_psram);
+    printf("Free Heap: %lu bytes (Internal SRAM Free: %lu, Largest: %lu, Min: %lu | PSRAM Free: %lu)\r\n",
+           (unsigned long)total_free, (unsigned long)free_sram,
+           (unsigned long)largest_sram, (unsigned long)min_sram,
+           (unsigned long)free_psram);
+    printf("Task Stack Min Remaining: app_task=%lu B, poll_worker=%lu B\r\n",
+           (unsigned long)desk_app_task_stack_hwm(),
+           (unsigned long)desk_firmware_background_task_stack_hwm());
 #else
     printf("Free Heap: Host Simulation (SRAM: OK, PSRAM: OK)\r\n");
 #endif
@@ -215,7 +223,7 @@ static void cmd_audio(int argc, char *argv[])
 {
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
     if (argc >= 2 && strcmp(argv[1], "test") == 0) {
-        printf("Audio 250ms output test rc=%d (audibility requires physical confirmation)\r\n",
+        printf("Audio 1000ms 1kHz output test rc=%d (audibility requires physical confirmation)\r\n",
                desk_watcher_audio_test_tone());
         return;
     }

@@ -5,6 +5,9 @@
 #include "desk_watcher_board.h"
 #ifndef DESK_WATCHER_BOARD_TEST
 #include "desk_watcher_audio.h"
+#include "desk_watcher_motion.h"
+#include "desk_watcher_camera.h"
+#include "desk_watcher_input.h"
 #endif
 
 #ifdef DESK_WATCHER_BOARD_TEST
@@ -202,6 +205,16 @@ int desk_watcher_board_audio_pa_set(bool enabled)
         return DESK_HW_ERR_IO;
     }
     return DESK_HW_OK;
+}
+
+int desk_watcher_board_pca_read(uint8_t reg, uint8_t *value)
+{
+    return watcher_pca_read(reg, value) == ESP_OK ? DESK_HW_OK : DESK_HW_ERR_IO;
+}
+
+int desk_watcher_board_pca_write(uint8_t reg, uint8_t value)
+{
+    return watcher_pca_write(reg, value) == ESP_OK ? DESK_HW_OK : DESK_HW_ERR_IO;
 }
 
 static esp_err_t watcher_i2c_init_or_reuse(void)
@@ -415,6 +428,158 @@ static const watcher_expression_t *watcher_find_expression(const char *name)
     return NULL;
 }
 
+static int s_bloub_frame_tick = 0;
+
+static inline bool bloub_in_capsule(int rx, int ry, int hw, int hh, int cr)
+{
+    int ax = rx < 0 ? -rx : rx;
+    int ay = ry < 0 ? -ry : ry;
+    if (ax > hw || ay > hh) return false;
+    if (ax > hw - cr && ay > hh - cr) {
+        int dx = ax - (hw - cr);
+        int dy = ay - (hh - cr);
+        return (dx * dx + dy * dy) <= (cr * cr);
+    }
+    return true;
+}
+
+static uint16_t watcher_bloub_render_pixel(const watcher_expression_t *expr,
+                                           const char *preset_name,
+                                           const char *preset_text,
+                                           const char *status_text,
+                                           int x, int y, int tick)
+{
+    /* 1. Outside 412x412 circular screen glass -> black bezel */
+    int c_dx = x - 206;
+    int c_dy = y - 206;
+    if ((c_dx * c_dx + c_dy * c_dy) > (206 * 206)) {
+        return 0x0000;
+    }
+
+    /* 2. Text display in bottom circular quadrant */
+    if (status_text && status_text[0] != '\0') {
+        if (watcher_glyph_pixel(status_text, x, y, 310)) return 0xFFFF;
+        if (watcher_glyph_pixel(preset_text, x, y, 280)) return 0xCE79;
+    } else {
+        if (watcher_glyph_pixel(preset_text, x, y, 310)) return 0xFFFF;
+    }
+
+    /* 3. Eye centers: Left eye at (146, 170), Right eye at (266, 170) */
+    int eye_cy = 170;
+    int left_cx = 146;
+    int right_cx = 266;
+
+    if (strcmp(preset_name, "happy") == 0) {
+        /* Inverted smiling crescent / upward curved arc */
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? left_cx : right_cx;
+            int rx = x - ecx;
+            int ry = y - eye_cy;
+            if (rx >= -30 && rx <= 30) {
+                int y_arc = -10 + (rx * rx) / 64;
+                int diff = ry - y_arc;
+                if (diff >= -5 && diff <= 5) {
+                    return 0xFFFF;
+                }
+            }
+        }
+    } else if (strcmp(preset_name, "error") == 0) {
+        /* Diagonal 'X' cross eyes */
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? left_cx : right_cx;
+            int rx = x - ecx;
+            int ry = y - eye_cy;
+            if (rx >= -24 && rx <= 24 && ry >= -24 && ry <= 24) {
+                int d1 = rx - ry; if (d1 < 0) d1 = -d1;
+                int d2 = rx + ry; if (d2 < 0) d2 = -d2;
+                if (d1 <= 4 || d2 <= 4) {
+                    return 0xFFFF;
+                }
+            }
+        }
+    } else if (strcmp(preset_name, "offline") == 0) {
+        /* Dim sleeping eyelid slits */
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? left_cx : right_cx;
+            int rx = x - ecx;
+            int ry = y - eye_cy;
+            if (rx >= -26 && rx <= 26 && ry >= -3 && ry <= 3) {
+                return 0x5AEB;
+            }
+        }
+        return 0x0000;
+    } else if (strcmp(preset_name, "thinking") == 0) {
+        /* Upward-glancing eyes with undulating thought orbit */
+        int w_dx = x - 206;
+        int w_dy = y - eye_cy;
+        int d2 = w_dx * w_dx + w_dy * w_dy;
+        if (d2 >= (72 * 72) && d2 <= (84 * 84)) {
+            int wave = (w_dx + w_dy + tick * 6);
+            if ((wave & 0x0F) < 8) {
+                return 0xFFE0;
+            }
+        }
+
+        int gaze_x = 12;
+        int gaze_y = -12;
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? (left_cx + gaze_x) : (right_cx + gaze_x);
+            int rx = x - ecx;
+            int ry = y - (eye_cy + gaze_y);
+            if (bloub_in_capsule(rx, ry, 18, 28, 14)) {
+                if (rx >= 4 && rx <= 8 && ry >= -16 && ry <= -12) return 0xFFFF;
+                return 0x5DDF;
+            }
+        }
+    } else if (strcmp(preset_name, "listening") == 0) {
+        /* Large attentive focused eyes leaning inward */
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? (left_cx + 5) : (right_cx - 5);
+            int rx = x - ecx;
+            int ry = y - eye_cy;
+            if (bloub_in_capsule(rx, ry, 26, 42, 20)) {
+                if ((rx >= 6 && rx <= 12 && ry >= -22 && ry <= -16) ||
+                    (rx >= -12 && rx <= -7 && ry >= 8 && ry <= 13)) {
+                    return 0xFFFF;
+                }
+                return 0x07FF;
+            }
+        }
+    } else if (strcmp(preset_name, "speaking") == 0) {
+        /* Rhythmic scaling cadence */
+        int bounce = ((tick * 5) % 18) - 9;
+        if (bounce < 0) bounce = -bounce;
+        int hh = 26 + bounce;
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? left_cx : right_cx;
+            int rx = x - ecx;
+            int ry = y - eye_cy;
+            if (bloub_in_capsule(rx, ry, 20, hh, 16)) {
+                if (rx >= 4 && rx <= 8 && ry >= -16 && ry <= -12) return 0xFFFF;
+                return 0x5DDF;
+            }
+        }
+    } else {
+        /* Default / Idle: natural capsule eyes with breathing & blinking */
+        bool blink = ((tick % 32) >= 30);
+        int hh = blink ? 4 : (32 + ((tick & 4) ? 2 : 0));
+        int gaze_x = (((tick / 16) % 3) - 1) * 6;
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? (left_cx + gaze_x) : (right_cx + gaze_x);
+            int rx = x - ecx;
+            int ry = y - eye_cy;
+            if (bloub_in_capsule(rx, ry, 22, hh, 16)) {
+                if (!blink && rx >= 5 && rx <= 9 && ry >= -18 && ry <= -14) {
+                    return 0xFFFF;
+                }
+                return 0x7FFF;
+            }
+        }
+    }
+
+    return expr->background;
+}
+
 static esp_err_t watcher_draw_state(const watcher_expression_t *expression,
                                    const char *preset_name, const char *status)
 {
@@ -440,16 +605,13 @@ static esp_err_t watcher_draw_state(const watcher_expression_t *expression,
         }
     }
 
+    s_bloub_frame_tick++;
     for (int y0 = 0; y0 < WATCHER_LCD_HEIGHT; y0 += WATCHER_DRAW_ROWS) {
         for (int row = 0; row < WATCHER_DRAW_ROWS; ++row) {
             const int y = y0 + row;
             for (int x = 0; x < WATCHER_LCD_WIDTH; ++x) {
-                uint16_t pixel = expression->background;
-                if (watcher_glyph_pixel(preset_text, x, y, 156) ||
-                    watcher_glyph_pixel(status_text, x, y, 194)) {
-                    pixel = 0xFFFF;
-                }
-                s_draw_buffer[row * WATCHER_LCD_WIDTH + x] = pixel;
+                s_draw_buffer[row * WATCHER_LCD_WIDTH + x] =
+                    watcher_bloub_render_pixel(expression, preset_name, preset_text, status_text, x, y, s_bloub_frame_tick);
             }
         }
         (void)xSemaphoreTake(s_draw_done, 0);
@@ -546,8 +708,13 @@ static int watcher_display_expression(const char *preset_name, const char *statu
     return DESK_HW_OK;
 }
 
-static int watcher_display_deinit(void)
+static int watcher_board_deinit(void)
 {
+#ifndef DESK_WATCHER_BOARD_TEST
+    desk_watcher_input_deinit();
+    desk_watcher_camera_deinit();
+    desk_watcher_motion_deinit();
+#endif
     (void)watcher_backlight_set(0);
     watcher_release_panel();
     /* Keep the shared I2C controller installed; the next init re-probes it. */
@@ -562,7 +729,12 @@ static int watcher_board_init(void)
     int lcd = watcher_display_init();
 #ifndef DESK_WATCHER_BOARD_TEST
     int audio = desk_watcher_audio_init();
-    return lcd == DESK_HW_OK || audio == DESK_HW_OK ? DESK_HW_OK : DESK_HW_ERR_UNAVAILABLE;
+    int motion = desk_watcher_motion_init();
+    int camera = desk_watcher_camera_init();
+    int input = desk_watcher_input_init();
+    (void)camera;
+    (void)input;
+    return (lcd == DESK_HW_OK || audio == DESK_HW_OK || motion == DESK_HW_OK) ? DESK_HW_OK : DESK_HW_ERR_UNAVAILABLE;
 #else
     return lcd;
 #endif
@@ -574,15 +746,18 @@ static const desk_board_driver_ops_t s_watcher_driver_ops = {
 #ifndef DESK_WATCHER_BOARD_TEST
     .audio_record_read = desk_watcher_audio_read,
     .audio_play_pcm = desk_watcher_audio_play,
+    .motion_move = desk_watcher_motion_move,
+    .motion_stop = desk_watcher_motion_stop,
+    .camera_capture = desk_watcher_camera_capture,
 #else
     .audio_record_read = NULL,
     .audio_play_pcm = NULL,
-#endif
     .motion_move = NULL,
     .motion_stop = NULL,
     .camera_capture = NULL,
+#endif
     .display_expression = watcher_display_expression,
-    .deinit = watcher_display_deinit,
+    .deinit = watcher_board_deinit,
 };
 
 const desk_board_driver_ops_t *desk_watcher_board_get_driver_ops(void)

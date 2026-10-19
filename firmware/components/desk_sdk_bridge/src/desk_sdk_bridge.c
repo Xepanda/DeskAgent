@@ -16,14 +16,20 @@
 #ifdef ESP_PLATFORM
 #include <sys/poll.h>
 #include "esp_attr.h"
+#include "tal_api.h"
 #define DESK_PROTOCOL_BSS EXT_RAM_BSS_ATTR
+#define desk_psram_malloc(sz) tal_psram_malloc(sz)
+#define desk_psram_free(ptr)  tal_psram_free(ptr)
 #else
 #include <poll.h>
 #define DESK_PROTOCOL_BSS
+#define desk_psram_malloc(sz) malloc(sz)
+#define desk_psram_free(ptr)  free(ptr)
 #endif
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -47,6 +53,7 @@ static void *s_tool_response_user_data = NULL;
 static char s_active_pairing_token[65] = "";
 static bool s_auth_required = false;
 static bool s_paired = false;
+static uint32_t s_last_heartbeat_time = 0;
 
 /* Device-side expected pairing code (interfaces.md 6.4). Provisioned explicitly
  * via desk_sdk_bridge_set_pairing_code(); never hardcoded, never logged. */
@@ -440,6 +447,89 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
     return false;
 }
 
+static bool json_extract_subobject(const char *json, const char *key, char *out_buf, size_t max_len)
+{
+    if (!json || !key || !out_buf || max_len == 0) return false;
+    out_buf[0] = '\0';
+
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    size_t needle_len = strlen(needle);
+
+    const char *p = json;
+    bool in_str = false;
+    bool escaped = false;
+
+    while (*p) {
+        if (escaped) {
+            escaped = false;
+            p++;
+            continue;
+        }
+        if (*p == '\\' && in_str) {
+            escaped = true;
+            p++;
+            continue;
+        }
+        if (*p == '\"') {
+            if (!in_str) {
+                if (strncmp(p, needle, needle_len) == 0) {
+                    const char *after = p + needle_len;
+                    while (*after && (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n')) after++;
+                    if (*after == ':') {
+                        after++;
+                        while (*after && (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n')) after++;
+                        if (*after == '{' || *after == '[') {
+                            char open_ch = *after;
+                            char close_ch = (open_ch == '{') ? '}' : ']';
+                            int depth = 1;
+                            const char *obj_start = after;
+                            after++;
+                            bool sub_in_str = false;
+                            bool sub_escaped = false;
+                            while (*after && depth > 0) {
+                                if (sub_escaped) {
+                                    sub_escaped = false;
+                                    after++;
+                                    continue;
+                                }
+                                if (*after == '\\' && sub_in_str) {
+                                    sub_escaped = true;
+                                    after++;
+                                    continue;
+                                }
+                                if (*after == '\"') {
+                                    sub_in_str = !sub_in_str;
+                                    after++;
+                                    continue;
+                                }
+                                if (!sub_in_str) {
+                                    if (*after == open_ch) depth++;
+                                    else if (*after == close_ch) depth--;
+                                }
+                                after++;
+                            }
+                            if (depth == 0) {
+                                size_t obj_len = (size_t)(after - obj_start);
+                                if (obj_len < max_len) {
+                                    memcpy(out_buf, obj_start, obj_len);
+                                    out_buf[obj_len] = '\0';
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                in_str = true;
+            } else {
+                in_str = false;
+            }
+        }
+        p++;
+    }
+    return false;
+}
+
 /**
  * @brief Build the '"request_id":"<id>",' fragment for a response envelope.
  *
@@ -467,6 +557,242 @@ static const char *desk_sdk_request_id_fragment(const char *json_in, char *scrat
     return scratch;
 }
 
+#define DESK_SDK_MAX_PENDING_REQUESTS 64
+
+typedef struct {
+    char request_id[64];
+    char operation[64];
+    uint64_t created_at_ms;
+    uint64_t updated_at_ms;
+    uint32_t timeout_ms;
+    desk_sdk_req_state_t state;
+    char last_status[32];
+    bool in_use;
+} desk_sdk_pending_req_t;
+
+static DESK_PROTOCOL_BSS desk_sdk_pending_req_t s_req_table[DESK_SDK_MAX_PENDING_REQUESTS];
+static pthread_mutex_t s_req_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t desk_sdk_time_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
+
+static void desk_sdk_req_table_init(void)
+{
+    pthread_mutex_lock(&s_req_mutex);
+    memset(s_req_table, 0, sizeof(s_req_table));
+    pthread_mutex_unlock(&s_req_mutex);
+}
+
+static int desk_sdk_req_table_add(const char *request_id, const char *operation, uint32_t timeout_ms)
+{
+    if (!request_id || request_id[0] == '\0') return -1;
+
+    pthread_mutex_lock(&s_req_mutex);
+    uint64_t now = desk_sdk_time_ms();
+
+    /* If already tracked, update it */
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
+            if (operation && operation[0] != '\0') {
+                strncpy(s_req_table[i].operation, operation, sizeof(s_req_table[i].operation) - 1);
+                s_req_table[i].operation[sizeof(s_req_table[i].operation) - 1] = '\0';
+            }
+            s_req_table[i].updated_at_ms = now;
+            s_req_table[i].state = DESK_SDK_REQ_STATE_PENDING;
+            strncpy(s_req_table[i].last_status, "pending", sizeof(s_req_table[i].last_status) - 1);
+            pthread_mutex_unlock(&s_req_mutex);
+            return 0;
+        }
+    }
+
+    /* Find empty or completed/failed slot */
+    int target_idx = -1;
+    uint64_t oldest_time = UINT64_MAX;
+    int oldest_idx = 0;
+
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (!s_req_table[i].in_use) {
+            target_idx = (int)i;
+            break;
+        }
+        if (s_req_table[i].state == DESK_SDK_REQ_STATE_COMPLETED ||
+            s_req_table[i].state == DESK_SDK_REQ_STATE_FAILED ||
+            s_req_table[i].state == DESK_SDK_REQ_STATE_TIMED_OUT) {
+            target_idx = (int)i;
+            break;
+        }
+        if (s_req_table[i].created_at_ms < oldest_time) {
+            oldest_time = s_req_table[i].created_at_ms;
+            oldest_idx = (int)i;
+        }
+    }
+
+    if (target_idx < 0) {
+        target_idx = oldest_idx;
+    }
+
+    desk_sdk_pending_req_t *entry = &s_req_table[target_idx];
+    memset(entry, 0, sizeof(*entry));
+    entry->in_use = true;
+    strncpy(entry->request_id, request_id, sizeof(entry->request_id) - 1);
+    entry->request_id[sizeof(entry->request_id) - 1] = '\0';
+    if (operation) {
+        strncpy(entry->operation, operation, sizeof(entry->operation) - 1);
+        entry->operation[sizeof(entry->operation) - 1] = '\0';
+    }
+    entry->created_at_ms = now;
+    entry->updated_at_ms = now;
+    entry->timeout_ms = timeout_ms > 0 ? timeout_ms : 60000;
+    entry->state = DESK_SDK_REQ_STATE_PENDING;
+    strncpy(entry->last_status, "pending", sizeof(entry->last_status) - 1);
+
+    pthread_mutex_unlock(&s_req_mutex);
+    return 0;
+}
+
+static int desk_sdk_req_table_update(const char *request_id, const char *status)
+{
+    if (!request_id || !status) return -1;
+
+    pthread_mutex_lock(&s_req_mutex);
+    uint64_t now = desk_sdk_time_ms();
+    int found_idx = -1;
+
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
+            found_idx = (int)i;
+            break;
+        }
+    }
+
+    if (found_idx >= 0) {
+        desk_sdk_pending_req_t *entry = &s_req_table[found_idx];
+        entry->updated_at_ms = now;
+        snprintf(entry->last_status, sizeof(entry->last_status), "%s", status);
+
+        if (strcmp(status, "accepted") == 0) {
+            entry->state = DESK_SDK_REQ_STATE_ACCEPTED;
+        } else if (strcmp(status, "completed") == 0 || strcmp(status, "succeeded") == 0) {
+            entry->state = DESK_SDK_REQ_STATE_COMPLETED;
+        } else if (strcmp(status, "failed") == 0 || strcmp(status, "error") == 0 || strcmp(status, "cancelled") == 0) {
+            entry->state = DESK_SDK_REQ_STATE_FAILED;
+        }
+        pthread_mutex_unlock(&s_req_mutex);
+        return 0;
+    }
+
+    pthread_mutex_unlock(&s_req_mutex);
+
+    /* If not currently tracked, record it now */
+    desk_sdk_req_table_add(request_id, "unknown", 60000);
+    pthread_mutex_lock(&s_req_mutex);
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
+            snprintf(s_req_table[i].last_status, sizeof(s_req_table[i].last_status), "%s", status);
+            if (strcmp(status, "accepted") == 0) {
+                s_req_table[i].state = DESK_SDK_REQ_STATE_ACCEPTED;
+            } else if (strcmp(status, "completed") == 0 || strcmp(status, "succeeded") == 0) {
+                s_req_table[i].state = DESK_SDK_REQ_STATE_COMPLETED;
+            } else {
+                s_req_table[i].state = DESK_SDK_REQ_STATE_FAILED;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_req_mutex);
+    return 0;
+}
+
+int desk_sdk_bridge_get_pending_request_count(void)
+{
+    pthread_mutex_lock(&s_req_mutex);
+    int count = 0;
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (s_req_table[i].in_use &&
+            (s_req_table[i].state == DESK_SDK_REQ_STATE_PENDING ||
+             s_req_table[i].state == DESK_SDK_REQ_STATE_ACCEPTED)) {
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&s_req_mutex);
+    return count;
+}
+
+bool desk_sdk_bridge_has_pending_request(const char *request_id)
+{
+    if (!request_id || request_id[0] == '\0') return false;
+    pthread_mutex_lock(&s_req_mutex);
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
+            bool active = (s_req_table[i].state == DESK_SDK_REQ_STATE_PENDING ||
+                           s_req_table[i].state == DESK_SDK_REQ_STATE_ACCEPTED);
+            pthread_mutex_unlock(&s_req_mutex);
+            return active;
+        }
+    }
+    pthread_mutex_unlock(&s_req_mutex);
+    return false;
+}
+
+int desk_sdk_bridge_get_request_status(const char *request_id, char *out_status, size_t max_len)
+{
+    if (!request_id || !out_status || max_len == 0) return -1;
+    pthread_mutex_lock(&s_req_mutex);
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
+            strncpy(out_status, s_req_table[i].last_status, max_len - 1);
+            out_status[max_len - 1] = '\0';
+            pthread_mutex_unlock(&s_req_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&s_req_mutex);
+    return -1;
+}
+
+int desk_sdk_bridge_clear_pending_requests(void)
+{
+    desk_sdk_req_table_init();
+    return 0;
+}
+
+int desk_sdk_bridge_cleanup_expired_requests(uint32_t timeout_ms)
+{
+    pthread_mutex_lock(&s_req_mutex);
+    uint64_t now = desk_sdk_time_ms();
+    int cleaned = 0;
+    for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+        if (s_req_table[i].in_use &&
+            (s_req_table[i].state == DESK_SDK_REQ_STATE_PENDING ||
+             s_req_table[i].state == DESK_SDK_REQ_STATE_ACCEPTED)) {
+            uint32_t thresh = timeout_ms > 0 ? timeout_ms : s_req_table[i].timeout_ms;
+            if (now >= s_req_table[i].created_at_ms && (now - s_req_table[i].created_at_ms) > thresh) {
+                s_req_table[i].state = DESK_SDK_REQ_STATE_TIMED_OUT;
+                strncpy(s_req_table[i].last_status, "timed_out", sizeof(s_req_table[i].last_status) - 1);
+                cleaned++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_req_mutex);
+    return cleaned;
+}
+
+uint32_t desk_sdk_bridge_get_last_heartbeat_time(void)
+{
+    return s_last_heartbeat_time;
+}
+
+bool desk_sdk_bridge_is_heartbeat_alive(uint32_t timeout_sec)
+{
+    if (s_last_heartbeat_time == 0) return false;
+    time_t now = time(NULL);
+    if ((uint32_t)now < s_last_heartbeat_time) return true;
+    return ((uint32_t)now - s_last_heartbeat_time) <= timeout_sec;
+}
 
 int desk_sdk_bridge_init(void)
 {
@@ -479,6 +805,8 @@ int desk_sdk_bridge_init(void)
     s_listen_fd = -1;
     s_client_fd = -1;
     s_bound_port = 0;
+    s_last_heartbeat_time = 0;
+    desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
     return 0;
 }
@@ -490,6 +818,8 @@ void desk_sdk_bridge_reset(void)
     s_active_pairing_token[0] = '\0';
     s_paired = false;
     s_auth_required = false;
+    s_last_heartbeat_time = 0;
+    desk_sdk_req_table_init();
     /* Provisioned expected pairing code intentionally survives a reset. */
     desk_sdk_socket_rx_reset();
 }
@@ -612,7 +942,7 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
 
     if (DESK_WSPK_HEADER_SIZE + payload_len > sizeof(stack_buf)) {
         target_size = DESK_WSPK_HEADER_SIZE + payload_len;
-        heap_buf = (uint8_t *)malloc(target_size);
+        heap_buf = (uint8_t *)desk_psram_malloc(target_size);
         if (!heap_buf) return -1;
         target_buf = heap_buf;
     }
@@ -635,7 +965,7 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
     }
 
     if (heap_buf) {
-        free(heap_buf);
+        desk_psram_free(heap_buf);
     }
     return rc;
 }
@@ -824,12 +1154,15 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  DESK_SDK_CAP_INPUTS,
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
                  DESK_SDK_CAP_AUDIO_STREAM,
-                 DESK_SDK_CAP_EXPRESSION);
+                 DESK_SDK_CAP_EXPRESSION,
+                 DESK_SDK_CAP_AUDIO_STREAM_ALT,
+                 DESK_SDK_CAP_EXPRESSION_ALT,
+                 DESK_SDK_CAP_MCP_TOOLS);
         return 0;
     }
 
@@ -841,18 +1174,22 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  rid,
                  DESK_SDK_CAP_INPUTS,
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
                  DESK_SDK_CAP_AUDIO_STREAM,
-                 DESK_SDK_CAP_EXPRESSION);
+                 DESK_SDK_CAP_EXPRESSION,
+                 DESK_SDK_CAP_AUDIO_STREAM_ALT,
+                 DESK_SDK_CAP_EXPRESSION_ALT,
+                 DESK_SDK_CAP_MCP_TOOLS);
         return 0;
     }
 
     /* Heartbeat: sys.ping */
     else if (strcmp(msg_type, "sys.ping") == 0) {
+        s_last_heartbeat_time = (uint32_t)time(NULL);
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
@@ -1012,7 +1349,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         size_t max_jpeg = 65536;
-        uint8_t *jpeg_buf = (uint8_t *)malloc(max_jpeg);
+        uint8_t *jpeg_buf = (uint8_t *)desk_psram_malloc(max_jpeg);
         if (!jpeg_buf) {
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.nack\",%s\"code\":500,\"error\":{"
@@ -1025,7 +1362,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         size_t jpeg_len = 0;
         int cap_rc = desk_hardware_camera_capture_jpeg(jpeg_buf, max_jpeg, &jpeg_len, 1000);
         if (cap_rc != DESK_HW_OK || jpeg_len == 0) {
-            free(jpeg_buf);
+            desk_psram_free(jpeg_buf);
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
                      "\"code\":\"RESOURCE_BUSY\","
@@ -1045,7 +1382,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         /* Send WSPK media frame (FRAME_IMAGE = 3) */
         desk_sdk_bridge_send_media_frame(DESK_WSPK_TYPE_IMAGE, 0, s_camera_session_id, s_camera_seq,
                                          jpeg_buf, jpeg_len);
-        free(jpeg_buf);
+        desk_psram_free(jpeg_buf);
         return 0;
     }
 
@@ -1178,6 +1515,16 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     else if (strcmp(msg_type, "tool.response") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        if (rid[0] == '\0') {
+            char data_rid[80] = "";
+            char data_obj[1024] = "";
+            if (json_extract_subobject(json_in, "data", data_obj, sizeof(data_obj))) {
+                if (json_parse_str(data_obj, "request_id", data_rid, sizeof(data_rid)) && data_rid[0] != '\0') {
+                    snprintf(rid_scratch, sizeof(rid_scratch), "\"request_id\":\"%s\",", data_rid);
+                    rid = rid_scratch;
+                }
+            }
+        }
         desk_sdk_bridge_handle_tool_response(json_in);
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"status\":\"received\"}}",
@@ -1302,18 +1649,68 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
 {
     if (!request_envelope_json) return -1;
 
+    char req_id[80] = "";
+    char operation[64] = "";
+
+    /* Extract request_id and operation */
+    if (!json_parse_top_level_str(request_envelope_json, "request_id", req_id, sizeof(req_id)) || req_id[0] == '\0') {
+        json_parse_str(request_envelope_json, "request_id", req_id, sizeof(req_id));
+    }
+    if (!json_parse_top_level_str(request_envelope_json, "operation", operation, sizeof(operation)) || operation[0] == '\0') {
+        json_parse_str(request_envelope_json, "operation", operation, sizeof(operation));
+    }
+
+    if (req_id[0] == '\0') {
+        time_t now = time(NULL);
+        if (now < 1700000000) now = 1792100000;
+        s_event_seq++;
+        snprintf(req_id, sizeof(req_id), "req-bridge-%08x-%04x", (unsigned int)now, (unsigned int)(s_event_seq & 0xFFFF));
+    }
+
+    /* Record in correlation table */
+    desk_sdk_req_table_add(req_id, operation, 60000);
+
+    /* Determine if we should wrap/format into full RequestEnvelope */
+    char formatted_req[4096];
+    const char *payload_to_send = request_envelope_json;
+
+    if (strstr(request_envelope_json, "\"schema_version\"") == NULL ||
+        strstr(request_envelope_json, "\"expires_at\"") == NULL) {
+        time_t now = time(NULL);
+        if (now < 1700000000) now = 1792100000;
+        char expires_at[32];
+        desk_sdk_format_iso8601(now + 60, expires_at, sizeof(expires_at));
+
+        char args_buf[2048] = "{}";
+        if (!json_extract_subobject(request_envelope_json, "arguments", args_buf, sizeof(args_buf))) {
+            strncpy(args_buf, "{}", sizeof(args_buf) - 1);
+        }
+
+        snprintf(formatted_req, sizeof(formatted_req),
+                 "{\"schema_version\":\"1.0.0\","
+                 "\"request_id\":\"%s\","
+                 "\"operation\":\"%s\","
+                 "\"arguments\":%s,"
+                 "\"expires_at\":\"%s\"}",
+                 req_id,
+                 operation[0] != '\0' ? operation : "unknown.tool",
+                 args_buf,
+                 expires_at);
+        payload_to_send = formatted_req;
+    }
+
     int ret = 0;
     if (s_outbound_cb) {
-        ret = s_outbound_cb(request_envelope_json, strlen(request_envelope_json), s_outbound_user_data);
+        ret = s_outbound_cb(payload_to_send, strlen(payload_to_send), s_outbound_user_data);
     }
 
     if (s_client_fd >= 0) {
-        size_t len = strlen(request_envelope_json);
-        if (desk_sdk_socket_write_all(s_client_fd, request_envelope_json, len) != 0) {
+        size_t len = strlen(payload_to_send);
+        if (desk_sdk_socket_write_all(s_client_fd, payload_to_send, len) != 0) {
             desk_sdk_socket_client_close();
             return -1;
         }
-        if (len == 0 || request_envelope_json[len - 1] != '\n') {
+        if (len == 0 || payload_to_send[len - 1] != '\n') {
             if (desk_sdk_socket_write_all(s_client_fd, "\n", 1) != 0) {
                 desk_sdk_socket_client_close();
                 return -1;
@@ -1327,8 +1724,117 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
 int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json)
 {
     if (!response_envelope_json) return -1;
+
+    char req_id[80] = "";
+    char raw_status[32] = "";
+    static DESK_PROTOCOL_BSS char s_data_buf[1024];
+    static DESK_PROTOCOL_BSS char s_result_buf[1024];
+    static DESK_PROTOCOL_BSS char s_error_buf[512];
+    static DESK_PROTOCOL_BSS char s_normalized[3072];
+
+    s_data_buf[0] = '\0';
+    s_result_buf[0] = '\0';
+    s_error_buf[0] = '\0';
+    s_normalized[0] = '\0';
+
+    /* 1. Extract data subobject if present */
+    json_extract_subobject(response_envelope_json, "data", s_data_buf, sizeof(s_data_buf));
+
+    /* 2. Extract request_id */
+    if (!json_parse_top_level_str(response_envelope_json, "request_id", req_id, sizeof(req_id)) || req_id[0] == '\0') {
+        if (s_data_buf[0] != '\0') {
+            json_parse_str(s_data_buf, "request_id", req_id, sizeof(req_id));
+        }
+    }
+
+    /* 3. Extract status */
+    if (!json_parse_top_level_str(response_envelope_json, "status", raw_status, sizeof(raw_status)) || raw_status[0] == '\0') {
+        if (s_data_buf[0] != '\0') {
+            json_parse_str(s_data_buf, "status", raw_status, sizeof(raw_status));
+        }
+    }
+
+    /* 4. Extract result / error */
+    if (!json_extract_subobject(response_envelope_json, "result", s_result_buf, sizeof(s_result_buf))) {
+        if (s_data_buf[0] != '\0') {
+            json_extract_subobject(s_data_buf, "result", s_result_buf, sizeof(s_result_buf));
+        }
+    }
+    if (!json_extract_subobject(response_envelope_json, "error", s_error_buf, sizeof(s_error_buf))) {
+        if (s_data_buf[0] != '\0') {
+            json_extract_subobject(s_data_buf, "error", s_error_buf, sizeof(s_error_buf));
+        }
+    }
+
+    /* Fallback status if missing */
+    if (raw_status[0] == '\0') {
+        if (s_error_buf[0] != '\0' || strstr(response_envelope_json, "\"code\":") != NULL) {
+            strncpy(raw_status, "failed", sizeof(raw_status) - 1);
+        } else {
+            strncpy(raw_status, "succeeded", sizeof(raw_status) - 1);
+        }
+    }
+
+    /* Update table with raw status */
+    desk_sdk_req_table_update(req_id, raw_status);
+
+    /* Normalize status: "completed" -> "succeeded" */
+    const char *eff_status = raw_status;
+    if (strcmp(raw_status, "completed") == 0) {
+        eff_status = "succeeded";
+    }
+
+    /* Prepare timestamp */
+    time_t now = time(NULL);
+    if (now < 1700000000) now = 1792100000;
+    char ts[32];
+    if (!json_parse_top_level_str(response_envelope_json, "timestamp", ts, sizeof(ts)) || ts[0] == '\0') {
+        if (s_data_buf[0] == '\0' || !json_parse_str(s_data_buf, "timestamp", ts, sizeof(ts)) || ts[0] == '\0') {
+            desk_sdk_format_iso8601(now, ts, sizeof(ts));
+        }
+    }
+
+    /* Construct normalized envelope JSON */
+    bool is_success = (strcmp(eff_status, "succeeded") == 0 || strcmp(eff_status, "accepted") == 0);
+
+    if (is_success) {
+        const char *res = (s_result_buf[0] != '\0') ? s_result_buf : "{}";
+        snprintf(s_normalized, sizeof(s_normalized),
+                 "{\"schema_version\":\"1.0.0\","
+                 "\"request_id\":\"%s\","
+                 "\"status\":\"%s\","
+                 "\"timestamp\":\"%s\","
+                 "\"result\":%s,"
+                 "\"data\":{"
+                 "\"schema_version\":\"1.0.0\","
+                 "\"request_id\":\"%s\","
+                 "\"status\":\"%s\","
+                 "\"timestamp\":\"%s\","
+                 "\"result\":%s"
+                 "}}",
+                 req_id, eff_status, ts, res,
+                 req_id, eff_status, ts, res);
+    } else {
+        const char *err = (s_error_buf[0] != '\0') ? s_error_buf : "{\"code\":\"EXECUTION_FAILED\",\"message\":\"Tool execution failed\"}";
+        snprintf(s_normalized, sizeof(s_normalized),
+                 "{\"schema_version\":\"1.0.0\","
+                 "\"request_id\":\"%s\","
+                 "\"status\":\"failed\","
+                 "\"timestamp\":\"%s\","
+                 "\"error\":%s,"
+                 "\"data\":{"
+                 "\"schema_version\":\"1.0.0\","
+                 "\"request_id\":\"%s\","
+                 "\"status\":\"failed\","
+                 "\"timestamp\":\"%s\","
+                 "\"error\":%s"
+                 "}}",
+                 req_id, ts, err,
+                 req_id, ts, err);
+    }
+
     if (s_tool_response_cb) {
-        return s_tool_response_cb(response_envelope_json, s_tool_response_user_data);
+        return s_tool_response_cb(s_normalized, s_tool_response_user_data);
     }
     return 0;
 }
@@ -1656,6 +2162,8 @@ int desk_firmware_poll(int timeout_ms)
 #ifdef ESP_PLATFORM
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 static TaskHandle_t s_worker_task_handle = NULL;
 static void firmware_worker_task(void *pvParameters)
 {
@@ -1664,12 +2172,13 @@ static void firmware_worker_task(void *pvParameters)
         desk_firmware_poll(20);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 int desk_firmware_start_background_task(void)
 {
     if (s_worker_task_handle != NULL) return 0;
-    BaseType_t ret = xTaskCreate(firmware_worker_task, "desk_poll_worker", 8192, NULL, 5, &s_worker_task_handle);
+    BaseType_t ret = xTaskCreateWithCaps(firmware_worker_task, "desk_poll_worker", 8192, NULL, 5,
+                                         &s_worker_task_handle, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     return ret == pdPASS ? 0 : -1;
 }
 void desk_firmware_stop_background_task(void)
@@ -1679,6 +2188,13 @@ void desk_firmware_stop_background_task(void)
 bool desk_firmware_is_background_task_running(void)
 {
     return s_worker_task_handle != NULL;
+}
+uint32_t desk_firmware_background_task_stack_hwm(void)
+{
+    if (s_worker_task_handle != NULL) {
+        return (uint32_t)uxTaskGetStackHighWaterMark(s_worker_task_handle) * sizeof(StackType_t);
+    }
+    return 0;
 }
 #else
 #include <pthread.h>
@@ -1713,5 +2229,9 @@ void desk_firmware_stop_background_task(void)
 bool desk_firmware_is_background_task_running(void)
 {
     return s_worker_running;
+}
+uint32_t desk_firmware_background_task_stack_hwm(void)
+{
+    return 0;
 }
 #endif

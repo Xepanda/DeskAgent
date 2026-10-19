@@ -53,6 +53,26 @@ class TestTclawRuntimeContract(unittest.TestCase):
         self.assertIn("strcmp(s_pending_request_id, request_id)", tclaw,
                       "TClaw response handling must reject mismatched request correlation")
 
+    def test_native_mcp_tools_registration_and_bridge_dispatch(self) -> None:
+        adapter = (ROOT / "firmware/main/src/tclaw_runtime_adapter.c").read_text(encoding="utf-8")
+        header = (ROOT / "firmware/main/include/tclaw_runtime_adapter.h").read_text(encoding="utf-8")
+
+        self.assertIn("desk_tclaw_runtime_register_mcp_tools", header)
+        self.assertIn("desk_tclaw_runtime_register_mcp_tools", adapter)
+        self.assertIn("EVENT_MQTT_CONNECTED", adapter)
+        self.assertIn("desk_mcp_tools", adapter)
+
+        # Check native tools registered
+        for tool in ("ha_execute", "codex_submit_turn", "reminder_create"):
+            self.assertIn(f'"{tool}"', adapter, f"Native tool {tool} must be registered")
+
+        # Check operations wired to Host bridge
+        for op in ("ha.execute", "codex.submit_turn", "reminder.create"):
+            self.assertIn(f'"{op}"', adapter, f"Tool operation {op} must be dispatched")
+
+        self.assertIn("desk_sdk_bridge_dispatch_tool_request", adapter,
+                      "Native tool execution must dispatch request envelope to SDK bridge")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,8 @@ bool desk_watcher_board_display_ready(void);
 int desk_watcher_board_i2c_ensure(void);
 int desk_watcher_board_i2c_probe(uint8_t address_7bit);
 int desk_watcher_board_audio_pa_set(bool enabled);
+int desk_watcher_board_pca_read(uint8_t reg, uint8_t *value);
+int desk_watcher_board_pca_write(uint8_t reg, uint8_t value);
 
 #ifdef __cplusplus
 }

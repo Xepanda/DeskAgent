@@ -66,6 +66,12 @@ class FrameCapturePipeline:
         with self._lock:
             self._running = False
             self._consumer = None
+            if self._thread and self._thread.is_alive() and self._thread != threading.current_thread():
+                try:
+                    self._thread.join(timeout=0.2)
+                except Exception:
+                    pass
+                self._thread = None
 
     def update_coordinates(self, pan: float, tilt: float) -> None:
         with self._lock:
@@ -170,7 +176,12 @@ class CameraViewerService:
         """Ingests live raw JPEG frame from physical robot camera link."""
         self.push_frame(frame_bytes, is_hardware=True)
 
-    def acquire_lease(self, client_id: str, lease_ms: Optional[int] = None) -> dict[str, Any]:
+    def acquire_lease(
+        self,
+        client_id: str,
+        lease_ms: Optional[int] = None,
+        target_fps: Optional[float] = None,
+    ) -> dict[str, Any]:
         """
         Acquires or renews single-viewer lease for camera streaming.
         Rejects concurrent clients with RESOURCE_BUSY.
@@ -199,6 +210,10 @@ class CameraViewerService:
             self._active_lease_owner = client_id
             self._lease_expires_at = now + duration
 
+            if target_fps is not None:
+                self.pipeline.fps = max(0.5, min(30.0, float(target_fps)))
+                self.pipeline._interval = 1.0 / self.pipeline.fps
+
             # Start active capture pipeline if configured
             if self.auto_start_pipeline:
                 self.pipeline.start(self.push_frame)
@@ -206,8 +221,10 @@ class CameraViewerService:
             return {
                 "granted": True,
                 "client_id": client_id,
+                "lease_id": f"lease-{client_id}",
                 "lease_duration_ms": int(duration * 1000),
                 "expires_at": self._lease_expires_at,
+                "target_fps": self.pipeline.fps,
             }
 
     def release_lease(self, client_id: str) -> bool:
@@ -295,3 +312,38 @@ class CameraViewerService:
                 "source": "hardware_sensor" if is_hw else "synthetic_pipeline",
                 "is_hardware": is_hw,
             }
+
+    def get_snapshot(
+        self,
+        client_id: Optional[str] = None,
+        auto_acquire_ms: int = 5000,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Retrieves a fresh snapshot JPEG frame.
+        If client_id is provided and holds an active lease, returns the latest frame.
+        If no active lease is held, auto-acquires a short ephemeral lease and awaits
+        a fresh frame from the capture pipeline.
+        """
+        with self._lock:
+            if self.is_lease_valid():
+                # An active lease is held: caller must explicitly match the lease owner
+                if not client_id or client_id != self._active_lease_owner:
+                    return None
+                effective_client = client_id
+            else:
+                # No active lease is held: acquire ephemeral lease
+                effective_client = client_id if client_id else "snapshot-viewer"
+                acq = self.acquire_lease(effective_client, lease_ms=auto_acquire_ms)
+                if not acq.get("granted"):
+                    return None
+
+        # Check latest frame, waiting briefly if pipeline is starting
+        frame = self.get_latest_frame(effective_client)
+        if frame is None and self.pipeline._running:
+            deadline = time.time() + 0.25
+            while time.time() < deadline:
+                time.sleep(0.02)
+                frame = self.get_latest_frame(effective_client)
+                if frame is not None:
+                    break
+        return frame

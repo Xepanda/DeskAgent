@@ -233,6 +233,27 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_sdk_bridge_handle_tool_response.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_handle_tool_response.argtypes = [ctypes.c_char_p]
 
+        cls.lib.desk_sdk_bridge_get_pending_request_count.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_get_pending_request_count.argtypes = []
+
+        cls.lib.desk_sdk_bridge_has_pending_request.restype = ctypes.c_bool
+        cls.lib.desk_sdk_bridge_has_pending_request.argtypes = [ctypes.c_char_p]
+
+        cls.lib.desk_sdk_bridge_get_request_status.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_get_request_status.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+
+        cls.lib.desk_sdk_bridge_clear_pending_requests.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_clear_pending_requests.argtypes = []
+
+        cls.lib.desk_sdk_bridge_cleanup_expired_requests.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_cleanup_expired_requests.argtypes = [ctypes.c_uint32]
+
+        cls.lib.desk_sdk_bridge_get_last_heartbeat_time.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_bridge_get_last_heartbeat_time.argtypes = []
+
+        cls.lib.desk_sdk_bridge_is_heartbeat_alive.restype = ctypes.c_bool
+        cls.lib.desk_sdk_bridge_is_heartbeat_alive.argtypes = [ctypes.c_uint32]
+
         cls.lib.desk_sdk_bridge_process_pairing_udp.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_process_pairing_udp.argtypes = [
             ctypes.c_char_p,
@@ -460,7 +481,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         data = resp.get("data", {})
         self.assertEqual(data.get("role"), "device")
         caps = data.get("capabilities", [])
-        expected_caps = ["inputs", "motion", "camera", "audio.stream", "expression.audio_follow.v1"]
+        expected_caps = ["inputs", "motion", "camera", "audio.stream", "expression.audio_follow.v1", "mcp_tools"]
         for cap in expected_caps:
             self.assertIn(cap, caps, f"Missing expected capability: {cap}")
 

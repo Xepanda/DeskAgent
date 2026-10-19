@@ -1326,3 +1326,8 @@ int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_acti
     }
     return -1;
 }
+
+int desk_hardware_feed_touch_event(desk_touch_target_t target, desk_touch_action_t action)
+{
+    return desk_hardware_inject_touch_event(target, action);
+}

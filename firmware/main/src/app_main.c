@@ -23,6 +23,9 @@
 #include "cJSON.h"
 #include "tkl_output.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #else
 #include <stdbool.h>
 
@@ -492,6 +495,8 @@ static int desk_agent_main_worker(void)
 
     printf("[READY] Provisioning stack started; waiting for observed Tuya lifecycle events.\n");
 #ifdef ESP_PLATFORM
+    printf("[BOOT] stage=stack_status app_task_stack_remaining=%lu B\n",
+           (unsigned long)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
     /* Deterministic lifecycle supervisory loop for main task */
     while (1) {
         int yield_rc = tuya_iot_yield(&s_tuya_client);
@@ -515,6 +520,16 @@ static int desk_agent_main_worker(void)
 }
 
 #ifdef ESP_PLATFORM
+static TaskHandle_t s_app_task_handle = NULL;
+
+uint32_t desk_app_task_stack_hwm(void)
+{
+    if (s_app_task_handle != NULL) {
+        return (uint32_t)uxTaskGetStackHighWaterMark(s_app_task_handle) * sizeof(StackType_t);
+    }
+    return 0;
+}
+
 static void desk_app_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -524,23 +539,27 @@ static void desk_app_task(void *pvParameters)
     }
     vTaskDelete(NULL);
 }
+#else
+uint32_t desk_app_task_stack_hwm(void) { return 0; }
 #endif
 
 int app_main(void)
 {
 #ifdef ESP_PLATFORM
-    /* Spawn dedicated FreeRTOS application task with 16KB stack
-     * to eliminate stack overflow risks in ESP-IDF task main (3.5KB default). */
-    BaseType_t task_rc = xTaskCreate(desk_app_task, "desk_app_task", 16384, NULL, 5, NULL);
+    /* Spawn dedicated FreeRTOS application task with 8KB stack in INTERNAL SRAM.
+     * Retaining an internal SRAM stack guarantees that Flash/NVS/KV operations (which
+     * temporarily disable the SPI flash cache bus) do not trigger cache-disabled access faults.
+     * Sized at 8KB (down from 16KB) while allowing main_task (CONFIG_ESP_MAIN_TASK_STACK_SIZE = 3584 B)
+     * to exit and return its stack memory to the internal heap upon app_main() return. */
+    BaseType_t task_rc = xTaskCreateWithCaps(desk_app_task, "desk_app_task", 8192, NULL, 5,
+                                            &s_app_task_handle, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (task_rc != pdPASS) {
-        printf("[ERROR] Failed to spawn desk_app_task (rc=%d), falling back to synchronous execution\n", (int)task_rc);
+        printf("[ERROR] Failed to spawn desk_app_task in internal SRAM (rc=%d), falling back to synchronous execution\n", (int)task_rc);
         return desk_agent_main_worker();
     }
 
-    /* Keep main supervisory task idle with minimal stack consumption */
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
+    /* Returning from app_main() allows ESP-IDF to automatically delete the main supervisory task
+     * (main_task), returning its stack memory (3,584 B) back to internal SRAM. */
     return 0;
 #else
     return desk_agent_main_worker();

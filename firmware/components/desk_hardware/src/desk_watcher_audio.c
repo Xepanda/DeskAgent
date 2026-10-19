@@ -15,6 +15,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "tdl_audio_driver.h"
 #include "audio_afe.h"
 #include <limits.h>
@@ -92,7 +94,7 @@ static void mic_task(void *arg)
     desk_arbiter_release(DESK_RES_AUDIO_RECORD, DESK_OWNER_TCLAW_VOICE);
     s_worker_exists=false;
     xSemaphoreGive(s_stopped);
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static OPERATE_RET native_open(TDD_AUDIO_HANDLE_T handle, TDL_AUDIO_MIC_CB callback)
@@ -116,7 +118,8 @@ static OPERATE_RET native_open(TDD_AUDIO_HANDLE_T handle, TDL_AUDIO_MIC_CB callb
     s_running = true;
     s_worker_exists = true;
     xSemaphoreTake(s_stopped, 0);
-    if (xTaskCreate(mic_task, "watcher_mic", 4096, NULL, 5, NULL) != pdPASS) {
+    if (xTaskCreateWithCaps(mic_task, "watcher_mic", 4096, NULL, 5, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         s_running = false; s_worker_exists = false; s_mic_cb = NULL;
         desk_arbiter_release(DESK_RES_AUDIO_RECORD, DESK_OWNER_TCLAW_VOICE);
         xSemaphoreGive(s_read_lock); xSemaphoreGive(s_lifecycle); return OPRT_MALLOC_FAILED;
@@ -168,19 +171,44 @@ static OPERATE_RET native_close(TDD_AUDIO_HANDLE_T h)
 
 int desk_watcher_audio_test_tone(void)
 {
-    /* 250 ms, low-amplitude 500 Hz square tone; no microphone recording. */
+    /* 1000 ms, 1000 Hz square wave at amplitude 12000 (~37% full scale) for audible verification. */
     int16_t frame[FRAME_SAMPLES];
     if (!s_ready) return DESK_HW_ERR_UNAVAILABLE;
     if (desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK) != DESK_OWNER_NONE)
         return DESK_HW_ERR_UNAVAILABLE;
     if (desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE, 0) != DESK_ARBITER_OK)
         return DESK_HW_ERR_UNAVAILABLE;
-    int rc=DESK_HW_OK;
-    for (unsigned offset=0; offset<4000 && rc==DESK_HW_OK; offset+=FRAME_SAMPLES) {
-        unsigned n=4000-offset < FRAME_SAMPLES ? 4000-offset : FRAME_SAMPLES;
-        for (unsigned i=0; i<n; ++i) frame[i]=((offset+i)/16)%2 ? 1200 : -1200;
-        rc=desk_watcher_audio_play(frame, n, RATE);
+
+    /* Save previous volume and mute status to restore after test */
+    int prev_vol = 50;
+    bool prev_mute = false;
+    esp_codec_dev_get_out_vol(s_speaker, &prev_vol);
+    esp_codec_dev_get_out_mute(s_speaker, &prev_mute);
+
+    /* Ensure unmuted and safe, audible volume */
+    if (esp_codec_dev_set_out_mute(s_speaker, false) != 0 ||
+        esp_codec_dev_set_out_vol(s_speaker, 65) != 0) {
+        desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
+        return DESK_HW_ERR_IO;
     }
+
+    ESP_LOGI("watcher_audio", "Starting 1000ms 1kHz audio test tone (vol=65, amp=12000)...");
+    int rc = DESK_HW_OK;
+    const unsigned total_samples = RATE; /* 1000 ms @ 16000 Hz = 16000 samples */
+    for (unsigned offset = 0; offset < total_samples && rc == DESK_HW_OK; offset += FRAME_SAMPLES) {
+        unsigned n = total_samples - offset < FRAME_SAMPLES ? total_samples - offset : FRAME_SAMPLES;
+        /* 1000 Hz tone at 16000 Hz sample rate: period is 16 samples (8 high, 8 low) */
+        for (unsigned i = 0; i < n; ++i) {
+            frame[i] = ((offset + i) % 16 < 8) ? 12000 : -12000;
+        }
+        rc = desk_watcher_audio_play(frame, n, RATE);
+    }
+    ESP_LOGI("watcher_audio", "Audio test tone completed rc=%d", rc);
+
+    /* Restore previous volume and mute status */
+    esp_codec_dev_set_out_vol(s_speaker, prev_vol);
+    esp_codec_dev_set_out_mute(s_speaker, prev_mute);
+
     desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
     return rc;
 }
@@ -236,17 +264,70 @@ int desk_watcher_audio_init(void)
     esp_codec_dev_cfg_t in = { .dev_type=ESP_CODEC_DEV_TYPE_IN, .codec_if=adc, .data_if=data };
     s_speaker=esp_codec_dev_new(&out); s_mic=esp_codec_dev_new(&in);
     if (!s_speaker || !s_mic) goto fail;
-    esp_codec_dev_sample_info_t format = { .sample_rate=RATE, .channel=1, .bits_per_sample=16 };
+    esp_codec_dev_sample_info_t format = {
+        .sample_rate = RATE,
+        .channel = 2,
+        .bits_per_sample = 16,
+        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1),
+    };
     if (esp_codec_dev_open(s_speaker, &format) != 0) goto fail;
-    format.channel=2; format.channel_mask=ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
-    if (esp_codec_dev_open(s_mic, &format) != 0 || esp_codec_dev_set_out_vol(s_speaker, 35) != 0 ||
-        esp_codec_dev_set_in_gain(s_mic, 24) != 0) goto fail;
+    format.channel = 2;
+    format.channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
+    if (esp_codec_dev_open(s_mic, &format) != 0 ||
+        esp_codec_dev_set_out_vol(s_speaker, 65) != 0 ||
+        esp_codec_dev_set_in_gain(s_mic, 27) != 0) goto fail;
+
+    /* Re-assert Seeed Watcher hardware configuration on shared I2S0:
+     * TX: MONO data duplicated to BOTH slots, 16-bit slot width, BCLK = 512kHz.
+     * RX: MONO sampled from RIGHT slot (ES7243/E), 16-bit slot width.
+     * Overrides any slot reconfiguration performed during esp_codec_dev_open. */
+    esp_err_t err;
+    if ((err = i2s_channel_disable(s_tx)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s disable tx failed: %d", err);
+        goto fail;
+    }
+    i2s_std_slot_config_t tx_slot = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    tx_slot.slot_mask = I2S_STD_SLOT_BOTH;
+    if ((err = i2s_channel_reconfig_std_slot(s_tx, &tx_slot)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s reconfig tx slot failed: %d", err);
+        goto fail;
+    }
+    i2s_std_clk_config_t tx_clk = I2S_STD_CLK_DEFAULT_CONFIG(RATE);
+    if ((err = i2s_channel_reconfig_std_clock(s_tx, &tx_clk)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s reconfig tx clock failed: %d", err);
+        goto fail;
+    }
+    if ((err = i2s_channel_enable(s_tx)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s enable tx failed: %d", err);
+        goto fail;
+    }
+
+    if ((err = i2s_channel_disable(s_rx)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s disable rx failed: %d", err);
+        goto fail;
+    }
+    i2s_std_slot_config_t rx_slot = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    rx_slot.slot_mask = I2S_STD_SLOT_RIGHT;
+    if ((err = i2s_channel_reconfig_std_slot(s_rx, &rx_slot)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s reconfig rx slot failed: %d", err);
+        goto fail;
+    }
+    i2s_std_clk_config_t rx_clk = I2S_STD_CLK_DEFAULT_CONFIG(RATE);
+    if ((err = i2s_channel_reconfig_std_clock(s_rx, &rx_clk)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s reconfig rx clock failed: %d", err);
+        goto fail;
+    }
+    if ((err = i2s_channel_enable(s_rx)) != ESP_OK) {
+        ESP_LOGE("watcher_audio", "i2s enable rx failed: %d", err);
+        goto fail;
+    }
+
     static TDD_AUDIO_INTFS_T interfaces = { .open=native_open, .play=native_play, .config=native_config, .close=native_close };
     static TDD_AUDIO_INFO_T info = { .sample_rate=RATE, .sample_ch_num=1, .sample_bits=16, .sample_tm_ms=20 };
     if (tdl_audio_driver_register("watcher_audio", &s_ready, &interfaces, &info) != OPRT_OK) goto fail;
     if (desk_watcher_board_audio_pa_set(true) != DESK_HW_OK) goto fail;
     s_ready=true;
-    ESP_LOGI("watcher_audio", "ES8311 + %s ready; shared I2S0 16kHz PCM", adc_e ? "ES7243E" : "ES7243");
+    ESP_LOGI("watcher_audio", "ES8311 + %s ready; shared I2S0 16kHz PCM (vol=65, mic_gain=27dB)", adc_e ? "ES7243E" : "ES7243");
     return DESK_HW_OK;
 fail:
     desk_watcher_board_audio_pa_set(false);
