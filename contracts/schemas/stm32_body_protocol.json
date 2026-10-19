@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/stm32_body_protocol.json",
+  "title": "DeskAgentSTM32BodyProtocolSchema",
+  "description": "Formal schema contract for ESP32-S3 <-> STM32 body coprocessor UART binary link protocol (0xA5 0x5A binary framing, Class 0x02 Motion)",
+  "definitions": {
+    "frame_header": {
+      "type": "object",
+      "required": [
+        "magic0",
+        "magic1",
+        "proto_version",
+        "msg_class",
+        "msg_id",
+        "flags",
+        "sequence",
+        "payload_len"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "magic0": {
+          "type": "integer",
+          "const": 165,
+          "description": "0xA5 Magic byte 0"
+        },
+        "magic1": {
+          "type": "integer",
+          "const": 90,
+          "description": "0x5A Magic byte 1"
+        },
+        "proto_version": {
+          "type": "integer",
+          "const": 1,
+          "description": "0x01 Protocol version"
+        },
+        "msg_class": {
+          "type": "integer",
+          "const": 2,
+          "description": "0x02 Motion domain class"
+        },
+        "msg_id": {
+          "type": "integer",
+          "enum": [0, 1, 2, 255],
+          "description": "Message ID: 0x00 ACK, 0x01 SERVO_MOVE, 0x02 SERVO_STOP, 0xFF NACK"
+        },
+        "flags": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Bitmask flags: 0x01 ACK_REQ, 0x02 ACK_RESP, 0x04 NACK_RESP"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Monotonically increasing uint32 sequence counter (Little-Endian)"
+        },
+        "payload_len": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Length of following payload in bytes (Little-Endian)"
+        }
+      }
+    },
+    "motion_move_payload": {
+      "type": "object",
+      "required": [
+        "axis_mask",
+        "pan_deg_x10",
+        "tilt_deg_x10",
+        "duration_ms",
+        "profile",
+        "source"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "axis_mask": {
+          "type": "integer",
+          "const": 3,
+          "description": "0x03: Both Pan and Tilt axes enabled"
+        },
+        "pan_deg_x10": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1800,
+          "description": "Pan angle in tenths of a degree (0.0° to 180.0°)"
+        },
+        "tilt_deg_x10": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 1400,
+          "description": "Tilt angle in tenths of a degree (100.0° to 140.0°)"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 65535,
+          "description": "Target duration in milliseconds"
+        },
+        "profile": {
+          "type": "integer",
+          "enum": [0, 1, 2],
+          "description": "Motion profile curve: 0 = smooth S-curve, 1 = linear, 2 = fast"
+        },
+        "source": {
+          "type": "integer",
+          "const": 1,
+          "description": "Command execution source flag (0x01 standard)"
+        }
+      }
+    },
+    "motion_stop_payload": {
+      "type": "object",
+      "required": ["stop_mode", "axis_mask"],
+      "additionalProperties": false,
+      "properties": {
+        "stop_mode": {
+          "type": "integer",
+          "enum": [1, 2],
+          "description": "Stop mode: 0x01 Normal decelerated stop, 0x02 Emergency cut-off stop"
+        },
+        "axis_mask": {
+          "type": "integer",
+          "const": 1,
+          "description": "0x01: Cancel all pending motion axes"
+        }
+      }
+    },
+    "ack_payload": {
+      "type": "object",
+      "required": ["status_code", "ack_reason"],
+      "additionalProperties": false,
+      "properties": {
+        "status_code": {
+          "type": "integer",
+          "const": 0,
+          "description": "0x00: Success / Accepted"
+        },
+        "ack_reason": {
+          "type": "integer",
+          "const": 0,
+          "description": "0x00: Dispatched and accepted by STM32 servo controller"
+        },
+        "pan_deg_x10": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1800,
+          "description": "Echoed or setpoint Pan angle in tenths of a degree"
+        },
+        "tilt_deg_x10": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 1400,
+          "description": "Echoed or setpoint Tilt angle in tenths of a degree"
+        }
+      }
+    },
+    "nack_payload": {
+      "type": "object",
+      "required": ["error_code", "sub_error"],
+      "additionalProperties": false,
+      "properties": {
+        "error_code": {
+          "type": "integer",
+          "enum": [1, 2, 3, 4, 5],
+          "description": "1: CRC_ERR, 2: OUT_OF_BOUNDS, 3: BUSY, 4: INVALID_PARAM, 5: HW_FAULT"
+        },
+        "sub_error": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Vendor or module diagnostic sub-code"
+        }
+      }
+    },
+    "crc16_checksum": {
+      "type": "object",
+      "required": ["algorithm", "polynomial", "initial_value", "endianness"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": { "type": "string", "const": "CRC16-CCITT-FALSE" },
+        "polynomial": { "type": "string", "const": "0x1021" },
+        "initial_value": { "type": "string", "const": "0xFFFF" },
+        "endianness": { "type": "string", "const": "little-endian" }
+      }
+    },
+    "timing_and_safety": {
+      "type": "object",
+      "required": [
+        "uart_baud_rate",
+        "ack_timeout_ms",
+        "max_retries",
+        "retry_seq_invariant",
+        "cr_002_semantic"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "uart_baud_rate": { "type": "integer", "const": 921600 },
+        "ack_timeout_ms": { "type": "integer", "const": 500 },
+        "max_retries": { "type": "integer", "const": 2 },
+        "retry_seq_invariant": {
+          "type": "string",
+          "const": "Retries must strictly preserve original uint32 sequence number"
+        },
+        "cr_002_semantic": {
+          "type": "string",
+          "const": "accepted=true, state_confirmed=false; reporting succeeded is strictly prohibited"
+        }
+      }
+    }
+  }
+}

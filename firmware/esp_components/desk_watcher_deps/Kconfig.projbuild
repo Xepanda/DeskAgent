@@ -1,0 +1,9 @@
+config DESK_WATCHER_NATIVE_CODEC
+    bool
+    default y
+    select CODEC_I2C_BACKWARD_COMPATIBLE
+    select CODEC_ES8311_SUPPORT
+    select CODEC_ES7243_SUPPORT
+    select CODEC_ES7243E_SUPPORT
+    help
+        The Watcher LCD and codec share the preinstalled legacy I2C0 bus.

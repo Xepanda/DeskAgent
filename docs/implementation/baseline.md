@@ -45,7 +45,7 @@
 
 | 外设子系统 | 硬件接口 / 控制器 | ESP32-S3 GPIO 引脚分配 | 附属控制 / 供电控制 (IO Expander) | 协议与电气参数 |
 | :--- | :--- | :--- | :--- | :--- |
-| **STM32 身体控制** | UART_NUM_2 | **TX: GPIO 19, RX: GPIO 20** | 无 | 921600 波特率, 8N1, COBS 帧封包 + CRC16 校验 |
+| **STM32 身体控制** | UART_NUM_2 | **TX: GPIO 19, RX: GPIO 20** | 无 | 921600 波特率, 8N1, 0xA5 0x5A 二进制帧封包 + CRC16-CCITT 校验 (COBS 已正式废除，见 r3a-stm32-protocol-adjudication.md) |
 | **音频 I2S (Codec)** | I2S0 | **MCLK: GPIO 10, SCLK: GPIO 11, LRCK: GPIO 12<br/>DSIN: GPIO 15 (ADC), DOUT: GPIO 16 (DAC)** | **IO_EXP Pin 12 (PWR_CODEC_PA)** 功放电源使能 | 16kHz / 24kHz mono s16le PCM, 标准飞利浦 I2S 格式 |
 | **通用 I2C (总线 0)** | I2C0 | **SDA: GPIO 47, SCL: GPIO 48, INT: GPIO 2** | 控制 IO 扩展芯片、PCF8563 RTC 与 Codec 配置 | 400 kHz 快速模式 |
 | **触摸 I2C (总线 1)** | I2C1 | **SDA: GPIO 39, SCL: GPIO 38** | **IO_EXP Pin 5 (TOUCH_INT)** 触摸中断输入 | 400 kHz 快速模式 |

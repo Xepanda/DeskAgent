@@ -1,0 +1,14 @@
+menu "DeskAgent board profile"
+
+config DESK_BOARD_SENSECAP_WATCHER
+    bool "Seeed SenseCAP Watcher"
+    default n
+    select ENABLE_AUDIO
+    select PLATFORM_FLASHSIZE_32M
+    help
+        Select the Watcher board adapter. This is a DeskAgent project profile,
+        not a TuyaOpen-provided board target.
+
+endmenu
+
+rsource "third_party/tclaw/Kconfig"

@@ -283,6 +283,44 @@ class MotionEnvelopeSemanticsTestCase(unittest.TestCase):
         self.assertEqual(resp["error"]["code"], "OPERATION_TIMEOUT")
         self.assertTrue(resp["error"]["retryable"])
 
+    def test_state_unconfirmed_error_code_propagates(self) -> None:
+        def policy(msg: dict) -> dict:
+            return {
+                "type": "sys.nack",
+                "code": 500,
+                "request_id": msg.get("request_id"),
+                "error": {"code": "STATE_UNCONFIRMED", "message": "physical state confirmation timeout"},
+            }
+
+        self._attach_real_adapter(policy)
+        resp = self._dispatch("req-sem-unconfirmed-01", "resource.motion.move", self._move_args()).to_dict()
+
+        self.assertEqual(resp["status"], "unknown")
+        self.assertEqual(resp["error"]["code"], "STATE_UNCONFIRMED")
+        self.assertFalse(resp["error"]["retryable"])
+        self.assertNotIn("result", resp)
+
+    def test_overclaiming_client_state_confirmed_strictly_enforced_false(self) -> None:
+        """CR-002: In open-loop PWM without encoder, state_confirmed is strictly False on Host."""
+        class MaliciousOverclaimingClient:
+            is_connected = True
+
+            def send_motion_move(self, pan, tilt, duration_ms=500):
+                return {
+                    "status": "accepted",
+                    "accepted": True,
+                    "state_confirmed": True,
+                    "pan": pan,
+                    "tilt": tilt,
+                }
+
+        self.app._robot_client = MaliciousOverclaimingClient()
+        resp = self._dispatch("req-sem-cr002-clamp", "resource.motion.move", self._move_args()).to_dict()
+
+        self.assertEqual(resp["status"], "accepted")
+        self.assertFalse(resp["result"]["state_confirmed"])
+        self.assertTrue(resp["result"]["accepted"])
+
 
 class RobotAdapterCorrelationTestCase(unittest.TestCase):
     """WP2-A3: strict request/response correlation in RobotAdapter."""
@@ -560,6 +598,44 @@ class RobotAdapterCorrelationTestCase(unittest.TestCase):
             self.assertRegex(rid, REQUEST_ID_RE)
             self.assertGreaterEqual(len(rid), 8)
             self.assertLessEqual(len(rid), 64)
+
+    def test_disconnect_clears_residual_buffer(self) -> None:
+        """interfaces.md 6.3 rule 4: Disconnection must clear residual buffer, never concatenate across reconnects."""
+        adapter = RobotAdapter(auto_pair=False)
+        adapter._recv_buf = '{"type":"sys.partial'
+        adapter._close_socket()
+        self.assertEqual(adapter._recv_buf, "", "residual buffer must be cleared upon socket close")
+
+    def test_oversized_frame_discarded(self) -> None:
+        """interfaces.md 6.3 rule 2: Oversized frame must be discarded and not corrupt subsequent messages."""
+        adapter, _client, firmware_sock = self._make_adapter()
+
+        # Send an oversized junk string without newline (> 65536 bytes) followed by a valid ACK
+        large_junk = "X" * 70000 + "\n"
+        valid_ack = json.dumps({
+            "type": "sys.ack",
+            "code": 0,
+            "request_id": "req-oversize-001",
+            "data": {"status": "accepted"},
+        }) + "\n"
+
+        result: dict[str, Any] = {}
+
+        def call() -> None:
+            result["res"] = adapter.send_command(
+                {"type": "ctrl.motion.move", "request_id": "req-oversize-001", "data": {}},
+                timeout=2.0,
+            )
+
+        t = threading.Thread(target=call)
+        t.start()
+        time.sleep(0.05)
+        firmware_sock.sendall(large_junk.encode("utf-8") + valid_ack.encode("utf-8"))
+        t.join(timeout=3.0)
+
+        self.assertIn("res", result)
+        self.assertEqual(result["res"].get("code"), 0)
+        self.assertEqual(result["res"].get("request_id"), "req-oversize-001")
 
 
 if __name__ == "__main__":

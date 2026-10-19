@@ -9,6 +9,10 @@
 id_rsa*
 secrets.*
 credentials.*
+# Local device authorization injected at build time; never commit real values.
+firmware/main/include/tuya_config_secrets.h
+**/tuya_config_secrets.h
+**/tuya_app_config_secrets.h
 *.token
 *.auth
 
@@ -50,6 +54,10 @@ node_modules/
 .pnpm-store/
 
 # 固件构建与 C/C++ 嵌入式构建产物 (Firmware & Build Artifacts)
+.build/
+.target_logging/
+# Windows local project alias; canonical source is firmware/.
+source/embedded/
 build/
 dist/
 out/
@@ -81,3 +89,8 @@ desktop.ini
 !docs/**/*.docx
 !*.md
 !docs/**/*.md
+
+# Machine-generated ESP-IDF configuration; canonical inputs are committed.
+firmware/sdkconfig
+# Device backups stay local, even if a future format lacks a .bin suffix.
+backups/

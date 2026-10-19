@@ -396,3 +396,10 @@ Provisioning 接口置位配对状态属于"未经验证即进入已配对状态
 3. `generate_dynamic_token()` 恒定产出 64 位小写十六进制，**不可能**违反 wire 契约。
 空字符串 `""` 则按 R11 拒绝（返回 -1）。
 
+**R12：STM32 机身通信协议裁决与 CR-002 边界冻结（R3a 裁决）。**
+依据 `docs/implementation/r3a-stm32-protocol-adjudication.md` 与 `contracts/schemas/stm32_body_protocol.json`：
+1. **废除 COBS**：正式废止历史草案中未证实的 `COBS framing` 描述；
+2. **冻结 `0xA5 0x5A` 二进制封包**：唯一权威标准为帧头 `0xA5 0x5A`、12 字节头部、小端序列化、CRC16-CCITT（Poly 0x1021, Init 0xFFFF, LE 追加于帧尾）；
+3. **时序与重试**：ACK 超时阈值锁定为 500ms，重试上限 2 次（总尝试 3 次），重试帧必须绝对保持原 `sequence`；
+4. **CR-002 语义边界**：在机身底座缺少物理角度编码器与限位传感器的硬件现实下，STM32 ACK 严格限定为 `accepted: true, state_confirmed: false`，绝对禁止伪报物理完成（`succeeded`）。
+

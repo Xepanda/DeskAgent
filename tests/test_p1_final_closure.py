@@ -43,6 +43,8 @@ class TestP1FinalClosure(unittest.TestCase):
     def test_csprng_dynamic_token_entropy(self) -> None:
         """Verifies dynamic token in C library produces 64-char hexadecimal string with high entropy."""
         lib_path = Path("firmware/build/libdesk_sdk_bridge.a")
+        if not lib_path.exists():
+            lib_path = Path("firmware/build/esp-idf/desk_sdk_bridge/libdesk_sdk_bridge.a")
         self.assertTrue(lib_path.exists(), "Firmware static library must be built")
 
         # Test via Python urandom equivalent and C shared library if compiled

@@ -1,0 +1,6 @@
+version: "1.0.1"
+description: Project-local IDF registration for the vendored Espressif SPD2010 LCD driver
+targets:
+  - esp32s3
+dependencies:
+  idf: ">=5.2.0"

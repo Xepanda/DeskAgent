@@ -6,8 +6,12 @@
 #include "desk_tclaw_bridge.h"
 #include "desk_hardware.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <ctype.h>
 #include <time.h>
+#include <sys/time.h>
 
 static void desk_tclaw_format_iso8601(time_t t, char *out_buf, size_t buf_len)
 {
@@ -17,6 +21,74 @@ static void desk_tclaw_format_iso8601(time_t t, char *out_buf, size_t buf_len)
     strftime(out_buf, buf_len, "%Y-%m-%dT%H:%M:%SZ", &tm_info);
 }
 
+static uint64_t desk_tclaw_get_time_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
+}
+
+/* --------------------------------------------------------------------------
+ * Lightweight JSON Scanning Utilities
+ * -------------------------------------------------------------------------- */
+static const char *desk_json_find_key(const char *json, const char *key)
+{
+    if (!json || !key) return NULL;
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *pos = strstr(json, needle);
+    if (!pos) return NULL;
+    pos += strlen(needle);
+    while (*pos && (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n')) pos++;
+    if (*pos != ':') return NULL;
+    pos++;
+    while (*pos && (*pos == ' ' || *pos == '\t' || *pos == '\r' || *pos == '\n')) pos++;
+    return pos;
+}
+
+static bool desk_json_parse_str(const char *json, const char *key, char *out_val, size_t max_len)
+{
+    if (!out_val || max_len == 0) return false;
+    out_val[0] = '\0';
+    const char *pos = desk_json_find_key(json, key);
+    if (!pos || *pos != '\"') return false;
+    pos++;
+    size_t i = 0;
+    while (*pos && *pos != '\"' && i < max_len - 1) {
+        if (*pos == '\\' && *(pos + 1)) pos++;
+        out_val[i++] = *pos++;
+    }
+    out_val[i] = '\0';
+    return true;
+}
+
+static float desk_json_parse_float(const char *json, const char *key, float default_val)
+{
+    const char *pos = desk_json_find_key(json, key);
+    if (!pos) return default_val;
+    return strtof(pos, NULL);
+}
+
+static int desk_json_parse_int(const char *json, const char *key, int default_val)
+{
+    const char *pos = desk_json_find_key(json, key);
+    if (!pos) return default_val;
+    return (int)strtol(pos, NULL, 10);
+}
+
+static bool desk_json_parse_bool(const char *json, const char *key, bool default_val)
+{
+    const char *pos = desk_json_find_key(json, key);
+    if (!pos) return default_val;
+    if (strncmp(pos, "true", 4) == 0 || strncmp(pos, "1", 1) == 0) return true;
+    if (strncmp(pos, "false", 5) == 0 || strncmp(pos, "0", 1) == 0) return false;
+    return default_val;
+}
+
+/* --------------------------------------------------------------------------
+ * State Variables
+ * -------------------------------------------------------------------------- */
+static bool s_initialized = false;
 static desk_tclaw_state_t s_state = TCLAW_STATE_IDLE;
 static desk_tclaw_tool_dispatcher_t s_tool_dispatcher = NULL;
 static void *s_dispatcher_user_data = NULL;
@@ -28,32 +100,49 @@ static int s_turn_count = 0;
 static char s_last_response[1024] = "";
 static char s_tuya_session_id[128] = "";
 static char s_current_pending_tool[128] = "";
+static char s_pending_request_id[64] = "";
+static uint64_t s_pending_tool_start_ms = 0;
+static uint32_t s_tool_timeout_ms = 5000;
+
 static tuya_cloud_connection_state_t s_tuya_conn_state = TUYA_CLOUD_DISCONNECTED;
 static char s_tuya_endpoint[128] = "";
 static char s_tuya_device_id[64] = "";
 static char s_tuya_token[128] = "";
 static char s_last_tool_result[1024] = "";
 
+/* --------------------------------------------------------------------------
+ * TClaw Dialogue Lifecycle
+ * -------------------------------------------------------------------------- */
 int desk_tclaw_init(void)
 {
+    s_initialized = true;
     s_state = TCLAW_STATE_IDLE;
     s_turn_count = 0;
     s_last_response[0] = '\0';
     s_current_pending_tool[0] = '\0';
+    s_pending_request_id[0] = '\0';
+    s_pending_tool_start_ms = 0;
+    s_tool_timeout_ms = 5000;
     s_speech_stream_cb = NULL;
     s_stream_user_data = NULL;
     s_last_tool_result[0] = '\0';
+    s_tuya_session_id[0] = '\0';
+    s_tuya_conn_state = TUYA_CLOUD_DISCONNECTED;
 
-    desk_hardware_display_set_expression("idle", "Ready");
+    desk_hardware_set_screen_expression("idle", "Ready");
     return 0;
 }
 
 void desk_tclaw_reset(void)
 {
+    s_initialized = false;
     s_state = TCLAW_STATE_IDLE;
     s_turn_count = 0;
     s_last_response[0] = '\0';
     s_current_pending_tool[0] = '\0';
+    s_pending_request_id[0] = '\0';
+    s_pending_tool_start_ms = 0;
+    s_tool_timeout_ms = 5000;
     s_speech_stream_cb = NULL;
     s_stream_user_data = NULL;
     s_tool_dispatcher = NULL;
@@ -64,10 +153,17 @@ void desk_tclaw_reset(void)
     s_tuya_device_id[0] = '\0';
     s_tuya_token[0] = '\0';
     s_last_tool_result[0] = '\0';
+
+    desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+    desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
+    desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
 }
 
 int desk_tclaw_start(void)
 {
+    if (!s_initialized) {
+        desk_tclaw_init();
+    }
     s_state = TCLAW_STATE_IDLE;
     return 0;
 }
@@ -75,6 +171,11 @@ int desk_tclaw_start(void)
 desk_tclaw_state_t desk_tclaw_get_state(void)
 {
     return s_state;
+}
+
+bool desk_tclaw_is_initialized(void)
+{
+    return s_initialized;
 }
 
 int desk_tclaw_register_speech_stream_cb(desk_tclaw_speech_stream_cb_t cb, void *user_data)
@@ -97,6 +198,29 @@ int desk_tclaw_get_turn_count(void)
     return s_turn_count;
 }
 
+const char *desk_tclaw_get_pending_tool(void)
+{
+    return s_current_pending_tool;
+}
+
+const char *desk_tclaw_get_pending_request_id(void)
+{
+    return s_pending_request_id;
+}
+
+void desk_tclaw_set_tool_timeout_ms(uint32_t timeout_ms)
+{
+    s_tool_timeout_ms = timeout_ms;
+}
+
+uint32_t desk_tclaw_get_tool_timeout_ms(void)
+{
+    return s_tool_timeout_ms;
+}
+
+/* --------------------------------------------------------------------------
+ * Speech & Interruption Execution
+ * -------------------------------------------------------------------------- */
 int desk_tclaw_start_speaking(const char *speech_text)
 {
     if (!speech_text) return -1;
@@ -109,11 +233,10 @@ int desk_tclaw_start_speaking(const char *speech_text)
     strncpy(s_last_response, speech_text, sizeof(s_last_response) - 1);
     s_last_response[sizeof(s_last_response) - 1] = '\0';
 
-    desk_hardware_display_set_expression("speaking", s_last_response);
+    desk_hardware_set_screen_expression("speaking", s_last_response);
 
     /* Stream speech tokens to registered listener if active */
     if (s_speech_stream_cb) {
-        /* Stream word tokens */
         char copy[1024];
         strncpy(copy, speech_text, sizeof(copy) - 1);
         copy[sizeof(copy) - 1] = '\0';
@@ -133,11 +256,18 @@ int desk_tclaw_interrupt(void)
 {
     desk_hardware_audio_play_stop();
     desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+    desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
+    desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
     s_state = TCLAW_STATE_IDLE;
-    desk_hardware_display_set_expression("idle", "Ready");
+    s_current_pending_tool[0] = '\0';
+    s_pending_request_id[0] = '\0';
+    desk_hardware_set_screen_expression("idle", "Ready");
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * MCP Tool Gateway & Built-In Hardware Tools
+ * -------------------------------------------------------------------------- */
 int desk_tclaw_register_tool_dispatcher(desk_tclaw_tool_dispatcher_t dispatcher, void *user_data)
 {
     s_tool_dispatcher = dispatcher;
@@ -145,12 +275,242 @@ int desk_tclaw_register_tool_dispatcher(desk_tclaw_tool_dispatcher_t dispatcher,
     return 0;
 }
 
+bool desk_tclaw_is_builtin_tool(const char *operation)
+{
+    if (!operation) return false;
+    return (strcmp(operation, "motion.move") == 0 ||
+            strcmp(operation, "resource.motion.move") == 0 ||
+            strcmp(operation, "ctrl.motion.move") == 0 ||
+            strcmp(operation, "motion.stop") == 0 ||
+            strcmp(operation, "resource.motion.stop") == 0 ||
+            strcmp(operation, "ctrl.motion.stop") == 0 ||
+            strcmp(operation, "camera.capture") == 0 ||
+            strcmp(operation, "resource.camera.capture") == 0 ||
+            strcmp(operation, "expression.set") == 0 ||
+            strcmp(operation, "resource.expression.set") == 0 ||
+            strcmp(operation, "display.expression") == 0 ||
+            strcmp(operation, "audio.stop") == 0 ||
+            strcmp(operation, "resource.audio.stop") == 0);
+}
+
+int desk_tclaw_execute_tool(const char *request_id,
+                            const char *operation,
+                            const char *arguments_json,
+                            char *out_response_json,
+                            size_t max_len)
+{
+    if (!request_id || !operation) return -1;
+    if (request_id[0] == '\0' || operation[0] == '\0') return -1;
+
+    uint64_t start_ms = desk_tclaw_get_time_ms();
+    time_t now = time(NULL);
+    if (now < 1700000000) now = 1792100000;
+    char timestamp[32];
+    desk_tclaw_format_iso8601(now, timestamp, sizeof(timestamp));
+
+    const char *args = arguments_json ? arguments_json : "{}";
+    char result_buf[512] = "";
+    char error_code[64] = "";
+    char error_msg[256] = "";
+    bool retryable = false;
+    const char *status = "failed";
+    int return_code = 0;
+
+    /* 1. Motion Move Tool: CR-002 semantic strictly enforced (accepted=true, state_confirmed=false) */
+    if (strcmp(operation, "motion.move") == 0 ||
+        strcmp(operation, "resource.motion.move") == 0 ||
+        strcmp(operation, "ctrl.motion.move") == 0) {
+
+        float pan_deg = desk_json_parse_float(args, "pan_deg", 90.0f);
+        float tilt_deg = desk_json_parse_float(args, "tilt_deg", 120.0f);
+        uint32_t duration_ms = (uint32_t)desk_json_parse_int(args, "duration_ms", 500);
+
+        if (desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE, 50) != DESK_ARBITER_OK) {
+            status = "failed";
+            strncpy(error_code, "RESOURCE_BUSY", sizeof(error_code) - 1);
+            strncpy(error_msg, "Motion gimbal is currently held by higher/equal owner", sizeof(error_msg) - 1);
+            retryable = true;
+            return_code = DESK_HW_ERR_BUSY;
+        } else {
+            int move_rc = desk_hardware_motion_move_to(pan_deg, tilt_deg, duration_ms);
+            desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
+
+            if (move_rc == DESK_HW_OK) {
+                status = "accepted";
+                snprintf(result_buf, sizeof(result_buf),
+                         "{\"pan_deg\":%.1f,\"tilt_deg\":%.1f,\"duration_ms\":%u,\"accepted\":true,\"state_confirmed\":false}",
+                         pan_deg, tilt_deg, (unsigned int)duration_ms);
+                return_code = DESK_HW_OK;
+            } else if (move_rc == DESK_HW_ERR_TIMEOUT) {
+                status = "failed";
+                strncpy(error_code, "OPERATION_TIMEOUT", sizeof(error_code) - 1);
+                strncpy(error_msg, "STM32 coprocessor motion ACK timed out", sizeof(error_msg) - 1);
+                retryable = true;
+                return_code = DESK_HW_ERR_TIMEOUT;
+            } else if (move_rc == DESK_HW_ERR_INVALID_ARG) {
+                status = "failed";
+                strncpy(error_code, "INVALID_ARGUMENT", sizeof(error_code) - 1);
+                strncpy(error_msg, "Motion target parameters out of mechanical bounds", sizeof(error_msg) - 1);
+                retryable = false;
+                return_code = DESK_HW_ERR_INVALID_ARG;
+            } else {
+                status = "failed";
+                strncpy(error_code, "HARDWARE_FAULT", sizeof(error_code) - 1);
+                strncpy(error_msg, "STM32 body hardware communication error", sizeof(error_msg) - 1);
+                retryable = false;
+                return_code = DESK_HW_ERR_IO;
+            }
+        }
+    }
+    /* 2. Motion Stop Tool */
+    else if (strcmp(operation, "motion.stop") == 0 ||
+             strcmp(operation, "resource.motion.stop") == 0 ||
+             strcmp(operation, "ctrl.motion.stop") == 0) {
+
+        bool emergency = desk_json_parse_bool(args, "emergency", false);
+        int stop_rc = desk_hardware_motion_stop(emergency);
+        desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
+
+        if (stop_rc == DESK_HW_OK) {
+            status = "accepted";
+            snprintf(result_buf, sizeof(result_buf),
+                     "{\"emergency\":%s,\"accepted\":true,\"state_confirmed\":false}",
+                     emergency ? "true" : "false");
+            return_code = DESK_HW_OK;
+        } else {
+            status = "failed";
+            strncpy(error_code, "HARDWARE_FAULT", sizeof(error_code) - 1);
+            strncpy(error_msg, "Failed to execute motion stop", sizeof(error_msg) - 1);
+            retryable = false;
+            return_code = DESK_HW_ERR_IO;
+        }
+    }
+    /* 3. Camera Capture Tool (Strictly real sensor frames only, never fake) */
+    else if (strcmp(operation, "camera.capture") == 0 ||
+             strcmp(operation, "resource.camera.capture") == 0) {
+
+        uint32_t timeout_ms = (uint32_t)desk_json_parse_int(args, "timeout_ms", 2000);
+
+        if (desk_arbiter_acquire(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE, 50) != DESK_ARBITER_OK) {
+            status = "failed";
+            strncpy(error_code, "RESOURCE_BUSY", sizeof(error_code) - 1);
+            strncpy(error_msg, "Camera sensor is currently acquired by another client", sizeof(error_msg) - 1);
+            retryable = true;
+            return_code = DESK_HW_ERR_BUSY;
+        } else {
+            uint8_t jpeg_temp[1024];
+            size_t out_len = 0;
+            int cam_rc = desk_hardware_camera_capture_jpeg(jpeg_temp, sizeof(jpeg_temp), &out_len, timeout_ms);
+            desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
+
+            if (cam_rc == DESK_HW_OK && out_len > 0) {
+                status = "succeeded";
+                snprintf(result_buf, sizeof(result_buf),
+                         "{\"format\":\"jpeg\",\"frame_len\":%zu,\"captured\":true}", out_len);
+                return_code = DESK_HW_OK;
+            } else {
+                status = "failed";
+                strncpy(error_code, "HARDWARE_FAULT", sizeof(error_code) - 1);
+                strncpy(error_msg, "Camera sensor frame unavailable - no synthetic frames permitted", sizeof(error_msg) - 1);
+                retryable = false;
+                return_code = DESK_HW_ERR_UNAVAILABLE;
+            }
+        }
+    }
+    /* 4. Display Expression Tool */
+    else if (strcmp(operation, "expression.set") == 0 ||
+             strcmp(operation, "resource.expression.set") == 0 ||
+             strcmp(operation, "display.expression") == 0) {
+
+        char preset[32] = "idle";
+        char status_text[64] = "Ready";
+        desk_json_parse_str(args, "preset", preset, sizeof(preset));
+        desk_json_parse_str(args, "status_text", status_text, sizeof(status_text));
+
+        int exp_rc = desk_hardware_set_screen_expression(preset, status_text);
+        if (exp_rc == DESK_HW_OK) {
+            status = "succeeded";
+            snprintf(result_buf, sizeof(result_buf),
+                     "{\"preset\":\"%s\",\"status_text\":\"%s\"}", preset, status_text);
+            return_code = DESK_HW_OK;
+        } else if (exp_rc == DESK_HW_ERR_BUSY) {
+            status = "failed";
+            strncpy(error_code, "RESOURCE_BUSY", sizeof(error_code) - 1);
+            strncpy(error_msg, "Display UI arbiter is busy", sizeof(error_msg) - 1);
+            retryable = true;
+            return_code = DESK_HW_ERR_BUSY;
+        } else {
+            status = "failed";
+            strncpy(error_code, "INVALID_ARGUMENT", sizeof(error_code) - 1);
+            strncpy(error_msg, "Invalid expression preset or parameters", sizeof(error_msg) - 1);
+            retryable = false;
+            return_code = DESK_HW_ERR_INVALID_ARG;
+        }
+    }
+    /* 5. Audio Stop Tool */
+    else if (strcmp(operation, "audio.stop") == 0 ||
+             strcmp(operation, "resource.audio.stop") == 0) {
+
+        desk_hardware_audio_play_stop();
+        desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+        status = "succeeded";
+        snprintf(result_buf, sizeof(result_buf), "{\"status\":\"stopped\"}");
+        return_code = DESK_HW_OK;
+    }
+    /* 6. Unsupported / External Operation */
+    else {
+        status = "failed";
+        strncpy(error_code, "UNKNOWN_OPERATION", sizeof(error_code) - 1);
+        snprintf(error_msg, sizeof(error_msg), "Operation '%s' not supported as built-in tool", operation);
+        retryable = false;
+        return_code = -1;
+    }
+
+    uint64_t elapsed_ms = desk_tclaw_get_time_ms() - start_ms;
+
+    /* Build Contract ResponseEnvelope */
+    if (out_response_json && max_len > 0) {
+        if (strcmp(status, "accepted") == 0 || strcmp(status, "succeeded") == 0) {
+            snprintf(out_response_json, max_len,
+                     "{\"schema_version\":\"1.0.0\","
+                     "\"request_id\":\"%s\","
+                     "\"status\":\"%s\","
+                     "\"timestamp\":\"%s\","
+                     "\"result\":%s,"
+                     "\"execution_duration_ms\":%llu}",
+                     request_id, status, timestamp,
+                     (result_buf[0] != '\0') ? result_buf : "{}",
+                     (unsigned long long)elapsed_ms);
+        } else {
+            snprintf(out_response_json, max_len,
+                     "{\"schema_version\":\"1.0.0\","
+                     "\"request_id\":\"%s\","
+                     "\"status\":\"failed\","
+                     "\"timestamp\":\"%s\","
+                     "\"error\":{\"code\":\"%s\",\"message\":\"%s\",\"retryable\":%s},"
+                     "\"execution_duration_ms\":%llu}",
+                     request_id, timestamp,
+                     error_code, error_msg,
+                     retryable ? "true" : "false",
+                     (unsigned long long)elapsed_ms);
+        }
+    }
+
+    return return_code;
+}
+
 int desk_tclaw_trigger_tool_call(const char *request_id, const char *operation, const char *arguments_json)
 {
     if (!request_id || !operation) return -1;
 
     s_state = TCLAW_STATE_TOOL_CALLING;
-    desk_hardware_display_set_expression("thinking", "Calling external tool...");
+    strncpy(s_current_pending_tool, operation, sizeof(s_current_pending_tool) - 1);
+    s_current_pending_tool[sizeof(s_current_pending_tool) - 1] = '\0';
+    strncpy(s_pending_request_id, request_id, sizeof(s_pending_request_id) - 1);
+    s_pending_request_id[sizeof(s_pending_request_id) - 1] = '\0';
+    s_pending_tool_start_ms = desk_tclaw_get_time_ms();
+
+    desk_hardware_set_screen_expression("thinking", "Calling external tool...");
 
     if (s_tool_dispatcher) {
         time_t now = time(NULL);
@@ -174,9 +534,116 @@ int desk_tclaw_trigger_tool_call(const char *request_id, const char *operation, 
 
         return s_tool_dispatcher(env, s_dispatcher_user_data);
     }
+
+    /* Fallback: If no dispatcher is registered, execute directly if it's a built-in tool */
+    if (desk_tclaw_is_builtin_tool(operation)) {
+        char resp_env[2048];
+        int exec_rc = desk_tclaw_execute_tool(request_id, operation, arguments_json, resp_env, sizeof(resp_env));
+        (void)exec_rc;
+        const char *status_str = "failed";
+        if (strstr(resp_env, "\"status\":\"accepted\"")) {
+            status_str = "accepted";
+        } else if (strstr(resp_env, "\"status\":\"succeeded\"")) {
+            status_str = "succeeded";
+        }
+        return desk_tclaw_handle_tool_response(request_id, status_str,
+                                               (strcmp(status_str, "failed") != 0) ? resp_env : NULL,
+                                               (strcmp(status_str, "failed") == 0) ? resp_env : NULL);
+    }
+
+    /* If neither dispatcher nor built-in tool, report error back immediately */
+    char err_json[256];
+    snprintf(err_json, sizeof(err_json), "{\"code\":\"UPSTREAM_UNAVAILABLE\",\"message\":\"No tool dispatcher registered\"}");
+    desk_tclaw_handle_tool_response(request_id, "failed", NULL, err_json);
+    return -1;
+}
+
+int desk_tclaw_handle_tool_response(const char *request_id,
+                                    const char *status,
+                                    const char *result_json,
+                                    const char *error_json)
+{
+    if (!request_id || !status) return -1;
+
+    char extracted_status[32] = "";
+    const char *eff_status = status;
+    const char *eff_result = result_json;
+    const char *eff_error = error_json;
+
+    /* Extract true envelope status if result_json carries a contract envelope */
+    if (result_json && strstr(result_json, "\"schema_version\"") != NULL) {
+        if (desk_json_parse_str(result_json, "status", extracted_status, sizeof(extracted_status))) {
+            if (strcmp(extracted_status, "accepted") == 0 ||
+                strcmp(extracted_status, "succeeded") == 0 ||
+                strcmp(extracted_status, "failed") == 0 ||
+                strcmp(extracted_status, "cancelled") == 0 ||
+                strcmp(extracted_status, "unknown") == 0) {
+                eff_status = extracted_status;
+            }
+        }
+    }
+
+    bool is_success = (strcmp(eff_status, "succeeded") == 0 || strcmp(eff_status, "accepted") == 0);
+
+    /* Report back to Tuya Cloud Dialogue session */
+    desk_tclaw_tuya_send_tool_result(s_tuya_session_id, s_current_pending_tool,
+                                     is_success ? (eff_result ? eff_result : "{}")
+                                                : (eff_error ? eff_error : "{\"error\":\"failed\"}"));
+
+    s_turn_count++;
+    char spoken[1024];
+    if (strcmp(eff_status, "accepted") == 0) {
+        snprintf(spoken, sizeof(spoken), "Action accepted successfully: %s",
+                 (eff_result && strlen(eff_result) > 0) ? eff_result : "OK");
+    } else if (strcmp(eff_status, "succeeded") == 0) {
+        snprintf(spoken, sizeof(spoken), "Action completed successfully: %s",
+                 (eff_result && strlen(eff_result) > 0) ? eff_result : "OK");
+    } else {
+        snprintf(spoken, sizeof(spoken), "Action encountered an error: %s",
+                 (eff_error && strlen(eff_error) > 0) ? eff_error : "Error");
+    }
+
+    s_current_pending_tool[0] = '\0';
+    s_pending_request_id[0] = '\0';
+    s_pending_tool_start_ms = 0;
+
+    return desk_tclaw_start_speaking(spoken);
+}
+
+int desk_tclaw_handle_tool_timeout(const char *request_id)
+{
+    if (s_state != TCLAW_STATE_TOOL_CALLING) return -1;
+    if (request_id && strlen(request_id) > 0 && strcmp(s_pending_request_id, request_id) != 0) {
+        return -1;
+    }
+
+    char err_json[256];
+    snprintf(err_json, sizeof(err_json),
+             "{\"code\":\"OPERATION_TIMEOUT\",\"message\":\"External tool execution timed out\",\"retryable\":true}");
+
+    const char *req = (request_id && strlen(request_id) > 0) ? request_id : s_pending_request_id;
+    return desk_tclaw_handle_tool_response(req, "failed", NULL, err_json);
+}
+
+int desk_tclaw_poll_timeouts(uint64_t now_ms)
+{
+    if (s_state != TCLAW_STATE_TOOL_CALLING) return 0;
+    if (s_pending_tool_start_ms == 0) return 0;
+
+    if (now_ms == 0) {
+        now_ms = desk_tclaw_get_time_ms();
+    }
+
+    if (now_ms >= s_pending_tool_start_ms + s_tool_timeout_ms) {
+        desk_tclaw_handle_tool_timeout(s_pending_request_id);
+        return 1;
+    }
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Tuya Cloud Dialogue Session Management
+ * -------------------------------------------------------------------------- */
 int desk_tclaw_tuya_session_connect(const char *endpoint, const char *device_id, const char *token)
 {
     if (!endpoint || !device_id || !token) return -1;
@@ -232,7 +699,7 @@ int desk_tclaw_tuya_session_start(const char *session_id)
     }
 
     s_state = TCLAW_STATE_LISTENING;
-    desk_hardware_display_set_expression("listening", "Tuya Cloud Voice Active");
+    desk_hardware_set_screen_expression("listening", "Tuya Cloud Voice Active");
     return 0;
 }
 
@@ -255,7 +722,7 @@ int desk_tclaw_tuya_session_feed_audio(const uint8_t *pcm_data, size_t len)
 
     if (s_state == TCLAW_STATE_IDLE) {
         s_state = TCLAW_STATE_LISTENING;
-        desk_hardware_display_set_expression("listening", "Listening...");
+        desk_hardware_set_screen_expression("listening", "Listening...");
     }
 
     return 0;
@@ -272,7 +739,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
                 s_tuya_session_id[sizeof(s_tuya_session_id) - 1] = '\0';
             }
             s_state = TCLAW_STATE_LISTENING;
-            desk_hardware_display_set_expression("listening", "Tuya Cloud Listening");
+            desk_hardware_set_screen_expression("listening", "Tuya Cloud Listening");
             break;
 
         case TUYA_DIALOGUE_EVT_STREAM_TOKEN:
@@ -289,7 +756,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
                 if (cur_len + strlen(event->token) < sizeof(s_last_response) - 1) {
                     strcat(s_last_response, event->token);
                 }
-                desk_hardware_display_set_expression("speaking", s_last_response);
+                desk_hardware_set_screen_expression("speaking", s_last_response);
 
                 if (s_speech_stream_cb) {
                     s_speech_stream_cb(event->token, event->is_final_token, s_stream_user_data);
@@ -299,7 +766,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
 
         case TUYA_DIALOGUE_EVT_TOOL_CALL:
             s_state = TCLAW_STATE_TOOL_CALLING;
-            desk_hardware_display_set_expression("thinking", "Calling tool...");
+            desk_hardware_set_screen_expression("thinking", "Calling tool...");
             if (event->tool_name) {
                 strncpy(s_current_pending_tool, event->tool_name, sizeof(s_current_pending_tool) - 1);
                 s_current_pending_tool[sizeof(s_current_pending_tool) - 1] = '\0';
@@ -326,16 +793,21 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
 
         case TUYA_DIALOGUE_EVT_SESSION_END:
             desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+            desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
+            desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
             s_turn_count++;
             s_state = TCLAW_STATE_IDLE;
             s_current_pending_tool[0] = '\0';
-            desk_hardware_display_set_expression("idle", "Ready");
+            s_pending_request_id[0] = '\0';
+            desk_hardware_set_screen_expression("idle", "Ready");
             break;
 
         case TUYA_DIALOGUE_EVT_ERROR:
             desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+            desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
+            desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
             s_state = TCLAW_STATE_IDLE;
-            desk_hardware_display_set_expression("idle", event->error_msg ? event->error_msg : "Error");
+            desk_hardware_set_screen_expression("idle", event->error_msg ? event->error_msg : "Error");
             break;
 
         default:
@@ -347,7 +819,6 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
 
 int desk_tclaw_tuya_send_tool_result(const char *session_id, const char *tool_name, const char *result_json)
 {
-    /* Feeds back tool execution result to active Tuya cloud dialogue session */
     (void)session_id;
     (void)tool_name;
     if (result_json) {
@@ -370,14 +841,53 @@ int desk_tclaw_tuya_get_last_tool_result(char *out_buf, size_t max_len)
 int desk_tclaw_tuya_session_stop(void)
 {
     desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+    desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
+    desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
     s_state = TCLAW_STATE_IDLE;
     s_tuya_session_id[0] = '\0';
     s_current_pending_tool[0] = '\0';
+    s_pending_request_id[0] = '\0';
     if (s_tuya_conn_state == TUYA_CLOUD_STREAMING) {
         s_tuya_conn_state = TUYA_CLOUD_CONNECTED;
     }
-    desk_hardware_display_set_expression("idle", "Ready");
+    desk_hardware_set_screen_expression("idle", "Ready");
     return 0;
+}
+
+int desk_tclaw_on_tuya_netcfg_started(void)
+{
+    return desk_hardware_set_screen_expression("thinking", "BLE Netcfg");
+}
+
+int desk_tclaw_on_tuya_mqtt_connected(void)
+{
+    s_tuya_conn_state = TUYA_CLOUD_CONNECTED;
+    int rc = desk_hardware_set_screen_expression("happy", "Online");
+
+    /* Play brief connection chime / audio tone (800Hz PCM, 50ms) */
+    static const int16_t s_connect_chime[64] = {
+        0, 3211, 6392, 9511, 12539, 15446, 18204, 20787,
+        23170, 25329, 27245, 28898, 30273, 31356, 32137, 32609,
+        32767, 32609, 32137, 31356, 30273, 28898, 27245, 25329,
+        23170, 20787, 18204, 15446, 12539, 9511, 6392, 3211,
+        0, -3211, -6392, -9511, -12539, -15446, -18204, -20787,
+        -23170, -25329, -27245, -28898, -30273, -31356, -32137, -32609,
+        -32767, -32609, -32137, -31356, -30273, -28898, -27245, -25329,
+        -23170, -20787, -18204, -15446, -12539, -9511, -6392, -3211
+    };
+    desk_hardware_audio_play_pcm(s_connect_chime, 64, 16000);
+    desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+
+    return rc;
+}
+
+int desk_tclaw_on_tuya_mqtt_disconnected(void)
+{
+    s_tuya_conn_state = TUYA_CLOUD_DISCONNECTED;
+    if (s_tuya_session_id[0] != '\0') {
+        desk_tclaw_tuya_session_stop();
+    }
+    return desk_hardware_set_screen_expression("idle", "Cloud Offline");
 }
 
 int desk_tclaw_inject_text(const char *user_prompt)
@@ -389,10 +899,10 @@ int desk_tclaw_inject_text(const char *user_prompt)
     }
 
     s_state = TCLAW_STATE_LISTENING;
-    desk_hardware_display_set_expression("listening", user_prompt);
+    desk_hardware_set_screen_expression("listening", user_prompt);
 
     s_state = TCLAW_STATE_THINKING;
-    desk_hardware_display_set_expression("thinking", "Thinking...");
+    desk_hardware_set_screen_expression("thinking", "Thinking...");
 
     /* Detect intent for tool dispatching through Tuya dialogue engine */
     char req_id[64];
@@ -412,6 +922,8 @@ int desk_tclaw_inject_text(const char *user_prompt)
         return desk_tclaw_trigger_tool_call(req_id, "life.create_reminder", remind_args);
     } else if (strstr(user_prompt, "camera") != NULL || strstr(user_prompt, "snapshot") != NULL) {
         return desk_tclaw_trigger_tool_call(req_id, "camera.capture", "{\"timeout_ms\":2000}");
+    } else if (strstr(user_prompt, "move") != NULL || strstr(user_prompt, "look") != NULL) {
+        return desk_tclaw_trigger_tool_call(req_id, "ctrl.motion.move", "{\"pan_deg\":90.0,\"tilt_deg\":110.0,\"duration_ms\":500}");
     } else if (strstr(user_prompt, "codex") != NULL || strstr(user_prompt, "review") != NULL) {
         return desk_tclaw_trigger_tool_call(req_id, "codex.submit_turn", "{\"prompt\":\"review current branch\"}");
     }
@@ -425,26 +937,66 @@ int desk_tclaw_inject_text(const char *user_prompt)
     return desk_tclaw_start_speaking(contextual_response);
 }
 
-int desk_tclaw_handle_tool_response(const char *request_id,
-                                    const char *status,
-                                    const char *result_json,
-                                    const char *error_json)
+/* --------------------------------------------------------------------------
+ * Single-Board Self-Test & Diagnostic Inspection
+ * -------------------------------------------------------------------------- */
+int desk_tclaw_self_test_report(desk_tclaw_self_test_t *out_report)
 {
-    if (!request_id || !status) return -1;
+    desk_tclaw_self_test_t diag;
+    memset(&diag, 0, sizeof(diag));
+    diag.initialized = s_initialized;
+    diag.state = s_state;
+    diag.tuya_state = s_tuya_conn_state;
+    diag.turn_count = s_turn_count;
+    strncpy(diag.session_id, s_tuya_session_id, sizeof(diag.session_id) - 1);
+    strncpy(diag.last_response, s_last_response, sizeof(diag.last_response) - 1);
+    strncpy(diag.pending_tool, s_current_pending_tool, sizeof(diag.pending_tool) - 1);
+    diag.audio_owner = desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK);
+    diag.motion_owner = desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL);
+    diag.camera_owner = desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR);
+    diag.last_error_code = 0;
 
-    /* Report back to Tuya Cloud Dialogue session */
-    desk_tclaw_tuya_send_tool_result(s_tuya_session_id, s_current_pending_tool,
-                                     (strcmp(status, "succeeded") == 0) ? result_json : error_json);
-
-    s_turn_count++;
-    char spoken[1024];
-    if (strcmp(status, "succeeded") == 0) {
-        snprintf(spoken, sizeof(spoken), "Action completed successfully: %s",
-                 (result_json && strlen(result_json) > 0) ? result_json : "OK");
-    } else {
-        snprintf(spoken, sizeof(spoken), "Action encountered an error: %s",
-                 (error_json && strlen(error_json) > 0) ? error_json : "Error");
+    if (!s_initialized) {
+        diag.last_error_code = DESK_HW_ERR_UNAVAILABLE;
+        if (out_report) *out_report = diag;
+        return DESK_HW_ERR_UNAVAILABLE;
     }
 
-    return desk_tclaw_start_speaking(spoken);
+    /* Dialogue state range check */
+    if (s_state < TCLAW_STATE_IDLE || s_state > TCLAW_STATE_TOOL_CALLING) {
+        diag.last_error_code = DESK_HW_ERR_INVALID_ARG;
+        if (out_report) *out_report = diag;
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+
+    /* Tuya Cloud state range check */
+    if (s_tuya_conn_state < TUYA_CLOUD_DISCONNECTED || s_tuya_conn_state > TUYA_CLOUD_ERROR) {
+        diag.last_error_code = DESK_HW_ERR_INVALID_ARG;
+        if (out_report) *out_report = diag;
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+
+    /* Arbiter invariant: When IDLE, audio playback must not be held by TCLAW_VOICE */
+    if (s_state == TCLAW_STATE_IDLE && diag.audio_owner == DESK_OWNER_TCLAW_VOICE) {
+        diag.last_error_code = DESK_HW_ERR_BUSY;
+        if (out_report) *out_report = diag;
+        return DESK_HW_ERR_BUSY;
+    }
+
+    /* Arbiter invariant: When SPEAKING, audio playback MUST be owned by TCLAW_VOICE */
+    if (s_state == TCLAW_STATE_SPEAKING && diag.audio_owner != DESK_OWNER_TCLAW_VOICE) {
+        diag.last_error_code = DESK_HW_ERR_BUSY;
+        if (out_report) *out_report = diag;
+        return DESK_HW_ERR_BUSY;
+    }
+
+    if (out_report) {
+        *out_report = diag;
+    }
+    return 0;
+}
+
+int desk_tclaw_self_test(void)
+{
+    return desk_tclaw_self_test_report(NULL);
 }
