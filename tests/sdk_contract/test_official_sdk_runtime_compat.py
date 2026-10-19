@@ -27,21 +27,25 @@ OFFICIAL_SDK_PATH = "/home/maidang/.gemini/antigravity-cli/brain/cb82573a-ba9b-4
 if OFFICIAL_SDK_PATH not in sys.path and os.path.isdir(OFFICIAL_SDK_PATH):
     sys.path.insert(0, OFFICIAL_SDK_PATH)
 
-from watcherobot.protocol import (
-    FRAME_AUDIO,
-    FRAME_IMAGE,
-    BinaryFrame,
-    parse_json_message,
-    parse_wspk,
-)
-from watcherobot.runtime.daemon.pairing.protocol import (
-    LAN_PAIRING_PROTOCOL,
-    LAN_PAIRING_VERSION,
-    PairAccept,
-    PairRequest,
-    encode_udp_message,
-    parse_udp_message,
-)
+try:
+    from watcherobot.protocol import (
+        FRAME_AUDIO,
+        FRAME_IMAGE,
+        BinaryFrame,
+        parse_json_message,
+        parse_wspk,
+    )
+    from watcherobot.runtime.daemon.pairing.protocol import (
+        LAN_PAIRING_PROTOCOL,
+        LAN_PAIRING_VERSION,
+        PairAccept,
+        PairRequest,
+        encode_udp_message,
+        parse_udp_message,
+    )
+    HAVE_WATCHEROBOT = True
+except ImportError:
+    HAVE_WATCHEROBOT = False
 
 # Arbiter resource and owner codes
 DESK_RES_MOTION_GIMBAL = 3
@@ -53,6 +57,7 @@ DESK_ARBITER_ERR_BUSY = 1
 OUTBOUND_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 
 
+@unittest.skipUnless(HAVE_WATCHEROBOT, "Official watcherobot python sdk not installed in environment")
 class TestOfficialSdkRuntimeCompat(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -309,8 +314,10 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(resp["code"], 0)
         # A device ACK only means "accepted" (interfaces.md 6.1); physical
         # completion is signalled by the resource.motion.completed event.
+        # CR-002: ACK-only semantics requires state_confirmed: false.
         self.assertEqual(resp["data"]["status"], "accepted")
         self.assertTrue(resp["data"]["accepted"])
+        self.assertIs(resp["data"]["state_confirmed"], False)
         self.assertAlmostEqual(resp["data"]["pan_deg"], 125.0, places=1)
         self.assertAlmostEqual(resp["data"]["tilt_deg"], 115.0, places=1)
 
@@ -411,6 +418,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         })
         self.assertEqual(resp_motion["type"], "sys.ack")
         self.assertEqual(resp_motion["data"]["status"], "accepted")
+        self.assertIs(resp_motion["data"]["state_confirmed"], False)
 
         # 3. TClaw finishes speech turn
         self.lib.desk_tclaw_interrupt()

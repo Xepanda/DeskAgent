@@ -12,9 +12,16 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <fcntl.h>
+#ifdef ESP_PLATFORM
+#include <sys/poll.h>
+#include "esp_attr.h"
+#define DESK_PROTOCOL_BSS EXT_RAM_BSS_ATTR
+#else
 #include <poll.h>
+#define DESK_PROTOCOL_BSS
+#endif
+#include <unistd.h>
 #include <errno.h>
 #include <time.h>
 
@@ -207,7 +214,7 @@ static uint16_t s_bound_port = 0;
 /* Persistent per-connection receive accumulator (interfaces.md 6.3).
  * A JSON control frame is a single line terminated by '\n'; frames may be
  * split across reads, batched into one read, or span multiple reads. */
-static char s_rx_buf[DESK_SDK_MAX_FRAME_LEN + 2];
+static DESK_PROTOCOL_BSS char s_rx_buf[DESK_SDK_MAX_FRAME_LEN + 2];
 static size_t s_rx_len = 0;
 /* Set while discarding an oversized frame; cleared at the next '\n' so that the
  * following frame's boundaries are not corrupted. */
@@ -366,6 +373,73 @@ static bool json_parse_bool(const char *json, const char *key, bool default_val)
     return default_val;
 }
 
+bool json_parse_top_level_str(const char *json, const char *key, char *out_val, size_t max_len)
+{
+    if (!json || !key || !out_val || max_len == 0) return false;
+    out_val[0] = '\0';
+
+    const char *p = json;
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (*p != '{') return false;
+    p++;
+
+    int depth = 1;
+    bool in_str = false;
+    bool escaped = false;
+
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    size_t needle_len = strlen(needle);
+
+    while (*p && depth > 0) {
+        if (escaped) {
+            escaped = false;
+            p++;
+            continue;
+        }
+        if (*p == '\\' && in_str) {
+            escaped = true;
+            p++;
+            continue;
+        }
+        if (*p == '\"') {
+            if (!in_str) {
+                in_str = true;
+                if (depth == 1 && strncmp(p, needle, needle_len) == 0) {
+                    const char *after = p + needle_len;
+                    while (*after && (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n')) after++;
+                    if (*after == ':') {
+                        after++;
+                        while (*after && (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n')) after++;
+                        if (*after == '\"') {
+                            after++;
+                            size_t idx = 0;
+                            while (*after && *after != '\"' && idx + 1 < max_len) {
+                                if (*after == '\\' && *(after + 1)) {
+                                    after++;
+                                }
+                                out_val[idx++] = *after++;
+                            }
+                            out_val[idx] = '\0';
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                in_str = false;
+            }
+            p++;
+            continue;
+        }
+        if (!in_str) {
+            if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+        }
+        p++;
+    }
+    return false;
+}
+
 /**
  * @brief Build the '"request_id":"<id>",' fragment for a response envelope.
  *
@@ -380,7 +454,7 @@ static const char *desk_sdk_request_id_fragment(const char *json_in, char *scrat
     if (!json_in) return "";
 
     char req_id[80] = "";
-    if (!json_parse_str(json_in, "request_id", req_id, sizeof(req_id)) || req_id[0] == '\0') {
+    if (!json_parse_top_level_str(json_in, "request_id", req_id, sizeof(req_id)) || req_id[0] == '\0') {
         return "";
     }
     /* interfaces.md 1.1: ^[a-zA-Z0-9_-]+$ -- reject anything that could break JSON. */
@@ -672,8 +746,29 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
 {
     if (!json_in || !out_buf || max_out_len < 64) return -1;
 
+    char msg_type[64] = "";
+    bool has_type = json_parse_top_level_str(json_in, "type", msg_type, sizeof(msg_type));
+    if (!has_type) {
+        char status_tmp[32] = "";
+        char req_id_tmp[64] = "";
+        if (json_parse_top_level_str(json_in, "status", status_tmp, sizeof(status_tmp)) &&
+            json_parse_top_level_str(json_in, "request_id", req_id_tmp, sizeof(req_id_tmp))) {
+            strncpy(msg_type, "tool.response", sizeof(msg_type) - 1);
+            msg_type[sizeof(msg_type) - 1] = '\0';
+        } else {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":404,\"error\":{"
+                     "\"code\":\"UNKNOWN_OPERATION\","
+                     "\"message\":\"Command missing valid top-level type\"}}",
+                     rid);
+            return 0;
+        }
+    }
+
     /* Handshake: sys.client.hello */
-    if (strstr(json_in, "sys.client.hello") != NULL) {
+    if (strcmp(msg_type, "sys.client.hello") == 0) {
         char provided_token[128] = "";
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
@@ -739,7 +834,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* System SDK ready get: sys.sdk.ready.get */
-    if (strstr(json_in, "sys.sdk.ready.get") != NULL) {
+    else if (strcmp(msg_type, "sys.sdk.ready.get") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
@@ -757,7 +852,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Heartbeat: sys.ping */
-    if (strstr(json_in, "sys.ping") != NULL) {
+    else if (strcmp(msg_type, "sys.ping") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
@@ -766,7 +861,10 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Motion control: ctrl.motion.move / motion.move / ctrl.motion.set_target */
-    if (strstr(json_in, "motion.move") != NULL || strstr(json_in, "motion.set_target") != NULL) {
+    else if (strcmp(msg_type, "ctrl.motion.move") == 0 ||
+             strcmp(msg_type, "motion.move") == 0 ||
+             strcmp(msg_type, "ctrl.motion.set_target") == 0 ||
+             strcmp(msg_type, "motion.set_target") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         float pan = json_parse_float(json_in, "pan_deg", -999.0f);
@@ -821,16 +919,18 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         }
 
         /* ACK semantics: "accepted" (dispatched to the driver), never
-         * "succeeded" -- physical completion stays on resource.motion.completed. */
+         * "succeeded" -- physical completion stays on resource.motion.completed.
+         * Per CR-002 and R3a protocol adjudication, motion commands are ACK-only:
+         * status="accepted", accepted=true, state_confirmed=false. */
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"status\":\"accepted\","
-                 "\"accepted\":true,\"pan_deg\":%.1f,\"tilt_deg\":%.1f,\"duration_ms\":%d}}",
-                 rid, pan, tilt, duration);
+                 "\"accepted\":true,\"state_confirmed\":false,\"pan_deg\":%.1f,\"tilt_deg\":%.1f,\"duration_ms\":%d}}",
+                 rid, pan, tilt, (int)duration);
         return 0;
     }
 
     /* Motion stop: ctrl.motion.stop / motion.stop */
-    if (strstr(json_in, "motion.stop") != NULL) {
+    else if (strcmp(msg_type, "ctrl.motion.stop") == 0 || strcmp(msg_type, "motion.stop") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         bool emergency = json_parse_bool(json_in, "emergency", false);
@@ -845,13 +945,13 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         }
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"status\":\"accepted\","
-                 "\"accepted\":true,\"stopped\":true}}",
+                 "\"accepted\":true,\"state_confirmed\":false,\"stopped\":true}}",
                  rid);
         return 0;
     }
 
     /* Motion action play: ctrl.motion.action.play */
-    if (strstr(json_in, "motion.action.play") != NULL) {
+    else if (strcmp(msg_type, "ctrl.motion.action.play") == 0 || strcmp(msg_type, "motion.action.play") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
@@ -861,7 +961,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Camera acquire lease: ctrl.camera.acquire / camera.acquire */
-    if (strstr(json_in, "camera.acquire") != NULL) {
+    else if (strcmp(msg_type, "ctrl.camera.acquire") == 0 || strcmp(msg_type, "camera.acquire") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         char client_id[32] = "sdk-client";
@@ -875,7 +975,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"status\":\"accepted\","
                      "\"accepted\":true,\"client_id\":\"%s\",\"lease_duration_ms\":%d}}",
-                     rid, client_id, lease_ms);
+                     rid, client_id, (int)lease_ms);
         } else if (arb == DESK_ARBITER_ERR_BUSY) {
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
@@ -893,7 +993,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Camera release lease: ctrl.camera.release / camera.release */
-    if (strstr(json_in, "camera.release") != NULL) {
+    else if (strcmp(msg_type, "ctrl.camera.release") == 0 || strcmp(msg_type, "camera.release") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         char client_id[32] = "sdk-client";
@@ -906,7 +1006,9 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Camera capture: ctrl.camera.capture / camera.capture / ctrl.camera.capture_with_feedback */
-    if (strstr(json_in, "camera.capture") != NULL) {
+    else if (strcmp(msg_type, "ctrl.camera.capture") == 0 ||
+             strcmp(msg_type, "camera.capture") == 0 ||
+             strcmp(msg_type, "ctrl.camera.capture_with_feedback") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         size_t max_jpeg = 65536;
@@ -948,7 +1050,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Microphone open / close: ctrl.microphone.open / ctrl.microphone.close */
-    if (strstr(json_in, "ctrl.microphone.open") != NULL) {
+    else if (strcmp(msg_type, "ctrl.microphone.open") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         int rate = json_parse_int(json_in, "sample_rate_hz", 16000);
@@ -960,7 +1062,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    if (strstr(json_in, "ctrl.microphone.close") != NULL) {
+    else if (strcmp(msg_type, "ctrl.microphone.close") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         desk_hardware_audio_record_stop();
@@ -971,7 +1073,10 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Expression play / set: ctrl.expression.play / ctrl.expression.set */
-    if (strstr(json_in, "expression.play") != NULL || strstr(json_in, "expression.set") != NULL) {
+    else if (strcmp(msg_type, "ctrl.expression.play") == 0 ||
+             strcmp(msg_type, "ctrl.expression.set") == 0 ||
+             strcmp(msg_type, "expression.play") == 0 ||
+             strcmp(msg_type, "expression.set") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
 
@@ -1033,7 +1138,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                     0, 3062, 5657, 7396, 8000, 7396, 5657, 3062,
                     0, -3062, -5657, -7396, -8000, -7396, -5657, -3062
                 };
-                static int16_t s_alert_pcm[1600];
+                static DESK_PROTOCOL_BSS int16_t s_alert_pcm[1600];
                 static bool s_alert_pcm_initialized = false;
                 if (!s_alert_pcm_initialized) {
                     for (size_t i = 0; i < 1600; i++) {
@@ -1054,10 +1159,10 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Expression audio follow: ctrl.expression.audio_follow */
-    if (strstr(json_in, "expression.audio_follow") != NULL) {
+    else if (strcmp(msg_type, "ctrl.expression.audio_follow") == 0 || strcmp(msg_type, "expression.audio_follow") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        bool enabled = (strstr(json_in, "\"enabled\":true") != NULL || strstr(json_in, "\"enabled\": true") != NULL);
+        bool enabled = json_parse_bool(json_in, "enabled", false);
         if (enabled) {
             desk_hardware_display_set_expression("speaking", "Audio Follow Active");
         } else {
@@ -1070,7 +1175,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* External tool response envelope from Python client */
-    if (strstr(json_in, "tool.response") != NULL || (strstr(json_in, "\"status\":") != NULL && strstr(json_in, "\"request_id\":") != NULL)) {
+    else if (strcmp(msg_type, "tool.response") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         desk_sdk_bridge_handle_tool_response(json_in);
@@ -1081,7 +1186,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 
     /* Unknown operation */
-    {
+    else {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
@@ -1089,8 +1194,8 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "\"code\":\"UNKNOWN_OPERATION\","
                  "\"message\":\"Command not recognized by Desk Agent SDK bridge\"}}",
                  rid);
+        return 0;
     }
-    return 0;
 }
 
 int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
@@ -1112,8 +1217,8 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
              "\"type\":\"%s\","
              "\"timestamp\":\"%s\","
              "\"payload\":%s}",
-             s_event_seq * 0x13579bdf,
-             s_event_seq,
+             (unsigned int)(s_event_seq * 0x13579bdf),
+             (unsigned int)s_event_seq,
              event_type,
              ts,
              payload_json);
@@ -1170,8 +1275,8 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
              "\"action\":\"%s\","
              "\"timestamp\":\"%s\""
              "}}",
-             s_event_seq * 0x13579bdf,
-             s_event_seq,
+             (unsigned int)(s_event_seq * 0x13579bdf),
+             (unsigned int)s_event_seq,
              ts,
              target_str,
              action_str,
@@ -1380,8 +1485,8 @@ int desk_sdk_socket_server_poll(int timeout_ms)
             return 0;
         }
 
-        char buf[1024];
-        ssize_t n = read(s_client_fd, buf, sizeof(buf));
+        static DESK_PROTOCOL_BSS char s_socket_chunk_buf[1024];
+        ssize_t n = read(s_client_fd, s_socket_chunk_buf, sizeof(s_socket_chunk_buf));
         if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
             return 0;
         }
@@ -1394,7 +1499,7 @@ int desk_sdk_socket_server_poll(int timeout_ms)
         /* Persistent accumulation across read() calls: frames may arrive split
          * across reads, batched into one read, or spanning several reads. */
         for (ssize_t i = 0; i < n; i++) {
-            char c = buf[i];
+            char c = s_socket_chunk_buf[i];
 
             if (s_rx_discarding) {
                 /* Discard an oversized frame, resynchronising on the next '\n'. */
@@ -1504,19 +1609,19 @@ int desk_sdk_pairing_server_poll(int timeout_ms)
     if (rc <= 0) return 0;
 
     if (pfd.revents & POLLIN) {
-        char buf[2048];
+        static DESK_PROTOCOL_BSS char s_pairing_buf[2048];
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
-        ssize_t n = recvfrom(s_pairing_udp_fd, buf, sizeof(buf) - 1, 0,
+        ssize_t n = recvfrom(s_pairing_udp_fd, s_pairing_buf, sizeof(s_pairing_buf) - 1, 0,
                              (struct sockaddr *)&client_addr, &addr_len);
         if (n > 0) {
-            buf[n] = '\0';
-            char reply[2048];
+            s_pairing_buf[n] = '\0';
+            static DESK_PROTOCOL_BSS char s_pairing_reply[2048];
             /* Fail-closed: a rejected pairing writes no reply at all
              * (interfaces.md 6.4.4 -- no wire message type is defined). */
-            if (desk_sdk_bridge_process_pairing_udp(buf, reply, sizeof(reply)) == DESK_SDK_PAIRING_OK &&
-                reply[0] != '\0') {
-                sendto(s_pairing_udp_fd, reply, strlen(reply), 0,
+            if (desk_sdk_bridge_process_pairing_udp(s_pairing_buf, s_pairing_reply, sizeof(s_pairing_reply)) == DESK_SDK_PAIRING_OK &&
+                s_pairing_reply[0] != '\0') {
+                sendto(s_pairing_udp_fd, s_pairing_reply, strlen(s_pairing_reply), 0,
                        (struct sockaddr *)&client_addr, addr_len);
             }
         }
@@ -1564,7 +1669,7 @@ static void firmware_worker_task(void *pvParameters)
 int desk_firmware_start_background_task(void)
 {
     if (s_worker_task_handle != NULL) return 0;
-    BaseType_t ret = xTaskCreate(firmware_worker_task, "desk_poll_worker", 4096, NULL, 5, &s_worker_task_handle);
+    BaseType_t ret = xTaskCreate(firmware_worker_task, "desk_poll_worker", 8192, NULL, 5, &s_worker_task_handle);
     return ret == pdPASS ? 0 : -1;
 }
 void desk_firmware_stop_background_task(void)

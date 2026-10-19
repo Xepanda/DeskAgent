@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schemas.tuyaopen.dev/status.v1.json",
+  "schemaVersion": 1,
+  "lifecycle": "configured",
+  "scaffold": {
+    "method": "manual",
+    "sourceTemplate": "base",
+    "scaffoldedAt": "2026-10-18T01:14:00.000Z",
+    "sdkRoot": "C:\\Users\\maida\\TuyaOpenIDE\\TuyaOpenSDK",
+    "boardId": "espressif-esp32-s3",
+    "kconfigId": "ESP32_S3"
+  },
+  "build": {
+    "lastResult": "success",
+    "lastBuildAt": "2026-10-19",
+    "artifact": "firmware/.build/bin/desk_agent_firmware.bin",
+    "exitCode": 0
+  },
+  "flash": {
+    "lastResult": "success",
+    "lastFlashAt": "2026-10-19",
+    "target": "esp32s3",
+    "port": "COM21",
+    "offset": "0x20000",
+    "scope": "app-only; not whole-device acceptance"
+  },
+  "lastChecked": {
+    "tos": null,
+    "env": null
+  }
+}

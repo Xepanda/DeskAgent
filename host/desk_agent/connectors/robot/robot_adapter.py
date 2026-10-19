@@ -24,6 +24,9 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Maximum allowed frame size in bytes (interfaces.md 6.3 rule 2)
+MAX_FRAME_SIZE = 65536
+
 
 class RobotAdapter:
     """Production client adapter connecting Host to Robot Firmware / SDK Bridge."""
@@ -204,6 +207,8 @@ class RobotAdapter:
         recv_buf = ""
         while not self._stop_event.is_set():
             if not self.is_connected:
+                # Clear residual buffer upon disconnect (interfaces.md 6.3 rule 4)
+                recv_buf = ""
                 if not self.connect_tcp(timeout=2.0):
                     self._stop_event.wait(self.reconnect_interval)
                     continue
@@ -216,6 +221,7 @@ class RobotAdapter:
                 rlist, _, xlist = select.select([sock], [], [sock], 0.2)
                 if xlist:
                     logger.info("Socket exceptional condition, closing")
+                    recv_buf = ""
                     with self._lock:
                         self._close_socket()
                     continue
@@ -224,10 +230,18 @@ class RobotAdapter:
                     data = sock.recv(4096)
                     if not data:
                         logger.info("Robot disconnected TCP connection")
+                        recv_buf = ""
                         with self._lock:
                             self._close_socket()
                         continue
                     recv_buf += data.decode("utf-8", errors="replace")
+                    # Enforce maximum frame length (interfaces.md 6.3 rule 2)
+                    if len(recv_buf) > MAX_FRAME_SIZE:
+                        logger.warning("Frame buffer exceeded MAX_FRAME_SIZE (%d bytes); discarding", MAX_FRAME_SIZE)
+                        if "\n" in recv_buf:
+                            _, recv_buf = recv_buf.split("\n", 1)
+                        else:
+                            recv_buf = ""
                     while "\n" in recv_buf:
                         line, recv_buf = recv_buf.split("\n", 1)
                         line = line.strip()
@@ -238,6 +252,7 @@ class RobotAdapter:
             except Exception as e:
                 if not self._stop_event.is_set():
                     logger.debug("Robot connection loop notice: %s", e)
+                    recv_buf = ""
                     with self._lock:
                         self._close_socket()
                     self._stop_event.wait(self.reconnect_interval)
@@ -322,6 +337,7 @@ class RobotAdapter:
             except Exception:
                 self._awaiting_ids.discard(req_id)
                 self._pending_responses.pop(req_id, None)
+                self._close_socket()
                 raise
 
         try:
@@ -372,6 +388,12 @@ class RobotAdapter:
                                     pass
                             if data:
                                 self._recv_buf += data.decode("utf-8", errors="replace")
+                                if len(self._recv_buf) > MAX_FRAME_SIZE:
+                                    logger.warning("Fallback frame buffer exceeded MAX_FRAME_SIZE (%d bytes); discarding", MAX_FRAME_SIZE)
+                                    if "\n" in self._recv_buf:
+                                        _, self._recv_buf = self._recv_buf.split("\n", 1)
+                                    else:
+                                        self._recv_buf = ""
                                 while "\n" in self._recv_buf:
                                     line, self._recv_buf = self._recv_buf.split("\n", 1)
                                     line = line.strip()
@@ -421,10 +443,10 @@ class RobotAdapter:
         res_type = res.get("type")
         code = res.get("code")
         raw_error = res.get("error")
-        err_code = raw_error.get("code") if isinstance(raw_error, dict) else None
+        err_code = raw_error.get("code") if isinstance(raw_error, dict) else (raw_error if isinstance(raw_error, str) else None)
 
         # No response at all / deadline elapsed.
-        if res.get("status") == "timeout" or code == 408 or err_code == "TIMEOUT":
+        if res.get("status") == "timeout" or code in (408, 504) or err_code in ("TIMEOUT", "OPERATION_TIMEOUT"):
             return "unknown", "OPERATION_TIMEOUT", True
 
         if res_type == "sys.nack":
@@ -444,14 +466,15 @@ class RobotAdapter:
 
         return "failed", "HARDWARE_FAULT", False
 
-    def send_motion_move(self, pan: float, tilt: float, duration_ms: int = 500) -> dict[str, Any]:
+    def send_motion_move(self, pan: float, tilt: float, duration_ms: int = 500, request_id: Optional[str] = None) -> dict[str, Any]:
         """Dispatches a gimbal motion command and reports the contract outcome.
 
         A firmware `sys.ack` only proves the command was accepted, so this never
         returns "completed"/"succeeded". Physical completion is signalled
         separately by the `resource.motion.completed` event (interfaces.md 6.1).
+        Under CR-002, motion is strictly ACK-only (state_confirmed: false).
         """
-        cmd = {
+        cmd: dict[str, Any] = {
             "type": "ctrl.motion.move",
             "data": {
                 "pan_deg": float(pan),
@@ -459,6 +482,8 @@ class RobotAdapter:
                 "duration_ms": int(duration_ms),
             },
         }
+        if request_id:
+            cmd["request_id"] = request_id
         res = self.send_command(cmd, timeout=2.0)
         status, error_code, retryable = self._classify_response(res)
         return {
@@ -470,16 +495,19 @@ class RobotAdapter:
             "pan": pan,
             "tilt": tilt,
             "duration_ms": duration_ms,
+            "request_id": res.get("request_id") or cmd.get("request_id"),
         }
 
-    def send_motion_stop(self, emergency: bool = False) -> dict[str, Any]:
+    def send_motion_stop(self, emergency: bool = False, request_id: Optional[str] = None) -> dict[str, Any]:
         """Dispatches a gimbal stop command and reports the contract outcome."""
-        cmd = {
+        cmd: dict[str, Any] = {
             "type": "ctrl.motion.stop",
             "data": {
                 "emergency": bool(emergency),
             },
         }
+        if request_id:
+            cmd["request_id"] = request_id
         res = self.send_command(cmd, timeout=2.0)
         status, error_code, retryable = self._classify_response(res)
         return {
@@ -489,6 +517,7 @@ class RobotAdapter:
             "error_code": error_code,
             "retryable": retryable,
             "emergency": bool(emergency),
+            "request_id": res.get("request_id") or cmd.get("request_id"),
         }
 
     def send_announcement(self, event_type: str, payload: dict[str, Any]) -> bool:

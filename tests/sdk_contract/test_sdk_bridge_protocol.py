@@ -311,6 +311,14 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_firmware_poll.restype = ctypes.c_int
         cls.lib.desk_firmware_poll.argtypes = [ctypes.c_int]
 
+        cls.lib.json_parse_top_level_str.restype = ctypes.c_bool
+        cls.lib.json_parse_top_level_str.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
@@ -320,12 +328,29 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
 
+    def tearDown(self) -> None:
+        self.lib.desk_hardware_register_driver_ops(None)
+        if hasattr(self, "_driver_ops_keepalive"):
+            self._driver_ops_keepalive.clear()
+
     def _process_cmd(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")
         out_buf = ctypes.create_string_buffer(4096)
         rc = self.lib.desk_sdk_bridge_process_command(cmd_str, out_buf, 4096)
         self.assertEqual(rc, 0, f"desk_sdk_bridge_process_command returned error code {rc}")
         return json.loads(out_buf.value.decode("utf-8"))
+
+    def _parse_top_level(self, json_str: str, key: str, max_len: int = 128) -> str | None:
+        buf = ctypes.create_string_buffer(max_len)
+        ok = self.lib.json_parse_top_level_str(
+            json_str.encode("utf-8"),
+            key.encode("utf-8"),
+            buf,
+            max_len,
+        )
+        if ok:
+            return buf.value.decode("utf-8")
+        return None
 
     # -- helpers -----------------------------------------------------------
 
@@ -369,11 +394,18 @@ class TestSdkBridgeProtocol(unittest.TestCase):
 
         ops = DeskBoardDriverOps()
         ops.driver_name = b"faulty_test_bsp"
+        ops.init = None
+        ops.audio_record_read = None
+        ops.audio_play_pcm = None
         ops.motion_move = on_move
         ops.motion_stop = on_stop
-        # Keep references alive for the lifetime of the test.
-        self._driver_cbs = (on_move, on_stop, on_mcu_tx)
-        self._driver_ops = ops
+        ops.camera_capture = None
+        ops.display_expression = None
+        ops.deinit = None
+
+        if not hasattr(self, "_driver_ops_keepalive"):
+            self._driver_ops_keepalive = []
+        self._driver_ops_keepalive.append((ops, on_move, on_stop, on_mcu_tx))
         self.assertEqual(self.lib.desk_hardware_register_mcu_tx_cb(on_mcu_tx, None), 0)
         self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops)), 0)
 
@@ -545,6 +577,377 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("type"), "sys.nack")
         self.assertEqual(resp.get("code"), 404)
         self.assertEqual(resp.get("error", {}).get("code"), "UNKNOWN_OPERATION")
+
+    def test_json_parse_top_level_str_direct(self) -> None:
+        """Unit tests for json_parse_top_level_str: top-level extraction, nested key isolation,
+        escaped quotes, key-prefix collisions, and buffer limits."""
+        # 1. Normal top-level extraction
+        self.assertEqual(self._parse_top_level('{"type": "sys.ping"}', "type"), "sys.ping")
+        self.assertEqual(self._parse_top_level('{"foo": "bar", "type": "motion.stop"}', "type"), "motion.stop")
+        self.assertEqual(self._parse_top_level('{\n  "type"\t:\r\n  "ctrl.camera.acquire"\n}', "type"), "ctrl.camera.acquire")
+
+        # 2. Nested key isolation: child object keys must not be parsed
+        self.assertIsNone(self._parse_top_level('{"result": {"type": "ctrl.motion.stop"}}', "type"))
+        self.assertEqual(
+            self._parse_top_level('{"result": {"type": "ctrl.motion.stop"}, "type": "tool.response"}', "type"),
+            "tool.response",
+        )
+
+        # 3. Nested key isolation: array element keys must not be parsed
+        self.assertIsNone(self._parse_top_level('{"items": [{"type": "camera.acquire"}]}', "type"))
+        self.assertEqual(
+            self._parse_top_level('{"items": [{"type": "camera.acquire"}], "type": "sys.ping"}', "type"),
+            "sys.ping",
+        )
+
+        # 4. Escaped quotes in strings before target key
+        self.assertEqual(
+            self._parse_top_level('{"note": "User said \\\"motion.stop\\\" now", "type": "tool.response"}', "type"),
+            "tool.response",
+        )
+        self.assertEqual(
+            self._parse_top_level('{"path": "C:\\\\folder\\\\sub", "type": "sys.ping"}', "type"),
+            "sys.ping",
+        )
+
+        # 5. Key prefix collision prevention: e.g. "typeface" vs "type"
+        self.assertEqual(
+            self._parse_top_level('{"typeface": "sans-serif", "type": "sys.pong"}', "type"),
+            "sys.pong",
+        )
+        self.assertIsNone(self._parse_top_level('{"types": "many"}', "type"))
+        self.assertIsNone(self._parse_top_level('{"my_type": "custom"}', "type"))
+
+        # 6. Non-string values: numbers, booleans, null, objects, arrays must return False
+        self.assertIsNone(self._parse_top_level('{"type": 12345}', "type"))
+        self.assertIsNone(self._parse_top_level('{"type": true}', "type"))
+        self.assertIsNone(self._parse_top_level('{"type": null}', "type"))
+        self.assertIsNone(self._parse_top_level('{"type": {"nested": "obj"}}', "type"))
+        self.assertIsNone(self._parse_top_level('{"type": ["arr"]}', "type"))
+
+        # 7. Empty string value
+        self.assertEqual(self._parse_top_level('{"type": ""}', "type"), "")
+
+        # 8. Malformed / non-object JSON
+        self.assertIsNone(self._parse_top_level('["type", "sys.ping"]', "type"))
+        self.assertIsNone(self._parse_top_level('not json', "type"))
+
+        # 9. Buffer length truncation safety
+        truncated = self._parse_top_level('{"type": "very_long_type_string_value"}', "type", max_len=10)
+        self.assertEqual(truncated, "very_long")
+
+    def test_tool_response_note_motion_stop_is_not_dispatched_as_command(self) -> None:
+        """Verifies tool.response containing 'motion.stop' in notes does NOT dispatch motion command."""
+        stop_calls = []
+
+        @DRIVER_MOTION_STOP_CB
+        def on_stop(emergency):
+            stop_calls.append(emergency)
+            return 0
+
+        @DRIVER_MOTION_MOVE_CB
+        def on_move(pan, tilt, duration):
+            return 0
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"spy_motion_bsp"
+        ops.init = None
+        ops.audio_record_read = None
+        ops.audio_play_pcm = None
+        ops.motion_move = on_move
+        ops.motion_stop = on_stop
+        ops.camera_capture = None
+        ops.display_expression = None
+        ops.deinit = None
+
+        if not hasattr(self, "_driver_ops_keepalive"):
+            self._driver_ops_keepalive = []
+        self._driver_ops_keepalive.append((ops, on_move, on_stop))
+        self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops))
+
+        received_responses = []
+
+        @TOOL_RESP_CB
+        def resp_cb(resp_ptr, user_data):
+            received_responses.append(ctypes.string_at(resp_ptr).decode("utf-8"))
+            return 0
+
+        self.lib.desk_sdk_bridge_register_tool_response_cb(resp_cb, None)
+
+        tool_resp_payload = {
+            "type": "tool.response",
+            "request_id": "req-tool-note-001",
+            "status": "succeeded",
+            "result": {
+                "action": "note_taking",
+                "note": "User asked to execute ctrl.motion.stop immediately",
+                "content": "motion.stop",
+            },
+        }
+        resp = self._process_cmd(tool_resp_payload)
+        self.assertEqual(resp.get("type"), "sys.ack")
+        self.assertEqual(resp.get("code"), 0)
+        self.assertEqual(resp.get("request_id"), "req-tool-note-001")
+
+        self.assertEqual(len(stop_calls), 0, "tool.response must not invoke motion_stop driver")
+        self.assertEqual(len(received_responses), 1, "tool.response must route to tool response callback")
+
+    def test_nested_keywords_in_tool_response_do_not_trigger_commands(self) -> None:
+        """Verifies tool.response containing nested command strings (sys.ping, motion.move, camera.acquire)
+        does not invoke any hardware or command handlers."""
+        move_calls = []
+        stop_calls = []
+
+        @DRIVER_MOTION_MOVE_CB
+        def on_move(pan, tilt, duration):
+            move_calls.append((pan, tilt, duration))
+            return 0
+
+        @DRIVER_MOTION_STOP_CB
+        def on_stop(emergency):
+            stop_calls.append(emergency)
+            return 0
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"spy_keywords_bsp"
+        ops.init = None
+        ops.audio_record_read = None
+        ops.audio_play_pcm = None
+        ops.motion_move = on_move
+        ops.motion_stop = on_stop
+        ops.camera_capture = None
+        ops.display_expression = None
+        ops.deinit = None
+
+        if not hasattr(self, "_driver_ops_keepalive"):
+            self._driver_ops_keepalive = []
+        self._driver_ops_keepalive.append((ops, on_move, on_stop))
+        self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops))
+
+        received_responses = []
+
+        @TOOL_RESP_CB
+        def resp_cb(resp_ptr, user_data):
+            received_responses.append(ctypes.string_at(resp_ptr).decode("utf-8"))
+            return 0
+
+        self.lib.desk_sdk_bridge_register_tool_response_cb(resp_cb, None)
+
+        test_payloads = [
+            ("sys.ping", {"note": "nested string with sys.ping test", "content": "ping sys.ping"}),
+            ("ctrl.motion.move", {"command": "ctrl.motion.move", "args": {"pan_deg": 45}}),
+            ("motion.move", {"note": "motion.move target pan 90"}),
+            ("ctrl.motion.stop", {"content": "emergency ctrl.motion.stop command"}),
+            ("motion.stop", {"note": "user requested motion.stop", "content": "motion.stop"}),
+            ("ctrl.camera.acquire", {"text": "acquire camera lease ctrl.camera.acquire"}),
+            ("camera.acquire", {"note": "camera.acquire background"}),
+            ("camera.capture", {"note": "camera.capture snapshot"}),
+            ("ctrl.expression.play", {"expression": "ctrl.expression.play happy"}),
+        ]
+
+        for i, (kw, res_content) in enumerate(test_payloads):
+            req_id = f"req-tool-nested-{i}"
+            resp = self._process_cmd({
+                "type": "tool.response",
+                "request_id": req_id,
+                "status": "succeeded",
+                "result": res_content,
+            })
+            self.assertEqual(resp.get("type"), "sys.ack")
+            self.assertNotEqual(resp.get("type"), "sys.pong", f"tool.response with {kw} must not return sys.pong")
+            self.assertEqual(resp.get("code"), 0)
+            self.assertEqual(resp.get("request_id"), req_id)
+
+        self.assertEqual(len(move_calls), 0, "No motion commands should have been executed")
+        self.assertEqual(len(stop_calls), 0, "No stop commands should have been executed")
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR), DESK_OWNER_NONE)
+        self.assertEqual(len(received_responses), len(test_payloads))
+
+    def test_non_tool_envelope_with_hardware_keywords_fail_closes(self) -> None:
+        """Verifies envelopes with missing type or non-command type containing hardware keywords
+        (motion.stop, sys.ping, camera.acquire) fail-close without executing any hardware commands."""
+        move_calls = []
+        stop_calls = []
+
+        @DRIVER_MOTION_MOVE_CB
+        def on_move(pan, tilt, duration):
+            move_calls.append((pan, tilt, duration))
+            return 0
+
+        @DRIVER_MOTION_STOP_CB
+        def on_stop(emergency):
+            stop_calls.append(emergency)
+            return 0
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"spy_fail_close_bsp"
+        ops.init = None
+        ops.audio_record_read = None
+        ops.audio_play_pcm = None
+        ops.motion_move = on_move
+        ops.motion_stop = on_stop
+        ops.camera_capture = None
+        ops.display_expression = None
+        ops.deinit = None
+
+        if not hasattr(self, "_driver_ops_keepalive"):
+            self._driver_ops_keepalive = []
+        self._driver_ops_keepalive.append((ops, on_move, on_stop))
+        self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops))
+
+        adversarial_cases = [
+            ("missing_type_with_stop", {
+                "request_id": "req-adv-1",
+                "note": "ctrl.motion.stop motion.stop emergency",
+                "content": "sys.ping camera.acquire",
+            }),
+            ("chat_type_with_ping_stop_camera", {
+                "type": "chat.message",
+                "request_id": "req-adv-2",
+                "note": "Please execute ctrl.motion.stop immediately",
+                "content": "camera.acquire sys.ping motion.stop",
+            }),
+            ("event_type_with_hardware_keywords", {
+                "type": "custom.event",
+                "request_id": "req-adv-3",
+                "data": {
+                    "note": "ctrl.camera.acquire ctrl.motion.move",
+                    "text": "ctrl.expression.play",
+                },
+            }),
+        ]
+
+        for name, payload in adversarial_cases:
+            resp = self._process_cmd(payload)
+            self.assertEqual(resp.get("type"), "sys.nack", f"{name} must fail-close with sys.nack")
+            self.assertEqual(resp.get("code"), 404, f"{name} must return 404")
+            self.assertEqual(resp.get("error", {}).get("code"), "UNKNOWN_OPERATION")
+
+        self.assertEqual(len(move_calls), 0, "Adversarial messages must never trigger motion_move")
+        self.assertEqual(len(stop_calls), 0, "Adversarial messages must never trigger motion_stop")
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR), DESK_OWNER_NONE)
+
+    def test_missing_or_malformed_type_fail_closes(self) -> None:
+        """Verifies missing, malformed, or nested type fields return 404 UNKNOWN_OPERATION fail-closed."""
+        cases = [
+            ("missing_type", {"data": {"foo": "bar"}}),
+            ("integer_type", {"type": 12345, "data": {}}),
+            ("nested_type_only", {"wrapper": {"type": "ctrl.motion.stop"}}),
+            ("empty_type", {"type": "", "data": {}}),
+            ("null_type", {"type": None, "data": {}}),
+        ]
+
+        for name, payload in cases:
+            resp = self._process_cmd(payload)
+            self.assertEqual(resp.get("type"), "sys.nack", f"{name} must fail-close with sys.nack")
+            self.assertEqual(resp.get("code"), 404, f"{name} must return 404")
+            self.assertEqual(resp.get("error", {}).get("code"), "UNKNOWN_OPERATION")
+
+    def test_legitimate_commands_still_route_correctly(self) -> None:
+        """Verifies legitimate commands route to their proper handlers."""
+        # 1. Ping
+        ping_resp = self._process_cmd({"type": "sys.ping", "request_id": "req-ping-exact"})
+        self.assertEqual(ping_resp.get("type"), "sys.pong")
+        self.assertEqual(ping_resp.get("request_id"), "req-ping-exact")
+
+        # 2. Stop (ctrl.motion.stop and motion.stop)
+        stop_resp = self._process_cmd({
+            "type": "ctrl.motion.stop",
+            "request_id": "req-stop-exact",
+            "data": {"emergency": True},
+        })
+        self.assertEqual(stop_resp.get("type"), "sys.ack")
+        self.assertEqual(stop_resp.get("request_id"), "req-stop-exact")
+        self.assertEqual(stop_resp.get("data", {}).get("status"), "accepted")
+        self.assertTrue(stop_resp.get("data", {}).get("accepted"))
+        self.assertIs(stop_resp.get("data", {}).get("state_confirmed"), False)
+        self.assertTrue(stop_resp.get("data", {}).get("stopped"))
+
+        stop_resp2 = self._process_cmd({
+            "type": "motion.stop",
+            "request_id": "req-stop-legacy",
+            "data": {"emergency": False},
+        })
+        self.assertEqual(stop_resp2.get("type"), "sys.ack")
+        self.assertEqual(stop_resp2.get("request_id"), "req-stop-legacy")
+        self.assertEqual(stop_resp2.get("data", {}).get("status"), "accepted")
+        self.assertTrue(stop_resp2.get("data", {}).get("accepted"))
+        self.assertIs(stop_resp2.get("data", {}).get("state_confirmed"), False)
+        self.assertTrue(stop_resp2.get("data", {}).get("stopped"))
+
+        # 3. Move (ctrl.motion.move and motion.move)
+        move_resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-move-exact",
+            "data": {"pan_deg": 30.0, "tilt_deg": 100.0, "duration_ms": 300},
+        })
+        self.assertEqual(move_resp.get("type"), "sys.ack")
+        self.assertEqual(move_resp.get("request_id"), "req-move-exact")
+        self.assertEqual(move_resp.get("data", {}).get("status"), "accepted")
+        self.assertTrue(move_resp.get("data", {}).get("accepted"))
+        self.assertIs(move_resp.get("data", {}).get("state_confirmed"), False)
+
+        move_resp2 = self._process_cmd({
+            "type": "motion.move",
+            "request_id": "req-move-legacy",
+            "data": {"pan_deg": 0.0, "tilt_deg": 90.0, "duration_ms": 200},
+        })
+        self.assertEqual(move_resp2.get("type"), "sys.ack")
+        self.assertEqual(move_resp2.get("request_id"), "req-move-legacy")
+        self.assertEqual(move_resp2.get("data", {}).get("status"), "accepted")
+        self.assertTrue(move_resp2.get("data", {}).get("accepted"))
+        self.assertIs(move_resp2.get("data", {}).get("state_confirmed"), False)
+
+        # 4. Camera lease acquire & release
+        acq_resp = self._process_cmd({
+            "type": "ctrl.camera.acquire",
+            "request_id": "req-cam-acq",
+            "data": {"client_id": "test-client-1", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(acq_resp.get("type"), "sys.ack")
+        self.assertEqual(acq_resp.get("request_id"), "req-cam-acq")
+        self.assertTrue(acq_resp.get("data", {}).get("accepted"))
+
+        rel_resp = self._process_cmd({
+            "type": "ctrl.camera.release",
+            "request_id": "req-cam-rel",
+            "data": {"client_id": "test-client-1"},
+        })
+        self.assertEqual(rel_resp.get("type"), "sys.ack")
+        self.assertEqual(rel_resp.get("request_id"), "req-cam-rel")
+        self.assertTrue(rel_resp.get("data", {}).get("accepted"))
+
+        # 5. Expression play
+        exp_resp = self._process_cmd({
+            "type": "ctrl.expression.play",
+            "request_id": "req-exp-play",
+            "data": {"preset": "happy", "text": "Hello world"},
+        })
+        self.assertEqual(exp_resp.get("type"), "sys.ack")
+        self.assertEqual(exp_resp.get("request_id"), "req-exp-play")
+        self.assertTrue(exp_resp.get("data", {}).get("accepted"))
+        self.assertEqual(exp_resp.get("data", {}).get("preset"), "happy")
+
+        # 6. Expression audio follow
+        follow_resp = self._process_cmd({
+            "type": "ctrl.expression.audio_follow",
+            "request_id": "req-exp-follow",
+            "data": {"enabled": True},
+        })
+        self.assertEqual(follow_resp.get("type"), "sys.ack")
+        self.assertEqual(follow_resp.get("request_id"), "req-exp-follow")
+        self.assertTrue(follow_resp.get("data", {}).get("enabled"))
+
+        # 7. Tool response
+        tool_resp = self._process_cmd({
+            "type": "tool.response",
+            "request_id": "req-tool-resp-legit",
+            "status": "succeeded",
+            "result": {"status": "done"},
+        })
+        self.assertEqual(tool_resp.get("type"), "sys.ack")
+        self.assertEqual(tool_resp.get("request_id"), "req-tool-resp-legit")
+        self.assertEqual(tool_resp.get("data", {}).get("status"), "received")
 
     def test_touch_event_formatting(self) -> None:
         """Verifies hardware touch events are formatted according to contract envelope and schema."""
@@ -1164,7 +1567,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp2.get("code"), 0)
 
     def test_ctrl_motion_stop(self) -> None:
-        """Verifies ctrl.motion.stop stops gimbal and returns sys.ack with stopped: True."""
+        """Verifies ctrl.motion.stop stops gimbal and returns sys.ack with stopped: True and state_confirmed: False."""
         resp = self._process_cmd({
             "type": "ctrl.motion.stop",
             "request_id": "req-motion-stop-1",
@@ -1175,6 +1578,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("request_id"), "req-motion-stop-1")
         self.assertEqual(resp.get("data", {}).get("status"), "accepted")
         self.assertTrue(resp.get("data", {}).get("accepted"))
+        self.assertIs(resp.get("data", {}).get("state_confirmed"), False)
         self.assertTrue(resp.get("data", {}).get("stopped"))
 
     def test_ctrl_expression_play_hardware_error_in_strict_mode(self) -> None:
@@ -1266,7 +1670,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("error", {}).get("code"), "HARDWARE_FAULT")
 
     def test_motion_move_success_ack_is_accepted_not_succeeded(self) -> None:
-        """interfaces.md 6.1: a successful motion ACK means accepted, not succeeded."""
+        """interfaces.md 6.1 & CR-002: a successful motion ACK means accepted, not succeeded, state_confirmed: false."""
         resp = self._process_cmd({
             "type": "ctrl.motion.move",
             "request_id": "req-accepted-level",
@@ -1276,6 +1680,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("code"), 0)
         self.assertEqual(resp.get("data", {}).get("status"), "accepted")
         self.assertTrue(resp.get("data", {}).get("accepted"))
+        self.assertIs(resp.get("data", {}).get("state_confirmed"), False)
         self.assertNotEqual(resp.get("data", {}).get("status"), "succeeded")
 
     # ------------------------------------------------------------------
@@ -1444,12 +1849,13 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(recovered.get("code"), 0)
         self.assertEqual(recovered.get("request_id"), "req-default-leak-recovered")
         self.assertEqual(recovered.get("data", {}).get("status"), "accepted")
+        self.assertIs(recovered.get("data", {}).get("state_confirmed"), False)
 
     def test_motion_success_ack_is_accepted_not_succeeded_default_mode(self) -> None:
         """Req 6 (CR-002 boundary): real C bridge test -- a succeeding move at
         default init (strict_mode == false) yields sys.ack code:0 with
-        data.status == "accepted" and data.accepted == true, and must never
-        claim succeeded/completed.
+        data.status == "accepted", data.accepted == true, and data.state_confirmed == false,
+        and must never claim succeeded/completed.
         """
         self._assert_default_mode()
 
@@ -1462,10 +1868,58 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("code"), 0)
         self.assertEqual(resp.get("data", {}).get("status"), "accepted")
         self.assertTrue(resp.get("data", {}).get("accepted"))
+        self.assertIs(resp.get("data", {}).get("state_confirmed"), False)
 
         raw = json.dumps(resp)
         self.assertNotIn("succeeded", raw, "a device ack must not claim physical completion")
         self.assertNotIn("completed", raw, "a device ack must not claim physical completion")
+        self.assertNotIn('"state_confirmed": true', raw, "a device ack must not claim state confirmed")
+        self.assertIn('"state_confirmed": false', raw, "a device ack must explicitly mark state unconfirmed")
+
+    def test_cr002_motion_ack_semantics_contract(self) -> None:
+        """CR-002 & R3a adjudication: motion move and stop ACK-only semantics.
+        sys.ack must contain status: "accepted", accepted: True, state_confirmed: False.
+        Under no circumstance may it claim physical completion (succeeded/completed/state_confirmed: true).
+        """
+        # Test ctrl.motion.move
+        move_resp = self._process_cmd({
+            "type": "ctrl.motion.move",
+            "request_id": "req-cr002-move-contract",
+            "data": {"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 300},
+        })
+        self.assertEqual(move_resp.get("type"), "sys.ack")
+        self.assertEqual(move_resp.get("code"), 0)
+        self.assertEqual(move_resp.get("request_id"), "req-cr002-move-contract")
+        move_data = move_resp.get("data", {})
+        self.assertEqual(move_data.get("status"), "accepted")
+        self.assertIs(move_data.get("accepted"), True)
+        self.assertIs(move_data.get("state_confirmed"), False)
+        self.assertAlmostEqual(move_data.get("pan_deg"), 90.0, places=1)
+        self.assertAlmostEqual(move_data.get("tilt_deg"), 120.0, places=1)
+        self.assertEqual(move_data.get("duration_ms"), 300)
+
+        # Test ctrl.motion.stop
+        stop_resp = self._process_cmd({
+            "type": "ctrl.motion.stop",
+            "request_id": "req-cr002-stop-contract",
+            "data": {"emergency": True},
+        })
+        self.assertEqual(stop_resp.get("type"), "sys.ack")
+        self.assertEqual(stop_resp.get("code"), 0)
+        self.assertEqual(stop_resp.get("request_id"), "req-cr002-stop-contract")
+        stop_data = stop_resp.get("data", {})
+        self.assertEqual(stop_data.get("status"), "accepted")
+        self.assertIs(stop_data.get("accepted"), True)
+        self.assertIs(stop_data.get("state_confirmed"), False)
+        self.assertIs(stop_data.get("stopped"), True)
+
+        # Wire payload negative checks
+        for resp in (move_resp, stop_resp):
+            wire = json.dumps(resp)
+            self.assertNotIn("succeeded", wire)
+            self.assertNotIn("completed", wire)
+            self.assertNotIn('"state_confirmed": true', wire)
+            self.assertIn('"state_confirmed": false', wire)
 
     # ------------------------------------------------------------------
     # WP2 -- request_id correlation

@@ -624,26 +624,30 @@ class DeskAgentHostApp:
         An ACK only ever proves acceptance, so a legacy ``completed``/``succeeded``
         claim from the hardware link is deliberately downgraded to ``accepted``
         and never surfaces as a success (interfaces.md 6.1 R1).
+        Under CR-002 and R3a/R12 protocol adjudication, motion is strictly ACK-only
+        (open-loop PWM without encoder feedback), so state_confirmed is ALWAYS False.
         """
         if not isinstance(ack, dict):
             return "unknown", False, False, "OPERATION_TIMEOUT", True
 
         raw_status = str(ack.get("status", "")).lower()
         accepted = bool(ack.get("accepted", False))
-        state_confirmed = bool(ack.get("state_confirmed", False))
         error_code = ack.get("error_code")
         retryable = bool(ack.get("retryable", False))
+
+        if error_code == "STATE_UNCONFIRMED":
+            return "unknown", False, False, "STATE_UNCONFIRMED", False
 
         if raw_status in ("failed", "unknown"):
             if error_code not in cls._MOTION_ERROR_CODES:
                 error_code = "HARDWARE_FAULT" if raw_status == "failed" else "OPERATION_TIMEOUT"
-            return raw_status, False, state_confirmed, error_code, retryable
+            return raw_status, False, False, error_code, retryable
 
         if raw_status in ("accepted", "completed", "succeeded", "in_progress") or accepted:
-            return "accepted", True, state_confirmed, None, False
+            return "accepted", True, False, None, False
 
         # Unrecognized shape: do not guess success.
-        return "unknown", False, state_confirmed, "OPERATION_TIMEOUT", True
+        return "unknown", False, False, "OPERATION_TIMEOUT", True
 
     def _handle_motion_move(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
@@ -806,7 +810,12 @@ def make_request_handler(app: DeskAgentHostApp):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 uptime = int(time.time() - app.start_time)
-                resp = json.dumps({"status": "healthy", "uptime_s": uptime}).encode()
+                resp = json.dumps({
+                    "status": "healthy",
+                    "uptime_s": uptime,
+                    "robot_connected": app.has_robot_hardware_connected(),
+                    "device_id": app.config.get("device_id", "desk-agent-r1-host"),
+                }).encode()
                 self.wfile.write(resp)
             elif self.path.startswith("/api/camera/frame"):
                 if not self._check_auth():
@@ -881,11 +890,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Desk Agent R1 Host Daemon")
     parser.add_argument("--config", "-c", type=str, help="Path to config.json")
     parser.add_argument("--port", "-p", type=int, help="Override HTTP server port")
+    parser.add_argument("--host", "-H", type=str, help="Override HTTP server host")
+    parser.add_argument("--check-config", action="store_true", help="Perform pre-flight configuration check and exit")
     args = parser.parse_args()
+
+    if args.check_config:
+        try:
+            test_app = DeskAgentHostApp(config_path=args.config)
+            test_app.close()
+            print(json.dumps({"status": "valid", "config": args.config or "default"}))
+            sys.exit(0)
+        except Exception as exc:
+            print(json.dumps({"status": "invalid", "error": str(exc)}), file=sys.stderr)
+            sys.exit(1)
 
     app = DeskAgentHostApp(config_path=args.config)
     port = args.port or app.config.get("server", {}).get("port", 8088)
-    host = app.config.get("server", {}).get("host", "127.0.0.1")
+    host = args.host or app.config.get("server", {}).get("host", "127.0.0.1")
 
     handler_cls = make_request_handler(app)
     httpd = ThreadedHTTPServer((host, port), handler_cls)

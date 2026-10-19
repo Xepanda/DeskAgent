@@ -2,7 +2,8 @@
 Unit and contract tests for Desk Agent R1 TClaw Dialogue Engine and Tool Gateway.
 Compiles and loads the C shared library for desk_hardware, desk_arbiter, and desk_tclaw_bridge,
 verifying dialogue turn state machine, audio playback acquisition, user speech/touch interruption,
-and MCP external tool RequestEnvelope dispatch / ResponseEnvelope handling.
+MCP external tool RequestEnvelope dispatch / ResponseEnvelope handling, CR-002 motion semantics,
+built-in hardware tool execution, strict camera capture gating, and single-board self-test.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 
 TCLAW_STATE_IDLE = 0
@@ -28,10 +30,42 @@ TUYA_CLOUD_RECONNECTING = 4
 TUYA_CLOUD_ERROR = 5
 
 DESK_RES_AUDIO_PLAYBACK = 0
+DESK_RES_AUDIO_RECORD = 1
+DESK_RES_CAMERA_SENSOR = 2
+DESK_RES_MOTION_GIMBAL = 3
+DESK_RES_DISPLAY_UI = 4
+
 DESK_OWNER_NONE = 0
+DESK_OWNER_IDLE = 1
 DESK_OWNER_TCLAW_VOICE = 2
+DESK_OWNER_SDK_REMOTE = 3
+DESK_OWNER_LAN_CAMERA = 4
+DESK_OWNER_SYSTEM_ALERT = 5
+
+DESK_HW_OK = 0
+DESK_HW_ERR_INVALID_ARG = -1
+DESK_HW_ERR_UNAVAILABLE = -2
+DESK_HW_ERR_TIMEOUT = -3
+DESK_HW_ERR_IO = -4
+DESK_HW_ERR_BUSY = -5
 
 TOOL_DISPATCH_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+
+
+class DeskTclawSelfTest(ctypes.Structure):
+    _fields_ = [
+        ("initialized", ctypes.c_bool),
+        ("state", ctypes.c_int),
+        ("tuya_state", ctypes.c_int),
+        ("turn_count", ctypes.c_int),
+        ("session_id", ctypes.c_char * 128),
+        ("last_response", ctypes.c_char * 256),
+        ("pending_tool", ctypes.c_char * 128),
+        ("audio_owner", ctypes.c_int),
+        ("motion_owner", ctypes.c_int),
+        ("camera_owner", ctypes.c_int),
+        ("last_error_code", ctypes.c_int),
+    ]
 
 
 class TestTClawDialogue(unittest.TestCase):
@@ -69,6 +103,23 @@ class TestTClawDialogue(unittest.TestCase):
         cls.lib.desk_arbiter_get_owner.restype = ctypes.c_int
         cls.lib.desk_arbiter_get_owner.argtypes = [ctypes.c_int]
 
+        cls.lib.desk_arbiter_acquire.restype = ctypes.c_int
+        cls.lib.desk_arbiter_acquire.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32]
+
+        cls.lib.desk_arbiter_release.restype = None
+        cls.lib.desk_arbiter_release.argtypes = [ctypes.c_int, ctypes.c_int]
+
+        cls.lib.desk_hardware_display_get_expression.restype = ctypes.c_int
+        cls.lib.desk_hardware_display_get_expression.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+
+        cls.lib.desk_hardware_camera_inject_frame.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_inject_frame.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
+
         cls.lib.desk_tclaw_init.restype = ctypes.c_int
         cls.lib.desk_tclaw_init.argtypes = []
 
@@ -77,6 +128,9 @@ class TestTClawDialogue(unittest.TestCase):
 
         cls.lib.desk_tclaw_get_state.restype = ctypes.c_int
         cls.lib.desk_tclaw_get_state.argtypes = []
+
+        cls.lib.desk_tclaw_is_initialized.restype = ctypes.c_bool
+        cls.lib.desk_tclaw_is_initialized.argtypes = []
 
         cls.lib.desk_tclaw_inject_text.restype = ctypes.c_int
         cls.lib.desk_tclaw_inject_text.argtypes = [ctypes.c_char_p]
@@ -145,6 +199,53 @@ class TestTClawDialogue(unittest.TestCase):
 
         cls.lib.desk_tclaw_reset.restype = None
         cls.lib.desk_tclaw_reset.argtypes = []
+
+        # Self-Test and Diagnostics API
+        cls.lib.desk_tclaw_self_test.restype = ctypes.c_int
+        cls.lib.desk_tclaw_self_test.argtypes = []
+
+        cls.lib.desk_tclaw_self_test_report.restype = ctypes.c_int
+        cls.lib.desk_tclaw_self_test_report.argtypes = [ctypes.POINTER(DeskTclawSelfTest)]
+
+        # Built-in Tool Execution & Timeout API
+        cls.lib.desk_tclaw_execute_tool.restype = ctypes.c_int
+        cls.lib.desk_tclaw_execute_tool.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+
+        cls.lib.desk_tclaw_is_builtin_tool.restype = ctypes.c_bool
+        cls.lib.desk_tclaw_is_builtin_tool.argtypes = [ctypes.c_char_p]
+
+        cls.lib.desk_tclaw_set_tool_timeout_ms.restype = None
+        cls.lib.desk_tclaw_set_tool_timeout_ms.argtypes = [ctypes.c_uint32]
+
+        cls.lib.desk_tclaw_get_tool_timeout_ms.restype = ctypes.c_uint32
+        cls.lib.desk_tclaw_get_tool_timeout_ms.argtypes = []
+
+        cls.lib.desk_tclaw_handle_tool_timeout.restype = ctypes.c_int
+        cls.lib.desk_tclaw_handle_tool_timeout.argtypes = [ctypes.c_char_p]
+
+        cls.lib.desk_tclaw_poll_timeouts.restype = ctypes.c_int
+        cls.lib.desk_tclaw_poll_timeouts.argtypes = [ctypes.c_uint64]
+
+        cls.lib.desk_tclaw_get_pending_tool.restype = ctypes.c_char_p
+        cls.lib.desk_tclaw_get_pending_tool.argtypes = []
+
+        cls.lib.desk_tclaw_get_pending_request_id.restype = ctypes.c_char_p
+        cls.lib.desk_tclaw_get_pending_request_id.argtypes = []
+
+        cls.lib.desk_tclaw_on_tuya_mqtt_connected.restype = ctypes.c_int
+        cls.lib.desk_tclaw_on_tuya_mqtt_connected.argtypes = []
+
+        cls.lib.desk_tclaw_on_tuya_mqtt_disconnected.restype = ctypes.c_int
+        cls.lib.desk_tclaw_on_tuya_mqtt_disconnected.argtypes = []
+
+        cls.lib.desk_tclaw_on_tuya_netcfg_started.restype = ctypes.c_int
+        cls.lib.desk_tclaw_on_tuya_netcfg_started.argtypes = []
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -349,4 +450,293 @@ class TestTClawDialogue(unittest.TestCase):
         self.assertEqual(rc_get, 0)
         self.assertEqual(res_buf.value.decode("utf-8"), '{"status": "success", "brightness": 255}')
 
+    # ----------------------------------------------------------------------
+    # R4 New Contracts: Self-Test, Diagnostics, Built-in Tools, CR-002, Timeouts
+    # ----------------------------------------------------------------------
+    def test_tclaw_self_test_and_diagnostics(self) -> None:
+        """Verifies single-board self-test desk_tclaw_self_test() and diagnostic reporting."""
+        # 1. Operational self-test PASS
+        rc = self.lib.desk_tclaw_self_test()
+        self.assertEqual(rc, DESK_HW_OK)
 
+        # 2. Detailed diagnostics report inspects safe state
+        report = DeskTclawSelfTest()
+        rc_diag = self.lib.desk_tclaw_self_test_report(ctypes.byref(report))
+        self.assertEqual(rc_diag, DESK_HW_OK)
+        self.assertTrue(report.initialized)
+        self.assertEqual(report.state, TCLAW_STATE_IDLE)
+        self.assertEqual(report.tuya_state, TUYA_CLOUD_DISCONNECTED)
+        self.assertEqual(report.audio_owner, DESK_OWNER_NONE)
+        self.assertEqual(report.motion_owner, DESK_OWNER_NONE)
+        self.assertEqual(report.camera_owner, DESK_OWNER_NONE)
+        self.assertEqual(report.last_error_code, 0)
+
+        # 3. Uninitialized failure: when reset, self-test fails with DESK_HW_ERR_UNAVAILABLE
+        self.lib.desk_tclaw_reset()
+        rc_uninit = self.lib.desk_tclaw_self_test()
+        self.assertEqual(rc_uninit, DESK_HW_ERR_UNAVAILABLE)
+
+        uninit_report = DeskTclawSelfTest()
+        rc_uninit_report = self.lib.desk_tclaw_self_test_report(ctypes.byref(uninit_report))
+        self.assertEqual(rc_uninit_report, DESK_HW_ERR_UNAVAILABLE)
+        self.assertFalse(uninit_report.initialized)
+
+        # 4. Re-initialization restores operational status
+        self.lib.desk_tclaw_init()
+        self.assertEqual(self.lib.desk_tclaw_self_test(), DESK_HW_OK)
+
+    def test_builtin_motion_tool_cr002_compliance(self) -> None:
+        """Verifies built-in motion tool execution complies strictly with CR-002 (accepted=True, state_confirmed=False)."""
+        resp_buf = ctypes.create_string_buffer(2048)
+        rc = self.lib.desk_tclaw_execute_tool(
+            b"req-mv-cr002",
+            b"motion.move",
+            b'{"pan_deg": 120.0, "tilt_deg": 115.0, "duration_ms": 400}',
+            resp_buf,
+            2048,
+        )
+        self.assertEqual(rc, DESK_HW_OK)
+
+        resp_env = json.loads(resp_buf.value.decode("utf-8"))
+        self.assertEqual(resp_env.get("schema_version"), "1.0.0")
+        self.assertEqual(resp_env.get("request_id"), "req-mv-cr002")
+        # CR-002: status MUST be 'accepted', NOT 'succeeded' or 'completed'
+        self.assertEqual(resp_env.get("status"), "accepted")
+        self.assertTrue(resp_env.get("result", {}).get("accepted"))
+        self.assertFalse(resp_env.get("result", {}).get("state_confirmed"))
+        self.assertEqual(resp_env.get("result", {}).get("pan_deg"), 120.0)
+        self.assertEqual(resp_env.get("result", {}).get("tilt_deg"), 115.0)
+
+        # Gimbal arbiter must be cleanly released
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_NONE)
+
+        # Test motion stop tool
+        rc_stop = self.lib.desk_tclaw_execute_tool(
+            b"req-stop-001",
+            b"motion.stop",
+            b'{"emergency": false}',
+            resp_buf,
+            2048,
+        )
+        self.assertEqual(rc_stop, DESK_HW_OK)
+        stop_env = json.loads(resp_buf.value.decode("utf-8"))
+        self.assertEqual(stop_env.get("status"), "accepted")
+        self.assertTrue(stop_env.get("result", {}).get("accepted"))
+        self.assertFalse(stop_env.get("result", {}).get("state_confirmed"))
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_NONE)
+
+    def test_builtin_motion_arbitration_rejection(self) -> None:
+        """Verifies motion tool execution is rejected with RESOURCE_BUSY when held by another owner."""
+        # Hold lock with SYSTEM_ALERT
+        self.lib.desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SYSTEM_ALERT, 0)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_SYSTEM_ALERT)
+
+        resp_buf = ctypes.create_string_buffer(2048)
+        rc = self.lib.desk_tclaw_execute_tool(
+            b"req-mv-busy",
+            b"motion.move",
+            b'{"pan_deg": 90.0, "tilt_deg": 120.0, "duration_ms": 300}',
+            resp_buf,
+            2048,
+        )
+        self.assertEqual(rc, DESK_HW_ERR_BUSY)
+        resp_env = json.loads(resp_buf.value.decode("utf-8"))
+        self.assertEqual(resp_env.get("status"), "failed")
+        self.assertEqual(resp_env.get("error", {}).get("code"), "RESOURCE_BUSY")
+        self.assertTrue(resp_env.get("error", {}).get("retryable"))
+
+        # Release SYSTEM_ALERT lock
+        self.lib.desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SYSTEM_ALERT)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_NONE)
+
+    def test_builtin_camera_capture_real_and_unavailable(self) -> None:
+        """Verifies camera tool fails closed when no frame is present, and succeeds when real JPEG is injected."""
+        resp_buf = ctypes.create_string_buffer(2048)
+
+        # 1. No frame present: must fail closed, strictly never synthesizing dummy image
+        rc_no_frame = self.lib.desk_tclaw_execute_tool(
+            b"req-cam-001",
+            b"camera.capture",
+            b'{"timeout_ms": 1000}',
+            resp_buf,
+            2048,
+        )
+        self.assertEqual(rc_no_frame, DESK_HW_ERR_UNAVAILABLE)
+        env_no_frame = json.loads(resp_buf.value.decode("utf-8"))
+        self.assertEqual(env_no_frame.get("status"), "failed")
+        self.assertEqual(env_no_frame.get("error", {}).get("code"), "HARDWARE_FAULT")
+        self.assertIn("unavailable", env_no_frame.get("error", {}).get("message"))
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR), DESK_OWNER_NONE)
+
+        # 2. Inject real camera frame: capture succeeds
+        fake_jpeg = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xFF\xDB\x00C\x00"
+        self.lib.desk_hardware_camera_inject_frame(fake_jpeg, len(fake_jpeg), 12345)
+
+        rc_cam = self.lib.desk_tclaw_execute_tool(
+            b"req-cam-002",
+            b"camera.capture",
+            b'{"timeout_ms": 1000}',
+            resp_buf,
+            2048,
+        )
+        self.assertEqual(rc_cam, DESK_HW_OK)
+        env_cam = json.loads(resp_buf.value.decode("utf-8"))
+        self.assertEqual(env_cam.get("status"), "succeeded")
+        self.assertEqual(env_cam.get("result", {}).get("format"), "jpeg")
+        self.assertEqual(env_cam.get("result", {}).get("frame_len"), len(fake_jpeg))
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR), DESK_OWNER_NONE)
+
+    def test_builtin_expression_tool(self) -> None:
+        """Verifies screen expression tool updates display and returns contract response."""
+        resp_buf = ctypes.create_string_buffer(2048)
+        rc = self.lib.desk_tclaw_execute_tool(
+            b"req-exp-001",
+            b"expression.set",
+            b'{"preset": "happy", "status_text": "Good Morning"}',
+            resp_buf,
+            2048,
+        )
+        self.assertEqual(rc, DESK_HW_OK)
+        env = json.loads(resp_buf.value.decode("utf-8"))
+        self.assertEqual(env.get("status"), "succeeded")
+        self.assertEqual(env.get("result", {}).get("preset"), "happy")
+        self.assertEqual(env.get("result", {}).get("status_text"), "Good Morning")
+
+        # Verify display readback
+        preset_buf = ctypes.create_string_buffer(64)
+        status_buf = ctypes.create_string_buffer(128)
+        self.lib.desk_hardware_display_get_expression(preset_buf, 64, status_buf, 128)
+        self.assertEqual(preset_buf.value.decode("utf-8"), "happy")
+        self.assertEqual(status_buf.value.decode("utf-8"), "Good Morning")
+
+    def test_cr002_accepted_tool_response_handling(self) -> None:
+        """Verifies CR-002 'accepted' tool responses are treated as successful turns rather than errors."""
+        accepted_payload = b'{"pan_deg": 90.0, "tilt_deg": 120.0, "accepted": true, "state_confirmed": false}'
+        rc = self.lib.desk_tclaw_handle_tool_response(
+            b"req-mv-acc",
+            b"accepted",
+            accepted_payload,
+            None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_SPEAKING)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_TCLAW_VOICE)
+
+        # Spoken text must reflect accepted action and NOT report error
+        resp_buf = ctypes.create_string_buffer(512)
+        self.lib.desk_tclaw_get_last_response(resp_buf, 512)
+        resp_text = resp_buf.value.decode("utf-8")
+        self.assertIn("Action accepted successfully", resp_text)
+        self.assertNotIn("Action encountered an error", resp_text)
+
+        # End turn
+        self.lib.desk_tclaw_interrupt()
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_IDLE)
+
+    def test_tool_timeout_handling_and_recovery(self) -> None:
+        """Verifies external tool execution timeout handling and clean recovery."""
+        # Register a dispatcher that simulates hang (does not reply)
+        @TOOL_DISPATCH_CB
+        def hanging_dispatcher(env_ptr, user_data):
+            return 0  # Accepts request but never sends back response
+
+        self.lib.desk_tclaw_register_tool_dispatcher(hanging_dispatcher, None)
+
+        rc = self.lib.desk_tclaw_trigger_tool_call(
+            b"req-hang-001",
+            b"ha.slow_service",
+            b'{"domain": "climate", "service": "set_temperature"}',
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_TOOL_CALLING)
+        self.assertEqual(self.lib.desk_tclaw_get_pending_tool(), b"ha.slow_service")
+        self.assertEqual(self.lib.desk_tclaw_get_pending_request_id(), b"req-hang-001")
+
+        # Explicit timeout handling
+        rc_timeout = self.lib.desk_tclaw_handle_tool_timeout(b"req-hang-001")
+        self.assertEqual(rc_timeout, 0)
+
+        # Transitions to SPEAKING error notice
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_SPEAKING)
+        resp_buf = ctypes.create_string_buffer(512)
+        self.lib.desk_tclaw_get_last_response(resp_buf, 512)
+        resp_text = resp_buf.value.decode("utf-8")
+        self.assertIn("Action encountered an error", resp_text)
+        self.assertIn("OPERATION_TIMEOUT", resp_text)
+
+        # End turn
+        self.lib.desk_tclaw_interrupt()
+        self.assertEqual(self.lib.desk_tclaw_get_state(), TCLAW_STATE_IDLE)
+
+    def test_tuya_connection_security_and_no_fake_connection(self) -> None:
+        """Verifies Tuya cloud connection rejects invalid/empty credentials and never fakes connection."""
+        # 1. Null / empty connect attempts are rejected
+        rc_null = self.lib.desk_tclaw_tuya_session_connect(None, None, None)
+        self.assertEqual(rc_null, -1)
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
+
+        rc_empty = self.lib.desk_tclaw_tuya_session_connect(b"", b"", b"")
+        self.assertEqual(rc_empty, -1)
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
+
+        # 2. Reconnecting without credentials fails into ERROR
+        self.lib.desk_tclaw_reset()
+        rc_rec_fail = self.lib.desk_tclaw_tuya_session_reconnect()
+        self.assertEqual(rc_rec_fail, -1)
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_ERROR)
+
+    def test_tuya_mqtt_state_machine_hooks(self) -> None:
+        """Verifies desk_tclaw_on_tuya_mqtt_connected and disconnected update state, screen and audio."""
+        self.lib.desk_tclaw_init()
+
+        preset_buf = ctypes.create_string_buffer(64)
+        text_buf = ctypes.create_string_buffer(256)
+
+        # 1. Netcfg started
+        rc_net = self.lib.desk_tclaw_on_tuya_netcfg_started()
+        self.assertEqual(rc_net, 0)
+        self.lib.desk_hardware_display_get_expression(preset_buf, 64, text_buf, 256)
+        self.assertEqual(preset_buf.value.decode("utf-8"), "thinking")
+        self.assertEqual(text_buf.value.decode("utf-8"), "BLE Netcfg")
+
+        # 2. Connected
+        rc_conn = self.lib.desk_tclaw_on_tuya_mqtt_connected()
+        self.assertEqual(rc_conn, 0)
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_CONNECTED)
+        self.lib.desk_hardware_display_get_expression(preset_buf, 64, text_buf, 256)
+        self.assertEqual(preset_buf.value.decode("utf-8"), "happy")
+        self.assertEqual(text_buf.value.decode("utf-8"), "Online")
+
+        # Audio playback lock must be released (arbiter clean)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_NONE)
+
+        # 3. Disconnected
+        rc_disc = self.lib.desk_tclaw_on_tuya_mqtt_disconnected()
+        self.assertEqual(rc_disc, 0)
+        self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
+        self.lib.desk_hardware_display_get_expression(preset_buf, 64, text_buf, 256)
+        self.assertEqual(preset_buf.value.decode("utf-8"), "idle")
+        self.assertEqual(text_buf.value.decode("utf-8"), "Cloud Offline")
+
+    def test_dialogue_motion_voice_intent_routing(self) -> None:
+        """Verifies voice dialogue intent routing for motion prompts dispatches ctrl.motion.move."""
+        dispatched: list[dict] = []
+
+        @TOOL_DISPATCH_CB
+        def dispatcher(env_ptr, user_data):
+            raw = ctypes.string_at(env_ptr).decode("utf-8")
+            dispatched.append(json.loads(raw))
+            return 0
+
+        self.lib.desk_tclaw_register_tool_dispatcher(dispatcher, None)
+
+        rc = self.lib.desk_tclaw_inject_text(b"Please look up at the ceiling")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["operation"], "ctrl.motion.move")
+        self.assertEqual(dispatched[0]["arguments"]["pan_deg"], 90.0)
+        self.assertEqual(dispatched[0]["arguments"]["tilt_deg"], 110.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

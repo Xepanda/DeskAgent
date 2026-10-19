@@ -186,7 +186,30 @@ int desk_sdk_bridge_set_pairing_code(const char *code);
 bool desk_sdk_bridge_is_pairing_code_configured(void);
 
 /**
+ * @brief Parse top-level string field from JSON payload.
+ *
+ * Scans only top-level (depth==1) keys in a JSON object, ignoring any nested
+ * occurrences inside child objects or arrays, string literals, or escaped quotes.
+ *
+ * @param json Input JSON string (must start with '{').
+ * @param key Top-level key name to search for (without quotes).
+ * @param out_val Buffer to receive the extracted string value (unescaped).
+ * @param max_len Maximum length of out_val buffer including null terminator.
+ * @return true if key was found at top level and parsed into out_val, false otherwise.
+ */
+bool json_parse_top_level_str(const char *json, const char *key, char *out_val, size_t max_len);
+
+/**
  * @brief Process incoming JSON command from Python SDK client.
+ *
+ * Supported command types include:
+ * - sys.ping -> sys.pong
+ * - sys.client.hello -> sys.ack (capabilities & auth negotiation)
+ * - ctrl.motion.move / ctrl.motion.stop -> sys.ack with CR-002 ACK-only semantics
+ *   (status="accepted", accepted=true, state_confirmed=false)
+ * - ctrl.camera.acquire / ctrl.camera.release / ctrl.camera.capture
+ * - ctrl.microphone.open / ctrl.microphone.close
+ * - ctrl.expression.play / ctrl.expression.set / ctrl.expression.audio_follow
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
 #define desk_sdk_bridge_process_line desk_sdk_bridge_process_command

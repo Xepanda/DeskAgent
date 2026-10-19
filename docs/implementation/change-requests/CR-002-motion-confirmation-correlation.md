@@ -3,7 +3,7 @@
 - **提出方**：A0 架构与协议
 - **提出日期**：2026-10-17
 - **关联**：PR #11 审查工作包 1、`docs/implementation/interfaces.md` §6.1 表行 4、§6.6 裁决 R6
-- **状态**：**待裁决 (OPEN)** — 阻塞 `STATE_UNCONFIRMED` 主动确认窗口的实现
+- **状态**：**已裁决 (RESOLVED - ACK-ONLY FOR R1)** — 明确 ACK-Only 模式，解除 R3a/R3b 阻塞
 - **影响模块**：A2（`firmware/components/desk_sdk_bridge/`）、A3（`host/desk_agent/`）
 
 ---
@@ -83,8 +83,17 @@ def _start_job(self, message_type: str, data: dict) -> Job:
 
 ---
 
-## 5. 请求裁决
+## 5. A0 R3a 正式裁决结论 (2026-10-18)
 
-请 A0 / 产品 / 官方 SDK 维护方就 Q1–Q3 给出结论。在裁决前，
-`interfaces.md` §1.4.3 对**运动类**命令的强制力降级为"不得伪报成功"，
-而非"必须产出 `STATE_UNCONFIRMED`"。
+依据 `docs/implementation/r3a-stm32-protocol-adjudication.md` 与 `contracts/schemas/stm32_body_protocol.json`，A0 对 Q1–Q3 正式裁决如下：
+
+1. **硬件现实与 Q1 裁决**：
+   - 经实板硬件证据核验，Seeed SenseCAP Watcher 机身舵机为开环 PWM 控制，**物理底座不存在任何绝对值角度编码器、位置传感器或机械到位行程开关**。
+   - STM32 硬件上不具备物理到位的检测能力，采纳方案 **(c)**：运动类指令在 DeskAgent R1 阶段正式锁定为 **ACK-Only 语义**。
+2. **终态契约与 Q3 裁决**：
+   - 固件与驱动在收到 STM32 ACK 后，回包终态严格定义为 `status: "accepted"`，`accepted: true`，`state_confirmed: false`。
+   - **绝对禁止**将指令下发成功冒充为物理到位（严禁返回 `succeeded` / `completed` / `state_confirmed: true`）。
+   - 在未增设物理传感器的前提下，不虚构两阶段确认窗口，避免未经对账的启发式猜测。
+3. **超时与重试时序（Q2 裁决）**：
+   - ESP32 ↔ STM32 串口下发与 ACK 确认窗口超时锁定为 **500 ms**；
+   - 超时未响应最多重试 **2 次**（总尝试 3 次），重试帧必须保持原 `sequence` 不变；连续重试耗尽后判定上游不可达（`DESK_HW_ERR_TIMEOUT` $\rightarrow$ `UPSTREAM_UNAVAILABLE`）。

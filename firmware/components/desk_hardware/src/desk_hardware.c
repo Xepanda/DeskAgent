@@ -9,9 +9,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/time.h>
+#include <time.h>
 
 #ifdef ESP_PLATFORM
 #include "driver/uart.h"
+#endif
+
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+#include "desk_watcher_board.h"
 #endif
 
 /* --- Motion & STM32 Link State --- */
@@ -22,6 +28,39 @@ static uint8_t s_last_mcu_frame[64];
 static size_t s_last_mcu_frame_len = 0;
 static desk_hardware_mcu_tx_cb_t s_mcu_tx_cb = NULL;
 static void *s_mcu_tx_user_data = NULL;
+static void default_mcu_uart_sender(const uint8_t *frame_data, size_t frame_len, void *user_data);
+
+/* Transaction state and timing */
+typedef enum {
+    MCU_TX_IDLE = 0,
+    MCU_TX_WAITING_ACK,
+    MCU_TX_ACKED,
+    MCU_TX_NACKED,
+    MCU_TX_TIMEOUT
+} mcu_tx_state_t;
+
+static volatile mcu_tx_state_t s_pending_state = MCU_TX_IDLE;
+static volatile uint32_t s_pending_seq = 0;
+static volatile uint8_t s_pending_err_code = 0;
+
+static uint32_t s_mcu_ack_timeout_ms = MCU_ACK_TIMEOUT_MS;
+static uint32_t s_mcu_retry_backoff_ms = MCU_RETRY_BACKOFF_MS;
+static uint32_t s_mcu_max_retries = MCU_MAX_RETRIES;
+
+/* Statistics counters */
+static uint32_t s_mcu_tx_count = 0;
+static uint32_t s_mcu_retry_count = 0;
+static uint32_t s_mcu_ack_count = 0;
+static uint32_t s_mcu_nack_count = 0;
+static uint32_t s_mcu_timeout_count = 0;
+static uint32_t s_mcu_crc_error_count = 0;
+
+static uint64_t mcu_get_time_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
+}
 
 /* --- Touch & Input State --- */
 static desk_touch_event_cb_t s_touch_cb = NULL;
@@ -33,7 +72,10 @@ static char s_current_status[64] = "Ready";
 
 /* --- Audio State & Ring Buffer --- */
 #define AUDIO_RING_BUFFER_SAMPLES 16384
+#ifndef ESP_PLATFORM
+/* Test-only ring: never reserve internal device SRAM for injected samples. */
 static int16_t s_audio_rec_ring[AUDIO_RING_BUFFER_SAMPLES];
+#endif
 static size_t s_audio_rec_widx = 0;
 static size_t s_audio_rec_ridx = 0;
 static size_t s_audio_rec_count = 0;
@@ -43,36 +85,16 @@ static void *s_audio_play_user_data = NULL;
 
 /* --- Camera State & Frame Buffer --- */
 #define CAMERA_MAX_JPEG_LEN 65536
+#ifndef ESP_PLATFORM
+/* Native camera drivers own their real JPEG buffers. */
 static uint8_t s_cam_frame_buf[CAMERA_MAX_JPEG_LEN];
+#endif
 static size_t s_cam_frame_len = 0;
 static uint32_t s_cam_timestamp_ms = 1000;
 static bool s_cam_streaming = false;
 static float s_cam_target_fps = 0.0f;
 static desk_camera_frame_cb_t s_cam_cb = NULL;
 static void *s_cam_user_data = NULL;
-
-/* Standard minimal JFIF JPEG header */
-static const uint8_t s_default_minimal_jpeg[] = {
-    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
-    0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48,
-    0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
-    0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
-    0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C,
-    0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
-    0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
-    0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20,
-    0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
-    0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27,
-    0x39, 0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34,
-    0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10,
-    0x00, 0x10, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4,
-    0x00, 0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01,
-    0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
-    0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0xFF,
-    0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F,
-    0x00, 0x7F, 0x00, 0xFF, 0xD9
-};
 
 /* --- STM32 CRC-16 (CCITT-FALSE: init 0xFFFF, poly 0x1021) --- */
 static uint16_t mcu_crc16_calc(const uint8_t *data, size_t len)
@@ -91,7 +113,7 @@ static uint16_t mcu_crc16_calc(const uint8_t *data, size_t len)
     return crc;
 }
 
-static size_t mcu_frame_pack_motion(uint8_t msg_id, const uint8_t *payload, uint16_t payload_len, uint8_t *out_buf)
+static size_t mcu_frame_pack_motion_with_seq(uint8_t msg_id, uint32_t seq, const uint8_t *payload, uint16_t payload_len, uint8_t *out_buf)
 {
     /* Prefix: 12 bytes */
     out_buf[0] = MCU_FRAME_MAGIC0;
@@ -99,13 +121,12 @@ static size_t mcu_frame_pack_motion(uint8_t msg_id, const uint8_t *payload, uint
     out_buf[2] = MCU_FRAME_PROTO_VERSION;
     out_buf[3] = MCU_FRAME_CLASS_MOTION;
     out_buf[4] = msg_id;
-    out_buf[5] = 0x01; /* MCU_FRAME_FLAG_ACK_REQ */
+    out_buf[5] = MCU_FRAME_FLAG_ACK_REQ; /* 0x01 */
 
-    s_mcu_seq++;
-    out_buf[6] = (uint8_t)(s_mcu_seq & 0xFFu);
-    out_buf[7] = (uint8_t)((s_mcu_seq >> 8) & 0xFFu);
-    out_buf[8] = (uint8_t)((s_mcu_seq >> 16) & 0xFFu);
-    out_buf[9] = (uint8_t)((s_mcu_seq >> 24) & 0xFFu);
+    out_buf[6] = (uint8_t)(seq & 0xFFu);
+    out_buf[7] = (uint8_t)((seq >> 8) & 0xFFu);
+    out_buf[8] = (uint8_t)((seq >> 16) & 0xFFu);
+    out_buf[9] = (uint8_t)((seq >> 24) & 0xFFu);
 
     out_buf[10] = (uint8_t)(payload_len & 0xFFu);
     out_buf[11] = (uint8_t)((payload_len >> 8) & 0xFFu);
@@ -122,8 +143,9 @@ static size_t mcu_frame_pack_motion(uint8_t msg_id, const uint8_t *payload, uint
     return 12 + payload_len + 2;
 }
 
-int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint32_t duration_ms,
-                                             uint8_t *out_buf, size_t max_len, size_t *out_len)
+int desk_hardware_format_stm32_motion_packet_with_seq(float pan_deg, float tilt_deg, uint32_t duration_ms,
+                                                      uint32_t seq,
+                                                      uint8_t *out_buf, size_t max_len, size_t *out_len)
 {
     if (!out_buf || !out_len || max_len < 23) {
         return DESK_HW_ERR_INVALID_ARG;
@@ -133,12 +155,14 @@ int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint
     if (pan_deg > DESK_MOTION_PAN_MAX_DEG) pan_deg = DESK_MOTION_PAN_MAX_DEG;
     if (tilt_deg < DESK_MOTION_TILT_MIN_DEG) tilt_deg = DESK_MOTION_TILT_MIN_DEG;
     if (tilt_deg > DESK_MOTION_TILT_MAX_DEG) tilt_deg = DESK_MOTION_TILT_MAX_DEG;
+    if (duration_ms < 100) duration_ms = 100;
+    if (duration_ms > 65535) duration_ms = 65535;
 
     uint8_t payload[9];
-    payload[0] = 0x03;
-    int16_t x_deg_x10 = (int16_t)(pan_deg * 10.0f);
-    int16_t y_deg_x10 = (int16_t)(tilt_deg * 10.0f);
-    uint16_t dur = (uint16_t)(duration_ms > 65535 ? 65535 : duration_ms);
+    payload[0] = MCU_AXIS_MASK_PAN_TILT; /* 0x03 */
+    int16_t x_deg_x10 = (int16_t)(pan_deg * 10.0f + 0.5f);
+    int16_t y_deg_x10 = (int16_t)(tilt_deg * 10.0f + 0.5f);
+    uint16_t dur = (uint16_t)duration_ms;
 
     payload[1] = (uint8_t)(x_deg_x10 & 0xFF);
     payload[2] = (uint8_t)((x_deg_x10 >> 8) & 0xFF);
@@ -146,29 +170,198 @@ int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint
     payload[4] = (uint8_t)((y_deg_x10 >> 8) & 0xFF);
     payload[5] = (uint8_t)(dur & 0xFF);
     payload[6] = (uint8_t)((dur >> 8) & 0xFF);
-    payload[7] = 0x00;
-    payload[8] = 0x01;
+    payload[7] = 0x00; /* profile: 0x00 smooth S-curve */
+    payload[8] = 0x01; /* source: 0x01 standard execution */
 
-    size_t packed = mcu_frame_pack_motion(MCU_MOTION_MSG_SERVO_MOVE, payload, sizeof(payload), out_buf);
+    size_t packed = mcu_frame_pack_motion_with_seq(MCU_MOTION_MSG_SERVO_MOVE, seq, payload, sizeof(payload), out_buf);
+    *out_len = packed;
+    return DESK_HW_OK;
+}
+
+int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint32_t duration_ms,
+                                             uint8_t *out_buf, size_t max_len, size_t *out_len)
+{
+    s_mcu_seq++;
+    return desk_hardware_format_stm32_motion_packet_with_seq(pan_deg, tilt_deg, duration_ms,
+                                                             s_mcu_seq,
+                                                             out_buf, max_len, out_len);
+}
+
+int desk_hardware_format_stm32_stop_packet_with_seq(bool emergency, uint32_t seq,
+                                                    uint8_t *out_buf, size_t max_len, size_t *out_len)
+{
+    if (!out_buf || !out_len || max_len < 16) {
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+    uint8_t payload[2];
+    payload[0] = emergency ? MCU_STOP_MODE_EMERGENCY : MCU_STOP_MODE_DECEL; /* 0x02 : 0x01 */
+    payload[1] = MCU_AXIS_MASK_CANCEL_ALL; /* 0x01 */
+
+    size_t packed = mcu_frame_pack_motion_with_seq(MCU_MOTION_MSG_SERVO_STOP, seq, payload, sizeof(payload), out_buf);
     *out_len = packed;
     return DESK_HW_OK;
 }
 
 int desk_hardware_format_stm32_stop_packet(bool emergency, uint8_t *out_buf, size_t max_len, size_t *out_len)
 {
-    if (!out_buf || !out_len || max_len < 16) {
+    s_mcu_seq++;
+    return desk_hardware_format_stm32_stop_packet_with_seq(emergency, s_mcu_seq, out_buf, max_len, out_len);
+}
+
+int desk_hardware_format_stm32_ack_packet(uint32_t seq, int16_t pan_deg_x10, int16_t tilt_deg_x10,
+                                          uint8_t *out_buf, size_t max_len, size_t *out_len)
+{
+    if (!out_buf || !out_len || max_len < 18) {
         return DESK_HW_ERR_INVALID_ARG;
     }
-    uint8_t payload[2];
-    payload[0] = emergency ? 0x02 : 0x01;
-    payload[1] = 0x01;
+    out_buf[0] = MCU_FRAME_MAGIC0;
+    out_buf[1] = MCU_FRAME_MAGIC1;
+    out_buf[2] = MCU_FRAME_PROTO_VERSION;
+    out_buf[3] = MCU_FRAME_CLASS_MOTION;
+    out_buf[4] = MCU_MOTION_MSG_ACK; /* 0x00 */
+    out_buf[5] = MCU_FRAME_FLAG_ACK_RESP; /* 0x02 */
+    out_buf[6] = (uint8_t)(seq & 0xFFu);
+    out_buf[7] = (uint8_t)((seq >> 8) & 0xFFu);
+    out_buf[8] = (uint8_t)((seq >> 16) & 0xFFu);
+    out_buf[9] = (uint8_t)((seq >> 24) & 0xFFu);
+    out_buf[10] = 0x04;
+    out_buf[11] = 0x00;
 
-    size_t packed = mcu_frame_pack_motion(MCU_MOTION_MSG_SERVO_STOP, payload, sizeof(payload), out_buf);
-    *out_len = packed;
+    out_buf[12] = (uint8_t)(pan_deg_x10 & 0xFF);
+    out_buf[13] = (uint8_t)((pan_deg_x10 >> 8) & 0xFF);
+    out_buf[14] = (uint8_t)(tilt_deg_x10 & 0xFF);
+    out_buf[15] = (uint8_t)((tilt_deg_x10 >> 8) & 0xFF);
+
+    uint16_t crc = mcu_crc16_calc(out_buf, 16);
+    out_buf[16] = (uint8_t)(crc & 0xFFu);
+    out_buf[17] = (uint8_t)((crc >> 8) & 0xFFu);
+
+    *out_len = 18;
     return DESK_HW_OK;
 }
 
+int desk_hardware_format_stm32_nack_packet(uint32_t seq, uint8_t error_code, uint8_t sub_error,
+                                           uint8_t *out_buf, size_t max_len, size_t *out_len)
+{
+    if (!out_buf || !out_len || max_len < 16) {
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+    out_buf[0] = MCU_FRAME_MAGIC0;
+    out_buf[1] = MCU_FRAME_MAGIC1;
+    out_buf[2] = MCU_FRAME_PROTO_VERSION;
+    out_buf[3] = MCU_FRAME_CLASS_MOTION;
+    out_buf[4] = MCU_MOTION_MSG_NACK; /* 0xFF */
+    out_buf[5] = MCU_FRAME_FLAG_NACK_RESP; /* 0x04 */
+    out_buf[6] = (uint8_t)(seq & 0xFFu);
+    out_buf[7] = (uint8_t)((seq >> 8) & 0xFFu);
+    out_buf[8] = (uint8_t)((seq >> 16) & 0xFFu);
+    out_buf[9] = (uint8_t)((seq >> 24) & 0xFFu);
+    out_buf[10] = 0x02;
+    out_buf[11] = 0x00;
+
+    out_buf[12] = error_code;
+    out_buf[13] = sub_error;
+
+    uint16_t crc = mcu_crc16_calc(out_buf, 14);
+    out_buf[14] = (uint8_t)(crc & 0xFFu);
+    out_buf[15] = (uint8_t)((crc >> 8) & 0xFFu);
+
+    *out_len = 16;
+    return DESK_HW_OK;
+}
+
+uint16_t desk_hardware_calc_crc16(const uint8_t *data, size_t len)
+{
+    return mcu_crc16_calc(data, len);
+}
+
+uint32_t desk_hardware_get_mcu_seq(void)
+{
+    return s_mcu_seq;
+}
+
+void desk_hardware_set_mcu_seq(uint32_t seq)
+{
+    s_mcu_seq = seq;
+}
+
+uint32_t desk_hardware_get_mcu_timeout_ms(void)
+{
+    return s_mcu_ack_timeout_ms;
+}
+
+void desk_hardware_set_mcu_timeout_ms(uint32_t timeout_ms)
+{
+    s_mcu_ack_timeout_ms = timeout_ms;
+}
+
+uint32_t desk_hardware_get_mcu_retry_backoff_ms(void)
+{
+    return s_mcu_retry_backoff_ms;
+}
+
+void desk_hardware_set_mcu_retry_backoff_ms(uint32_t backoff_ms)
+{
+    s_mcu_retry_backoff_ms = backoff_ms;
+}
+
+uint32_t desk_hardware_get_mcu_max_retries(void)
+{
+    return s_mcu_max_retries;
+}
+
+void desk_hardware_set_mcu_max_retries(uint32_t max_retries)
+{
+    s_mcu_max_retries = max_retries;
+}
+
+uint32_t desk_hardware_get_mcu_crc_error_count(void)
+{
+    return s_mcu_crc_error_count;
+}
+
+void desk_hardware_reset_mcu_crc_error_count(void)
+{
+    s_mcu_crc_error_count = 0;
+}
+
+uint32_t desk_hardware_get_mcu_tx_count(void)
+{
+    return s_mcu_tx_count;
+}
+
+uint32_t desk_hardware_get_mcu_retry_count(void)
+{
+    return s_mcu_retry_count;
+}
+
+uint32_t desk_hardware_get_mcu_ack_count(void)
+{
+    return s_mcu_ack_count;
+}
+
+uint32_t desk_hardware_get_mcu_nack_count(void)
+{
+    return s_mcu_nack_count;
+}
+
+uint32_t desk_hardware_get_mcu_timeout_count(void)
+{
+    return s_mcu_timeout_count;
+}
+
+void desk_hardware_reset_mcu_stats(void)
+{
+    s_mcu_tx_count = 0;
+    s_mcu_retry_count = 0;
+    s_mcu_ack_count = 0;
+    s_mcu_nack_count = 0;
+    s_mcu_timeout_count = 0;
+    s_mcu_crc_error_count = 0;
+}
+
 static const desk_board_driver_ops_t *s_board_driver_ops = NULL;
+static bool s_board_driver_initialized = false;
 static bool s_strict_hardware_mode = false;
 static bool s_display_hw_initialized = false;
 
@@ -189,7 +382,12 @@ bool desk_hardware_is_strict_mode(void)
 
 void desk_hardware_set_display_initialized(bool init)
 {
+#ifndef ESP_PLATFORM
+    /* Explicit host-side L2 fixture hook. Production ESP builds cannot use it. */
     s_display_hw_initialized = init;
+#else
+    (void)init;
+#endif
 }
 
 bool desk_hardware_is_display_initialized(void)
@@ -226,7 +424,8 @@ static int default_driver_init(void)
     const char *disp_dev = getenv("DESK_DISPLAY_DEVICE");
     s_display_hw_initialized = (disp_dev && strlen(disp_dev) > 0);
 #else
-    s_display_hw_initialized = true;
+    /* No SenseCAP Watcher display BSP is present in this target. */
+    s_display_hw_initialized = false;
 #endif
     return 0;
 }
@@ -235,7 +434,7 @@ static int default_driver_audio_read(int16_t *pcm_buf, size_t samples, size_t *r
 {
     (void)pcm_buf; (void)samples;
     *read_samples = 0;
-    return 0;
+    return DESK_HW_ERR_UNAVAILABLE;
 }
 
 static int default_driver_audio_play(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz)
@@ -243,7 +442,9 @@ static int default_driver_audio_play(const int16_t *pcm_buf, size_t samples, uin
     (void)sample_rate_hz;
     if (!pcm_buf || samples == 0) return 0;
 #ifdef ESP_PLATFORM
-    /* On ESP-IDF, write to I2S speaker peripheral (I2S0 ES8311 DAC) */
+    (void)pcm_buf;
+    (void)samples;
+    return DESK_HW_ERR_UNAVAILABLE;
 #else
     if (s_audio_out_fd >= 0) {
         size_t bytes_to_write = samples * sizeof(int16_t);
@@ -258,80 +459,189 @@ static int default_driver_audio_play(const int16_t *pcm_buf, size_t samples, uin
     return 0;
 }
 
-static int default_driver_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms)
+static bool mcu_transport_is_available(void)
 {
-    uint8_t pkt[64];
-    size_t pkt_len = 0;
-    int rc = desk_hardware_format_stm32_motion_packet(pan_deg, tilt_deg, duration_ms, pkt, sizeof(pkt), &pkt_len);
-    if (rc != DESK_HW_OK) return rc;
+#ifdef ESP_PLATFORM
+    /* UART2 must have been installed by a board layer before it can be used. */
+    if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) return true;
+    return uart_is_driver_installed(UART_NUM_2);
+#else
+    if (s_uart_fd >= 0) return true;
+    if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) return true;
+    const char *uart_dev = getenv("DESK_UART_DEVICE");
+    if (uart_dev && strlen(uart_dev) > 0) return true;
+    return false;
+#endif
+}
+
+static int mcu_transport_send(const uint8_t *frame_data, size_t frame_len)
+{
+    if (!frame_data || frame_len == 0) return DESK_HW_ERR_INVALID_ARG;
 
 #ifdef ESP_PLATFORM
-    int written = uart_write_bytes(UART_NUM_2, (const char *)pkt, pkt_len);
-    if (written < 0 && s_strict_hardware_mode) {
-        return DESK_HW_ERR_IO;
+    if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
+        s_mcu_tx_cb(frame_data, frame_len, s_mcu_tx_user_data);
+        return DESK_HW_OK;
     }
+    if (!uart_is_driver_installed(UART_NUM_2)) {
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    int written = uart_write_bytes(UART_NUM_2, (const char *)frame_data, frame_len);
+    if (written != (int)frame_len) return DESK_HW_ERR_IO;
 #else
     if (s_uart_fd >= 0) {
-        ssize_t w = write(s_uart_fd, pkt, pkt_len);
-        if (w != (ssize_t)pkt_len && s_strict_hardware_mode) {
-            return DESK_HW_ERR_IO;
-        }
+        ssize_t w = write(s_uart_fd, frame_data, frame_len);
+        if (w != (ssize_t)frame_len) return DESK_HW_ERR_IO;
     } else {
         const char *uart_dev = getenv("DESK_UART_DEVICE");
         if (uart_dev && strlen(uart_dev) > 0) {
             s_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NDELAY);
             if (s_uart_fd >= 0) {
-                ssize_t w = write(s_uart_fd, pkt, pkt_len);
-                if (w != (ssize_t)pkt_len && s_strict_hardware_mode) {
-                    return DESK_HW_ERR_IO;
-                }
-            } else if (s_strict_hardware_mode) {
-                return DESK_HW_ERR_IO;
+                ssize_t w = write(s_uart_fd, frame_data, frame_len);
+                if (w != (ssize_t)frame_len) return DESK_HW_ERR_IO;
+            } else if (!(s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender)) {
+                return DESK_HW_ERR_UNAVAILABLE;
             }
-        } else if (s_strict_hardware_mode) {
-            return DESK_HW_ERR_IO;
+        } else if (!(s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender)) {
+            return DESK_HW_ERR_UNAVAILABLE;
         }
+    }
+#endif
+
+#ifndef ESP_PLATFORM
+    if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
+        s_mcu_tx_cb(frame_data, frame_len, s_mcu_tx_user_data);
     }
 #endif
     return DESK_HW_OK;
 }
 
+static int mcu_execute_transaction(const uint8_t *frame_data, size_t frame_len, uint32_t expected_seq)
+{
+    if (!mcu_transport_is_available()) {
+#ifdef ESP_PLATFORM
+        return DESK_HW_ERR_UNAVAILABLE;
+#else
+        if (s_strict_hardware_mode) return DESK_HW_ERR_UNAVAILABLE;
+        return DESK_HW_OK;
+#endif
+    }
+
+    s_pending_seq = expected_seq;
+    s_pending_state = MCU_TX_WAITING_ACK;
+    s_pending_err_code = 0;
+
+    for (uint32_t attempt = 0; attempt <= s_mcu_max_retries; ++attempt) {
+        if (attempt > 0) {
+            s_mcu_retry_count++;
+            if (s_mcu_retry_backoff_ms > 0) {
+                usleep((useconds_t)s_mcu_retry_backoff_ms * 1000);
+            }
+        }
+        s_mcu_tx_count++;
+        s_pending_state = MCU_TX_WAITING_ACK;
+
+        int send_rc = mcu_transport_send(frame_data, frame_len);
+        if (send_rc != DESK_HW_OK) {
+            s_pending_state = MCU_TX_IDLE;
+            return send_rc;
+        }
+
+        /* Check if ACK was processed synchronously inside TX callback */
+        if (s_pending_state == MCU_TX_ACKED) {
+            s_pending_state = MCU_TX_IDLE;
+            return DESK_HW_OK;
+        }
+        if (s_pending_state == MCU_TX_NACKED) {
+            if (s_pending_err_code == MCU_NACK_ERR_OUT_OF_BOUNDS ||
+                s_pending_err_code == MCU_NACK_ERR_INVALID_PARAM) {
+                s_pending_state = MCU_TX_IDLE;
+                return DESK_HW_ERR_INVALID_ARG;
+            }
+            continue;
+        }
+
+        /* Wait for ACK up to s_mcu_ack_timeout_ms */
+        uint64_t start_ms = mcu_get_time_ms();
+        while (s_pending_state == MCU_TX_WAITING_ACK) {
+            uint64_t now_ms = mcu_get_time_ms();
+            if (now_ms - start_ms >= (uint64_t)s_mcu_ack_timeout_ms) {
+                break;
+            }
+
+#ifndef ESP_PLATFORM
+            if (s_uart_fd >= 0) {
+                uint8_t rx_buf[64];
+                ssize_t n = read(s_uart_fd, rx_buf, sizeof(rx_buf));
+                if (n > 0) {
+                    desk_hardware_mcu_receive_bytes(rx_buf, (size_t)n);
+                }
+            }
+#else
+            uint8_t rx_buf[64];
+            int n = uart_read_bytes(UART_NUM_2, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(5));
+            if (n > 0) {
+                desk_hardware_mcu_receive_bytes(rx_buf, (size_t)n);
+            }
+#endif
+            if (s_pending_state != MCU_TX_WAITING_ACK) {
+                break;
+            }
+            usleep(2000);
+        }
+
+        if (s_pending_state == MCU_TX_ACKED) {
+            s_pending_state = MCU_TX_IDLE;
+            return DESK_HW_OK;
+        }
+        if (s_pending_state == MCU_TX_NACKED) {
+            if (s_pending_err_code == MCU_NACK_ERR_OUT_OF_BOUNDS ||
+                s_pending_err_code == MCU_NACK_ERR_INVALID_PARAM) {
+                s_pending_state = MCU_TX_IDLE;
+                return DESK_HW_ERR_INVALID_ARG;
+            }
+            continue;
+        }
+    }
+
+    s_mcu_timeout_count++;
+    s_pending_state = MCU_TX_TIMEOUT;
+    return DESK_HW_ERR_TIMEOUT;
+}
+
+static int default_driver_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms)
+{
+    (void)pan_deg; (void)tilt_deg; (void)duration_ms;
+    if (s_last_mcu_frame_len != 23 || s_last_mcu_frame[4] != MCU_MOTION_MSG_SERVO_MOVE) {
+        int rc = desk_hardware_format_stm32_motion_packet(pan_deg, tilt_deg, duration_ms,
+                                                          s_last_mcu_frame, sizeof(s_last_mcu_frame),
+                                                          &s_last_mcu_frame_len);
+        if (rc != DESK_HW_OK) return rc;
+    }
+
+    uint32_t seq = (uint32_t)s_last_mcu_frame[6] |
+                   ((uint32_t)s_last_mcu_frame[7] << 8) |
+                   ((uint32_t)s_last_mcu_frame[8] << 16) |
+                   ((uint32_t)s_last_mcu_frame[9] << 24);
+
+    return mcu_execute_transaction(s_last_mcu_frame, s_last_mcu_frame_len, seq);
+}
+
 static int default_driver_motion_stop(bool emergency)
 {
-    uint8_t pkt[64];
-    size_t pkt_len = 0;
-    int rc = desk_hardware_format_stm32_stop_packet(emergency, pkt, sizeof(pkt), &pkt_len);
-    if (rc != DESK_HW_OK) return rc;
+    if (s_last_mcu_frame_len != 16 || s_last_mcu_frame[4] != MCU_MOTION_MSG_SERVO_STOP) {
+        int rc = desk_hardware_format_stm32_stop_packet(emergency,
+                                                        s_last_mcu_frame, sizeof(s_last_mcu_frame),
+                                                        &s_last_mcu_frame_len);
+        if (rc != DESK_HW_OK) return rc;
+    }
 
-#ifdef ESP_PLATFORM
-    int written = uart_write_bytes(UART_NUM_2, (const char *)pkt, pkt_len);
-    if (written < 0 && s_strict_hardware_mode) {
-        return DESK_HW_ERR_IO;
-    }
-#else
-    if (s_uart_fd >= 0) {
-        ssize_t w = write(s_uart_fd, pkt, pkt_len);
-        if (w != (ssize_t)pkt_len && s_strict_hardware_mode) {
-            return DESK_HW_ERR_IO;
-        }
-    } else {
-        const char *uart_dev = getenv("DESK_UART_DEVICE");
-        if (uart_dev && strlen(uart_dev) > 0) {
-            s_uart_fd = open(uart_dev, O_RDWR | O_NOCTTY | O_NDELAY);
-            if (s_uart_fd >= 0) {
-                ssize_t w = write(s_uart_fd, pkt, pkt_len);
-                if (w != (ssize_t)pkt_len && s_strict_hardware_mode) {
-                    return DESK_HW_ERR_IO;
-                }
-            } else if (s_strict_hardware_mode) {
-                return DESK_HW_ERR_IO;
-            }
-        } else if (s_strict_hardware_mode) {
-            return DESK_HW_ERR_IO;
-        }
-    }
-#endif
-    return DESK_HW_OK;
+    uint32_t seq = (uint32_t)s_last_mcu_frame[6] |
+                   ((uint32_t)s_last_mcu_frame[7] << 8) |
+                   ((uint32_t)s_last_mcu_frame[8] << 16) |
+                   ((uint32_t)s_last_mcu_frame[9] << 24);
+
+    return mcu_execute_transaction(s_last_mcu_frame, s_last_mcu_frame_len, seq);
 }
 
 static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len)
@@ -353,6 +663,9 @@ static int default_driver_display_expression(const char *preset_name, const char
     if (s_strict_hardware_mode && !s_display_hw_initialized) {
         return DESK_HW_ERR_UNAVAILABLE;
     }
+#ifdef ESP_PLATFORM
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
     (void)status_text;
     return DESK_HW_OK;
 }
@@ -391,8 +704,17 @@ int desk_hardware_register_driver_ops(const desk_board_driver_ops_t *ops)
         s_board_driver_ops->deinit();
     }
     s_board_driver_ops = ops ? ops : &s_default_esp32_driver_ops;
-    if (s_board_driver_ops && s_board_driver_ops->init) {
-        s_board_driver_ops->init();
+    s_board_driver_initialized = false;
+    s_display_hw_initialized = false;
+    if (s_board_driver_ops && s_board_driver_ops != &s_default_esp32_driver_ops) {
+        /* Registration without init means the provider supplied an already-ready driver. */
+        int rc = s_board_driver_ops->init ? s_board_driver_ops->init() : DESK_HW_OK;
+        if (rc != DESK_HW_OK) return rc;
+        s_board_driver_initialized = true;
+        s_display_hw_initialized = s_board_driver_ops->display_expression != NULL;
+    } else if (s_board_driver_ops == &s_default_esp32_driver_ops && s_board_driver_ops->init) {
+        int rc = s_board_driver_ops->init();
+        if (rc != DESK_HW_OK) return rc;
     }
     return 0;
 }
@@ -442,6 +764,14 @@ int desk_hardware_init(void)
     s_mcu_tx_user_data = NULL;
     s_strict_hardware_mode = false;
 
+    s_pending_state = MCU_TX_IDLE;
+    s_pending_seq = 0;
+    s_pending_err_code = 0;
+    s_mcu_ack_timeout_ms = MCU_ACK_TIMEOUT_MS;
+    s_mcu_retry_backoff_ms = MCU_RETRY_BACKOFF_MS;
+    s_mcu_max_retries = MCU_MAX_RETRIES;
+    desk_hardware_reset_mcu_stats();
+
     strncpy(s_current_preset, "idle", sizeof(s_current_preset) - 1);
     s_current_preset[sizeof(s_current_preset) - 1] = '\0';
     strncpy(s_current_status, "Ready", sizeof(s_current_status) - 1);
@@ -449,7 +779,7 @@ int desk_hardware_init(void)
 
     s_display_hw_initialized = false;
 #ifdef ESP_PLATFORM
-    s_display_hw_initialized = true;
+    s_display_hw_initialized = false;
 #else
     const char *disp_dev = getenv("DESK_DISPLAY_DEVICE");
     if (disp_dev && strlen(disp_dev) > 0) {
@@ -467,6 +797,19 @@ int desk_hardware_init(void)
     s_audio_rec_ridx = 0;
     s_audio_rec_count = 0;
     s_synth_phase = 0;
+
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    /* Keep core/network/CLI startup alive when this board's LCD BSP is missing
+     * or its physical expander/panel path cannot be verified. */
+    int watcher_rc = desk_hardware_register_driver_ops(desk_watcher_board_get_driver_ops());
+    s_display_hw_initialized = desk_watcher_board_display_ready();
+    if (watcher_rc != DESK_HW_OK) {
+        s_board_driver_initialized = false;
+        s_display_hw_initialized = false;
+        printf("[HW] SenseCAP Watcher display unavailable (rc=%d); continuing core startup.\n",
+               watcher_rc);
+    }
+#endif
 
     return 0;
 }
@@ -489,32 +832,90 @@ int desk_hardware_get_last_mcu_frame(uint8_t *out_buf, size_t max_len, size_t *o
 
 int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len)
 {
-    if (!data || len < 14) return -1;
+    if (!data || len < 14) return DESK_HW_ERR_INVALID_ARG;
     if (data[0] != MCU_FRAME_MAGIC0 || data[1] != MCU_FRAME_MAGIC1) return -2;
+    if (data[2] != MCU_FRAME_PROTO_VERSION) return -2;
 
-    uint16_t payload_len = (uint16_t)(data[10] | (data[11] << 8));
+    uint16_t payload_len = (uint16_t)(data[10] | ((uint16_t)data[11] << 8));
     if (len < (size_t)(12 + payload_len + 2)) return -3;
 
     /* Verify CRC16 */
     uint16_t expected_crc = mcu_crc16_calc(data, 12 + payload_len);
-    uint16_t actual_crc = (uint16_t)(data[12 + payload_len] | (data[13 + payload_len] << 8));
-    if (expected_crc != actual_crc) return -4;
+    uint16_t actual_crc = (uint16_t)(data[12 + payload_len] | ((uint16_t)data[13 + payload_len] << 8));
+    if (expected_crc != actual_crc) {
+        s_mcu_crc_error_count++;
+        return -4;
+    }
+
+    uint32_t seq = (uint32_t)data[6] |
+                   ((uint32_t)data[7] << 8) |
+                   ((uint32_t)data[8] << 16) |
+                   ((uint32_t)data[9] << 24);
 
     uint8_t msg_class = data[3];
-    if (msg_class == MCU_FRAME_CLASS_MOTION) {
-        if (payload_len >= 4) {
-            int16_t pan_x10 = (int16_t)(data[12] | (data[13] << 8));
-            int16_t tilt_x10 = (int16_t)(data[14] | (data[15] << 8));
+    uint8_t msg_id = data[4];
+    uint8_t flags = data[5];
+
+    if (msg_class != MCU_FRAME_CLASS_MOTION) {
+        return DESK_HW_OK;
+    }
+
+    /* Check for NACK */
+    if (msg_id == MCU_MOTION_MSG_NACK || (flags & MCU_FRAME_FLAG_NACK_RESP)) {
+        s_mcu_nack_count++;
+        uint8_t err_code = (payload_len >= 1) ? data[12] : 0;
+        if (s_pending_state == MCU_TX_WAITING_ACK && s_pending_seq == seq) {
+            s_pending_err_code = err_code;
+            s_pending_state = MCU_TX_NACKED;
+        }
+        return DESK_HW_ERR_IO;
+    }
+
+    /* Check for ACK */
+    if (msg_id == MCU_MOTION_MSG_ACK || (flags & MCU_FRAME_FLAG_ACK_RESP)) {
+        s_mcu_ack_count++;
+        if (payload_len >= 6) {
+            int16_t pan_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
+            int16_t tilt_x10 = (int16_t)(data[16] | ((uint16_t)data[17] << 8));
+            if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
+                s_current_pan = pan_x10 / 10.0f;
+                s_current_tilt = tilt_x10 / 10.0f;
+            }
+        } else if (payload_len >= 4) {
+            int16_t pan_x10 = (int16_t)(data[12] | ((uint16_t)data[13] << 8));
+            int16_t tilt_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
+            if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
+                s_current_pan = pan_x10 / 10.0f;
+                s_current_tilt = tilt_x10 / 10.0f;
+            }
+        }
+        if (s_pending_state == MCU_TX_WAITING_ACK && s_pending_seq == seq) {
+            s_pending_state = MCU_TX_ACKED;
+        }
+        return DESK_HW_OK;
+    }
+
+    /* Generic motion frame fallback */
+    if (payload_len >= 4) {
+        int16_t pan_x10 = (int16_t)(data[12] | ((uint16_t)data[13] << 8));
+        int16_t tilt_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
+        if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
             s_current_pan = pan_x10 / 10.0f;
             s_current_tilt = tilt_x10 / 10.0f;
         }
     }
-    return 0;
+    return DESK_HW_OK;
 }
 
 /* Audio API */
 int desk_hardware_audio_record_start(uint32_t sample_rate_hz)
 {
+#ifdef ESP_PLATFORM
+    if (!s_board_driver_initialized || !s_board_driver_ops ||
+        !s_board_driver_ops->audio_record_read) {
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#endif
     if (desk_arbiter_acquire(DESK_RES_AUDIO_RECORD, DESK_OWNER_TCLAW_VOICE, 100) != DESK_ARBITER_OK) {
         return -1;
     }
@@ -523,7 +924,11 @@ int desk_hardware_audio_record_start(uint32_t sample_rate_hz)
 
 int desk_hardware_audio_record_inject(const int16_t *pcm_buf, size_t samples)
 {
-    if (!pcm_buf || samples == 0) return -1;
+    if (!pcm_buf || samples == 0) return DESK_HW_ERR_INVALID_ARG;
+#ifdef ESP_PLATFORM
+    /* Injection is an L2 host-test facility, never a production microphone source. */
+    return DESK_HW_ERR_UNAVAILABLE;
+#else
     for (size_t i = 0; i < samples; i++) {
         s_audio_rec_ring[s_audio_rec_widx] = pcm_buf[i];
         s_audio_rec_widx = (s_audio_rec_widx + 1) % AUDIO_RING_BUFFER_SAMPLES;
@@ -535,21 +940,42 @@ int desk_hardware_audio_record_inject(const int16_t *pcm_buf, size_t samples)
         }
     }
     return 0;
+#endif
 }
 
 int desk_hardware_audio_record_read(int16_t *pcm_buf, size_t samples, size_t *read_samples)
 {
-    if (!pcm_buf || !read_samples) return -1;
+    if (read_samples) *read_samples = 0;
+    if (!pcm_buf || !read_samples || samples == 0) return DESK_HW_ERR_INVALID_ARG;
 
     size_t out_count = 0;
+#ifndef ESP_PLATFORM
     /* Read available samples from injected ring buffer */
     while (s_audio_rec_count > 0 && out_count < samples) {
         pcm_buf[out_count++] = s_audio_rec_ring[s_audio_rec_ridx];
         s_audio_rec_ridx = (s_audio_rec_ridx + 1) % AUDIO_RING_BUFFER_SAMPLES;
         s_audio_rec_count--;
     }
+#endif
 
-    /* Return actual samples read without synthesizing artificial 440Hz test sine tone */
+    /* A registered ESP BSP owns the physical mic path. */
+#ifdef ESP_PLATFORM
+    if (out_count == 0) {
+        if (!s_board_driver_initialized || !s_board_driver_ops ||
+            !s_board_driver_ops->audio_record_read) {
+            *read_samples = 0;
+            return DESK_HW_ERR_UNAVAILABLE;
+        }
+        size_t driver_count = 0;
+        int rc = s_board_driver_ops->audio_record_read(pcm_buf, samples, &driver_count);
+        if (rc != DESK_HW_OK) return rc;
+        if (driver_count > samples) return DESK_HW_ERR_IO;
+        if (driver_count == 0) return DESK_HW_ERR_UNAVAILABLE;
+        *read_samples = driver_count;
+        return DESK_HW_OK;
+    }
+#endif
+    /* Return actual injected samples without synthesizing artificial test tone. */
     *read_samples = out_count;
     return 0;
 }
@@ -569,6 +995,12 @@ int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void 
 
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz)
 {
+#ifdef ESP_PLATFORM
+    if (!s_board_driver_initialized || !s_board_driver_ops ||
+        !s_board_driver_ops->audio_play_pcm) {
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#endif
     desk_resource_owner_t current = desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK);
     if (current == DESK_OWNER_NONE) {
         if (desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 100) != DESK_ARBITER_OK) {
@@ -580,9 +1012,7 @@ int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_
     }
     if (s_board_driver_ops && s_board_driver_ops->audio_play_pcm && pcm_buf && samples > 0) {
         int rc = s_board_driver_ops->audio_play_pcm(pcm_buf, samples, sample_rate_hz);
-        if (rc != 0 && s_strict_hardware_mode) {
-            return rc;
-        }
+        if (rc != DESK_HW_OK) return rc;
     }
     return 0;
 }
@@ -597,6 +1027,9 @@ int desk_hardware_audio_play_stop(void)
 /* Motion / Gimbal API */
 int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms)
 {
+#ifdef ESP_PLATFORM
+    if (!s_board_driver_ops || !s_board_driver_ops->motion_move) return DESK_HW_ERR_UNAVAILABLE;
+#endif
     /* Mechanical clamping */
     if (pan_deg < DESK_MOTION_PAN_MIN_DEG) pan_deg = DESK_MOTION_PAN_MIN_DEG;
     if (pan_deg > DESK_MOTION_PAN_MAX_DEG) pan_deg = DESK_MOTION_PAN_MAX_DEG;
@@ -618,12 +1051,16 @@ int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duratio
             return -1; /* Gimbal locked or busy */
         }
         need_release = true;
+    } else if (current != DESK_OWNER_SDK_REMOTE && current != DESK_OWNER_TCLAW_VOICE) {
+        return -1; /* Gimbal held by another owner (e.g. SYSTEM_ALERT or LAN_CAMERA lease) */
     }
 
     desk_hardware_format_stm32_motion_packet(pan_deg, tilt_deg, duration_ms,
                                              s_last_mcu_frame, sizeof(s_last_mcu_frame), &s_last_mcu_frame_len);
-    if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
-        s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
+    if (s_board_driver_ops && s_board_driver_ops->motion_move != default_driver_motion_move) {
+        if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
+            s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
+        }
     }
 
     /* interfaces.md 6.1: a driver failure is never reported as success. The
@@ -653,10 +1090,15 @@ int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duratio
 
 int desk_hardware_motion_stop(bool emergency)
 {
+#ifdef ESP_PLATFORM
+    if (!s_board_driver_ops || !s_board_driver_ops->motion_stop) return DESK_HW_ERR_UNAVAILABLE;
+#endif
     desk_hardware_format_stm32_stop_packet(emergency,
                                            s_last_mcu_frame, sizeof(s_last_mcu_frame), &s_last_mcu_frame_len);
-    if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
-        s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
+    if (s_board_driver_ops && s_board_driver_ops->motion_stop != default_driver_motion_stop) {
+        if (s_mcu_tx_cb && s_mcu_tx_cb != default_mcu_uart_sender) {
+            s_mcu_tx_cb(s_last_mcu_frame, s_last_mcu_frame_len, s_mcu_tx_user_data);
+        }
     }
     int drv_rc = DESK_HW_OK;
     if (s_board_driver_ops && s_board_driver_ops->motion_stop) {
@@ -682,6 +1124,10 @@ int desk_hardware_motion_get_position(float *out_pan, float *out_tilt)
 /* Camera API */
 int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, uint32_t timestamp_ms)
 {
+#ifdef ESP_PLATFORM
+    (void)jpeg_buf; (void)jpeg_len; (void)timestamp_ms;
+    return DESK_HW_ERR_UNAVAILABLE;
+#else
     if (!jpeg_buf || jpeg_len == 0 || jpeg_len > CAMERA_MAX_JPEG_LEN) return -1;
     memcpy(s_cam_frame_buf, jpeg_buf, jpeg_len);
     s_cam_frame_len = jpeg_len;
@@ -691,10 +1137,12 @@ int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, 
         s_cam_cb(s_cam_frame_buf, s_cam_frame_len, s_cam_timestamp_ms, s_cam_user_data);
     }
     return 0;
+#endif
 }
 
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
 {
+    if (out_len) *out_len = 0;
     if (!out_buf || !out_len) return DESK_HW_ERR_INVALID_ARG;
     (void)timeout_ms;
 
@@ -708,6 +1156,9 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
         }
     }
 
+#ifdef ESP_PLATFORM
+    return DESK_HW_ERR_UNAVAILABLE;
+#else
     if (s_cam_frame_len == 0) {
         /* No frame in sensor buffer and driver unavailable: return real error, do not fake dummy */
         return DESK_HW_ERR_UNAVAILABLE;
@@ -718,23 +1169,34 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
     memcpy(out_buf, s_cam_frame_buf, s_cam_frame_len);
     *out_len = s_cam_frame_len;
     return DESK_HW_OK;
+#endif
 }
 
 int desk_hardware_camera_stream_start(float target_fps, desk_camera_frame_cb_t cb, void *user_data)
 {
+#ifdef ESP_PLATFORM
+    /* Only single real JPEG capture is supported on-device at present. */
+    (void)target_fps; (void)cb; (void)user_data;
+    return DESK_HW_ERR_UNAVAILABLE;
+#else
     s_cam_target_fps = target_fps;
     s_cam_cb = cb;
     s_cam_user_data = user_data;
     s_cam_streaming = true;
     return 0;
+#endif
 }
 
 int desk_hardware_camera_stream_pump(void)
 {
+#ifdef ESP_PLATFORM
+    return DESK_HW_ERR_UNAVAILABLE;
+#else
     if (!s_cam_streaming || !s_cam_cb) return -1;
     s_cam_timestamp_ms += (uint32_t)(s_cam_target_fps > 0 ? (1000.0f / s_cam_target_fps) : 66);
     s_cam_cb(s_cam_frame_buf, s_cam_frame_len, s_cam_timestamp_ms, s_cam_user_data);
     return 0;
+#endif
 }
 
 int desk_hardware_camera_stream_stop(void)
@@ -748,21 +1210,92 @@ int desk_hardware_camera_stream_stop(void)
 /* Display & Expression API */
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text)
 {
-    if (s_board_driver_ops && s_board_driver_ops->display_expression) {
-        int rc = s_board_driver_ops->display_expression(preset_name, status_text);
-        if (rc != DESK_HW_OK) {
-            return rc;
-        }
+    if (!preset_name || strlen(preset_name) == 0) {
+        return DESK_HW_ERR_INVALID_ARG;
     }
-    if (preset_name) {
+
+#ifdef ESP_PLATFORM
+    if (!s_display_hw_initialized || !s_board_driver_initialized ||
+        !s_board_driver_ops || !s_board_driver_ops->display_expression) {
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#else
+    if (s_strict_hardware_mode && !s_display_hw_initialized) {
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#endif
+
+    desk_resource_owner_t current = desk_arbiter_get_owner(DESK_RES_DISPLAY_UI);
+    bool need_release = false;
+    if (current == DESK_OWNER_NONE) {
+        if (desk_arbiter_acquire(DESK_RES_DISPLAY_UI, DESK_OWNER_IDLE, 50) != DESK_ARBITER_OK) {
+            return DESK_HW_ERR_BUSY;
+        }
+        need_release = true;
+    }
+
+    int rc = DESK_HW_OK;
+    if (s_board_driver_ops && s_board_driver_ops->display_expression) {
+        rc = s_board_driver_ops->display_expression(preset_name, status_text);
+    }
+
+    if (rc == DESK_HW_OK) {
         strncpy(s_current_preset, preset_name, sizeof(s_current_preset) - 1);
         s_current_preset[sizeof(s_current_preset) - 1] = '\0';
+
+        if (status_text) {
+            strncpy(s_current_status, status_text, sizeof(s_current_status) - 1);
+            s_current_status[sizeof(s_current_status) - 1] = '\0';
+        } else {
+            s_current_status[0] = '\0';
+        }
     }
-    if (status_text) {
-        strncpy(s_current_status, status_text, sizeof(s_current_status) - 1);
-        s_current_status[sizeof(s_current_status) - 1] = '\0';
+
+    if (need_release) {
+        desk_arbiter_release(DESK_RES_DISPLAY_UI, DESK_OWNER_IDLE);
     }
-    return DESK_HW_OK;
+
+    return rc;
+}
+
+int desk_hardware_set_screen_expression(const char *preset_name, const char *status_text)
+{
+    return desk_hardware_display_set_expression(preset_name, status_text);
+}
+
+int desk_hardware_display_self_test(desk_display_self_test_t *out_result)
+{
+    bool hw_ok = s_display_hw_initialized;
+    int err = DESK_HW_OK;
+
+#ifdef ESP_PLATFORM
+    if (!hw_ok || !s_board_driver_initialized || !s_board_driver_ops ||
+        !s_board_driver_ops->display_expression) {
+        err = DESK_HW_ERR_UNAVAILABLE;
+    }
+#else
+    if (s_strict_hardware_mode && !hw_ok) {
+        err = DESK_HW_ERR_UNAVAILABLE;
+    }
+#endif
+
+    if (out_result) {
+        out_result->initialized = hw_ok;
+        out_result->strict_mode = s_strict_hardware_mode;
+        strncpy(out_result->current_preset, s_current_preset, sizeof(out_result->current_preset) - 1);
+        out_result->current_preset[sizeof(out_result->current_preset) - 1] = '\0';
+        strncpy(out_result->current_status, s_current_status, sizeof(out_result->current_status) - 1);
+        out_result->current_status[sizeof(out_result->current_status) - 1] = '\0';
+        out_result->arbiter_owner = desk_arbiter_get_owner(DESK_RES_DISPLAY_UI);
+        out_result->last_error_code = err;
+    }
+
+    return err;
+}
+
+int desk_hardware_screen_self_test(desk_display_self_test_t *out_result)
+{
+    return desk_hardware_display_self_test(out_result);
 }
 
 int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len, char *out_status, size_t max_status_len)

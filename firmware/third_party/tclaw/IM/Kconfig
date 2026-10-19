@@ -1,0 +1,71 @@
+menu "IM Config"
+    config OUTBOUND_STACK_SIZE
+        int "IM outbound thread stack size (bytes)"
+        default 12288
+        help
+            Stack size in bytes for the IM outbound thread (default 12*1024).
+    config IM_FS_POLL_STACK
+        int "IM feishu poll thread stack size (bytes)"
+        default 16384
+        help
+            Stack size in bytes for the IM feishu poll thread (default 16*1024).
+    config IM_TG_POLL_STACK
+        int "IM telegram poll thread stack size (bytes)"
+        default 12288
+        help
+            Stack size in bytes for the IM telegram poll thread (default 12*1024).
+    config IM_DC_POLL_STACK
+        int "IM discord poll thread stack size (bytes)"
+        default 12288
+        help
+            Stack size in bytes for the IM discord poll thread (default 12*1024).
+    config IM_WX_POLL_STACK
+        int "IM weixin poll thread stack size (bytes)"
+        default 14336
+        help
+            Stack size in bytes for the IM weixin poll thread (default 14*1024).
+    config IM_WX_QR_STACK
+        int "IM weixin QR code thread stack size (bytes)"
+        default 10240
+        help
+            Stack size in bytes for the IM weixin QR code thread (default 10*1024).
+    config IM_QQ_POLL_STACK
+        int "IM qqbot gateway thread stack size (bytes)"
+        default 14336
+        help
+            Stack size in bytes for the IM qqbot WebSocket gateway thread (default 14*1024).
+    config IM_QQ_TOKEN_STACK
+        int "IM qqbot token refresh thread stack size (bytes)"
+        default 8192
+        help
+            Stack size in bytes for the IM qqbot token refresh thread (default 8*1024).
+
+    config IM_WX_UPDATES_BUF_SIZE
+        int "Weixin get_updates cursor buffer (bytes)"
+        default 4096
+        help
+            Cursor/state buffer for weixin long-poll. Allocated from PSRAM at
+            weixin_bot_init. Lower on tight-SRAM boards.
+
+    config IM_FS_DEDUP_CACHE_SIZE
+        int "Feishu dedup ring cache entries (count)"
+        default 512
+        help
+            Number of 8-byte FNV hashes kept per dedup ring (one for messages,
+            one for events). 512 = 4 KiB per ring = 8 KiB total. Allocated
+            from PSRAM at feishu_bot_init. Lower on tight-SRAM boards.
+
+    config IM_TG_DEDUP_CACHE_SIZE
+        int "Telegram dedup ring cache entries (count)"
+        default 64
+        help
+            Number of 8-byte FNV hashes kept for telegram message dedup.
+            Allocated from PSRAM at telegram_bot_init.
+
+    config IM_QQ_DEDUP_CACHE_SIZE
+        int "QQ bot dedup ring cache entries (count)"
+        default 64
+        help
+            Number of 8-byte FNV hashes kept for QQ bot message dedup.
+            Allocated from PSRAM at qqbot init.
+endmenu

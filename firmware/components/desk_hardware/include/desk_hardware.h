@@ -107,13 +107,42 @@ typedef void (*desk_hardware_audio_play_cb_t)(const int16_t *pcm_buf,
                                               void *user_data);
 int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void *user_data);
 
-/* STM32 Coprocessor MCU Frame Definitions */
+/* STM32 Coprocessor MCU Frame Definitions (R3a Ratified) */
 #define MCU_FRAME_MAGIC0          0xA5u
 #define MCU_FRAME_MAGIC1          0x5Au
 #define MCU_FRAME_PROTO_VERSION   0x01u
 #define MCU_FRAME_CLASS_MOTION    0x02u
+
+/* MCU Message IDs */
+#define MCU_MOTION_MSG_ACK        0x00u
 #define MCU_MOTION_MSG_SERVO_MOVE 0x01u
 #define MCU_MOTION_MSG_SERVO_STOP 0x02u
+#define MCU_MOTION_MSG_NACK       0xFFu
+
+/* MCU Frame Flags */
+#define MCU_FRAME_FLAG_ACK_REQ    0x01u
+#define MCU_FRAME_FLAG_ACK_RESP   0x02u
+#define MCU_FRAME_FLAG_NACK_RESP  0x04u
+
+/* Timing, Retry & Safety Contracts */
+#define MCU_ACK_TIMEOUT_MS        500u
+#define MCU_MAX_RETRIES           2u
+#define MCU_RETRY_BACKOFF_MS      50u
+
+/* Stop Mode Definitions */
+#define MCU_STOP_MODE_DECEL       0x01u
+#define MCU_STOP_MODE_EMERGENCY   0x02u
+
+/* Axis Mask Definitions */
+#define MCU_AXIS_MASK_PAN_TILT    0x03u
+#define MCU_AXIS_MASK_CANCEL_ALL  0x01u
+
+/* NACK Error Codes */
+#define MCU_NACK_ERR_CRC          0x01u
+#define MCU_NACK_ERR_OUT_OF_BOUNDS 0x02u
+#define MCU_NACK_ERR_BUSY         0x03u
+#define MCU_NACK_ERR_INVALID_PARAM 0x04u
+#define MCU_NACK_ERR_HW_FAULT     0x05u
 
 typedef void (*desk_hardware_mcu_tx_cb_t)(const uint8_t *frame_data,
                                           size_t frame_len,
@@ -127,8 +156,39 @@ int desk_hardware_motion_stop(bool emergency);
 int desk_hardware_motion_get_position(float *out_pan, float *out_tilt);
 int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint32_t duration_ms,
                                              uint8_t *out_buf, size_t max_len, size_t *out_len);
+int desk_hardware_format_stm32_motion_packet_with_seq(float pan_deg, float tilt_deg, uint32_t duration_ms,
+                                                      uint32_t seq,
+                                                      uint8_t *out_buf, size_t max_len, size_t *out_len);
 int desk_hardware_format_stm32_stop_packet(bool emergency,
                                            uint8_t *out_buf, size_t max_len, size_t *out_len);
+int desk_hardware_format_stm32_stop_packet_with_seq(bool emergency, uint32_t seq,
+                                                    uint8_t *out_buf, size_t max_len, size_t *out_len);
+int desk_hardware_format_stm32_ack_packet(uint32_t seq, int16_t pan_deg_x10, int16_t tilt_deg_x10,
+                                          uint8_t *out_buf, size_t max_len, size_t *out_len);
+int desk_hardware_format_stm32_nack_packet(uint32_t seq, uint8_t error_code, uint8_t sub_error,
+                                           uint8_t *out_buf, size_t max_len, size_t *out_len);
+
+/* Checksum and Sequence Helpers */
+uint16_t desk_hardware_calc_crc16(const uint8_t *data, size_t len);
+uint32_t desk_hardware_get_mcu_seq(void);
+void desk_hardware_set_mcu_seq(uint32_t seq);
+
+/* Protocol Timing Configuration & Statistics */
+uint32_t desk_hardware_get_mcu_timeout_ms(void);
+void desk_hardware_set_mcu_timeout_ms(uint32_t timeout_ms);
+uint32_t desk_hardware_get_mcu_retry_backoff_ms(void);
+void desk_hardware_set_mcu_retry_backoff_ms(uint32_t backoff_ms);
+uint32_t desk_hardware_get_mcu_max_retries(void);
+void desk_hardware_set_mcu_max_retries(uint32_t max_retries);
+
+uint32_t desk_hardware_get_mcu_crc_error_count(void);
+void desk_hardware_reset_mcu_crc_error_count(void);
+uint32_t desk_hardware_get_mcu_tx_count(void);
+uint32_t desk_hardware_get_mcu_retry_count(void);
+uint32_t desk_hardware_get_mcu_ack_count(void);
+uint32_t desk_hardware_get_mcu_nack_count(void);
+uint32_t desk_hardware_get_mcu_timeout_count(void);
+void desk_hardware_reset_mcu_stats(void);
 
 /* Camera API */
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
@@ -138,9 +198,32 @@ int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, 
 int desk_hardware_camera_stream_pump(void);
 int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len);
 
-/* Display & Expression API */
+/* R0 Hardware Mapping & Physical Safety Constants */
+#define DESK_PIN_UART0_TX            43
+#define DESK_PIN_UART0_RX            44
+#define DESK_PIN_STM32_TX            19
+#define DESK_PIN_STM32_RX            20
+#define DESK_UART_STM32_BAUD         921600
+#define DESK_DISPLAY_WIDTH           412
+#define DESK_DISPLAY_HEIGHT          412
+#define DESK_DISPLAY_CONTROLLER      "SPD2010"
+
+/* Display Diagnostic & Self-Test Structures (R2) */
+typedef struct {
+    bool initialized;                     /**< Display controller initialized and ready */
+    bool strict_mode;                     /**< Strict hardware validation mode flag */
+    char current_preset[32];              /**< Active expression preset (e.g. "idle", "listening") */
+    char current_status[64];              /**< Active screen status text (e.g. "Ready") */
+    desk_resource_owner_t arbiter_owner; /**< Current owner of DESK_RES_DISPLAY_UI */
+    int last_error_code;                  /**< 0 if operational, or DESK_HW_ERR_* */
+} desk_display_self_test_t;
+
+/* Display & Expression API (R2) */
+int desk_hardware_set_screen_expression(const char *preset_name, const char *status_text);
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text);
 int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len, char *out_status, size_t max_status_len);
+int desk_hardware_display_self_test(desk_display_self_test_t *out_result);
+int desk_hardware_screen_self_test(desk_display_self_test_t *out_result);
 void desk_hardware_set_display_initialized(bool init);
 bool desk_hardware_is_display_initialized(void);
 

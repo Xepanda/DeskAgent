@@ -13,6 +13,7 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "desk_arbiter.h"
 
 typedef enum {
     TCLAW_STATE_IDLE = 0,
@@ -43,6 +44,11 @@ int desk_tclaw_start(void);
  * @brief Query current TClaw state.
  */
 desk_tclaw_state_t desk_tclaw_get_state(void);
+
+/**
+ * @brief Check if TClaw dialogue engine has been initialized.
+ */
+bool desk_tclaw_is_initialized(void);
 
 /**
  * @brief Inject synthetic user text into TClaw session (for automated testing).
@@ -91,6 +97,8 @@ int desk_tclaw_get_last_response(char *out_buf, size_t max_len);
 /**
  * @brief Retrieve total dialogue turns completed.
  */
+int desk_tclaw_get_turn_count(void);
+
 /**
  * @brief Tuya Cloud Dialogue Event Types
  */
@@ -141,6 +149,115 @@ int desk_tclaw_tuya_send_tool_result(const char *session_id, const char *tool_na
 int desk_tclaw_tuya_get_last_tool_result(char *out_buf, size_t max_len);
 int desk_tclaw_tuya_session_stop(void);
 const char *desk_tclaw_tuya_get_session_id(void);
+
+/**
+ * @brief Handle Tuya MQTT cloud connection event.
+ *
+ * Transitions Tuya connection state to TUYA_CLOUD_CONNECTED, updates
+ * screen expression to 'happy' / 'Online', and plays connection audio cue.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+int desk_tclaw_on_tuya_mqtt_connected(void);
+
+/**
+ * @brief Handle Tuya MQTT cloud disconnection event.
+ *
+ * Transitions Tuya connection state to TUYA_CLOUD_DISCONNECTED and
+ * updates screen expression to 'idle' / 'Cloud Offline'.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+int desk_tclaw_on_tuya_mqtt_disconnected(void);
+
+/**
+ * @brief Handle Tuya Network Configuration start event (e.g. BLE netcfg).
+ *
+ * Updates screen expression to 'thinking' / 'BLE Netcfg'.
+ *
+ * @return 0 on success, negative error code on failure.
+ */
+int desk_tclaw_on_tuya_netcfg_started(void);
+
+/**
+ * @brief TClaw Single Board Self-Test Report Structure.
+ */
+typedef struct {
+    bool initialized;                     /**< TClaw framework initialized */
+    desk_tclaw_state_t state;             /**< Current dialogue state */
+    tuya_cloud_connection_state_t tuya_state; /**< Tuya cloud connection state */
+    int turn_count;                       /**< Completed dialogue turns */
+    char session_id[128];                 /**< Active Tuya session identifier */
+    char last_response[256];              /**< Last spoken response text */
+    char pending_tool[128];               /**< Name of currently pending tool call */
+    desk_resource_owner_t audio_owner;    /**< Current owner of DESK_RES_AUDIO_PLAYBACK */
+    desk_resource_owner_t motion_owner;   /**< Current owner of DESK_RES_MOTION_GIMBAL */
+    desk_resource_owner_t camera_owner;   /**< Current owner of DESK_RES_CAMERA_SENSOR */
+    int last_error_code;                  /**< 0 if normal, or DESK_HW_ERR_* */
+} desk_tclaw_self_test_t;
+
+/**
+ * @brief Execute TClaw single board self-test.
+ * @return 0 on success (all checks pass), negative DESK_HW_ERR_* on failure.
+ */
+int desk_tclaw_self_test(void);
+
+/**
+ * @brief Execute TClaw single board self-test and retrieve diagnostic report.
+ * @param out_report Pointer to self-test diagnostic report structure (can be NULL).
+ * @return 0 on success, negative DESK_HW_ERR_* on failure.
+ */
+int desk_tclaw_self_test_report(desk_tclaw_self_test_t *out_report);
+
+/**
+ * @brief Execute a built-in hardware tool or format contract ResponseEnvelope.
+ *
+ * Implements Watcher BSP operations (motion, camera, screen expression) with:
+ * - Strict resource arbitration (AUDIO_PLAYBACK, MOTION_GIMBAL, CAMERA_SENSOR, DISPLAY_UI)
+ * - CR-002 motion semantic compliance (status="accepted", accepted=true, state_confirmed=false)
+ * - True camera capture (errors if unavailable, strictly never generates synthetic frames)
+ *
+ * @param request_id Unique request ID.
+ * @param operation Tool operation name (e.g., "motion.move", "camera.capture", "expression.set").
+ * @param arguments_json JSON arguments object string.
+ * @param out_response_json Optional buffer to receive full contract ResponseEnvelope JSON.
+ * @param max_len Size of out_response_json buffer.
+ * @return 0 on successful execution or dispatch, negative error code on fatal failure.
+ */
+int desk_tclaw_execute_tool(const char *request_id,
+                            const char *operation,
+                            const char *arguments_json,
+                            char *out_response_json,
+                            size_t max_len);
+
+/**
+ * @brief Check if an operation name corresponds to a supported built-in hardware tool.
+ */
+bool desk_tclaw_is_builtin_tool(const char *operation);
+
+/**
+ * @brief External tool execution timeout configuration (milliseconds).
+ */
+void desk_tclaw_set_tool_timeout_ms(uint32_t timeout_ms);
+uint32_t desk_tclaw_get_tool_timeout_ms(void);
+
+/**
+ * @brief Explicitly trigger tool execution timeout handling for a pending request.
+ */
+int desk_tclaw_handle_tool_timeout(const char *request_id);
+
+/**
+ * @brief Poll for external tool execution timeout.
+ * @param now_ms Current system timestamp in milliseconds (pass 0 to query clock).
+ * @return 0 if normal, 1 if a timeout was triggered, negative on error.
+ */
+int desk_tclaw_poll_timeouts(uint64_t now_ms);
+
+/**
+ * @brief Retrieve pending tool operation name and request ID.
+ */
+const char *desk_tclaw_get_pending_tool(void);
+const char *desk_tclaw_get_pending_request_id(void);
 
 #ifdef __cplusplus
 }

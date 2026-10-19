@@ -1,0 +1,98 @@
+{
+  "$schema": "https://schemas.tuyaopen.dev/architecture.v1.json",
+  "schemaVersion": 1,
+  "surfaces": {
+    "embedded": {
+      "enabled": true,
+      "path": "source/embedded",
+      "scaffolded": true,
+      "platform": "esp32",
+      "framework": "base",
+      "board": "espressif-esp32-s3",
+      "chip": "esp32s3",
+      "entrypoint": {
+        "file": "source/embedded/main/src/app_main.c",
+        "symbol": "app_main"
+      },
+      "rtos": {
+        "kind": "freertos",
+        "tasks": [
+          {
+            "name": "app_main",
+            "stackDepth": "1024 * 8",
+            "priority": "1"
+          }
+        ]
+      },
+      "memory": {
+        "stack": "1024*8",
+        "heap": "32MB Flash / 8MB PSRAM"
+      },
+      "hardware": {
+        "peripherals": [
+          "qspi_lcd",
+          "i2c_sensor",
+          "i2s_audio",
+          "uart_stm32",
+          "spi_himax_camera"
+        ],
+        "interfaces": [
+          "wifi_station",
+          "tcp_sdk_37020",
+          "udp_sdk_37021",
+          "tal_cli_serial"
+        ]
+      }
+    },
+    "miniapp": {
+      "enabled": false,
+      "path": "source/miniapp",
+      "scaffolded": false,
+      "panelKind": null,
+      "entrypoint": null
+    }
+  },
+  "modules": [
+    {
+      "id": "app",
+      "name": "DeskAgent Embedded Firmware",
+      "kind": "executable",
+      "language": "C",
+      "sources": [
+        "source/embedded/main/src/",
+        "source/embedded/components/"
+      ],
+      "surface": "embedded"
+    }
+  ],
+  "components": [
+    {
+      "id": "desk_hardware",
+      "description": "Hardware driver abstraction, arbiter, LCD, audio, Himax, STM32",
+      "path": "source/embedded/components/desk_hardware"
+    },
+    {
+      "id": "desk_tclaw",
+      "description": "TClaw protocol bridge, cloud dialogue state machine",
+      "path": "source/embedded/components/desk_tclaw"
+    },
+    {
+      "id": "desk_sdk_bridge",
+      "description": "Official Python SDK bridge, TCP/UDP sockets, capability negotiation",
+      "path": "source/embedded/components/desk_sdk_bridge"
+    },
+    {
+      "id": "tal_cli",
+      "description": "TuyaOpen TAL CLI diagnosis command suite",
+      "path": "source/embedded/components/tal_cli"
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "tuyaopen-core",
+      "version": "main",
+      "kind": "core",
+      "surface": "embedded"
+    }
+  ]
+}
