@@ -94,3 +94,7 @@ desktop.ini
 firmware/sdkconfig
 # Device backups stay local, even if a future format lacks a .bin suffix.
 backups/
+
+# 显式保留已构建的目标固件发布产物 (Track Compiled Firmware Dist Artifacts)
+!firmware/dist/
+!firmware/dist/**
