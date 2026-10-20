@@ -567,6 +567,8 @@ typedef struct {
     uint32_t timeout_ms;
     desk_sdk_req_state_t state;
     char last_status[32];
+    char result_payload[512];
+    bool has_response;
     bool in_use;
 } desk_sdk_pending_req_t;
 
@@ -654,7 +656,7 @@ static int desk_sdk_req_table_add(const char *request_id, const char *operation,
     return 0;
 }
 
-static int desk_sdk_req_table_update(const char *request_id, const char *status)
+static int desk_sdk_req_table_update_with_payload(const char *request_id, const char *status, const char *payload)
 {
     if (!request_id || !status) return -1;
 
@@ -673,6 +675,11 @@ static int desk_sdk_req_table_update(const char *request_id, const char *status)
         desk_sdk_pending_req_t *entry = &s_req_table[found_idx];
         entry->updated_at_ms = now;
         snprintf(entry->last_status, sizeof(entry->last_status), "%s", status);
+        if (payload && payload[0] != '\0') {
+            strncpy(entry->result_payload, payload, sizeof(entry->result_payload) - 1);
+            entry->result_payload[sizeof(entry->result_payload) - 1] = '\0';
+        }
+        entry->has_response = true;
 
         if (strcmp(status, "accepted") == 0) {
             entry->state = DESK_SDK_REQ_STATE_ACCEPTED;
@@ -693,6 +700,11 @@ static int desk_sdk_req_table_update(const char *request_id, const char *status)
     for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
         if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
             snprintf(s_req_table[i].last_status, sizeof(s_req_table[i].last_status), "%s", status);
+            if (payload && payload[0] != '\0') {
+                strncpy(s_req_table[i].result_payload, payload, sizeof(s_req_table[i].result_payload) - 1);
+                s_req_table[i].result_payload[sizeof(s_req_table[i].result_payload) - 1] = '\0';
+            }
+            s_req_table[i].has_response = true;
             if (strcmp(status, "accepted") == 0) {
                 s_req_table[i].state = DESK_SDK_REQ_STATE_ACCEPTED;
             } else if (strcmp(status, "completed") == 0 || strcmp(status, "succeeded") == 0) {
@@ -705,6 +717,45 @@ static int desk_sdk_req_table_update(const char *request_id, const char *status)
     }
     pthread_mutex_unlock(&s_req_mutex);
     return 0;
+}
+
+
+int desk_sdk_bridge_wait_tool_response(const char *request_id,
+                                       uint32_t timeout_ms,
+                                       char *out_status, size_t status_max_len,
+                                       char *out_result, size_t result_max_len)
+{
+    if (!request_id || request_id[0] == '\0') return -1;
+    uint64_t deadline = desk_sdk_time_ms() + timeout_ms;
+
+    while (desk_sdk_time_ms() < deadline) {
+        pthread_mutex_lock(&s_req_mutex);
+        for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+            if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
+                if (s_req_table[i].has_response) {
+                    if (out_status && status_max_len > 0) {
+                        strncpy(out_status, s_req_table[i].last_status, status_max_len - 1);
+                        out_status[status_max_len - 1] = '\0';
+                    }
+                    if (out_result && result_max_len > 0) {
+                        strncpy(out_result, s_req_table[i].result_payload, result_max_len - 1);
+                        out_result[result_max_len - 1] = '\0';
+                    }
+                    pthread_mutex_unlock(&s_req_mutex);
+                    return 0;
+                }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&s_req_mutex);
+
+#ifdef ESP_PLATFORM
+        usleep(20000);
+#else
+        usleep(20000);
+#endif
+    }
+    return -1;
 }
 
 int desk_sdk_bridge_get_pending_request_count(void)
@@ -1775,8 +1826,9 @@ int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json)
         }
     }
 
-    /* Update table with raw status */
-    desk_sdk_req_table_update(req_id, raw_status);
+    /* Update table with raw status and payload */
+    bool is_payload_succ = (strcmp(raw_status, "succeeded") == 0 || strcmp(raw_status, "completed") == 0 || strcmp(raw_status, "accepted") == 0);
+    desk_sdk_req_table_update_with_payload(req_id, raw_status, is_payload_succ ? s_result_buf : s_error_buf);
 
     /* Normalize status: "completed" -> "succeeded" */
     const char *eff_status = raw_status;

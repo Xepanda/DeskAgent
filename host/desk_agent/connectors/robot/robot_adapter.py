@@ -17,6 +17,7 @@ import json
 import logging
 import select
 import socket
+import struct
 import threading
 import time
 import uuid
@@ -67,6 +68,9 @@ class RobotAdapter:
         self._event_listeners: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
         self._tool_request_handler: Optional[Callable[[dict[str, Any]], None]] = None
         self._recv_buf: str = ""
+        self._raw_recv_buf = bytearray()
+        self._camera_frame_callbacks: list[Callable[[bytes], None]] = []
+        self._audio_frame_callbacks: list[Callable[[bytes], None]] = []
 
     def _new_request_id(self) -> str:
         """Generates a collision-free request id.
@@ -88,6 +92,18 @@ class RobotAdapter:
     @property
     def capabilities(self) -> list[str]:
         return list(self._capabilities)
+
+    def register_camera_frame_callback(self, cb: Callable[[bytes], None]) -> None:
+        """Registers a callback to receive raw JPEG camera frames from WSPK binary stream."""
+        with self._lock:
+            if cb not in self._camera_frame_callbacks:
+                self._camera_frame_callbacks.append(cb)
+
+    def register_audio_frame_callback(self, cb: Callable[[bytes], None]) -> None:
+        """Registers a callback to receive audio stream frames from WSPK binary stream."""
+        with self._lock:
+            if cb not in self._audio_frame_callbacks:
+                self._audio_frame_callbacks.append(cb)
 
     def start(self) -> None:
         """Starts the persistent background connection & event receiver worker."""
@@ -202,18 +218,58 @@ class RobotAdapter:
                     pass
                 return False
 
+    def _process_incoming_bytes(self, raw_buf: bytearray, data: bytes) -> None:
+        """Processes incoming bytes, unbundling WSPK binary media frames and newline-delimited JSON commands."""
+        raw_buf.extend(data)
+        while raw_buf:
+            if raw_buf.startswith(b"WSPK"):
+                # Header is 16 bytes: <4sBBHII
+                if len(raw_buf) < 16:
+                    break
+                magic, frame_type, flags, stream_id, sequence, payload_size = struct.unpack("<4sBBHII", raw_buf[:16])
+                if len(raw_buf) < 16 + payload_size:
+                    break
+                payload = bytes(raw_buf[16:16 + payload_size])
+                del raw_buf[:16 + payload_size]
+                if frame_type == 0x02:  # Camera JPEG frame
+                    with self._lock:
+                        cbs = list(self._camera_frame_callbacks)
+                    for cb in cbs:
+                        try:
+                            cb(payload)
+                        except Exception as cb_err:
+                            logger.warning("Camera frame callback error: %s", cb_err)
+                elif frame_type == 0x01:  # Audio frame
+                    with self._lock:
+                        cbs = list(self._audio_frame_callbacks)
+                    for cb in cbs:
+                        try:
+                            cb(payload)
+                        except Exception as cb_err:
+                            logger.warning("Audio frame callback error: %s", cb_err)
+            elif b"\n" in raw_buf:
+                nl_idx = raw_buf.find(b"\n")
+                line_bytes = bytes(raw_buf[:nl_idx])
+                del raw_buf[:nl_idx + 1]
+                line_str = line_bytes.decode("utf-8", errors="replace").strip()
+                if line_str:
+                    self._handle_incoming_line(line_str)
+            else:
+                if len(raw_buf) > MAX_FRAME_SIZE:
+                    logger.warning("Frame buffer exceeded MAX_FRAME_SIZE (%d bytes); discarding", MAX_FRAME_SIZE)
+                    raw_buf.clear()
+                break
+
     def _connection_loop(self) -> None:
         """Background loop ensuring continuous connectivity and reading incoming events/requests."""
-        recv_buf = ""
+        raw_buf = bytearray()
         while not self._stop_event.is_set():
             if not self.is_connected:
-                # Clear residual buffer upon disconnect (interfaces.md 6.3 rule 4)
-                recv_buf = ""
+                raw_buf.clear()
                 if not self.connect_tcp(timeout=2.0):
                     self._stop_event.wait(self.reconnect_interval)
                     continue
 
-            # Socket is connected; wait for input with select
             try:
                 sock = self._sock
                 if not sock:
@@ -221,38 +277,26 @@ class RobotAdapter:
                 rlist, _, xlist = select.select([sock], [], [sock], 0.2)
                 if xlist:
                     logger.info("Socket exceptional condition, closing")
-                    recv_buf = ""
+                    raw_buf.clear()
                     with self._lock:
                         self._close_socket()
                     continue
 
                 if rlist:
-                    data = sock.recv(4096)
+                    data = sock.recv(8192)
                     if not data:
                         logger.info("Robot disconnected TCP connection")
-                        recv_buf = ""
+                        raw_buf.clear()
                         with self._lock:
                             self._close_socket()
                         continue
-                    recv_buf += data.decode("utf-8", errors="replace")
-                    # Enforce maximum frame length (interfaces.md 6.3 rule 2)
-                    if len(recv_buf) > MAX_FRAME_SIZE:
-                        logger.warning("Frame buffer exceeded MAX_FRAME_SIZE (%d bytes); discarding", MAX_FRAME_SIZE)
-                        if "\n" in recv_buf:
-                            _, recv_buf = recv_buf.split("\n", 1)
-                        else:
-                            recv_buf = ""
-                    while "\n" in recv_buf:
-                        line, recv_buf = recv_buf.split("\n", 1)
-                        line = line.strip()
-                        if line:
-                            self._handle_incoming_line(line)
+                    self._process_incoming_bytes(raw_buf, data)
             except BlockingIOError:
                 pass
             except Exception as e:
                 if not self._stop_event.is_set():
                     logger.debug("Robot connection loop notice: %s", e)
-                    recv_buf = ""
+                    raw_buf.clear()
                     with self._lock:
                         self._close_socket()
                     self._stop_event.wait(self.reconnect_interval)
@@ -387,18 +431,7 @@ class RobotAdapter:
                                 except OSError:
                                     pass
                             if data:
-                                self._recv_buf += data.decode("utf-8", errors="replace")
-                                if len(self._recv_buf) > MAX_FRAME_SIZE:
-                                    logger.warning("Fallback frame buffer exceeded MAX_FRAME_SIZE (%d bytes); discarding", MAX_FRAME_SIZE)
-                                    if "\n" in self._recv_buf:
-                                        _, self._recv_buf = self._recv_buf.split("\n", 1)
-                                    else:
-                                        self._recv_buf = ""
-                                while "\n" in self._recv_buf:
-                                    line, self._recv_buf = self._recv_buf.split("\n", 1)
-                                    line = line.strip()
-                                    if line:
-                                        self._handle_incoming_line(line)
+                                self._process_incoming_bytes(self._raw_recv_buf, data)
                             else:
                                 with self._lock:
                                     self._close_socket()
@@ -529,11 +562,12 @@ class RobotAdapter:
             return False
 
         title = payload.get("title", "Alert")
+        text = payload.get("text") or title
         cmd = {
             "type": "ctrl.expression.play",
             "data": {
                 "preset": "alert",
-                "text": title,
+                "text": text,
                 "event_type": event_type,
                 "payload": payload,
             },

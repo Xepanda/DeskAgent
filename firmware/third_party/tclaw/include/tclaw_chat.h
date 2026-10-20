@@ -28,6 +28,9 @@ extern "C" {
 ***********************************************************/
 OPERATE_RET tclaw_chat_init(void);
 
+typedef void (*tclaw_chat_event_hook_t)(AI_NOTIFY_EVENT_T *event);
+void tclaw_chat_register_event_hook(tclaw_chat_event_hook_t hook);
+
 #ifdef __cplusplus
 }
 #endif

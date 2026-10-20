@@ -25,6 +25,7 @@
 #include "im_config.h"
 #include "ws_server.h"
 #include "cJSON.h"
+#include "desk_hardware.h"
 
 enum {
     STAGE_SYS_BUS = 0,
@@ -150,14 +151,73 @@ static OPERATE_RET __tool_ha_execute(const MCP_PROPERTY_LIST_T *properties,
     int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
     cJSON_free(env_str);
 
-    if (rc == 0) {
-        ai_mcp_return_value_set_str(ret_val,
-            "Home Assistant service call dispatched to host. Execution in progress.");
-        return OPRT_OK;
-    } else {
+    if (rc != 0) {
         ai_mcp_return_value_set_str(ret_val, "Error: failed to dispatch to host bridge");
         return OPRT_COM_ERROR;
     }
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 2500, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
+        char reply[640];
+        snprintf(reply, sizeof(reply), "Home Assistant service call executed successfully: %s",
+                 result_buf[0] ? result_buf : "{\"success\":true}");
+        ai_mcp_return_value_set_str(ret_val, reply);
+        return OPRT_OK;
+    } else if (wait_rc == 0 && (strcmp(status, "failed") == 0 || strcmp(status, "error") == 0)) {
+        char reply[640];
+        snprintf(reply, sizeof(reply), "Home Assistant service call failed: %s",
+                 result_buf[0] ? result_buf : "unknown error");
+        ai_mcp_return_value_set_str(ret_val, reply);
+        return OPRT_COM_ERROR;
+    } else {
+        ai_mcp_return_value_set_str(ret_val,
+            "Home Assistant service call dispatched to host. Execution in progress.");
+        return OPRT_OK;
+    }
+}
+
+static OPERATE_RET __tool_ha_get_state(const MCP_PROPERTY_LIST_T *properties,
+                                       MCP_RETURN_VALUE_T *ret_val,
+                                       void *user_data)
+{
+    (void)user_data;
+    const char *entity_id = __get_str_prop(properties, "entity_id");
+    if (!entity_id) {
+        ai_mcp_return_value_set_str(ret_val, "Error: 'entity_id' is required");
+        return OPRT_INVALID_PARM;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-hag-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "ha.get_state");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "entity_id", entity_id);
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!env_str) return OPRT_MALLOC_FAILED;
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+    if (rc != 0) return OPRT_COM_ERROR;
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 2000, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
+        ai_mcp_return_value_set_str(ret_val, result_buf[0] ? result_buf : "{\"state\":\"unknown\"}");
+        return OPRT_OK;
+    }
+    ai_mcp_return_value_set_str(ret_val, "Unable to query entity state from Home Assistant.");
+    return OPRT_COM_ERROR;
 }
 
 static OPERATE_RET __tool_codex_submit(const MCP_PROPERTY_LIST_T *properties,
@@ -196,14 +256,23 @@ static OPERATE_RET __tool_codex_submit(const MCP_PROPERTY_LIST_T *properties,
     int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
     cJSON_free(env_str);
 
-    if (rc == 0) {
-        ai_mcp_return_value_set_str(ret_val,
-            "Task submitted to Codex Companion on PC. Result will be processed asynchronously.");
-        return OPRT_OK;
-    } else {
+    if (rc != 0) {
         ai_mcp_return_value_set_str(ret_val, "Error: failed to dispatch to host bridge");
         return OPRT_COM_ERROR;
     }
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 1000, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "accepted") == 0 || strcmp(status, "succeeded") == 0)) {
+        ai_mcp_return_value_set_str(ret_val,
+            "Task accepted by Codex Companion on PC. It will execute in background and notify you upon completion.");
+        return OPRT_OK;
+    }
+
+    ai_mcp_return_value_set_str(ret_val,
+        "Task submitted to Codex Companion on PC. Result will be processed asynchronously.");
+    return OPRT_OK;
 }
 
 static OPERATE_RET __tool_reminder_create(const MCP_PROPERTY_LIST_T *properties,
@@ -229,6 +298,7 @@ static OPERATE_RET __tool_reminder_create(const MCP_PROPERTY_LIST_T *properties,
     cJSON *args = cJSON_CreateObject();
     cJSON_AddStringToObject(args, "title", title);
     if (due_time && due_time[0]) {
+        cJSON_AddStringToObject(args, "due_at", due_time);
         cJSON_AddStringToObject(args, "due_time", due_time);
     }
     cJSON_AddItemToObject(root, "arguments", args);
@@ -244,19 +314,205 @@ static OPERATE_RET __tool_reminder_create(const MCP_PROPERTY_LIST_T *properties,
     int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
     cJSON_free(env_str);
 
-    if (rc == 0) {
-        ai_mcp_return_value_set_str(ret_val, "Reminder scheduled successfully on host.");
-        return OPRT_OK;
-    } else {
+    if (rc != 0) {
         ai_mcp_return_value_set_str(ret_val, "Error: failed to dispatch to host bridge");
         return OPRT_COM_ERROR;
     }
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 2000, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
+        char reply[640];
+        snprintf(reply, sizeof(reply), "Reminder scheduled successfully: %s",
+                 result_buf[0] ? result_buf : title);
+        ai_mcp_return_value_set_str(ret_val, reply);
+        return OPRT_OK;
+    } else if (wait_rc == 0 && (strcmp(status, "failed") == 0 || strcmp(status, "error") == 0)) {
+        char reply[640];
+        snprintf(reply, sizeof(reply), "Failed to schedule reminder: %s",
+                 result_buf[0] ? result_buf : "unknown error");
+        ai_mcp_return_value_set_str(ret_val, reply);
+        return OPRT_COM_ERROR;
+    } else {
+        ai_mcp_return_value_set_str(ret_val, "Reminder creation request dispatched to host.");
+        return OPRT_OK;
+    }
+}
+
+static OPERATE_RET __tool_reminder_list(const MCP_PROPERTY_LIST_T *properties,
+                                       MCP_RETURN_VALUE_T *ret_val,
+                                       void *user_data)
+{
+    (void)user_data;
+    const char *status_filter = __get_str_prop(properties, "status");
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-reml-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "reminder.list");
+
+    cJSON *args = cJSON_CreateObject();
+    if (status_filter && status_filter[0]) {
+        cJSON_AddStringToObject(args, "status", status_filter);
+    }
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!env_str) return OPRT_MALLOC_FAILED;
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+    if (rc != 0) return OPRT_COM_ERROR;
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 2000, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
+        ai_mcp_return_value_set_str(ret_val, result_buf[0] ? result_buf : "{\"items\":[]}");
+        return OPRT_OK;
+    }
+    ai_mcp_return_value_set_str(ret_val, "Unable to fetch reminders list.");
+    return OPRT_COM_ERROR;
+}
+
+static OPERATE_RET __tool_reminder_delete(const MCP_PROPERTY_LIST_T *properties,
+                                         MCP_RETURN_VALUE_T *ret_val,
+                                         void *user_data)
+{
+    (void)user_data;
+    const char *reminder_id = __get_str_prop(properties, "reminder_id");
+    if (!reminder_id || reminder_id[0] == '\0') {
+        ai_mcp_return_value_set_str(ret_val, "Error: 'reminder_id' is required");
+        return OPRT_INVALID_PARM;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-remd-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "reminder.delete");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "reminder_id", reminder_id);
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!env_str) return OPRT_MALLOC_FAILED;
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+    if (rc != 0) return OPRT_COM_ERROR;
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 2000, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
+        ai_mcp_return_value_set_str(ret_val, "Reminder deleted successfully.");
+        return OPRT_OK;
+    }
+    ai_mcp_return_value_set_str(ret_val, "Failed to delete reminder.");
+    return OPRT_COM_ERROR;
+}
+
+static OPERATE_RET __tool_note_create(const MCP_PROPERTY_LIST_T *properties,
+                                     MCP_RETURN_VALUE_T *ret_val,
+                                     void *user_data)
+{
+    (void)user_data;
+    const char *title = __get_str_prop(properties, "title");
+    const char *content = __get_str_prop(properties, "content");
+    if (!content || content[0] == '\0') {
+        content = title;
+    }
+    if (!content || content[0] == '\0') {
+        ai_mcp_return_value_set_str(ret_val, "Error: 'content' or 'title' is required");
+        return OPRT_INVALID_PARM;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-note-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "note.create");
+
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddStringToObject(args, "title", (title && title[0]) ? title : "Voice Memo");
+    cJSON_AddStringToObject(args, "content", content);
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!env_str) return OPRT_MALLOC_FAILED;
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+    if (rc != 0) return OPRT_COM_ERROR;
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 2000, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
+        ai_mcp_return_value_set_str(ret_val, "Note saved successfully.");
+        return OPRT_OK;
+    }
+    ai_mcp_return_value_set_str(ret_val, "Note creation dispatched.");
+    return OPRT_OK;
+}
+
+static OPERATE_RET __tool_note_list(const MCP_PROPERTY_LIST_T *properties,
+                                   MCP_RETURN_VALUE_T *ret_val,
+                                   void *user_data)
+{
+    (void)user_data;
+    const char *query = __get_str_prop(properties, "query");
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[37];
+    snprintf(req_id, sizeof(req_id), "req-notel-%u", (unsigned)tal_time_get_posix());
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", "note.list");
+
+    cJSON *args = cJSON_CreateObject();
+    if (query && query[0]) {
+        cJSON_AddStringToObject(args, "query", query);
+    }
+    cJSON_AddItemToObject(root, "arguments", args);
+
+    char *env_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!env_str) return OPRT_MALLOC_FAILED;
+
+    int rc = desk_sdk_bridge_dispatch_tool_request(env_str);
+    cJSON_free(env_str);
+    if (rc != 0) return OPRT_COM_ERROR;
+
+    char status[32] = "";
+    char result_buf[256] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 2000, status, sizeof(status), result_buf, sizeof(result_buf));
+    if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
+        ai_mcp_return_value_set_str(ret_val, result_buf[0] ? result_buf : "{\"items\":[]}");
+        return OPRT_OK;
+    }
+    ai_mcp_return_value_set_str(ret_val, "Unable to query notes list.");
+    return OPRT_COM_ERROR;
 }
 
 int desk_tclaw_runtime_register_mcp_tools(void)
 {
     OPERATE_RET rt = OPRT_OK;
-    PR_INFO("[TCLAW_RUNTIME] registering DeskAgent native MCP tools (ha.execute, codex.submit_turn, reminder.create)...");
+    PR_INFO("[TCLAW_RUNTIME] registering DeskAgent native MCP tools (ha, codex, reminder, note)...");
 
     TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
         "ha_execute",
@@ -266,6 +522,14 @@ int desk_tclaw_runtime_register_mcp_tools(void)
         MCP_PROP_STR("entity_id", "Home Assistant entity identifier, e.g. 'light.desk' or 'switch.heater'"),
         MCP_PROP_STR("action", "Action to perform, e.g. 'turn_on', 'turn_off', 'toggle'"),
         MCP_PROP_STR_DEF("parameters", "Optional JSON parameters for service call", "{}")
+    ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "ha_get_state",
+        "Get current state of a smart home entity in Home Assistant.",
+        __tool_ha_get_state,
+        NULL,
+        MCP_PROP_STR("entity_id", "Home Assistant entity identifier, e.g. 'light.desk'")
     ));
 
     TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
@@ -286,6 +550,39 @@ int desk_tclaw_runtime_register_mcp_tools(void)
         MCP_PROP_STR("due_time", "Target ISO-8601 timestamp for alert trigger")
     ));
 
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "reminder_list",
+        "List upcoming or pending reminders on DeskAgent.",
+        __tool_reminder_list,
+        NULL,
+        MCP_PROP_STR_DEF("status", "Status filter ('pending' or 'completed')", "pending")
+    ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "reminder_delete",
+        "Delete a reminder by ID.",
+        __tool_reminder_delete,
+        NULL,
+        MCP_PROP_STR("reminder_id", "Reminder identifier to delete")
+    ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "note_create",
+        "Create a quick note, memo, or thought log on DeskAgent.",
+        __tool_note_create,
+        NULL,
+        MCP_PROP_STR("title", "Title of the note"),
+        MCP_PROP_STR("content", "Content of the note")
+    ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+        "note_list",
+        "List or search stored notes and memos.",
+        __tool_note_list,
+        NULL,
+        MCP_PROP_STR_DEF("query", "Search keyword query", "")
+    ));
+
     PR_INFO("[TCLAW_RUNTIME] native MCP tools registered successfully");
     return OPRT_OK;
 }
@@ -302,6 +599,50 @@ const desk_tclaw_runtime_stage_t *desk_tclaw_runtime_stages(unsigned *count)
     return s_stages;
 }
 
+static const char *s_current_ai_preset = NULL;
+
+static void __desk_ai_chat_event_handler(AI_NOTIFY_EVENT_T *event)
+{
+    if (!event) return;
+    const char *new_preset = NULL;
+    const char *status_text = NULL;
+
+    switch (event->type) {
+    case AI_USER_EVT_KEY_WAKEUP:
+    case AI_USER_EVT_MIC_DATA:
+        new_preset = "listening";
+        status_text = "Listening...";
+        break;
+    case AI_USER_EVT_ASR_OK:
+        new_preset = "thinking";
+        status_text = "Thinking...";
+        break;
+    case AI_USER_EVT_TEXT_STREAM_START:
+    case AI_USER_EVT_TTS_START:
+    case AI_USER_EVT_TTS_DATA:
+        new_preset = "speaking";
+        status_text = "Speaking...";
+        break;
+    case AI_USER_EVT_TTS_STOP:
+    case AI_USER_EVT_END:
+        new_preset = "idle";
+        status_text = "Ready";
+        break;
+    case AI_USER_EVT_ASR_ERROR:
+    case AI_USER_EVT_TTS_ERROR:
+        new_preset = "error";
+        status_text = "Error";
+        break;
+    default:
+        break;
+    }
+
+    if (new_preset && (s_current_ai_preset == NULL || strcmp(s_current_ai_preset, new_preset) != 0)) {
+        s_current_ai_preset = new_preset;
+        desk_hardware_set_screen_expression(new_preset, status_text);
+    }
+}
+
 int desk_tclaw_runtime_init(void)
 {
     int first_error = 0;
@@ -309,8 +650,12 @@ int desk_tclaw_runtime_init(void)
     record_stage(STAGE_SYS_BUS, rc == OPRT_OK ? DESK_TCLAW_RUNTIME_READY : DESK_TCLAW_RUNTIME_FAILED, rc);
     if (rc != OPRT_OK && first_error == 0) first_error = rc;
 
+
     rc = tclaw_chat_init();
     record_stage(STAGE_TCLAW_CHAT, rc == OPRT_OK ? DESK_TCLAW_RUNTIME_SUBSCRIBED : DESK_TCLAW_RUNTIME_FAILED, rc);
+    if (rc == OPRT_OK) {
+        tclaw_chat_register_event_hook(__desk_ai_chat_event_handler);
+    }
     if (rc != OPRT_OK && first_error == 0) first_error = rc;
 
     if (!has_im_credentials()) {
@@ -406,22 +751,22 @@ int desk_tclaw_runtime_handle_bridge_response(const char *response_json)
     if ((success && !result) || (!success && !error)) goto done;
 
     const char *pending_id = desk_tclaw_get_pending_request_id();
-    if (!pending_id || pending_id[0] == '\0' || strcmp(pending_id, request_id) != 0) {
-        rc = OPRT_RESOURCE_NOT_READY;
-        goto done;
-    }
-
-    char *result_json = success ? cJSON_PrintUnformatted(result) : NULL;
-    char *error_json = success ? NULL : cJSON_PrintUnformatted(error);
-    if ((success && !result_json) || (!success && !error_json)) {
+    if (pending_id && pending_id[0] != '\0' && strcmp(pending_id, request_id) == 0) {
+        char *result_json = success ? cJSON_PrintUnformatted(result) : NULL;
+        char *error_json = success ? NULL : cJSON_PrintUnformatted(error);
+        if ((success && !result_json) || (!success && !error_json)) {
+            cJSON_free(result_json);
+            cJSON_free(error_json);
+            rc = OPRT_MALLOC_FAILED;
+            goto done;
+        }
+        rc = desk_tclaw_handle_tool_response(request_id, status, result_json, error_json);
         cJSON_free(result_json);
         cJSON_free(error_json);
-        rc = OPRT_MALLOC_FAILED;
-        goto done;
+    } else {
+        /* Native MCP tool responses or unsolicited completions are recorded in s_req_table */
+        rc = OPRT_OK;
     }
-    rc = desk_tclaw_handle_tool_response(request_id, status, result_json, error_json);
-    cJSON_free(result_json);
-    cJSON_free(error_json);
 
 done:
     cJSON_Delete(root);

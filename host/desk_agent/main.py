@@ -184,6 +184,23 @@ class DeskAgentHostApp:
             self.register_robot_hardware_client(self.robot_adapter)
             self.register_announcement_channel(self.robot_adapter.send_announcement)
             self.robot_adapter.register_tool_request_handler(self._on_robot_tool_request)
+            self.robot_adapter.register_camera_frame_callback(self.camera_service.ingest_robot_frame)
+
+            def _on_codex_event(event_type: str, data: dict[str, Any]) -> None:
+                if event_type in ("codex.turn_completed", "codex.completed"):
+                    summary = data.get("summary") or f"Task {data.get('task_id', '')} finished"
+                    announcement = {
+                        "title": "Codex 任务完成",
+                        "text": f"Codex任务已完成：{summary}",
+                        "sound": "notify",
+                        "task_id": data.get("task_id"),
+                    }
+                    if self.robot_adapter:
+                        self.robot_adapter.send_announcement("codex.completed", announcement)
+
+            if hasattr(self.companion, "add_event_listener"):
+                self.companion.add_event_listener(_on_codex_event)
+
             self.robot_adapter.start()
 
         # HA State Subscription
@@ -453,15 +470,27 @@ class DeskAgentHostApp:
 
     def _handle_reminder_create(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
-        res = self.life_service.create_reminder(
-            reminder_id=args.get("reminder_id", req.request_id),
-            title=args["title"],
-            due_at=args["due_at"],
-            timezone_str=args.get("timezone", "Asia/Shanghai"),
-            repeat_rule=args.get("repeat_rule"),
-            priority=args.get("priority", "normal"),
-        )
-        return ResponseEnvelope.create_success(req.request_id, res)
+        title = args.get("title") or args.get("text") or "Reminder"
+        due_at = args.get("due_at") or args.get("due_time")
+        if not due_at:
+            now = datetime.now(timezone.utc)
+            due_at = (now + timedelta(minutes=10)).isoformat()
+        try:
+            res = self.life_service.create_reminder(
+                reminder_id=args.get("reminder_id", req.request_id),
+                title=title,
+                due_at=due_at,
+                timezone_str=args.get("timezone", "Asia/Shanghai"),
+                repeat_rule=args.get("repeat_rule"),
+                priority=args.get("priority", "normal"),
+            )
+            return ResponseEnvelope.create_success(req.request_id, res)
+        except Exception as e:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                error_code="EXECUTION_FAILED",
+                error_message=str(e),
+            )
 
     def _handle_reminder_list(self, req: RequestEnvelope) -> ResponseEnvelope:
         status_filter = req.arguments.get("status")
@@ -498,13 +527,22 @@ class DeskAgentHostApp:
 
     def _handle_note_create(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
-        res = self.life_service.create_note(
-            note_id=args.get("note_id", req.request_id),
-            title=args.get("title", "Untitled"),
-            content=args["content"],
-            tags=args.get("tags"),
-        )
-        return ResponseEnvelope.create_success(req.request_id, res)
+        title = args.get("title", "Untitled")
+        content = args.get("content") or args.get("note") or title
+        try:
+            res = self.life_service.create_note(
+                note_id=args.get("note_id", req.request_id),
+                title=title,
+                content=content,
+                tags=args.get("tags"),
+            )
+            return ResponseEnvelope.create_success(req.request_id, res)
+        except Exception as e:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                error_code="EXECUTION_FAILED",
+                error_message=str(e),
+            )
 
     def _handle_note_list(self, req: RequestEnvelope) -> ResponseEnvelope:
         tag_filter = req.arguments.get("tag")

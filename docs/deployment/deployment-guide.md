@@ -143,6 +143,38 @@ sudo systemctl restart desk-agent
    > 服务将**拒绝启动**并以非零码退出，**绝不静默降级为无鉴权监听**。
 6. 防火墙配置：若设置为 `0.0.0.0`，在 Windows 高级安全防火墙中放行 TCP 8765 端口入站规则（仅限家庭/受信任子网）。
 
+### 3.3 登录自启动注册与服务管理 (Task Scheduler)
+为保证日常使用中 Companion 随 Windows 登录无感启动，项目提供无管理员特权要求的 Task Scheduler 注册脚本：
+```powershell
+# 注册开机登录后台自启动（默认最小化静默运行）
+powershell -ExecutionPolicy Bypass -File deploy\windows\register-autostart.ps1
+
+# 同时将 Host 进程注册为 Windows 自启动（可选，适用于 PC 单机全栈运行场景）
+powershell -ExecutionPolicy Bypass -File deploy\windows\register-autostart.ps1 -IncludeHost
+
+# 取消自启动任务
+powershell -ExecutionPolicy Bypass -File deploy\windows\unregister-autostart.ps1
+```
+
+### 3.4 Windows 本地 Host 服务启动 (可选开发/全单机模式)
+除泰山派部署外，Host 守护进程亦可直接在 Windows 上运行：
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\windows\run-host.ps1
+```
+
+### 3.5 一键连接引导与诊断工具 (Setup Wizard)
+在完成固件与 Host/Companion 配置后，使用诊断脚本校验全链路连通性：
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\windows\setup-connection.ps1
+```
+诊断向导依次检查：
+1. Python 运行环境与版本
+2. Codex CLI 工具状态
+3. Companion 配置文件与安全策略
+4. Companion 8765 端口健康检查
+5. Host 8088 端口健康检查
+6. 机器人 37020 端口连通状态与 Wi-Fi 建议
+
 ---
 
 ## 4. ESP32-S3 机器人固件构建与烧录

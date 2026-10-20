@@ -127,6 +127,22 @@ int desk_sdk_bridge_register_outbound(desk_sdk_outbound_send_cb_t cb, void *user
 int desk_sdk_bridge_register_tool_response_cb(desk_sdk_tool_response_cb_t cb, void *user_data);
 
 /**
+ * @brief Wait for a tool response for a given request_id up to timeout_ms.
+ * 
+ * @param request_id Request ID to wait for
+ * @param timeout_ms Maximum time to wait in milliseconds
+ * @param out_status Buffer to receive final status string ("succeeded", "failed", etc.)
+ * @param status_max_len Size of out_status buffer
+ * @param out_result Buffer to receive result JSON or error description
+ * @param result_max_len Size of out_result buffer
+ * @return 0 on success, -1 on timeout or error
+ */
+int desk_sdk_bridge_wait_tool_response(const char *request_id,
+                                       uint32_t timeout_ms,
+                                       char *out_status, size_t status_max_len,
+                                       char *out_result, size_t result_max_len);
+
+/**
  * @brief Pack WSPK binary header (16-byte Little Endian <4sBBHII).
  */
 int desk_wspk_pack_header(uint8_t frame_type,

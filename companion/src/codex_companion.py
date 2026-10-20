@@ -325,6 +325,7 @@ class CodexCompanion:
         self._thread_to_task: dict[str, str] = {}
         self._turn_to_task: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
 
         if db_path is None:
             if "unittest" in sys.modules and os.environ.get("DESK_AGENT_USE_REAL_CODEX") != "1":
@@ -343,6 +344,20 @@ class CodexCompanion:
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
         self._load_from_db()
+
+    def add_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
+        with self._lock:
+            if cb not in self._event_listeners:
+                self._event_listeners.append(cb)
+
+    def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> None:
+        with self._lock:
+            listeners = list(self._event_listeners)
+        for cb in listeners:
+            try:
+                cb(event_type, data)
+            except Exception as err:
+                logger.warning("Codex event listener error: %s", err)
 
     def _get_connection(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -610,6 +625,12 @@ class CodexCompanion:
                     self._tasks[task_id]["status"] = "completed"
                     self._tasks[task_id]["state"] = "completed"
                     self._persist_task(self._tasks[task_id])
+                    summary = params.get("summary") or self._tasks[task_id].get("prompt", "")[:60]
+                    self._dispatch_event("codex.turn_completed", {
+                        "task_id": task_id,
+                        "status": "completed",
+                        "summary": summary,
+                    })
 
     def _get_transport(self) -> JsonRpcTransport:
         if self._transport is not None:

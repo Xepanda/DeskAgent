@@ -46,6 +46,12 @@
 ***********************variable define**********************
 ***********************************************************/
 static TIMER_ID sg_printf_heap_tm;
+static tclaw_chat_event_hook_t s_chat_event_hook = NULL;
+
+void tclaw_chat_register_event_hook(tclaw_chat_event_hook_t hook)
+{
+    s_chat_event_hook = hook;
+}
 
 #if defined(ENABLE_COMP_AI_DISPLAY) && (ENABLE_COMP_AI_DISPLAY == 1)
 static AI_UI_WIFI_STATUS_E sg_wifi_status = AI_UI_WIFI_STATUS_DISCONNECTED;
@@ -137,6 +143,10 @@ static void __ai_chat_handle_event(AI_NOTIFY_EVENT_T *event)
 
     if (NULL == event) {
         return;
+    }
+
+    if (s_chat_event_hook) {
+        s_chat_event_hook(event);
     }
 
 
