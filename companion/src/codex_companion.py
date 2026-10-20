@@ -909,13 +909,106 @@ class CodexCompanion:
 class RemoteCodexCompanionClient:
     """HTTP client connecting Host (on 泰山派 Linux) to Windows Codex Companion."""
 
-    def __init__(self, endpoint_url: str, auth_token: Optional[str] = None, timeout_sec: float = 10.0) -> None:
+    def __init__(
+        self,
+        endpoint_url: str,
+        auth_token: Optional[str] = None,
+        timeout_sec: float = 10.0,
+        poll_interval: float = 1.0,
+    ) -> None:
         self.endpoint_url = endpoint_url.rstrip("/")
         if self.endpoint_url.endswith("/rpc"):
             self.endpoint_url = self.endpoint_url[:-4]
         self.auth_token = auth_token
         self.timeout_sec = timeout_sec
+        self.poll_interval = poll_interval
         self.workspaces: dict[str, str] = {}
+        self._lock = threading.Lock()
+        self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
+        self._pending_tasks: dict[str, dict[str, Any]] = {}
+        self._stop_event = threading.Event()
+        self._poll_thread: Optional[threading.Thread] = None
+
+    def add_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
+        with self._lock:
+            if cb not in self._event_listeners:
+                self._event_listeners.append(cb)
+
+    def remove_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
+        with self._lock:
+            if cb in self._event_listeners:
+                self._event_listeners.remove(cb)
+
+    def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> None:
+        with self._lock:
+            listeners = list(self._event_listeners)
+        for cb in listeners:
+            try:
+                cb(event_type, data)
+            except Exception as err:
+                logger.warning("Remote Codex event listener error: %s", err)
+
+    def _ensure_polling_thread(self) -> None:
+        with self._lock:
+            if self._poll_thread is None or not self._poll_thread.is_alive():
+                self._stop_event.clear()
+                self._poll_thread = threading.Thread(
+                    target=self._poll_worker,
+                    name="RemoteCodexPoller",
+                    daemon=True,
+                )
+                self._poll_thread.start()
+
+    def _poll_worker(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                task_items = list(self._pending_tasks.items())
+            if not task_items:
+                self._stop_event.wait(self.poll_interval)
+                continue
+
+            for task_id, task_meta in task_items:
+                if self._stop_event.is_set():
+                    break
+                try:
+                    res = self.get_task_status(task_id)
+                except Exception as exc:
+                    logger.debug("Failed to poll status for task %s: %s", task_id, exc)
+                    continue
+
+                if not isinstance(res, dict):
+                    continue
+
+                status = str(res.get("status") or res.get("state") or "").lower()
+                if status in ("completed", "succeeded"):
+                    with self._lock:
+                        self._pending_tasks.pop(task_id, None)
+                    summary = res.get("summary") or (
+                        res.get("result", {}).get("summary")
+                        if isinstance(res.get("result"), dict)
+                        else None
+                    )
+                    if not summary:
+                        prompt = task_meta.get("prompt", "")
+                        summary = prompt[:60] if prompt else f"Task {task_id} completed"
+                    self._dispatch_event("codex.turn_completed", {
+                        "task_id": task_id,
+                        "status": "completed",
+                        "summary": summary,
+                        "result": res,
+                    })
+                elif status in ("failed", "error", "cancelled"):
+                    with self._lock:
+                        self._pending_tasks.pop(task_id, None)
+                    err_msg = res.get("error") or f"Task {task_id} failed"
+                    self._dispatch_event("codex.failed", {
+                        "task_id": task_id,
+                        "status": "failed",
+                        "summary": str(err_msg),
+                        "result": res,
+                    })
+
+            self._stop_event.wait(self.poll_interval)
 
     def _rpc_call(self, operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         url = f"{self.endpoint_url}/rpc"
@@ -956,12 +1049,21 @@ class RemoteCodexCompanionClient:
             raise ConnectionError(f"Failed to connect to Windows Companion at {url}: {exc}") from exc
 
     def submit_task(self, task_id: str, workspace_alias: str, prompt: str, model: Optional[str] = None) -> dict[str, Any]:
-        return self._rpc_call("codex.submit_turn", {
+        res = self._rpc_call("codex.submit_turn", {
             "task_id": task_id,
             "workspace_alias": workspace_alias,
             "prompt": prompt,
             "model": model,
         })
+        with self._lock:
+            self._pending_tasks[task_id] = {
+                "task_id": task_id,
+                "prompt": prompt,
+                "workspace_alias": workspace_alias,
+                "model": model,
+            }
+        self._ensure_polling_thread()
+        return res
 
     def get_task_status(self, task_id: str) -> Optional[dict[str, Any]]:
         return self._rpc_call("codex.get_task", {"task_id": task_id})
@@ -990,6 +1092,12 @@ class RemoteCodexCompanionClient:
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> dict[str, Any]:
         return self._rpc_call("codex.cancel", {"task_id": task_id, "reason": reason})
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=1.0)
+
 
 
 # ---------------------------------------------------------------------------

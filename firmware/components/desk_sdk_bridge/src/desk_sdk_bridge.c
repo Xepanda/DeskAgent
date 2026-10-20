@@ -605,6 +605,8 @@ static int desk_sdk_req_table_add(const char *request_id, const char *operation,
             }
             s_req_table[i].updated_at_ms = now;
             s_req_table[i].state = DESK_SDK_REQ_STATE_PENDING;
+            s_req_table[i].has_response = false;
+            s_req_table[i].result_payload[0] = '\0';
             strncpy(s_req_table[i].last_status, "pending", sizeof(s_req_table[i].last_status) - 1);
             pthread_mutex_unlock(&s_req_mutex);
             return 0;
@@ -741,6 +743,7 @@ int desk_sdk_bridge_wait_tool_response(const char *request_id,
                         strncpy(out_result, s_req_table[i].result_payload, result_max_len - 1);
                         out_result[result_max_len - 1] = '\0';
                     }
+                    s_req_table[i].has_response = false;
                     pthread_mutex_unlock(&s_req_mutex);
                     return 0;
                 }

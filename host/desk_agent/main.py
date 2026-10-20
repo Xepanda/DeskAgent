@@ -38,84 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("DeskAgentHost")
 
 
-class RemoteCodexCompanionClient:
-    """HTTP client connecting Host (on 泰山派 Linux) to Windows Codex Companion."""
-
-    def __init__(self, endpoint_url: str, auth_token: Optional[str] = None, timeout_sec: float = 10.0) -> None:
-        self.endpoint_url = endpoint_url.rstrip("/")
-        if self.endpoint_url.endswith("/rpc"):
-            self.endpoint_url = self.endpoint_url[:-4]
-        self.auth_token = auth_token
-        self.timeout_sec = timeout_sec
-        self.workspaces: dict[str, str] = {}
-
-    def _rpc_call(self, operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        url = f"{self.endpoint_url}/rpc"
-        payload = {
-            "schema_version": "1.0.0",
-            "request_id": f"req-rem-codex-{uuid.uuid4().hex[:8]}",
-            "operation": operation,
-            "arguments": dict(arguments),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=int(self.timeout_sec))).isoformat().replace("+00:00", "Z"),
-        }
-        headers = {"Content-Type": "application/json"}
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-            headers["X-Companion-Token"] = self.auth_token
-
-        req = urllib.request.Request(
-            url=url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if data.get("status") == "succeeded" or data.get("success") is True:
-                    return data.get("result", {})
-                err = data.get("error", {})
-                if isinstance(err, dict):
-                    err_msg = err.get("message", "Unknown error")
-                    err_code = err.get("code", "ERROR")
-                else:
-                    err_msg = str(err)
-                    err_code = "ERROR"
-                raise RuntimeError(f"Windows Companion error ({err_code}): {err_msg}")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                raise PermissionError("Authentication failed with Windows Companion") from exc
-            raise ConnectionError(f"HTTP error connecting to Windows Companion at {url}: {exc}") from exc
-        except Exception as exc:
-            raise ConnectionError(f"Failed to connect to Windows Companion at {url}: {exc}") from exc
-
-    def submit_task(self, task_id: str, workspace_alias: str, prompt: str, model: Optional[str] = None) -> dict[str, Any]:
-        return self._rpc_call("codex.submit_turn", {
-            "task_id": task_id,
-            "workspace_alias": workspace_alias,
-            "prompt": prompt,
-            "model": model,
-        })
-
-    def get_task_status(self, task_id: str) -> Optional[dict[str, Any]]:
-        return self._rpc_call("codex.get_task", {"task_id": task_id})
-
-    def respond_approval(self, approval_id: str, task_id: str, decision: str, reason: Optional[str] = None) -> dict[str, Any]:
-        return self._rpc_call("codex.decide_approval", {
-            "approval_id": approval_id,
-            "task_id": task_id,
-            "decision": decision,
-            "reason": reason,
-        })
-
-    def get_pending_approvals(self, task_id: Optional[str] = None) -> list[dict[str, Any]]:
-        args = {"task_id": task_id} if task_id else {}
-        res = self._rpc_call("codex.get_pending_approvals", args)
-        return res.get("approvals", [])
-
-    def list_workspaces(self) -> list[str]:
-        res = self._rpc_call("codex.list_workspaces", {})
-        return res.get("workspaces", [])
+from companion.src.codex_companion import RemoteCodexCompanionClient
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -143,7 +66,8 @@ class DeskAgentHostApp:
         cam_cfg = self.config.get("camera", {})
         self.camera_service = CameraViewerService(
             default_lease_ms=cam_cfg.get("default_lease_ms", 10000),
-            auto_start_pipeline=True,
+            auto_start_pipeline=cam_cfg.get("auto_start_pipeline", True),
+            allow_synthetic=cam_cfg.get("allow_synthetic", True),
         )
 
         codex_cfg = self.config.get("codex", {})
@@ -378,6 +302,11 @@ class DeskAgentHostApp:
                 self._ha_sub_stop()
             except Exception:
                 pass
+        if getattr(self, "companion", None) and hasattr(self.companion, "close"):
+            try:
+                self.companion.close()
+            except Exception:
+                pass
         self.camera_service.stop_capture()
         self.life_service.close()
 
@@ -488,8 +417,8 @@ class DeskAgentHostApp:
         except Exception as e:
             return ResponseEnvelope.create_error(
                 req.request_id,
-                error_code="EXECUTION_FAILED",
-                error_message=str(e),
+                code="EXECUTION_FAILED",
+                message=str(e),
             )
 
     def _handle_reminder_list(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -540,8 +469,8 @@ class DeskAgentHostApp:
         except Exception as e:
             return ResponseEnvelope.create_error(
                 req.request_id,
-                error_code="EXECUTION_FAILED",
-                error_message=str(e),
+                code="EXECUTION_FAILED",
+                message=str(e),
             )
 
     def _handle_note_list(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -616,11 +545,31 @@ class DeskAgentHostApp:
                 message=f"Camera lease is currently held by '{res.get('current_owner')}'",
                 details=res,
             )
+        if self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+            try:
+                self._robot_client.send_command({
+                    "type": "ctrl.camera.acquire",
+                    "client_id": client_id,
+                    "lease_duration_ms": res.get("lease_duration_ms", 10000),
+                }, timeout=1.0)
+                self._robot_client.send_command({
+                    "type": "ctrl.camera.capture",
+                }, timeout=1.0)
+            except Exception as e:
+                logger.debug("Failed to dispatch camera acquire/capture to robot: %s", e)
         return ResponseEnvelope.create_success(req.request_id, res)
 
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")
         released = self.camera_service.release_lease(client_id)
+        if released and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+            try:
+                self._robot_client.send_command({
+                    "type": "ctrl.camera.release",
+                    "client_id": client_id,
+                }, timeout=1.0)
+            except Exception as e:
+                logger.debug("Failed to dispatch camera release to robot: %s", e)
         return ResponseEnvelope.create_success(req.request_id, {"released": released})
 
     def register_robot_hardware_client(self, client: Any) -> None:
@@ -888,6 +837,11 @@ def make_request_handler(app: DeskAgentHostApp):
                 )
 
                 if is_snapshot_path:
+                    if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                        try:
+                            app._robot_client.send_command({"type": "ctrl.camera.capture"}, timeout=1.0)
+                        except Exception as e:
+                            logger.debug("Snapshot trigger to robot error: %s", e)
                     frame_info = app.camera_service.get_snapshot(client_id=client_id)
                 else:
                     # /api/camera/frame strictly enforces existing lease ownership

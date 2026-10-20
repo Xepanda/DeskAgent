@@ -106,6 +106,14 @@ static const char *__get_str_prop(const MCP_PROPERTY_LIST_T *props, const char *
     return NULL;
 }
 
+static void __gen_mcp_req_id(const char *prefix, char *out_id, size_t out_len)
+{
+    static uint32_t s_req_seq = 0;
+    uint32_t seq = ++s_req_seq;
+    uint32_t ts = (uint32_t)tal_time_get_posix();
+    snprintf(out_id, out_len, "req-%s-%u-%u", prefix, (unsigned)ts, (unsigned)seq);
+}
+
 static OPERATE_RET __tool_ha_execute(const MCP_PROPERTY_LIST_T *properties,
                                      MCP_RETURN_VALUE_T *ret_val,
                                      void *user_data)
@@ -121,8 +129,8 @@ static OPERATE_RET __tool_ha_execute(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-ha-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("ha", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "ha.execute");
@@ -173,8 +181,8 @@ static OPERATE_RET __tool_ha_execute(const MCP_PROPERTY_LIST_T *properties,
         return OPRT_COM_ERROR;
     } else {
         ai_mcp_return_value_set_str(ret_val,
-            "Home Assistant service call dispatched to host. Execution in progress.");
-        return OPRT_OK;
+            "Home Assistant service call failed: response timed out or host unreachable.");
+        return OPRT_COM_ERROR;
     }
 }
 
@@ -191,8 +199,8 @@ static OPERATE_RET __tool_ha_get_state(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-hag-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("hag", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "ha.get_state");
@@ -234,8 +242,8 @@ static OPERATE_RET __tool_codex_submit(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-codex-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("codex", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "codex.submit_turn");
@@ -268,11 +276,17 @@ static OPERATE_RET __tool_codex_submit(const MCP_PROPERTY_LIST_T *properties,
         ai_mcp_return_value_set_str(ret_val,
             "Task accepted by Codex Companion on PC. It will execute in background and notify you upon completion.");
         return OPRT_OK;
+    } else if (wait_rc == 0 && (strcmp(status, "failed") == 0 || strcmp(status, "error") == 0)) {
+        char reply[384];
+        snprintf(reply, sizeof(reply), "Failed to submit task to Codex Companion: %s",
+                 result_buf[0] ? result_buf : "unknown error");
+        ai_mcp_return_value_set_str(ret_val, reply);
+        return OPRT_COM_ERROR;
     }
 
     ai_mcp_return_value_set_str(ret_val,
-        "Task submitted to Codex Companion on PC. Result will be processed asynchronously.");
-    return OPRT_OK;
+        "Failed to submit task to Codex Companion: response timed out or host unreachable.");
+    return OPRT_COM_ERROR;
 }
 
 static OPERATE_RET __tool_reminder_create(const MCP_PROPERTY_LIST_T *properties,
@@ -289,8 +303,8 @@ static OPERATE_RET __tool_reminder_create(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-rem-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("rem", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "reminder.create");
@@ -335,8 +349,8 @@ static OPERATE_RET __tool_reminder_create(const MCP_PROPERTY_LIST_T *properties,
         ai_mcp_return_value_set_str(ret_val, reply);
         return OPRT_COM_ERROR;
     } else {
-        ai_mcp_return_value_set_str(ret_val, "Reminder creation request dispatched to host.");
-        return OPRT_OK;
+        ai_mcp_return_value_set_str(ret_val, "Failed to schedule reminder: response timed out or host unreachable.");
+        return OPRT_COM_ERROR;
     }
 }
 
@@ -349,8 +363,8 @@ static OPERATE_RET __tool_reminder_list(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-reml-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("reml", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "reminder.list");
@@ -393,8 +407,8 @@ static OPERATE_RET __tool_reminder_delete(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-remd-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("remd", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "reminder.delete");
@@ -439,8 +453,8 @@ static OPERATE_RET __tool_note_create(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-note-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("note", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "note.create");
@@ -464,9 +478,15 @@ static OPERATE_RET __tool_note_create(const MCP_PROPERTY_LIST_T *properties,
     if (wait_rc == 0 && (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0)) {
         ai_mcp_return_value_set_str(ret_val, "Note saved successfully.");
         return OPRT_OK;
+    } else if (wait_rc == 0 && (strcmp(status, "failed") == 0 || strcmp(status, "error") == 0)) {
+        char reply[384];
+        snprintf(reply, sizeof(reply), "Failed to save note: %s",
+                 result_buf[0] ? result_buf : "unknown error");
+        ai_mcp_return_value_set_str(ret_val, reply);
+        return OPRT_COM_ERROR;
     }
-    ai_mcp_return_value_set_str(ret_val, "Note creation dispatched.");
-    return OPRT_OK;
+    ai_mcp_return_value_set_str(ret_val, "Failed to save note: response timed out or host unreachable.");
+    return OPRT_COM_ERROR;
 }
 
 static OPERATE_RET __tool_note_list(const MCP_PROPERTY_LIST_T *properties,
@@ -478,8 +498,8 @@ static OPERATE_RET __tool_note_list(const MCP_PROPERTY_LIST_T *properties,
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return OPRT_MALLOC_FAILED;
-    char req_id[37];
-    snprintf(req_id, sizeof(req_id), "req-notel-%u", (unsigned)tal_time_get_posix());
+    char req_id[48];
+    __gen_mcp_req_id("notel", req_id, sizeof(req_id));
     cJSON_AddStringToObject(root, "request_id", req_id);
     cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
     cJSON_AddStringToObject(root, "operation", "note.list");

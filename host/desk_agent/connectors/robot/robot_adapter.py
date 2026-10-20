@@ -231,7 +231,7 @@ class RobotAdapter:
                     break
                 payload = bytes(raw_buf[16:16 + payload_size])
                 del raw_buf[:16 + payload_size]
-                if frame_type == 0x02:  # Camera JPEG frame
+                if frame_type in (0x02, 0x03):  # Video (0x02) or Image (0x03) JPEG frame
                     with self._lock:
                         cbs = list(self._camera_frame_callbacks)
                     for cb in cbs:
@@ -552,6 +552,30 @@ class RobotAdapter:
             "emergency": bool(emergency),
             "request_id": res.get("request_id") or cmd.get("request_id"),
         }
+
+    def send_camera_acquire(self, client_id: str = "host", lease_ms: int = 10000, timeout: float = 2.0) -> dict[str, Any]:
+        """Requests camera viewing lease from robot arbiter."""
+        cmd = {
+            "type": "ctrl.camera.acquire",
+            "client_id": client_id,
+            "lease_duration_ms": lease_ms,
+        }
+        return self.send_command(cmd, timeout=timeout)
+
+    def send_camera_release(self, client_id: str = "host", timeout: float = 2.0) -> dict[str, Any]:
+        """Releases camera viewing lease on robot arbiter."""
+        cmd = {
+            "type": "ctrl.camera.release",
+            "client_id": client_id,
+        }
+        return self.send_command(cmd, timeout=timeout)
+
+    def send_camera_capture(self, timeout: float = 2.0) -> dict[str, Any]:
+        """Triggers single frame capture and WSPK media transmission from robot camera."""
+        cmd = {
+            "type": "ctrl.camera.capture",
+        }
+        return self.send_command(cmd, timeout=timeout)
 
     def send_announcement(self, event_type: str, payload: dict[str, Any]) -> bool:
         """
