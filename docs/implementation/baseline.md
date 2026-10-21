@@ -67,15 +67,15 @@
 |     - TClaw 主框架: Tuya 官方云端语音对话、采音/播报主循环、MCP 外部工具请求生成      |
 |     - 硬件资源仲裁器 (Resource Arbiter): 统筹 Audio, Motion, Camera, Display 单一所有权|
 |     - 板级驱动 (BSP HAL): STM32 Body 舵机 (TX:19/RX:20)、ES8311/ES7210、HX6538 相机  |
-|     - 官方 SDK 适配桥: 提供标准 UDP 37021 配对发现与 TCP 37020 全双工通道             |
+|     - SDK 适配层: UDP 37021 配对处理；目标 Runtime 是 LAN WebSocket 服务端，设备应主动连接 |
 |     [禁止]: 自建第二个设备连接 Runtime，禁止绕过仲裁直接抢占硬件驱动                  |
 +---------------------------------------------------------------------------------------+
-                                           | Wi-Fi LAN (TCP 37020 / UDP 37021)
+                                           | Wi-Fi LAN (UDP pairing + outbound WebSocket)
                                            v
 +---------------------------------------------------------------------------------------+
-|  2. 官方 SDK / Runtime 桥接层 (RobotAdapter / WatcheRobot Runtime):                   |
-|     - 维护受管设备生命周期: UDP 37021 动态握手、TCP 37020 长连接会话、掉线重连       |
-|     - 协议兼容与 capabilities 注册: inputs, motion, camera, audio_stream, expression   |
+|  2. 官方 SDK / Runtime 桥接层 (WatcheRobot Runtime):                                 |
+|     - Host 广播 UDP 37021 并监听 LAN WebSocket；设备主动连接并在该连接上重连         |
+|     - 协议兼容与 capabilities 注册: inputs, motion, camera, expression；SDK 音频当前 unsupported |
 |     - 区分单设备所有权: 作为宿主侧唯一的物理机器人连接持有者，严格杜绝两套 daemon 抢占 |
 |     - 严格请求响应与超时管理: 请求未收到设备 ACK 时必须超时报错，绝不伪造成功         |
 +---------------------------------------------------------------------------------------+
@@ -108,11 +108,11 @@
 
 **架构铁律**：在整个系统运行环境中，**只允许存在一个物理设备网络连接持有者**。
 1. **连接端点**：
-   - 固件端在端口 `UDP 37021` 广播/响应配对（携带 CSPRNG 动态 Token），在端口 `TCP 37020` 监听官方客户端连接；
-   - 宿主端由 `RobotAdapter`（受管 Application 机制）负责维护到机器人的 TCP 37020 单一物理长连接。
+   - 锁定的官方 Runtime 在 Host 侧发起 UDP 37021 配对广播，并监听 PairRequest 中指定的 LAN WebSocket 端口；设备应作为 WebSocket client 连接 Host。配对码是设备屏幕显示的短时码，不是 session token；
+   - 固件当前的 TCP 37020 server 是 DeskAgent 自有协议端点，与官方 Runtime WebSocket 不是同一链路，不能声称互通。`RobotAdapter` 若连接 TCP 37020，只代表自有协议适配器。
 2. **禁止自建多重 Daemon**：
    - 严禁在泰山派上同时启动多个独立的连接进程争抢 TCP 37020，所有运动控制、音频播报、表情显示与工具结果回送均经由统一的 `RobotAdapter` 实例下发；
-   - 如果官方 WatcheRobot Python Runtime 介入，`RobotAdapter` 作为内部标准协议客户端无缝适配，保持通信信道单一、有序。
+   - 官方 Runtime 与自有 `RobotAdapter` 是不同传输路径；设备单连接 owner 规则应由产品选定并只启用一条受管链路，不得将 TCP 37020 包装为官方 Runtime 连接。
 
 ---
 

@@ -144,6 +144,8 @@ Hard resetting via RTS pin...
 - **校验状态**：`Hash of data verified.`，写入与哈希校验 100% 通过。
 
 ### 3.2 物理串口 115200 开机自检与完整启动日志 (BootLog Evidence)
+
+> 历史日志中 `WatcheRobot SDK TCP Server` / `SDK TCP Stream Port` 是当时固件的 DeskAgent 自有 TCP 37020 listener 标签，不代表官方 WatcheRobot Python SDK Runtime 已连接或互通。官方 SDK/Runtime 的实际方向是 Host UDP pairing + Host WebSocket listener、设备主动建立 WebSocket；详见当前 [P0-3 契约](p0-3-official-sdk-device-contract.md)。
 硬件复位后，从物理串口 `COM21` 捕获完整首启日志：
 
 ```text

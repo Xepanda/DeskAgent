@@ -82,7 +82,7 @@
       "tag": "v0.1.11",
       "commit": "8bc13967a06ef073459be47e930ff43ef37ee8fb",
       "worktree_status": "contract test suite validated (60/60 PASS)",
-      "role": "Official Python SDK protocol reference (UDP 37021 pairing, TCP 37020 WSPK framing)"
+      "role": "Official WatcheRobot Python SDK/Runtime source reference (v0.1.11; Host UDP pairing and Host WebSocket listener; device is a WebSocket client). Tests include a pinned Runtime + production C client localhost socket loopback (Level 2), not physical device interoperability."
     }
   },
   "target_hardware": {

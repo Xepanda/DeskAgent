@@ -234,14 +234,14 @@
 | 链路编号 | 调用方 (Caller) | 接收方 (Receiver) | 通信通道与协议 | 承载操作 / 接口 | 验证命令与测试用例 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **L-01** | TClaw 语音框架 (ESP32) | Tuya Cloud 大模型 | TLS WebSocket | 语音 Opus 流上传、云端 ASR、LLM 推理、TTS 音频下发、Tool Call 事件 | `tests/firmware_contract/test_tclaw_dialogue.py` (仿真) / 真机台架 (A1 实测) |
-| **L-02** | TClaw MCP 工具 (ESP32) | Host 核心路由器 (RK3566) | TCP 37020 协议桥接通道 | `RequestEnvelope` (格式: `ha.*`, `codex.*`, `reminder.*`) | `tests/firmware_contract/test_tclaw_dialogue.py` / `test_p1_final_closure.py` |
-| **L-03** | Host 核心路由器 (RK3566) | TClaw 语音框架 (ESP32) | TCP 37020 协议桥接通道 | `ResponseEnvelope` (执行结果及终态反馈) | `tests/firmware_contract/test_tclaw_dialogue.py` / `test_g1_official_sdk_and_tuya_interop.py` |
-| **L-04** | Host 提醒调度器 (RK3566) | 机器人扬声器 (ESP32) | TCP 37020 `RobotAdapter` | `reminder.alert` -> `ctrl.expression.play` / WSPK 音频流 | `tests/core/test_host_daemon.py` / `test_p1_final_closure.py` |
+| **L-02** | TClaw MCP 工具 (ESP32) | Host 核心路由器 (RK3566) | DeskAgent 自有 TCP 37020 协议桥接通道 | `RequestEnvelope` (格式: `ha.*`, `codex.*`, `reminder.*`) | `tests/firmware_contract/test_tclaw_dialogue.py` / `test_p1_final_closure.py` |
+| **L-03** | Host 核心路由器 (RK3566) | TClaw 语音框架 (ESP32) | DeskAgent 自有 TCP 37020 协议桥接通道 | `ResponseEnvelope` (执行结果及终态反馈) | `tests/firmware_contract/test_tclaw_dialogue.py` / `test_g1_official_sdk_and_tuya_interop.py` |
+| **L-04** | Host 提醒调度器 (RK3566) | 机器人扬声器 (ESP32) | DeskAgent 自有 TCP 37020 `RobotAdapter` | `reminder.alert` -> `ctrl.expression.play` / WSPK 音频流 | `tests/core/test_host_daemon.py` / `test_p1_final_closure.py` |
 | **L-05** | Host 核心路由器 (RK3566) | Windows Companion (PC) | HTTP RPC (端口 8765, Bearer Token) | `codex.submit_turn`, `codex.get_task`, `codex.respond_approval`, `codex.get_pending_approvals` | `tests/companion/test_codex_companion.py` / `test_p1_final_closure.py` |
 | **L-06** | Windows Companion (PC) | Codex app-server | Stdio JSON-RPC 双向管道 | `thread/start`, `turn/start`, `turn/approval`, `thread/cancel` | `tests/companion/test_codex_companion.py` |
 | **L-07** | Host HAConnector (RK3566) | Home Assistant 实例 | REST API + WebSocket API | `GET /api/states`, `POST /api/services`, WS 事件订阅 | `tests/connectors/test_ha_connector.py` / `test_p1_final_closure.py` |
 | **L-08** | Web 浏览器 / 管理端 | Host 相机与控制台 (RK3566) | HTTP (端口 8088, Token 认证) | `resource.camera.acquire`, `GET /api/camera/frame`, `POST /api/rpc` | `tests/camera/test_camera_service.py` / `test_host_daemon.py` |
-| **L-09** | 官方 Python SDK (RK3566) | 固件 SDK 桥接器 (ESP32) | UDP 37021 (配对发现) + TCP 37020 (数据流) | `sys.client.hello`, `ctrl.motion.move`, `ctrl.expression.play`, `WSPK` 二进制音频帧 | `tests/sdk_contract/test_sdk_bridge_protocol.py` / `test_wspk_framing.py` |
+| **L-09** | 官方 Python SDK Runtime (RK3566) | 固件 SDK 桥接器 (ESP32) | Runtime 广播 UDP 37021 + Runtime 监听 LAN WebSocket；设备作为 WebSocket client 连接 Runtime | `pair.request` / `pair.accept`、`sys.client.hello`、控制 JSON 与 WSPK binary message | `test_official_sdk_runtime_compat.py` 启动 pinned Runtime + 生产 C client localhost loopback（L2；非物理设备） |
 | **L-10** | 固件板级驱动 (ESP32) | STM32 身体微控制器 | UART2 (TX:19, RX:20, 921600) | `watche_hw_body_move`, `watche_hw_body_stop`, `position_request` | `firmware/build/desk_agent_firmware_test` (C 驱动层) / 真机台架 (A1 实测) |
 
 ---
@@ -311,9 +311,9 @@
 
 ### 6.4 配对校验（对应工作包 4）
 
-**裁决 R4：官方 wire 契约已定义 `pairing_code` 字段与格式，但未定义校验失败的响应；本仓设备侧亦无配对码来源。故采取 fail-closed，并提交接口问题 CR-001。**
+**裁决 R4：错误码拒绝静默丢弃；配对码由设备本地用户确认后短时生成并显示，RAM 注入 A2。细节与分工见 [CR-003](change-requests/CR-003-pairing-code-production-injection.md)。**
 
-依据外部锁定官方 SDK `watcherobot/runtime/daemon/pairing/protocol.py`（Level 1 证据）：
+依据外部锁定官方 SDK `v0.1.11` (`8bc13967a06ef073459be47e930ff43ef37ee8fb`) 的 `watcherobot/runtime/daemon/pairing/protocol.py`（Level 1 证据）：
 
 - `pair.request` 字段集固定为 `{type, protocol, version, request_id, daemon_instance_id, pairing_code, target_mode, websocket_port}`，`pairing_code` 必须匹配 `^[0-9]{6}$`。
 - `pair.accept` 字段集固定为 `{type, protocol, version, request_id, daemon_instance_id, target_mode, session_token}`，`session_token` 必须为 64 位小写十六进制。
@@ -323,13 +323,15 @@
 **强制要求**：
 1. 设备侧必须校验 `pairing_code`：格式（6 位数字）与**与设备侧已配置的期望码精确匹配**。
 2. **校验通过前**，严禁置 `s_paired = true`，严禁生成或发放 `session_token`，严禁回复 `pair.accept`。
-3. 未配置期望配对码时，**必须 fail-closed**（不配对、不发 token）。设备侧期望码只能经显式**配置注入**（`desk_sdk_bridge_set_pairing_code()`），**严禁硬编码**生产配对码，**严禁**写入日志。
+3. 未配置活动配对码时，**必须 fail-closed**（不配对、不发 token）。依 CR-003 的 A0 推荐，A1 在设备端由 CSPRNG 生成六位码，经 `desk_sdk_bridge_set_pairing_code()` 显式注入并只在本机配对 UI 显示；不得硬编码、构建期注入、持久化或复用 Tuya provisioning 凭据。
 4. 由于官方契约未定义校验失败响应，本阶段**不新增** wire 消息类型；失败时**不回复 `pair.accept`**（即不授予），并记录诊断日志（已脱敏）。
-5. 未定义项作为接口问题登记于 **CR-001**，由 A0 与产品/官方 SDK 方确认后再补齐失败响应语义。
+5. 配对码生命周期与展示的实现任务登记于 **CR-003**；旧 CR-001 中配对码来源问题由 CR-003 取代。失败 wire response 仍未由官方定义，设备继续静默拒绝，不新增 `pair.reject` 或扩展 `pair.busy`。
 
 ### 6.5 Windows Companion 启动安全（对应工作包 5）
 
 **裁决 R5：默认回环；跨机监听必须显式配置强令牌，且拒绝占位/空令牌。**
+
+该监听规则只适用于 Windows Companion 的 HTTP RPC。官方 Python SDK Runtime 是另一个进程，其 WebSocket listener 必须允许目标设备从 LAN 到达；不得把 Companion 的 loopback-only 默认套用到设备 Runtime。设备主动连接 Runtime，设备侧 TCP 37020 listener 不构成 SDK 兼容通道。
 
 依据 §4.4 与 AGENTS.md 第 5 节（严禁写入真实生产凭据）：
 
