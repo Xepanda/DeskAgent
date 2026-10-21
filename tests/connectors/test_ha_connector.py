@@ -479,6 +479,32 @@ class TestHAConnector(unittest.TestCase):
         self.assertFalse(res["state_confirmed"])
         self.assertEqual(res["observed_state"], "off")
 
+    def test_state_confirmation_http_reads_use_remaining_deadline(self) -> None:
+        """Offline REST reads cannot each restart the confirmation timeout window."""
+        requests: list[tuple[str, float]] = []
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            requests.append((method, timeout))
+            if method == "POST":
+                return 200, []
+            return 200, {"entity_id": "light.desk", "state": "off"}
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123", token="token", timeout_sec=5.0, transport=mock_transport,
+        )
+        result = ha.execute(
+            "light.desk", "turn_on",
+            wait_for_state={"expected_state": "on", "timeout_ms": 80},
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertFalse(result["state_confirmed"])
+        state_reads = [timeout for method, timeout in requests if method == "GET"]
+        self.assertGreaterEqual(len(state_reads), 2)
+        # Baseline and post-service confirmation reads share the bounded wait
+        # budget; none can silently inherit the connector's 5 second default.
+        self.assertTrue(all(timeout <= 0.08 for timeout in state_reads), state_reads)
+
     # -------------------------------------------------------------------------
     # 5. WebSocket Integration & Real-time Event Streaming Tests
     # -------------------------------------------------------------------------

@@ -574,6 +574,10 @@ class HAConnector:
         Retrieves current state snapshot of an entity from Home Assistant.
         Strictly enforces domain and entity allowlists and denylists.
         """
+        return self._get_state(entity_id, timeout=None)
+
+    def _get_state(self, entity_id: str, timeout: Optional[float]) -> dict[str, Any]:
+        """Fetch state with an optional request timeout for bounded confirmation waits."""
         if not self.is_entity_allowed(entity_id):
             raise PermissionError(f"Entity '{entity_id}' is outside allowed domain/entity scope")
 
@@ -589,7 +593,7 @@ class HAConnector:
             }
 
         path = f"/api/states/{entity_id}"
-        state_data = self._http_request("GET", path)
+        state_data = self._http_request("GET", path, timeout=timeout)
         if not isinstance(state_data, dict):
             raise ConnectionError(f"Invalid state payload returned for {entity_id}: {state_data}")
 
@@ -702,7 +706,8 @@ class HAConnector:
         before_state: Optional[dict[str, Any]] = None
         if wait_for_state is not None:
             try:
-                before = self.get_state(entity_id)
+                baseline_timeout = min(self.timeout_sec, max(0.001, timeout_ms / 1000.0))
+                before = self._get_state(entity_id, timeout=baseline_timeout)
                 before_state = dict(before)
                 if isinstance(before.get("attributes"), dict):
                     before_state["attributes"] = dict(before["attributes"])
@@ -753,7 +758,8 @@ class HAConnector:
 
             # Check initial state immediately
             try:
-                current_st = self.get_state(entity_id)
+                remaining = max(0.001, deadline - time.monotonic())
+                current_st = self._get_state(entity_id, timeout=min(self.timeout_sec, remaining))
                 observed_state = current_st.get("state")
                 state_changed = _state_snapshot_changed(before_state, current_st)
                 if self._is_state_confirmed(current_st, expected_state, expected_attributes):
@@ -780,7 +786,8 @@ class HAConnector:
                     self._state_condition.wait(timeout=min(poll_interval, remaining))
 
                 try:
-                    current_st = self.get_state(entity_id)
+                    remaining = max(0.001, deadline - time.monotonic())
+                    current_st = self._get_state(entity_id, timeout=min(self.timeout_sec, remaining))
                     observed_state = current_st.get("state")
                     state_changed = _state_snapshot_changed(before_state, current_st)
                     if self._is_state_confirmed(current_st, expected_state, expected_attributes):
