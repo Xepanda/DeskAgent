@@ -293,7 +293,7 @@ class TestWatcherHardwareContract(unittest.TestCase):
         self.assertEqual(parse(malformed, len(malformed), 7, 1,
                                ctypes.byref(nack), ctypes.byref(is_nack)), -5)
 
-    def test_zero_code_nack_is_still_reported_as_nack(self) -> None:
+    def test_zero_code_nack_is_rejected(self) -> None:
         payload = bytes([0xA5, 0x5A, 1, 2, 0xFF, 4]) + struct.pack("<IH", 9, 2)
         payload += bytes([0, 0])
         raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
@@ -303,8 +303,20 @@ class TestWatcherHardwareContract(unittest.TestCase):
         rc = self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 9, 2,
                                                    ctypes.byref(nack), ctypes.byref(is_nack))
         self.assertEqual(rc, -4)
-        self.assertTrue(is_nack.value)
+        self.assertFalse(is_nack.value)
         self.assertEqual(nack.value, 0)
+
+    def test_nack_requires_exact_flags(self) -> None:
+        payload = bytes([0xA5, 0x5A, 1, 2, 0xFF, 0x05]) + struct.pack("<IH", 9, 2)
+        payload += bytes([1, 0])
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0)
+        is_nack = ctypes.c_bool(False)
+        rc = self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 9, 2,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack))
+        self.assertEqual(rc, -4)
+        self.assertFalse(is_nack.value)
 
     def test_camera_ptl_header_parsing(self) -> None:
         """Verifies Himax PTL 7-byte Base Header parsing and negative rejection."""

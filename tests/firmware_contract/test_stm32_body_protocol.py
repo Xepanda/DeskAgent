@@ -678,6 +678,14 @@ class TestSTM32BodyProtocol(unittest.TestCase):
             outcomes.append(self.lib.desk_hardware_mcu_receive_bytes(
                 (ctypes.c_uint8 * len(trailing))(*trailing), len(trailing)
             ))
+            nack = (ctypes.c_uint8 * 64)()
+            nack_len = ctypes.c_size_t()
+            self.lib.desk_hardware_format_stm32_nack_packet(
+                seq, 0, 0, nack, len(nack), ctypes.byref(nack_len)
+            )
+            outcomes.append(self.lib.desk_hardware_mcu_receive_bytes(
+                nack, nack_len.value
+            ))
             send(bytearray(valid))
 
         _KEEP_ALIVE.append(on_tx)
@@ -686,7 +694,8 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         self.lib.desk_hardware_set_mcu_max_retries(0)
         self.assertEqual(self.lib.desk_hardware_motion_move_to(90.0, 120.0, 300), DESK_HW_OK)
         self.assertEqual(outcomes, [DESK_HW_ERR_BUSY, DESK_HW_ERR_IO, DESK_HW_ERR_IO,
-                                    DESK_HW_ERR_IO, -3, DESK_HW_OK])
+                                    DESK_HW_ERR_IO, -3, DESK_HW_ERR_IO, DESK_HW_OK])
+        self.assertEqual(self.lib.desk_hardware_get_mcu_nack_count(), 0)
         self.lib.desk_hardware_set_mcu_max_retries(MCU_MAX_RETRIES)
         self.lib.desk_hardware_set_mcu_timeout_ms(MCU_ACK_TIMEOUT_MS)
 

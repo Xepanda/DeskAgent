@@ -275,7 +275,10 @@ int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
     uint8_t flags = frame[5];
     uint8_t msg_id = frame[4];
     if ((flags & MCU_FRAME_FLAG_NACK_RESP) || msg_id == MCU_MOTION_MSG_NACK) {
-        if (payload_len != 2) return DESK_HW_ERR_IO;
+        if (msg_id != MCU_MOTION_MSG_NACK || flags != MCU_FRAME_FLAG_NACK_RESP ||
+            payload_len != 2 || frame[12] == 0) {
+            return DESK_HW_ERR_IO;
+        }
         *out_nack_code = frame[12];
         *out_is_nack = true;
         return DESK_HW_ERR_IO;

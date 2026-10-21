@@ -865,7 +865,8 @@ int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len)
 
     /* Check for NACK */
     if (msg_id == MCU_MOTION_MSG_NACK || flags == MCU_FRAME_FLAG_NACK_RESP) {
-        if (msg_id != MCU_MOTION_MSG_NACK || flags != MCU_FRAME_FLAG_NACK_RESP || payload_len != 2) {
+        if (msg_id != MCU_MOTION_MSG_NACK || flags != MCU_FRAME_FLAG_NACK_RESP ||
+            payload_len != 2 || data[12] == 0) {
             return DESK_HW_ERR_IO;
         }
         s_mcu_nack_count++;
