@@ -425,7 +425,7 @@ class CodexCompanion:
                     "thread_id": th_id,
                     "turn_id": tu_id,
                     "prompt": row["prompt"] or "",
-                    "model": row["model"] or "gpt-5-codex",
+                    "model": row["model"] or None,
                     "summary": row["summary"] or "",
                     "last_output": row["last_output"] or "",
                     "state": row["status"],
@@ -635,13 +635,29 @@ class CodexCompanion:
                     self._tasks[task_id]["state"] = "running"
                     self._tasks[task_id]["status"] = "running"
                     item = params.get("item") if isinstance(params.get("item"), dict) else {}
-                    output_text = (
-                        params.get("output")
-                        or params.get("text")
-                        or item.get("text")
-                        or item.get("content")
-                        or item.get("formatted")
+                    item_type = item.get("type")
+                    item_role = item.get("role") or item.get("author")
+                    is_user_message = item_type == "userMessage" or item_role == "user"
+                    is_assistant_message = item_type in ("agentMessage", "assistantMessage") or item_role in (
+                        "assistant",
+                        "agent",
                     )
+                    output_text = None
+                    if not is_user_message and is_assistant_message:
+                        output_text = item.get("text") or item.get("formatted")
+                        if not output_text:
+                            content = item.get("content")
+                            if isinstance(content, str):
+                                output_text = content
+                            elif isinstance(content, list):
+                                text_parts = [
+                                    part.get("text", "")
+                                    for part in content
+                                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                                ]
+                                output_text = "".join(text_parts).strip() or None
+                    elif not item and not is_user_message:
+                        output_text = params.get("output")
                     if output_text:
                         self._tasks[task_id]["last_output"] = str(output_text).strip()
                     self._persist_task(self._tasks[task_id])
@@ -662,11 +678,15 @@ class CodexCompanion:
                                 summary = str(error_info)
                             else:
                                 summary = f"Task {task_id} failed"
+                        summary = str(summary).strip()
+                        self._tasks[task_id]["summary"] = summary
+                        self._tasks[task_id]["last_output"] = summary
                         self._dispatch_event("codex.failed", {
                             "task_id": task_id,
                             "status": "failed",
                             "summary": summary,
                         })
+                        self._persist_task(self._tasks[task_id])
                     elif raw_status in ("interrupted", "cancelled"):
                         self._tasks[task_id]["status"] = "interrupted"
                         self._tasks[task_id]["state"] = "interrupted"
@@ -790,13 +810,15 @@ class CodexCompanion:
                     appr["task_id"] = task_id
 
         # 2. Start turn (Codex app-server uses threadId and input array)
-        turn_res = transport.send_request("turn/start", {
+        turn_params = {
             "threadId": thread_id,
             "thread_id": thread_id,
             "input": [{"type": "text", "text": prompt}],
             "prompt": prompt,
-            "model": model or "gpt-5-codex",
-        })
+        }
+        if model is not None:
+            turn_params["model"] = model
+        turn_res = transport.send_request("turn/start", turn_params)
         if "turn" in turn_res and isinstance(turn_res["turn"], dict):
             turn_id = turn_res["turn"].get("id", f"trn_{task_id[:8]}_01")
             state = turn_res["turn"].get("status", "running")
@@ -817,7 +839,7 @@ class CodexCompanion:
                 "thread_id": thread_id,
                 "turn_id": turn_id,
                 "prompt": prompt,
-                "model": model or "gpt-5-codex",
+                "model": model,
                 "state": state,
                 "status": state,
             }

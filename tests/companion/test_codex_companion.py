@@ -136,6 +136,121 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertNotIn("thread_id", interrupt_call["params"])
         self.assertNotIn("turn_id", interrupt_call["params"])
 
+    def test_default_model_is_omitted_and_explicit_model_is_preserved(self) -> None:
+        sent_calls: list[dict[str, Any]] = []
+
+        class ModelTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                sent_calls.append({"method": method, "params": dict(params)})
+                if method == "initialize":
+                    return {"capabilities": {}}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": f"thr-{len(sent_calls)}"}
+                if method == "turn/start":
+                    return {"turn_id": f"turn-{len(sent_calls)}", "state": "running"}
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=ModelTransport(),
+            db_path=":memory:",
+        )
+        companion.submit_task("tsk-default-model", "test-project", "hello")
+        companion.submit_task("tsk-explicit-model", "test-project", "hello", model="chosen-model")
+
+        turn_calls = [call["params"] for call in sent_calls if call["method"] == "turn/start"]
+        self.assertEqual(len(turn_calls), 2)
+        self.assertNotIn("model", turn_calls[0])
+        self.assertEqual(turn_calls[1].get("model"), "chosen-model")
+        self.assertIsNone(companion.get_task_status("tsk-default-model")["model"])
+        self.assertEqual(companion.get_task_status("tsk-explicit-model")["model"], "chosen-model")
+
+    def test_user_message_is_not_output_but_agent_message_with_null_role_is(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        user_task = companion.submit_task("tsk-user-item", "test-project", "private user prompt")
+        companion._handle_server_notification(
+            "item/created",
+            {
+                "threadId": user_task["thread_id"],
+                "turnId": user_task["turn_id"],
+                "item": {"type": "userMessage", "content": [{"type": "text", "text": "private user prompt"}]},
+            },
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": user_task["thread_id"], "turnId": user_task["turn_id"], "status": "completed"},
+        )
+        user_status = companion.get_task_status("tsk-user-item")
+        self.assertNotIn("private user prompt", user_status["last_output"])
+        self.assertNotIn("private user prompt", user_status["summary"])
+
+        agent_task = companion.submit_task("tsk-agent-item", "test-project", "another prompt")
+        companion._handle_server_notification(
+            "item/completed",
+            {
+                "threadId": agent_task["thread_id"],
+                "turnId": agent_task["turn_id"],
+                "item": {
+                    "type": "agentMessage",
+                    "role": None,
+                    "content": [{"type": "text", "text": "real assistant result"}],
+                },
+            },
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": agent_task["thread_id"], "turnId": agent_task["turn_id"], "status": "completed"},
+        )
+        agent_status = companion.get_task_status("tsk-agent-item")
+        self.assertEqual(agent_status["last_output"], "real assistant result")
+        self.assertEqual(agent_status["summary"], "real assistant result")
+
+    def test_failed_turn_is_reported_as_failure_with_server_error(self) -> None:
+        db_path = os.path.join(self.workspace_dir, "failed-task.sqlite3")
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_path,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        companion.add_event_listener(lambda event, data: events.append((event, data)))
+        task = companion.submit_task("tsk-failed-turn", "test-project", "run the task")
+
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": task["thread_id"],
+                "turnId": task["turn_id"],
+                "status": "failed",
+                "error": {"message": "app-server rejected the operation"},
+            },
+        )
+
+        status = companion.get_task_status("tsk-failed-turn")
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["summary"], "app-server rejected the operation")
+        self.assertEqual(events, [("codex.failed", {
+            "task_id": "tsk-failed-turn",
+            "status": "failed",
+            "summary": "app-server rejected the operation",
+        })])
+
+        restored_companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_path,
+        )
+        restored = restored_companion.get_task_status("tsk-failed-turn")
+        self.assertEqual(restored["status"], "failed")
+        self.assertEqual(restored["summary"], "app-server rejected the operation")
+        companion._conn.close()
+        restored_companion._conn.close()
+
     # -------------------------------------------------------------------------
     # 4. Approval Correlation Lifecycle
     # -------------------------------------------------------------------------
