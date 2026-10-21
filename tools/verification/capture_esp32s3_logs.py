@@ -311,10 +311,11 @@ def capture_port(
     reconnect_delay: float = 2.0,
     max_reconnects: int = 5,
     read_timeout: float = 0.5,
+    save_raw: bool = True,
     serial_factory: Callable[..., object] = _open_serial,
 ) -> int:
     raw_path, events_path, summary_path = _new_output_paths(output_dir, port)
-    capture = SerialLogCapture(raw_path, events_path, summary_path)
+    capture = SerialLogCapture(raw_path if save_raw else None, events_path, summary_path)
     serial_handle = None
     reconnects = 0
     ever_connected = False
@@ -351,7 +352,7 @@ def capture_port(
             except Exception:
                 pass
         summary = capture.close()
-    print(f"Raw capture:   {raw_path}")
+    print(f"Raw capture:   {raw_path if save_raw else 'disabled (bytes processed in memory only)'}")
     print(f"Event summary: {events_path}")
     print(f"Counts:        {summary_path}")
     if exit_code:
@@ -381,6 +382,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconnect-delay", type=float, default=2.0)
     parser.add_argument("--max-reconnects", type=int, default=5, help="maximum retry attempts when --reconnect is set")
     parser.add_argument("--read-timeout", type=float, default=0.5)
+    parser.add_argument("--no-raw", action="store_true", help="do not persist raw serial bytes; write only redacted events and byte counts")
     return parser
 
 
@@ -390,7 +392,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.baud <= 0 or args.read_timeout <= 0 or args.reconnect_delay < 0 or args.max_reconnects < 0:
         parser.error("baud/read-timeout must be positive; reconnect delay and max reconnects cannot be negative")
     if args.capture:
-        print("Read-only UART capture. Raw bytes are preserved unchanged and may contain credentials; keep all output local.")
+        if args.no_raw:
+            print("Read-only UART capture. Raw bytes are processed in memory only; only redacted events and counts are persisted.")
+        else:
+            print("Read-only UART capture. Raw bytes are preserved unchanged and may contain credentials; keep all output local.")
         return capture_port(
             args.port,
             args.baud,
@@ -399,6 +404,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             reconnect_delay=args.reconnect_delay,
             max_reconnects=args.max_reconnects,
             read_timeout=args.read_timeout,
+            save_raw=not args.no_raw,
         )
     if not args.parse_file.is_file():
         parser.error(f"raw input file does not exist: {args.parse_file}")

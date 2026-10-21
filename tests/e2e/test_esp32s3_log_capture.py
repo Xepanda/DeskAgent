@@ -163,6 +163,46 @@ class TestEsp32S3LogCapture(unittest.TestCase):
             ["connected", "disconnected", "reconnected", "disconnected"],
         )
 
+    def test_capture_can_count_and_parse_without_persisting_raw_bytes(self) -> None:
+        class FakeSerial:
+            def __init__(self) -> None:
+                self.sent: list[bytes] = []
+                self.reads = 0
+
+            def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    return b"I MQTT pairing_code=654321 state=connected\n"
+                raise KeyboardInterrupt
+
+            def write(self, data: bytes) -> int:
+                self.sent.append(data)
+                return len(data)
+
+            def close(self) -> None:
+                pass
+
+        serial = FakeSerial()
+        with tempfile.TemporaryDirectory() as temp_dir, contextlib.redirect_stdout(io.StringIO()):
+            exit_code = capture_port(
+                "COMTEST",
+                115200,
+                Path(temp_dir),
+                save_raw=False,
+                serial_factory=lambda **_: serial,
+            )
+            root = Path(temp_dir)
+            event_path = next(root.glob("*.events.jsonl"))
+            summary_path = next(root.glob("*.summary.json"))
+            events_text = event_path.read_text(encoding="utf-8")
+            summary_text = summary_path.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(list(root.glob("*.raw.bin")))
+        self.assertEqual(serial.sent, [], "capture must never write to the serial device")
+        self.assertNotIn("654321", events_text + summary_text)
+        self.assertEqual(json.loads(summary_text)["raw_bytes"], len(b"I MQTT pairing_code=654321 state=connected\n"))
+
 
 if __name__ == "__main__":
     unittest.main()
