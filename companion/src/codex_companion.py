@@ -382,6 +382,8 @@ class CodexCompanion:
                 cwd TEXT NOT NULL,
                 prompt TEXT,
                 model TEXT,
+                summary TEXT,
+                last_output TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -398,6 +400,12 @@ class CodexCompanion:
             );
             """)
             conn.commit()
+            for col in ("summary", "last_output"):
+                try:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
+            conn.commit()
 
     def _load_from_db(self) -> None:
         with self._lock:
@@ -405,7 +413,7 @@ class CodexCompanion:
             cur = conn.cursor()
 
             # Load tasks
-            cur.execute("SELECT task_id, thread_id, turn_id, status, alias, cwd, prompt, model, created_at, updated_at FROM tasks")
+            cur.execute("SELECT task_id, thread_id, turn_id, status, alias, cwd, prompt, model, summary, last_output, created_at, updated_at FROM tasks")
             for row in cur.fetchall():
                 tid = row["task_id"]
                 th_id = row["thread_id"] or ""
@@ -418,6 +426,8 @@ class CodexCompanion:
                     "turn_id": tu_id,
                     "prompt": row["prompt"] or "",
                     "model": row["model"] or "gpt-5-codex",
+                    "summary": row["summary"] or "",
+                    "last_output": row["last_output"] or "",
                     "state": row["status"],
                     "status": row["status"],
                     "created_at": row["created_at"],
@@ -474,8 +484,8 @@ class CodexCompanion:
             conn = self._get_connection()
             conn.execute(
                 """
-                INSERT INTO tasks (task_id, thread_id, turn_id, status, alias, cwd, prompt, model, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (task_id, thread_id, turn_id, status, alias, cwd, prompt, model, summary, last_output, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     thread_id=excluded.thread_id,
                     turn_id=excluded.turn_id,
@@ -484,6 +494,8 @@ class CodexCompanion:
                     cwd=excluded.cwd,
                     prompt=excluded.prompt,
                     model=excluded.model,
+                    summary=excluded.summary,
+                    last_output=excluded.last_output,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -495,6 +507,8 @@ class CodexCompanion:
                     task.get("target_dir", ""),
                     task.get("prompt", ""),
                     task.get("model", ""),
+                    task.get("summary", ""),
+                    task.get("last_output", ""),
                     created_at,
                     now,
                 ),
@@ -664,9 +678,6 @@ class CodexCompanion:
                             "summary": summary,
                         })
                     else:
-                        self._tasks[task_id]["status"] = "completed"
-                        self._tasks[task_id]["state"] = "completed"
-                        self._persist_task(self._tasks[task_id])
                         turn_res = turn.get("result") if isinstance(turn.get("result"), dict) else {}
                         summary = (
                             params.get("summary")
@@ -684,7 +695,14 @@ class CodexCompanion:
                             summary = summary.get("summary") or summary.get("text") or summary.get("message") or "任务已成功完成"
                         summary = str(summary).strip()
                         if not summary or summary == self._tasks[task_id].get("prompt", ""):
+                            summary = self._tasks[task_id].get("last_output") or "任务已成功完成"
+                        if summary == self._tasks[task_id].get("prompt", ""):
                             summary = "任务已成功完成"
+                        self._tasks[task_id]["status"] = "completed"
+                        self._tasks[task_id]["state"] = "completed"
+                        self._tasks[task_id]["summary"] = summary
+                        self._tasks[task_id]["last_output"] = self._tasks[task_id].get("last_output") or summary
+                        self._persist_task(self._tasks[task_id])
                         self._dispatch_event("codex.turn_completed", {
                             "task_id": task_id,
                             "status": "completed",
@@ -961,6 +979,9 @@ class CodexCompanion:
             if not task:
                 return None
             res = dict(task)
+            res["summary"] = task.get("summary") or task.get("last_output") or ""
+            res["last_output"] = task.get("last_output") or ""
+            res["output"] = task.get("last_output") or task.get("summary") or ""
             res["pending_approvals"] = self.get_pending_approvals(task_id)
             return res
 
@@ -1041,14 +1062,29 @@ class RemoteCodexCompanionClient:
             if cb in self._event_listeners:
                 self._event_listeners.remove(cb)
 
-    def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> None:
+    def acknowledge_task(self, task_id: str) -> None:
+        """Acknowledges successful delivery of a task notification and removes it from pending list and disk."""
+        with self._lock:
+            if task_id in self._pending_tasks:
+                self._pending_tasks.pop(task_id, None)
+                self._save_persisted_tasks()
+                logger.info("Remote Codex task %s acknowledged and cleared from pending queue", task_id)
+
+    def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> bool:
         with self._lock:
             listeners = list(self._event_listeners)
+        if not listeners:
+            return False
+        any_false = False
         for cb in listeners:
             try:
-                cb(event_type, data)
+                res = cb(event_type, data)
+                if res is False:
+                    any_false = True
             except Exception as err:
                 logger.warning("Remote Codex event listener error: %s", err)
+                any_false = True
+        return not any_false
 
     def _ensure_polling_thread(self) -> None:
         with self._lock:
@@ -1072,6 +1108,21 @@ class RemoteCodexCompanionClient:
             for task_id, task_meta in task_items:
                 if self._stop_event.is_set():
                     break
+
+                existing_notification = task_meta.get("notification")
+                if existing_notification:
+                    event_type = "codex.turn_completed"
+                    if task_meta.get("status") in ("interrupted", "cancelled"):
+                        event_type = "codex.interrupted"
+                    elif task_meta.get("status") in ("failed", "error"):
+                        event_type = "codex.failed"
+                    acked = self._dispatch_event(event_type, existing_notification)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
+                    continue
+
                 try:
                     res = self.get_task_status(task_id)
                 except Exception as exc:
@@ -1081,17 +1132,23 @@ class RemoteCodexCompanionClient:
                 if not isinstance(res, dict):
                     continue
 
-                status = str(res.get("status") or res.get("state") or "").lower()
-                if status in ("completed", "succeeded"):
-                    with self._lock:
-                        self._pending_tasks.pop(task_id, None)
-                        self._save_persisted_tasks()
-                    res_dict = res.get("result") if isinstance(res.get("result"), dict) else {}
+                res_dict = res.get("result") if isinstance(res.get("result"), dict) else {}
+                task_status = str(
+                    res_dict.get("status")
+                    or res_dict.get("state")
+                    or res.get("status")
+                    or res.get("state")
+                    or ""
+                ).lower()
+
+                if task_status in ("completed", "succeeded"):
                     summary = (
-                        res.get("summary")
-                        or res_dict.get("summary")
+                        res_dict.get("summary")
+                        or res_dict.get("last_output")
                         or res_dict.get("output")
                         or res_dict.get("response")
+                        or res.get("summary")
+                        or res.get("last_output")
                         or res.get("output")
                         or res.get("response")
                         or res.get("message")
@@ -1102,34 +1159,64 @@ class RemoteCodexCompanionClient:
                     summary = str(summary).strip()
                     if not summary or summary == task_meta.get("prompt", ""):
                         summary = "任务已成功完成"
-                    self._dispatch_event("codex.turn_completed", {
+
+                    event_payload = {
                         "task_id": task_id,
                         "status": "completed",
                         "summary": summary,
                         "result": res,
-                    })
-                elif status in ("interrupted", "cancelled"):
+                    }
                     with self._lock:
-                        self._pending_tasks.pop(task_id, None)
+                        self._pending_tasks[task_id]["notification"] = event_payload
+                        self._pending_tasks[task_id]["status"] = "completed"
+                        self._pending_tasks[task_id]["summary"] = summary
                         self._save_persisted_tasks()
-                    summary = res.get("summary") or f"Task {task_id} interrupted"
-                    self._dispatch_event("codex.interrupted", {
+
+                    acked = self._dispatch_event("codex.turn_completed", event_payload)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
+
+                elif task_status in ("interrupted", "cancelled"):
+                    summary = res_dict.get("summary") or res.get("summary") or f"Task {task_id} interrupted"
+                    event_payload = {
                         "task_id": task_id,
                         "status": "interrupted",
                         "summary": summary,
                         "result": res,
-                    })
-                elif status in ("failed", "error"):
+                    }
                     with self._lock:
-                        self._pending_tasks.pop(task_id, None)
+                        self._pending_tasks[task_id]["notification"] = event_payload
+                        self._pending_tasks[task_id]["status"] = "interrupted"
+                        self._pending_tasks[task_id]["summary"] = summary
                         self._save_persisted_tasks()
-                    err_msg = res.get("error") or f"Task {task_id} failed"
-                    self._dispatch_event("codex.failed", {
+
+                    acked = self._dispatch_event("codex.interrupted", event_payload)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
+
+                elif task_status in ("failed", "error"):
+                    err_msg = res_dict.get("error") or res.get("error") or f"Task {task_id} failed"
+                    event_payload = {
                         "task_id": task_id,
                         "status": "failed",
                         "summary": str(err_msg),
                         "result": res,
-                    })
+                    }
+                    with self._lock:
+                        self._pending_tasks[task_id]["notification"] = event_payload
+                        self._pending_tasks[task_id]["status"] = "failed"
+                        self._pending_tasks[task_id]["summary"] = str(err_msg)
+                        self._save_persisted_tasks()
+
+                    acked = self._dispatch_event("codex.failed", event_payload)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
 
             self._stop_event.wait(self.poll_interval)
 

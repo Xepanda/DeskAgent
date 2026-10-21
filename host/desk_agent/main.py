@@ -86,6 +86,11 @@ class DeskAgentHostApp:
                 codex_bin=codex_cfg.get("codex_bin", "codex"),
             )
 
+        if hasattr(self.companion, "add_event_listener"):
+            self.companion.add_event_listener(self._on_codex_event)
+            if hasattr(self.companion, "start"):
+                self.companion.start()
+
         # Router Setup
         self.router = Router()
         self._register_routes()
@@ -111,44 +116,6 @@ class DeskAgentHostApp:
             self.register_announcement_channel(self.robot_adapter.send_announcement)
             self.robot_adapter.register_tool_request_handler(self._on_robot_tool_request)
             self.robot_adapter.register_camera_frame_callback(self.camera_service.ingest_robot_frame)
-
-            def _on_codex_event(event_type: str, data: dict[str, Any]) -> None:
-                if event_type in ("codex.turn_completed", "codex.completed"):
-                    summary = data.get("summary") or f"Task {data.get('task_id', '')} finished"
-                    announcement = {
-                        "title": "Codex 任务完成",
-                        "text": f"Codex任务已完成：{summary}",
-                        "sound": "notify",
-                        "task_id": data.get("task_id"),
-                    }
-                    if self.robot_adapter:
-                        self.robot_adapter.send_announcement("codex.completed", announcement)
-                elif event_type in ("codex.failed", "codex.error"):
-                    summary = data.get("summary") or f"Task {data.get('task_id', '')} failed"
-                    announcement = {
-                        "title": "Codex 任务失败",
-                        "text": f"Codex任务执行失败：{summary}",
-                        "sound": "alert",
-                        "task_id": data.get("task_id"),
-                    }
-                    if self.robot_adapter:
-                        self.robot_adapter.send_announcement("codex.failed", announcement)
-                elif event_type in ("codex.interrupted", "codex.cancelled"):
-                    summary = data.get("summary") or f"Task {data.get('task_id', '')} interrupted"
-                    announcement = {
-                        "title": "Codex 任务中断",
-                        "text": f"Codex任务已中断：{summary}",
-                        "sound": "alert",
-                        "task_id": data.get("task_id"),
-                    }
-                    if self.robot_adapter:
-                        self.robot_adapter.send_announcement("codex.interrupted", announcement)
-
-            if hasattr(self.companion, "add_event_listener"):
-                self.companion.add_event_listener(_on_codex_event)
-                if hasattr(self.companion, "start"):
-                    self.companion.start()
-
             self.robot_adapter.start()
 
         # HA State Subscription
@@ -184,6 +151,60 @@ class DeskAgentHostApp:
             target=self._delivery_loop, name="desk-outbox-delivery", daemon=True
         )
         self._delivery_thread.start()
+
+    def _on_codex_event(self, event_type: str, data: dict[str, Any]) -> bool:
+        task_id = data.get("task_id", "")
+        if event_type in ("codex.turn_completed", "codex.completed"):
+            summary = data.get("summary") or f"Task {task_id} finished"
+            announcement_topic = "codex.completed"
+            announcement = {
+                "title": "Codex 任务完成",
+                "text": f"Codex任务已完成：{summary}",
+                "sound": "notify",
+                "task_id": task_id,
+            }
+        elif event_type in ("codex.failed", "codex.error"):
+            summary = data.get("summary") or f"Task {task_id} failed"
+            announcement_topic = "codex.failed"
+            announcement = {
+                "title": "Codex 任务失败",
+                "text": f"Codex任务执行失败：{summary}",
+                "sound": "alert",
+                "task_id": task_id,
+            }
+        elif event_type in ("codex.interrupted", "codex.cancelled"):
+            summary = data.get("summary") or f"Task {task_id} interrupted"
+            announcement_topic = "codex.interrupted"
+            announcement = {
+                "title": "Codex 任务中断",
+                "text": f"Codex任务已中断：{summary}",
+                "sound": "alert",
+                "task_id": task_id,
+            }
+        else:
+            return True
+
+        # Persist to SQLite outbox first so announcement survives host crash/restarts
+        outbox_id = self.life_service.enqueue_outbox(announcement_topic, announcement)
+
+        # Try immediate delivery if robot is currently online
+        delivered = False
+        if self.robot_adapter and getattr(self.robot_adapter, "is_connected", False):
+            try:
+                delivered = bool(self.robot_adapter.send_announcement(announcement_topic, announcement))
+                if delivered:
+                    if hasattr(self.companion, "acknowledge_task"):
+                        self.companion.acknowledge_task(task_id)
+                    self.life_service.mark_outbox_dispatched(outbox_id)
+                    logger.info("Codex announcement for task %s delivered immediately to robot", task_id)
+            except Exception as e:
+                logger.warning("Failed immediate dispatch of Codex announcement: %s", e)
+
+        if delivered:
+            return True
+        else:
+            logger.info("Robot not connected or announcement not confirmed for task %s; outbox %s queued for delivery retry", task_id, outbox_id)
+            return False
 
     def register_announcement_channel(self, channel: Callable[[str, dict[str, Any]], bool]) -> None:
         """Registers external robot audio / TTS speaker delivery channel."""
@@ -282,6 +303,31 @@ class DeskAgentHostApp:
                             backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
                             self.life_service.record_outbox_failure(
                                 outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
+                            )
+                    elif topic in ("codex.completed", "codex.failed", "codex.interrupted"):
+                        if self.robot_adapter and getattr(self.robot_adapter, "is_connected", False):
+                            try:
+                                delivered = bool(self.robot_adapter.send_announcement(topic, payload))
+                                if delivered:
+                                    task_id = payload.get("task_id")
+                                    if task_id and hasattr(self.companion, "acknowledge_task"):
+                                        self.companion.acknowledge_task(task_id)
+                                    self.life_service.mark_outbox_dispatched(outbox_id)
+                                    logger.info("Outbox Codex announcement %s (%s) delivered to robot", outbox_id, topic)
+                                else:
+                                    backoff = min(60, 2 ** (item.get("retry_count", 0) + 1))
+                                    self.life_service.record_outbox_failure(
+                                        outbox_id, "Robot announcement channel rejected or busy", backoff_seconds=backoff
+                                    )
+                            except Exception as exc:
+                                backoff = min(60, 2 ** (item.get("retry_count", 0) + 1))
+                                self.life_service.record_outbox_failure(
+                                    outbox_id, f"Robot delivery exception: {exc}", backoff_seconds=backoff
+                                )
+                        else:
+                            backoff = min(30, 2 ** (item.get("retry_count", 0) + 1))
+                            self.life_service.record_outbox_failure(
+                                outbox_id, "Robot is disconnected", backoff_seconds=backoff
                             )
                     else:
                         self.life_service.mark_outbox_dispatched(outbox_id)

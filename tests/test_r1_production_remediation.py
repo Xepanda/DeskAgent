@@ -607,5 +607,139 @@ class TestP2RemainingRemediations(unittest.TestCase):
                 server.server_close()
                 app.close()
 
+    def test_codex_notification_persistence_until_device_delivery_and_reconnect_retry(self) -> None:
+        """Issue 1 (P2): Notifications delivered while robot is offline remain persisted in SQLite and Remote client,
+        and are successfully retried and cleared once robot connects."""
+        with tempfile.TemporaryDirectory() as td:
+            db_p = os.path.join(td, "test.db")
+            cfg_p = os.path.join(td, "cfg.json")
+            state_p = os.path.join(td, "remote_codex_tasks.json")
+            with open(cfg_p, "w", encoding="utf-8") as f:
+                json.dump({"storage": {"db_path": db_p}, "robot": {"enabled": False}}, f)
+
+            app = DeskAgentHostApp(cfg_p)
+            rem_client = None
+            try:
+                mock_robot = MagicMock()
+                mock_robot.is_connected = False
+                mock_robot.send_announcement.return_value = False
+                app.robot_adapter = mock_robot
+
+                # Remote client with an in-flight task
+                with open(state_p, "w", encoding="utf-8") as f:
+                    json.dump({"tsk-retry-01": {"task_id": "tsk-retry-01", "prompt": "Do work", "status": "running"}}, f)
+
+                rem_client = RemoteCodexCompanionClient("http://127.0.0.1:9997", state_file_path=state_p)
+                app.companion = rem_client
+                rem_client.add_event_listener(app._on_codex_event)
+
+                # 1. When task completes on remote while robot is disconnected
+                def mock_rpc(op, args):
+                    if op == "codex.get_task":
+                        return {"status": "succeeded", "result": {"task_id": "tsk-retry-01", "status": "completed", "output": "Finished correctly"}}
+                    return {"status": "succeeded", "result": {}}
+
+                with patch.object(rem_client, "_rpc_call", side_effect=mock_rpc):
+                    # Give poller time to see task completed
+                    deadline = time.time() + 2.5
+                    while time.time() < deadline:
+                        with rem_client._lock:
+                            if "notification" in rem_client._pending_tasks.get("tsk-retry-01", {}):
+                                break
+                        time.sleep(0.05)
+
+                # The task MUST NOT be deleted from rem_client because robot was offline!
+                self.assertIn("tsk-retry-01", rem_client._pending_tasks)
+                self.assertEqual(rem_client._pending_tasks["tsk-retry-01"]["status"], "completed")
+
+                # The announcement MUST be persisted in SQLite outbox
+                pending_outbox = app.life_service.get_pending_outbox_messages()
+                self.assertTrue(any(msg.get("topic") == "codex.completed" for msg in pending_outbox))
+
+                # 2. Now simulate robot connecting!
+                mock_robot.is_connected = True
+                mock_robot.send_announcement.return_value = True
+
+                # Wait up to 2.5 seconds for _delivery_loop to deliver the pending outbox message and clear task
+                deadline = time.time() + 2.5
+                while time.time() < deadline:
+                    pending = [m for m in app.life_service.get_pending_outbox_messages() if m.get("topic") == "codex.completed"]
+                    with rem_client._lock:
+                        has_pending = "tsk-retry-01" in rem_client._pending_tasks
+                    if not pending and not has_pending:
+                        break
+                    time.sleep(0.05)
+
+                # Verified: outbox delivered and marked dispatched
+                remaining = [m for m in app.life_service.get_pending_outbox_messages() if m.get("topic") == "codex.completed"]
+                self.assertEqual(len(remaining), 0, "Outbox message should be dispatched after robot connected")
+
+                # Verified: task removed from RemoteCodexCompanionClient pending tasks and disk!
+                self.assertNotIn("tsk-retry-01", rem_client._pending_tasks)
+                with open(state_p, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                self.assertNotIn("tsk-retry-01", saved)
+            finally:
+                if rem_client:
+                    rem_client.close()
+                app.close()
+
+    def test_codex_remote_host_gets_persisted_assistant_output_summary(self) -> None:
+        """Issue 2 (P2): Assistant output is persisted in SQLite across server restart, returned in task query,
+        and extracted by Remote Codex client without falling back to neutral default."""
+        from companion.src.codex_companion import CodexCompanion
+        with tempfile.TemporaryDirectory() as td:
+            db_file = os.path.join(td, "codex_server.db")
+            comp = CodexCompanion(db_path=db_file)
+            comp.workspaces["ws-1"] = "/tmp"
+
+            # 1. Start task and feed assistant's actual output via item/updated
+            comp._tasks["task-persist-out"] = {
+                "task_id": "task-persist-out",
+                "workspace_alias": "ws-1",
+                "prompt": "修复第45行的空指针",
+            }
+            comp._handle_server_notification("item/updated", {
+                "task_id": "task-persist-out",
+                "item": {"type": "message", "text": "已在第45行增加空指针防护代码"},
+            })
+            comp._handle_server_notification("turn/completed", {
+                "task_id": "task-persist-out",
+                "turn": {"id": "turn-1", "status": "completed"},
+            })
+            comp.close()
+
+            # 2. Simulate server restart: reopen CodexCompanion with the same SQLite db
+            comp_reloaded = CodexCompanion(db_path=db_file)
+            status_data = comp_reloaded.get_task_status("task-persist-out")
+            self.assertIsNotNone(status_data)
+            self.assertEqual(status_data["summary"], "已在第45行增加空指针防护代码")
+            self.assertEqual(status_data["last_output"], "已在第45行增加空指针防护代码")
+
+            # 3. Remote client query extracts this summary
+            remote_client = RemoteCodexCompanionClient("http://127.0.0.1:9996")
+            def mock_rpc(op, args):
+                if op == "codex.get_task":
+                    return {"status": "succeeded", "result": status_data}
+                return {"status": "succeeded", "result": {}}
+
+            events = []
+            remote_client._pending_tasks["task-persist-out"] = {
+                "task_id": "task-persist-out",
+                "prompt": "修复第45行的空指针",
+            }
+            with patch.object(remote_client, "_rpc_call", side_effect=mock_rpc):
+                remote_client.add_event_listener(lambda ev, data: events.append((ev, data)))
+                deadline = time.time() + 2.0
+                while time.time() < deadline and not events:
+                    time.sleep(0.05)
+
+            self.assertTrue(len(events) >= 1)
+            self.assertEqual(events[0][1]["summary"], "已在第45行增加空指针防护代码")
+            self.assertNotEqual(events[0][1]["summary"], "任务已成功完成")
+
+            remote_client.close()
+            comp_reloaded.close()
+
 if __name__ == "__main__":
     unittest.main()
