@@ -131,7 +131,7 @@
 
 ## 3. 稳定错误代码体系 (`contracts/error_codes.json`)
 
-系统统一定义 13 个不可变稳定错误码：
+系统统一定义稳定错误码；新增码需通过 A0 裁决并保持既有码语义不变：
 
 | 错误代码 | 错误类别 | 可重试 | 产生场景与处理规范 |
 | :--- | :--- | :---: | :--- |
@@ -141,6 +141,7 @@
 | `UNKNOWN_OPERATION` | CLIENT_ERROR | 否 | 调用的 `domain.action` 未实现或未注册 |
 | `RESOURCE_BUSY` | TRANSIENT_ERROR | 是 | 硬件被更高/同级所有者占用（如相机预览中禁止跟随运动） |
 | `RESOURCE_NOT_FOUND` | CLIENT_ERROR | 否 | 目标 `entity_id`、`task_id`、`reminder_id` 不存在 |
+| `STATE_CONFLICT` | CLIENT_ERROR | 否 | 目标资源/提醒 occurrence 存在，但当前生命周期状态不允许请求的状态转换；查询当前状态，状态或用户意图改变后以新 request_id 发起新请求 |
 | `OPERATION_TIMEOUT` | TRANSIENT_ERROR | 是 | 在超时时限内未收到下层或物理响应 |
 | `HARDWARE_FAULT` | HARDWARE_ERROR | 否 | 舵机机械卡死 (Stall)、I2C 总线挂起或驱动故障 |
 | `UPSTREAM_UNAVAILABLE` | INTEGRATION_ERROR | 是 | HA Core、Tuya 云端或 Codex app-server 断开连接 |
