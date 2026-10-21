@@ -283,6 +283,46 @@ class TestCodexCompanion(unittest.TestCase):
         companion._conn.close()
         restored_companion._conn.close()
 
+    def test_failed_and_interrupted_events_redact_prompt_echo_and_keep_status_distinct(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        prompt = "private task instructions"
+        events: list[tuple[str, dict[str, Any]]] = []
+        companion.add_event_listener(lambda event, data: events.append((event, data)))
+
+        failed = companion.submit_task("tsk-redacted-failure", "test-project", prompt)
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": failed["thread_id"],
+                "turnId": failed["turn_id"],
+                "status": "failed",
+                "error": {"message": f"Execution failed while handling: {prompt}"},
+            },
+        )
+
+        interrupted = companion.submit_task("tsk-redacted-interruption", "test-project", prompt)
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": interrupted["thread_id"],
+                "turnId": interrupted["turn_id"],
+                "status": "interrupted",
+                "summary": f"Interrupted: {prompt}",
+            },
+        )
+
+        self.assertEqual([event for event, _ in events], ["codex.failed", "codex.interrupted"])
+        self.assertEqual([data["status"] for _, data in events], ["failed", "interrupted"])
+        self.assertNotIn(prompt, json.dumps(events))
+        self.assertIn("[user request omitted]", events[0][1]["summary"])
+        self.assertIn("[user request omitted]", events[1][1]["summary"])
+        self.assertEqual(companion.get_task_status("tsk-redacted-failure")["status"], "failed")
+        self.assertEqual(companion.get_task_status("tsk-redacted-interruption")["status"], "interrupted")
+
     # -------------------------------------------------------------------------
     # 4. Approval Correlation Lifecycle
     # -------------------------------------------------------------------------

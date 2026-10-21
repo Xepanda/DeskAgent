@@ -351,6 +351,17 @@ class CodexCompanion:
             if cb not in self._event_listeners:
                 self._event_listeners.append(cb)
 
+    @staticmethod
+    def _safe_terminal_summary(task: dict[str, Any], candidate: Any, fallback: str) -> str:
+        """Return terminal text without echoing the user's original prompt."""
+        if isinstance(candidate, dict):
+            candidate = candidate.get("summary") or candidate.get("text") or candidate.get("message")
+        summary = str(candidate or "").strip()
+        prompt = str(task.get("prompt") or "").strip()
+        if prompt and prompt in summary:
+            summary = summary.replace(prompt, "[user request omitted]").strip()
+        return summary or fallback
+
     def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> None:
         with self._lock:
             listeners = list(self._event_listeners)
@@ -679,7 +690,9 @@ class CodexCompanion:
                                 summary = str(error_info)
                             else:
                                 summary = f"Task {task_id} failed"
-                        summary = str(summary).strip()
+                        summary = self._safe_terminal_summary(
+                            self._tasks[task_id], summary, f"Task {task_id} failed"
+                        )
                         self._tasks[task_id]["summary"] = summary
                         self._tasks[task_id]["last_output"] = summary
                         self._dispatch_event("codex.failed", {
@@ -692,7 +705,11 @@ class CodexCompanion:
                         self._tasks[task_id]["status"] = "interrupted"
                         self._tasks[task_id]["state"] = "interrupted"
                         self._persist_task(self._tasks[task_id])
-                        summary = params.get("summary") or turn.get("summary") or f"Task {task_id} interrupted"
+                        summary = self._safe_terminal_summary(
+                            self._tasks[task_id],
+                            params.get("summary") or turn.get("summary"),
+                            f"Task {task_id} interrupted",
+                        )
                         self._dispatch_event("codex.interrupted", {
                             "task_id": task_id,
                             "status": "interrupted",
@@ -714,11 +731,11 @@ class CodexCompanion:
                         )
                         if isinstance(summary, dict):
                             summary = summary.get("summary") or summary.get("text") or summary.get("message") or "任务已成功完成"
-                        summary = str(summary).strip()
-                        if not summary or summary == self._tasks[task_id].get("prompt", ""):
-                            summary = self._tasks[task_id].get("last_output") or "任务已成功完成"
-                        if summary == self._tasks[task_id].get("prompt", ""):
-                            summary = "任务已成功完成"
+                        summary = self._safe_terminal_summary(
+                            self._tasks[task_id],
+                            summary,
+                            self._tasks[task_id].get("last_output") or "任务已成功完成",
+                        )
                         self._tasks[task_id]["status"] = "completed"
                         self._tasks[task_id]["state"] = "completed"
                         self._tasks[task_id]["summary"] = summary
