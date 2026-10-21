@@ -470,6 +470,12 @@ class LifeService:
             if not row:
                 return None
 
+            # Scheduler retries may revisit an occurrence after the first
+            # transaction committed. Only pending occurrences may produce a
+            # new alert; otherwise a retry would enqueue duplicate playback.
+            if row["occ_state"] != "pending":
+                return None
+
             reminder_id = row["reminder_id"]
             scheduled_at = row["scheduled_at"]
             repeat_rule = row["repeat_rule"]

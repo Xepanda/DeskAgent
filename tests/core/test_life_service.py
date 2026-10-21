@@ -384,6 +384,25 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(pending[0]["payload"]["title"], "Atomic Pill")
         self.assertFalse(pending[0]["payload"]["is_catchup"])
 
+    def test_trigger_occurrence_to_outbox_does_not_replay_non_pending_occurrence(self) -> None:
+        """A scheduler retry after a committed trigger must not enqueue a duplicate alert."""
+        self.service.create_reminder(
+            reminder_id="rem-no-replay",
+            title="One alert only",
+            due_at="2026-10-15T08:00:00Z",
+        )
+        due = self.service.get_due_occurrences("2026-10-15T09:00:00Z")
+        occurrence_id = due[0]["occurrence_id"]
+
+        first = self.service.trigger_occurrence_to_outbox(occurrence_id)
+        second = self.service.trigger_occurrence_to_outbox(occurrence_id)
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        pending = self.service.get_pending_outbox_messages()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["payload"]["occurrence_id"], occurrence_id)
+
     def test_trigger_occurrence_to_outbox_recurring_schedules_next(self) -> None:
         self.service.create_reminder(
             reminder_id="rem-atomic-rec",
