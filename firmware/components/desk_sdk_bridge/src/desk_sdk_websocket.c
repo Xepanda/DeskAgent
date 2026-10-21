@@ -17,6 +17,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#if !defined(ESP_PLATFORM) && defined(DESK_SDK_OPENSSL_TESTING)
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#endif
+
 #ifdef ESP_PLATFORM
 #include "esp_random.h"
 #include "esp_attr.h"
@@ -135,6 +140,18 @@ static int ws_expected_accept(const char *key, char *out, size_t cap)
     if (n <= 0 || (size_t)n >= sizeof(joined) || tal_sha1_ret((const uint8_t *)joined, (uint32_t)n, digest) != OPRT_OK) return -1;
     if (!tuya_base64_encode(digest, out, sizeof(digest)) || strlen(out) >= cap) return -1;
     return 0;
+}
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+static int ws_expected_accept(const char *key, char *out, size_t cap)
+{
+    char joined[128];
+    uint8_t digest[SHA_DIGEST_LENGTH];
+    if (!key || !out || cap < 29) return -1;
+    int n = snprintf(joined, sizeof(joined), "%s%s", key, WS_GUID);
+    if (n <= 0 || (size_t)n >= sizeof(joined)) return -1;
+    if (!SHA1((const unsigned char *)joined, (size_t)n, digest)) return -1;
+    int encoded = EVP_EncodeBlock((unsigned char *)out, digest, sizeof(digest));
+    return encoded == 28 && (size_t)encoded < cap ? 0 : -1;
 }
 #else
 static int ws_expected_accept(const char *key, char *out, size_t cap)

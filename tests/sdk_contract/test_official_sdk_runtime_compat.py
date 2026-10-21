@@ -72,6 +72,28 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.so_path = os.path.join(cls.temp_dir.name, "libdesk_sdk_bridge_compat.so")
         repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+        # The production pairing path learns the Runtime's host from the source
+        # address of the UDP request. This narrow test seam fills only that
+        # already-validated address/port after process_pairing_udp(); the C
+        # RFC6455 client, official Runtime listener and all wire traffic below
+        # remain the production implementations.
+        shim_path = os.path.join(cls.temp_dir.name, "sdk_runtime_loopback_shim.c")
+        with open(shim_path, "w", encoding="utf-8") as shim:
+            shim.write(
+                f'#include "{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c"\n'
+                f'#include "{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c"\n'
+                'int desk_sdk_test_set_pairing_target(const char *host, unsigned short port) {\n'
+                '  if (!host || !port || !s_paired || strlen(host) >= sizeof(s_pair_host)) return -1;\n'
+                '  strcpy(s_pair_host, host); s_pair_websocket_port = port; return 0;\n'
+                '}\n'
+                'const char *desk_sdk_test_last_ack(void) { return (const char *)s_ws_ack; }\n'
+                'const char *desk_sdk_test_http_response(void) { return s_ws_http_response; }\n'
+                'int desk_sdk_test_ws_state(void) { return (int)s_ws_state; }\n'
+                'int desk_sdk_test_preflight(void) { char host[64], hello[512]; uint16_t port = 0; '
+                'return desk_sdk_bridge_get_pairing_target(host, sizeof(host), &port) == 0 && '
+                'desk_sdk_bridge_build_hardware_hello(hello, sizeof(hello)) > 0 ? 1 : 0; }\n'
+            )
+
         # Compile C shared library
         cmd = [
             "gcc",
@@ -79,14 +101,15 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             "-fPIC",
             "-O2",
             "-Wall",
+            "-DDESK_SDK_OPENSSL_TESTING",
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
-            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
-            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
+            shim_path,
+            "-lcrypto",
             "-o",
             cls.so_path,
         ]
@@ -167,6 +190,22 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
+        cls.lib.desk_sdk_test_set_pairing_target.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_set_pairing_target.argtypes = [ctypes.c_char_p, ctypes.c_ushort]
+        cls.lib.desk_sdk_ws_client_connect_paired.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_connect_paired.argtypes = []
+        cls.lib.desk_sdk_ws_client_poll.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_poll.argtypes = [ctypes.c_int]
+        cls.lib.desk_sdk_test_last_ack.restype = ctypes.c_char_p
+        cls.lib.desk_sdk_test_last_ack.argtypes = []
+        cls.lib.desk_sdk_test_http_response.restype = ctypes.c_char_p
+        cls.lib.desk_sdk_test_http_response.argtypes = []
+        cls.lib.desk_sdk_test_ws_state.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_ws_state.argtypes = []
+        cls.lib.desk_sdk_test_preflight.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_preflight.argtypes = []
+        cls.lib.desk_sdk_bridge_send_event.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_send_event.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -306,6 +345,154 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(ack["data"]["role"], "hardware")
         self.assertEqual(pairing.snapshot()["state"], "connected")
 
+    def test_c_firmware_client_runtime_commands_results_events_media_and_reconnect(self) -> None:
+        """Connect the production C WebSocket client to the pinned Runtime and exchange real frames."""
+        import io
+        import time
+        from PIL import Image
+
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+
+        request_id = "21a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "f730f29e670c49f7a3320c4314eb9805"
+        pairing = DevicePairingSession(
+            daemon_instance_id=daemon_id,
+            request_id_factory=lambda: request_id,
+        )
+
+        async def exercise_runtime() -> None:
+            clock = {"now": 1.0}
+
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=clock["now"])
+                clock["now"] += 1.0
+
+            async def disconnected(_peer_ip: str) -> None:
+                pairing.device_disconnected(now=clock["now"])
+                clock["now"] += 1.0
+
+            server = ExternalWebSocketServer(
+                host="127.0.0.1",
+                port=0,
+                hardware_hello_authorizer=authorize,
+                device_disconnect_listener=disconnected,
+            )
+            await server.start()
+            poll_stop = asyncio.Event()
+
+            async def poll_c_client() -> None:
+                while not poll_stop.is_set():
+                    await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 50)
+
+            poll_task = asyncio.create_task(poll_c_client())
+            try:
+                request = PairRequest(
+                    request_id=request_id,
+                    daemon_instance_id=daemon_id,
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=server.bound_port,
+                )
+                pair_reply = ctypes.create_string_buffer(1024)
+                rc = self.lib.desk_sdk_bridge_process_pairing_udp(
+                    encode_udp_message(request), pair_reply, len(pair_reply)
+                )
+                self.assertEqual(rc, 0)
+                pair_accept = parse_udp_message(pair_reply.value)
+                pairing.start_pairing(
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=server.bound_port,
+                    now=0.0,
+                )
+                pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=0.5)
+                self.assertEqual(
+                    self.lib.desk_sdk_test_set_pairing_target(
+                        b"127.0.0.1", server.bound_port
+                    ),
+                    0,
+                )
+                self.assertEqual(self.lib.desk_sdk_test_preflight(), 1)
+                connect_rc = await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired)
+                self.assertEqual(connect_rc, 0,
+                                 f"state={self.lib.desk_sdk_test_ws_state()}, "
+                                 f"http={self.lib.desk_sdk_test_http_response().decode('utf-8', 'replace')!r}, "
+                                 f"ack={self.lib.desk_sdk_test_last_ack().decode('utf-8', 'replace')!r}")
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_connected())
+
+                async with websockets.connect(server.url) as desktop:
+                    await desktop.send(json.dumps({
+                        "type": "sys.client.hello", "code": 0,
+                        "data": {"role": "desktop", "version": "1.0"},
+                    }))
+                    desktop_hello = json.loads(await desktop.recv())
+                    self.assertEqual(desktop_hello["type"], "sys.ack")
+
+                    await desktop.send(json.dumps({
+                        "type": "ctrl.motion.set_target", "code": 0,
+                        "request_id": "runtime-motion-01",
+                        "data": {"pan_deg": 111, "tilt_deg": 99,
+                                 "command_id": "runtime-motion-01"},
+                    }))
+                    result = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual((result["type"], result["code"]), ("sys.ack", 0))
+                    self.assertEqual(result["request_id"], "runtime-motion-01")
+                    self.assertEqual(result["data"]["status"], "accepted")
+                    self.assertIs(result["data"]["state_confirmed"], False)
+
+                    await desktop.send(json.dumps({
+                        "type": "runtime.unsupported.operation", "code": 0, "data": {},
+                    }))
+                    nack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(nack["type"], "sys.nack")
+                    self.assertNotEqual(nack["code"], 0)
+
+                    self.assertEqual(self.lib.desk_sdk_bridge_send_event(
+                        b"resource.motion.completed",
+                        b'{"command_id":"runtime-motion-01","status":"succeeded"}',
+                    ), 0)
+                    event = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(event["type"], "resource.motion.completed")
+                    self.assertEqual(event["payload"]["command_id"], "runtime-motion-01")
+
+                    image_out = io.BytesIO()
+                    Image.new("RGB", (4, 3), (32, 96, 160)).save(image_out, format="JPEG")
+                    jpeg = image_out.getvalue()
+                    payload = ctypes.create_string_buffer(jpeg)
+                    self.assertEqual(self.lib.desk_sdk_bridge_send_media_frame(
+                        FRAME_IMAGE, 0, 0x1234, 7, payload, len(jpeg)
+                    ), 0)
+                    media = parse_wspk(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual((media.frame_type, media.stream_id, media.sequence),
+                                     (FRAME_IMAGE, 0x1234, 7))
+                    self.assertEqual(media.payload, jpeg)
+                    with Image.open(io.BytesIO(media.payload)) as decoded:
+                        decoded.load()
+                        self.assertEqual(decoded.size, (4, 3))
+
+                # Force the official Runtime to close sessions, then let the
+                # C client's bounded retry path reconnect with the same token.
+                await server.registry.close_all(code=1012, reason="interop reconnect check")
+                deadline = time.monotonic() + 8.0
+                reconnected = False
+                while time.monotonic() < deadline:
+                    if self.lib.desk_sdk_ws_client_is_connected() and pairing.snapshot()["state"] == "connected":
+                        reconnected = True
+                        break
+                    await asyncio.sleep(0.1)
+                self.assertTrue(reconnected, "C client did not reconnect to official Runtime")
+            finally:
+                poll_stop.set()
+                await poll_task
+                await server.stop()
+
+        asyncio.run(exercise_runtime())
+
     def test_official_udp_pairing_rejected_when_unprovisioned(self) -> None:
         """Fail-closed: an unprovisioned device must not answer with pair.accept."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
@@ -322,7 +509,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         out_buf = ctypes.create_string_buffer(1024)
         rc = self.lib.desk_sdk_bridge_process_pairing_udp(wire_bytes, out_buf, 1024)
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 1)  # DESK_SDK_PAIRING_REJECTED
         self.assertEqual(out_buf.value, b"", "no pairing response may be emitted")
 
     def test_official_udp_pairing_rejected_on_wrong_code(self) -> None:
@@ -338,7 +525,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         )
         out_buf = ctypes.create_string_buffer(1024)
         rc = self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(official_pair_req), out_buf, 1024)
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 1)  # DESK_SDK_PAIRING_REJECTED
         self.assertEqual(out_buf.value, b"")
 
     def test_official_hardware_hello_with_token(self) -> None:
