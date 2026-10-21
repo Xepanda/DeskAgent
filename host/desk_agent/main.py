@@ -323,6 +323,8 @@ class DeskAgentHostApp:
                     payload = item.get("payload", {})
 
                     if topic == "reminder.alert":
+                        if not self.life_service.claim_reminder_alert(outbox_id):
+                            continue
                         title = payload.get("title", "Reminder")
                         rem_id = payload.get("reminder_id", "")
                         occ_id = payload.get("occurrence_id", "")
@@ -580,7 +582,9 @@ class DeskAgentHostApp:
 
     def _handle_reminder_snooze(self, req: RequestEnvelope) -> ResponseEnvelope:
         snooze_min = req.arguments.get("snooze_minutes", 10)
-        item = self.life_service.snooze_reminder(req.arguments["reminder_id"], snooze_min)
+        item = self.life_service.snooze_reminder(
+            req.arguments["reminder_id"], snooze_min, req.arguments.get("occurrence_id")
+        )
         return ResponseEnvelope.create_success(req.request_id, item)
 
     def _handle_reminder_stop_ringing(self, req: RequestEnvelope) -> ResponseEnvelope:

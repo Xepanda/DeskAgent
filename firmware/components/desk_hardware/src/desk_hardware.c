@@ -653,7 +653,7 @@ static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_
 #else
     (void)out_buf; (void)max_len; (void)out_len;
 #endif
-    return -1;
+    return DESK_HW_ERR_UNAVAILABLE;
 }
 
 static int default_driver_display_expression(const char *preset_name, const char *status_text)
@@ -1160,6 +1160,18 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
     if (out_len) *out_len = 0;
     if (!out_buf || !out_len) return DESK_HW_ERR_INVALID_ARG;
     (void)timeout_ms;
+
+#ifndef ESP_PLATFORM
+    /* Host simulator frames are the capture source for L2 tests. The default
+     * host driver intentionally reports unavailable, so consume an injected
+     * frame before asking that stub. ESP production never accepts injection. */
+    if (s_cam_frame_len > 0) {
+        if (max_len < s_cam_frame_len) return DESK_HW_ERR_INVALID_ARG;
+        memcpy(out_buf, s_cam_frame_buf, s_cam_frame_len);
+        *out_len = s_cam_frame_len;
+        return DESK_HW_OK;
+    }
+#endif
 
     /* First attempt capturing live frame from registered hardware driver */
     if (s_board_driver_ops && s_board_driver_ops->camera_capture) {

@@ -267,6 +267,25 @@ class LifeService:
                 conn.execute("ALTER TABLE outbox ADD COLUMN next_retry_at TEXT;")
             except sqlite3.OperationalError:
                 pass
+            # Recover only alerts whose occurrence is still active; confirmations
+            # committed before a crash must never be replayed after restart.
+            dispatching = conn.execute(
+                "SELECT outbox_id, payload_json FROM outbox "
+                "WHERE event_type = 'reminder.alert' AND state = 'dispatching'"
+            ).fetchall()
+            for row in dispatching:
+                try:
+                    occurrence_id = json.loads(row["payload_json"]).get("occurrence_id")
+                except (TypeError, json.JSONDecodeError):
+                    occurrence_id = None
+                occurrence = conn.execute(
+                    "SELECT state FROM occurrences WHERE occurrence_id = ?", (occurrence_id,)
+                ).fetchone() if occurrence_id else None
+                recovered_state = "pending" if occurrence and occurrence["state"] == "ringing" else "cancelled"
+                conn.execute(
+                    "UPDATE outbox SET state = ? WHERE outbox_id = ?",
+                    (recovered_state, row["outbox_id"]),
+                )
             conn.commit()
 
     @staticmethod
@@ -662,6 +681,7 @@ class LifeService:
                 "UPDATE occurrences SET state = 'dismissed', delivered_at = ? WHERE occurrence_id = ?",
                 (now_str, occurrence_id),
             )
+            self._cancel_reminder_alerts(conn, occurrence_id=occurrence_id)
             conn.execute(
                 "UPDATE reminders SET status = 'ringing_stopped', updated_at = ? WHERE reminder_id = ?",
                 (now_str, reminder_id),
@@ -678,14 +698,21 @@ class LifeService:
         now = datetime.now(timezone.utc)
         now_str = now.isoformat().replace("+00:00", "Z")
         new_due = (now + timedelta(minutes=snooze_minutes)).isoformat().replace("+00:00", "Z")
-        new_occ_id = f"occ-{reminder_id}-{int(now.timestamp())}"
+        new_occ_id = f"occ-{reminder_id}-{uuid.uuid4().hex}"
 
         with self._lock, self._get_connection() as conn:
             # Mark current occurrence snoozed if supplied
             if occurrence_id:
-                conn.execute("UPDATE occurrences SET state = 'snoozed' WHERE occurrence_id = ?", (occurrence_id,))
+                cursor = conn.execute(
+                    "UPDATE occurrences SET state = 'snoozed' WHERE occurrence_id = ? AND reminder_id = ?",
+                    (occurrence_id, reminder_id),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"Occurrence '{occurrence_id}' not found for reminder '{reminder_id}'")
+                self._cancel_reminder_alerts(conn, occurrence_id=occurrence_id)
             else:
                 conn.execute("UPDATE occurrences SET state = 'snoozed' WHERE reminder_id = ? AND state = 'pending'", (reminder_id,))
+                self._cancel_reminder_alerts(conn, reminder_id=reminder_id)
 
             # Create new occurrence
             conn.execute(
@@ -714,11 +741,35 @@ class LifeService:
                 (now_str, reminder_id),
             )
             conn.execute(
-                "UPDATE occurrences SET state = 'completed' WHERE reminder_id = ? AND state = 'pending'",
+                "UPDATE occurrences SET state = 'completed' WHERE reminder_id = ? AND state IN ('pending', 'ringing')",
                 (reminder_id,),
             )
+            self._cancel_reminder_alerts(conn, reminder_id=reminder_id)
             conn.commit()
         return {"reminder_id": reminder_id, "status": "completed"}
+
+    @staticmethod
+    def _cancel_reminder_alerts(
+        conn: sqlite3.Connection,
+        *,
+        reminder_id: Optional[str] = None,
+        occurrence_id: Optional[str] = None,
+    ) -> None:
+        """Cancel queued reminder alerts in the same transaction as user confirmation."""
+        rows = conn.execute(
+            "SELECT outbox_id, payload_json FROM outbox "
+            "WHERE event_type = 'reminder.alert' AND state IN ('pending', 'dispatching')"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if occurrence_id is not None and payload.get("occurrence_id") != occurrence_id:
+                continue
+            if reminder_id is not None and payload.get("reminder_id") != reminder_id:
+                continue
+            conn.execute("UPDATE outbox SET state = 'cancelled' WHERE outbox_id = ?", (row["outbox_id"],))
 
     # =========================================================================
     # Outbox Notifications (Reliable Proactive Delivery)
@@ -790,10 +841,22 @@ class LifeService:
         now_str = self._now_utc_str()
         with self._lock, self._get_connection() as conn:
             conn.execute(
-                "UPDATE outbox SET state = 'dispatched', dispatched_at = ? WHERE outbox_id = ?",
+                "UPDATE outbox SET state = 'dispatched', dispatched_at = ? "
+                "WHERE outbox_id = ? AND state != 'cancelled'",
                 (now_str, outbox_id),
             )
             conn.commit()
+
+    def claim_reminder_alert(self, outbox_id: str) -> bool:
+        """Atomically reserve a queued reminder alert before the worker sends it."""
+        with self._lock, self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox SET state = 'dispatching' "
+                "WHERE outbox_id = ? AND event_type = 'reminder.alert' AND state = 'pending'",
+                (outbox_id,),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
 
     def record_outbox_failure(
         self,
@@ -806,10 +869,31 @@ class LifeService:
         """Records an outbox delivery failure, increments retry count, applies optional backoff, and marks failed if max retries exceeded."""
         now = datetime.now(timezone.utc)
         with self._lock, self._get_connection() as conn:
-            row = conn.execute("SELECT retry_count, event_type FROM outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            row = conn.execute(
+                "SELECT retry_count, event_type, state, payload_json FROM outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
             if not row:
                 return
+            if row["state"] == "cancelled":
+                return
             new_retries = row["retry_count"] + 1
+            if row["event_type"] == "reminder.alert":
+                try:
+                    occurrence_id = json.loads(row["payload_json"]).get("occurrence_id")
+                except (TypeError, json.JSONDecodeError):
+                    occurrence_id = None
+                if occurrence_id:
+                    occurrence = conn.execute(
+                        "SELECT state FROM occurrences WHERE occurrence_id = ?", (occurrence_id,)
+                    ).fetchone()
+                    if not occurrence or occurrence["state"] != "ringing":
+                        conn.execute(
+                            "UPDATE outbox SET state = 'cancelled', retry_count = ? WHERE outbox_id = ?",
+                            (new_retries, outbox_id),
+                        )
+                        conn.commit()
+                        return
             if not keep_pending and row["event_type"] != "reminder.alert" and new_retries >= max_retries:
                 new_state = "failed"
                 next_retry = None
@@ -821,7 +905,8 @@ class LifeService:
                     next_retry = None
 
             conn.execute(
-                "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? WHERE outbox_id = ?",
+                "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
+                "WHERE outbox_id = ? AND state != 'cancelled'",
                 (new_retries, new_state, next_retry, outbox_id),
             )
             conn.commit()

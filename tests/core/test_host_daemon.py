@@ -120,6 +120,34 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data["status"], "succeeded")
             self.assertTrue(len(data["result"]["items"]) >= 1)
 
+    def test_reminder_snooze_route_passes_occurrence_id(self) -> None:
+        reminder_id = "rem-daemon-snooze-occurrence"
+        self.app.life_service.create_reminder(
+            reminder_id=reminder_id,
+            title="Snooze route",
+            due_at="2020-01-01T00:00:00Z",
+        )
+        occurrence_id = self.app.life_service.get_all_occurrences(reminder_id)[0]["occurrence_id"]
+        self.app.life_service.trigger_occurrence_to_outbox(occurrence_id)
+
+        req = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-daemon-snooze-occurrence",
+            operation="reminder.snooze",
+            arguments={
+                "reminder_id": reminder_id,
+                "snooze_minutes": 10,
+                "occurrence_id": occurrence_id,
+            },
+            expires_at="2030-01-01T00:00:00Z",
+        )
+        response = self.app._handle_reminder_snooze(req)
+
+        self.assertEqual(response.status.value, "succeeded")
+        occurrences = self.app.life_service.get_all_occurrences(reminder_id)
+        previous = next(item for item in occurrences if item["occurrence_id"] == occurrence_id)
+        self.assertEqual(previous["state"], "snoozed")
+
     def test_rpc_note_flow(self) -> None:
         note_payload = {
             "schema_version": "1.0.0",

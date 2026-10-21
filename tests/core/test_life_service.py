@@ -16,6 +16,7 @@ import os
 import tempfile
 import unittest
 import gc
+from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from host.desk_agent.services.life_service import LifeService
@@ -143,6 +144,98 @@ class TestLifeService(unittest.TestCase):
         self.service.complete_reminder("rem-alarm-01")
         rem_completed = self.service.get_reminder("rem-alarm-01")
         self.assertEqual(rem_completed["status"], "completed")
+
+    def _create_pending_reminder_alert(self, reminder_id: str) -> str:
+        self.service.create_reminder(
+            reminder_id=reminder_id,
+            title=f"Alert {reminder_id}",
+            due_at="2020-01-01T00:00:00Z",
+        )
+        occurrence_id = self.service.get_all_occurrences(reminder_id)[0]["occurrence_id"]
+        self.assertIsNotNone(self.service.trigger_occurrence_to_outbox(occurrence_id))
+        return occurrence_id
+
+    def _outbox_state_for_occurrence(self, occurrence_id: str) -> str:
+        with self.service._get_connection() as conn:
+            row = conn.execute(
+                "SELECT state FROM outbox WHERE event_type = 'reminder.alert' "
+                "AND json_extract(payload_json, '$.occurrence_id') = ?",
+                (occurrence_id,),
+            ).fetchone()
+        return row["state"]
+
+    def test_stop_ringing_cancels_only_matching_pending_alert(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-dismiss-outbox")
+        other_occurrence_id = self._create_pending_reminder_alert("rem-other-alert")
+
+        self.service.stop_ringing(occurrence_id)
+
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
+        self.assertEqual(self._outbox_state_for_occurrence(other_occurrence_id), "pending")
+
+    def test_complete_reminder_cancels_its_pending_alert(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-complete-outbox")
+
+        self.service.complete_reminder("rem-complete-outbox")
+
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
+
+    def test_claimed_alert_is_cancelled_by_confirmation(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-claimed-outbox")
+        with self.service._get_connection() as conn:
+            outbox_id = conn.execute(
+                "SELECT outbox_id FROM outbox WHERE event_type = 'reminder.alert' "
+                "AND json_extract(payload_json, '$.occurrence_id') = ?",
+                (occurrence_id,),
+            ).fetchone()["outbox_id"]
+
+        self.assertTrue(self.service.claim_reminder_alert(outbox_id))
+        self.service.stop_ringing(occurrence_id)
+        self.service.record_outbox_failure(outbox_id, "cancel raced with send")
+        self.service.mark_outbox_dispatched(outbox_id)
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
+        self.service.close()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("UPDATE outbox SET state = 'dispatching' WHERE outbox_id = ?", (outbox_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        self.service = LifeService(self.db_path)
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
+
+    def test_unconfirmed_claimed_alert_is_retried_after_service_restart(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-claimed-restart")
+        with self.service._get_connection() as conn:
+            outbox_id = conn.execute(
+                "SELECT outbox_id FROM outbox WHERE event_type = 'reminder.alert' "
+                "AND json_extract(payload_json, '$.occurrence_id') = ?",
+                (occurrence_id,),
+            ).fetchone()["outbox_id"]
+        self.assertTrue(self.service.claim_reminder_alert(outbox_id))
+        self.service.close()
+        self.service = LifeService(self.db_path)
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "pending")
+
+    def test_snooze_occurrence_cancels_alert_and_creates_unique_occurrence_ids(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-snooze-outbox")
+        fixed_now = datetime(2026, 10, 22, 1, 2, 3, tzinfo=timezone.utc)
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz else fixed_now.replace(tzinfo=None)
+
+        with patch("host.desk_agent.services.life_service.datetime", FrozenDateTime):
+            first = self.service.snooze_reminder(
+                "rem-snooze-outbox", snooze_minutes=10, occurrence_id=occurrence_id
+            )
+            second = self.service.snooze_reminder(
+                "rem-snooze-outbox", snooze_minutes=10, occurrence_id=occurrence_id
+            )
+
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
+        self.assertNotEqual(first["occurrence_id"], second["occurrence_id"])
 
     # -------------------------------------------------------------------------
     # 4. Outbox Notification Queue

@@ -624,6 +624,7 @@ class PairingFailClosedGate(unittest.TestCase):
             f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{REPO_ROOT}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{REPO_ROOT}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{REPO_ROOT}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-lpthread", "-o", cls.so_path,
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
@@ -664,9 +665,10 @@ class PairingFailClosedGate(unittest.TestCase):
     def _pair_request(pairing_code: Optional[str]) -> bytes:
         req: dict[str, Any] = {
             "protocol": "watcher_lan_pairing_v1",
-            "request_id": "pair-gate-001",
-            "daemon_instance_id": "sdk-daemon-gate",
+            "request_id": "21a9dbf05ea3443480e62076f79a3b12",
+            "daemon_instance_id": "f730f29e670c49f7a3320c4314eb9805",
             "target_mode": "python_sdk",
+            "websocket_port": 8765,
         }
         if pairing_code is not None:
             req["pairing_code"] = pairing_code

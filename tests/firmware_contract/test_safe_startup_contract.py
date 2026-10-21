@@ -81,6 +81,7 @@ class TestSafeStartupContract(unittest.TestCase):
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             f"{repo_root}/firmware/components/desk_cli/src/desk_cli.c",
             f"{repo_root}/firmware/main/src/provisioning_state.c",
             f"{repo_root}/firmware/main/src/tclaw_runtime_adapter.c",

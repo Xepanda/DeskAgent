@@ -21,11 +21,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 # Import official WatcheRobot SDK from the locked path
-OFFICIAL_SDK_PATH = "/home/maidang/.gemini/antigravity-cli/brain/cb82573a-ba9b-42ea-a6be-405983e79f69/scratch/watcherobot_python_sdk/src"
-if OFFICIAL_SDK_PATH not in sys.path and os.path.isdir(OFFICIAL_SDK_PATH):
-    sys.path.insert(0, OFFICIAL_SDK_PATH)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OFFICIAL_SDK_SRC = REPO_ROOT / ".target_logging/sdk-acceptance/vendor/WatcheRobot_python_sdk/src"
+OFFICIAL_SDK_PATH = Path(os.environ.get("WATCHEROBOT_SDK_SRC", str(DEFAULT_OFFICIAL_SDK_SRC)))
+if OFFICIAL_SDK_PATH.is_dir() and str(OFFICIAL_SDK_PATH) not in sys.path:
+    sys.path.insert(0, str(OFFICIAL_SDK_PATH))
 
 try:
     from watcherobot.protocol import (
@@ -355,6 +358,18 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
     def test_official_camera_capture_and_wspk_stream(self) -> None:
         """Verifies ctrl.camera.capture returns positive session_id and emits official WSPK image frame."""
+        # The device requires an explicit camera lease before capture. Use the
+        # same client identity for acquire/release, matching the SDK lifecycle.
+        lease_resp = self._exec_command({
+            "type": "ctrl.camera.acquire",
+            "client_id": "sdk-client",
+            "lease_duration_ms": 10000,
+            "data": {"command_id": "cmd-cam-acquire-01"},
+        })
+        self.assertEqual(lease_resp["type"], "sys.ack", lease_resp)
+        self.assertEqual(lease_resp["code"], 0, lease_resp)
+        self.assertTrue(lease_resp["data"]["accepted"], lease_resp)
+
         # 1. Inject a sample JPEG into the camera HAL
         test_jpeg = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00OFFICIAL_SDK_CAMERA_FRAME\xFF\xD9"
         self.lib.desk_hardware_camera_inject_frame(test_jpeg, len(test_jpeg), 12345)
@@ -371,31 +386,41 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         self.lib.desk_sdk_bridge_register_outbound(on_outbound, None)
 
-        # 3. Send ctrl.camera.capture
-        resp = self._exec_command({
-            "type": "ctrl.camera.capture",
-            "code": 0,
-            "data": {
-                "width": 0,
-                "height": 0,
-                "quality": 0,
-                "command_id": "cmd-cam-capture-01",
-            },
-        })
-        self.assertEqual(resp["type"], "sys.ack")
-        self.assertEqual(resp["code"], 0)
-        session_id = resp["data"].get("session_id")
-        self.assertIsInstance(session_id, int)
-        self.assertGreater(session_id, 0)
+        try:
+            # 3. Send ctrl.camera.capture under the acquired lease.
+            resp = self._exec_command({
+                "type": "ctrl.camera.capture",
+                "code": 0,
+                "data": {
+                    "width": 0,
+                    "height": 0,
+                    "quality": 0,
+                    "command_id": "cmd-cam-capture-01",
+                },
+            })
+            self.assertEqual(resp["type"], "sys.ack", resp)
+            self.assertEqual(resp["code"], 0, resp)
+            session_id = resp["data"].get("session_id")
+            self.assertIsInstance(session_id, int)
+            self.assertGreater(session_id, 0)
 
-        # 4. Verify WSPK binary frame was dispatched and unpacks using official parse_wspk
-        self.assertEqual(len(intercepted_frames), 1)
-        wspk_pkt = intercepted_frames[0]
-        parsed_binary = parse_wspk(wspk_pkt)
+            # 4. Verify WSPK binary frame was dispatched and unpacks using official parse_wspk.
+            self.assertEqual(len(intercepted_frames), 1)
+            wspk_pkt = intercepted_frames[0]
+            parsed_binary = parse_wspk(wspk_pkt)
 
-        self.assertEqual(parsed_binary.frame_type, FRAME_IMAGE)
-        self.assertEqual(parsed_binary.stream_id, session_id)
-        self.assertEqual(parsed_binary.payload, test_jpeg)
+            self.assertEqual(parsed_binary.frame_type, FRAME_IMAGE)
+            self.assertEqual(parsed_binary.stream_id, session_id)
+            self.assertEqual(parsed_binary.payload, test_jpeg)
+        finally:
+            release_resp = self._exec_command({
+                "type": "ctrl.camera.release",
+                "client_id": "sdk-client",
+                "data": {"command_id": "cmd-cam-release-01"},
+            })
+            self.assertEqual(release_resp["type"], "sys.ack", release_resp)
+            self.assertEqual(release_resp["code"], 0, release_resp)
+            self.assertTrue(release_resp["data"]["accepted"], release_resp)
 
     def test_official_microphone_lifecycle(self) -> None:
         """Verifies ctrl.microphone.open returns session_id and close cleans up."""

@@ -135,6 +135,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-o",
             cls.so_path,
         ]
@@ -1231,7 +1232,10 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         pair_req = json.dumps({
             "type": "pair.request",
             "protocol": "watcher_lan_pairing_v1",
-            "client_id": "test_py_sdk_runner",
+            "request_id": "0123456789abcdef0123456789abcdef",
+            "daemon_instance_id": "abcdef0123456789abcdef0123456789",
+            "target_mode": "python_sdk",
+            "websocket_port": 37020,
             "pairing_code": "123456",
             "timestamp": 1792000000,
         }).encode("utf-8")
@@ -1273,7 +1277,10 @@ class TestSdkBridgeProtocol(unittest.TestCase):
                 json.dumps({
                     "type": "pair.request",
                     "protocol": "watcher_lan_pairing_v1",
-                    "client_id": "test_py_sdk_runner",
+                    "request_id": "1123456789abcdef0123456789abcdef",
+                    "daemon_instance_id": "abcdef0123456789abcdef0123456789",
+                    "target_mode": "python_sdk",
+                    "websocket_port": 37020,
                     "pairing_code": "123456",
                 }).encode("utf-8"),
                 ("127.0.0.1", udp_port),

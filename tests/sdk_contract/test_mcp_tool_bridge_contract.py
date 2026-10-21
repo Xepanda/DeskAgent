@@ -51,6 +51,7 @@ class TestMcpToolBridgeContract(unittest.TestCase):
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-o",
             cls.so_path,
         ]
@@ -546,7 +547,10 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         # 1. Unprovisioned pairing code -> fail-closed rejection
         pair_req = json.dumps({
             "protocol": "watcher_lan_pairing_v1",
-            "request_id": "pair-001",
+            "request_id": "0123456789abcdef0123456789abcdef",
+            "daemon_instance_id": "abcdef0123456789abcdef0123456789",
+            "target_mode": "python_sdk",
+            "websocket_port": 37020,
             "pairing_code": "123456",
         }).encode("utf-8")
         rc_rej = self.lib.desk_sdk_bridge_process_pairing_udp(pair_req, udp_out, ctypes.sizeof(udp_out))
@@ -558,7 +562,10 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         # 3. Wrong pairing code -> rejected
         pair_req_bad = json.dumps({
             "protocol": "watcher_lan_pairing_v1",
-            "request_id": "pair-002",
+            "request_id": "1123456789abcdef0123456789abcdef",
+            "daemon_instance_id": "abcdef0123456789abcdef0123456789",
+            "target_mode": "python_sdk",
+            "websocket_port": 37020,
             "pairing_code": "111111",
         }).encode("utf-8")
         self.assertEqual(self.lib.desk_sdk_bridge_process_pairing_udp(pair_req_bad, udp_out, ctypes.sizeof(udp_out)), 1)
@@ -566,7 +573,10 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         # 4. Valid pairing code -> accepted with 64-char hex session token
         pair_req_ok = json.dumps({
             "protocol": "watcher_lan_pairing_v1",
-            "request_id": "pair-003",
+            "request_id": "2123456789abcdef0123456789abcdef",
+            "daemon_instance_id": "abcdef0123456789abcdef0123456789",
+            "target_mode": "python_sdk",
+            "websocket_port": 37020,
             "pairing_code": "888888",
         }).encode("utf-8")
         rc_ok = self.lib.desk_sdk_bridge_process_pairing_udp(pair_req_ok, udp_out, ctypes.sizeof(udp_out))
