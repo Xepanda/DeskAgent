@@ -64,6 +64,21 @@ DESK_ARBITER_ERR_BUSY = 1
 OUTBOUND_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 
 
+def _jpeg_dimensions(payload: bytes) -> tuple[int, int]:
+    """Read dimensions from a baseline JPEG SOF0 segment without Pillow."""
+    if not payload.startswith(b"\xff\xd8") or not payload.endswith(b"\xff\xd9"):
+        raise ValueError("payload is not a complete JPEG")
+    sof = payload.find(b"\xff\xc0")
+    if sof < 0 or sof + 9 > len(payload):
+        raise ValueError("JPEG does not contain a complete baseline SOF0 segment")
+    segment_length = int.from_bytes(payload[sof + 2 : sof + 4], "big")
+    if segment_length < 7 or sof + 2 + segment_length > len(payload):
+        raise ValueError("JPEG SOF0 segment has an invalid length")
+    height = int.from_bytes(payload[sof + 5 : sof + 7], "big")
+    width = int.from_bytes(payload[sof + 7 : sof + 9], "big")
+    return width, height
+
+
 @unittest.skipUnless(HAVE_WATCHEROBOT, "Official watcherobot python sdk not installed in environment")
 class TestOfficialSdkRuntimeCompat(unittest.TestCase):
     @classmethod
@@ -347,9 +362,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
     def test_c_firmware_client_runtime_commands_results_events_media_and_reconnect(self) -> None:
         """Connect the production C WebSocket client to the pinned Runtime and exchange real frames."""
-        import io
         import time
-        from PIL import Image
 
         try:
             import psutil  # noqa: F401
@@ -460,9 +473,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     self.assertEqual(event["type"], "resource.motion.completed")
                     self.assertEqual(event["payload"]["command_id"], "runtime-motion-01")
 
-                    image_out = io.BytesIO()
-                    Image.new("RGB", (4, 3), (32, 96, 160)).save(image_out, format="JPEG")
-                    jpeg = image_out.getvalue()
+                    jpeg = (Path(__file__).parent / "fixtures" / "interop_4x3.jpg").read_bytes()
                     payload = ctypes.create_string_buffer(jpeg)
                     self.assertEqual(self.lib.desk_sdk_bridge_send_media_frame(
                         FRAME_IMAGE, 0, 0x1234, 7, payload, len(jpeg)
@@ -471,9 +482,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     self.assertEqual((media.frame_type, media.stream_id, media.sequence),
                                      (FRAME_IMAGE, 0x1234, 7))
                     self.assertEqual(media.payload, jpeg)
-                    with Image.open(io.BytesIO(media.payload)) as decoded:
-                        decoded.load()
-                        self.assertEqual(decoded.size, (4, 3))
+                    self.assertEqual(_jpeg_dimensions(media.payload), (4, 3))
 
                 # Force the official Runtime to close sessions, then let the
                 # C client's bounded retry path reconnect with the same token.
