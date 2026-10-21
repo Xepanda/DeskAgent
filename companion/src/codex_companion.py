@@ -638,9 +638,10 @@ class CodexCompanion:
                     item_type = item.get("type")
                     item_role = item.get("role") or item.get("author")
                     is_user_message = item_type == "userMessage" or item_role == "user"
-                    is_assistant_message = item_type in ("agentMessage", "assistantMessage") or item_role in (
-                        "assistant",
-                        "agent",
+                    is_assistant_message = (
+                        item_type in ("agentMessage", "assistantMessage")
+                        or item_role in ("assistant", "agent")
+                        or (item_type == "message" and not item_role)
                     )
                     output_text = None
                     if not is_user_message and is_assistant_message:
@@ -1138,7 +1139,29 @@ class RemoteCodexCompanionClient:
                         event_type = "codex.interrupted"
                     elif task_meta.get("status") in ("failed", "error"):
                         event_type = "codex.failed"
-                    acked = self._dispatch_event(event_type, existing_notification)
+                    event_payload = {
+                        key: existing_notification[key]
+                        for key in ("status", "summary", "thread_id", "turn_id", "resolution")
+                        if key in existing_notification
+                    }
+                    event_payload["task_id"] = task_id
+                    summary = event_payload.get("summary")
+                    if isinstance(summary, dict):
+                        summary = summary.get("summary") or summary.get("text") or summary.get("message")
+                    summary = str(summary or "").strip()
+                    if not summary or summary == task_meta.get("prompt", ""):
+                        if event_type == "codex.failed":
+                            summary = f"Task {task_id} failed"
+                        elif event_type == "codex.interrupted":
+                            summary = f"Task {task_id} interrupted"
+                        else:
+                            summary = "任务已成功完成"
+                    event_payload["summary"] = summary
+                    with self._lock:
+                        task_meta["notification"] = event_payload
+                        task_meta["summary"] = summary
+                        self._save_persisted_tasks()
+                    acked = self._dispatch_event(event_type, event_payload)
                     if acked:
                         with self._lock:
                             self._pending_tasks.pop(task_id, None)
@@ -1186,7 +1209,6 @@ class RemoteCodexCompanionClient:
                         "task_id": task_id,
                         "status": "completed",
                         "summary": summary,
-                        "result": res,
                     }
                     with self._lock:
                         self._pending_tasks[task_id]["notification"] = event_payload
@@ -1206,7 +1228,6 @@ class RemoteCodexCompanionClient:
                         "task_id": task_id,
                         "status": "interrupted",
                         "summary": summary,
-                        "result": res,
                     }
                     with self._lock:
                         self._pending_tasks[task_id]["notification"] = event_payload
@@ -1221,17 +1242,31 @@ class RemoteCodexCompanionClient:
                             self._save_persisted_tasks()
 
                 elif task_status in ("failed", "error"):
-                    err_msg = res_dict.get("error") or res.get("error") or f"Task {task_id} failed"
+                    err_msg = (
+                        res_dict.get("summary")
+                        or res_dict.get("last_output")
+                        or res_dict.get("output")
+                        or res_dict.get("error")
+                        or res.get("summary")
+                        or res.get("last_output")
+                        or res.get("output")
+                        or res.get("error")
+                        or f"Task {task_id} failed"
+                    )
+                    if isinstance(err_msg, dict):
+                        err_msg = err_msg.get("message") or err_msg.get("summary") or f"Task {task_id} failed"
+                    err_msg = str(err_msg).strip()
+                    if not err_msg or err_msg == task_meta.get("prompt", ""):
+                        err_msg = f"Task {task_id} failed"
                     event_payload = {
                         "task_id": task_id,
                         "status": "failed",
-                        "summary": str(err_msg),
-                        "result": res,
+                        "summary": err_msg,
                     }
                     with self._lock:
                         self._pending_tasks[task_id]["notification"] = event_payload
                         self._pending_tasks[task_id]["status"] = "failed"
-                        self._pending_tasks[task_id]["summary"] = str(err_msg)
+                        self._pending_tasks[task_id]["summary"] = err_msg
                         self._save_persisted_tasks()
 
                     acked = self._dispatch_event("codex.failed", event_payload)

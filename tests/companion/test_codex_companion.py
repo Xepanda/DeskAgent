@@ -209,6 +209,38 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(agent_status["last_output"], "real assistant result")
         self.assertEqual(agent_status["summary"], "real assistant result")
 
+    def test_legacy_message_item_is_output_only_without_user_role(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        task = companion.submit_task("tsk-legacy-message", "test-project", "make a change")
+        companion._handle_server_notification(
+            "item/updated",
+            {"threadId": task["thread_id"], "turnId": task["turn_id"], "item": {"type": "message", "text": "assistant result"}},
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": task["thread_id"], "turnId": task["turn_id"], "status": "completed"},
+        )
+        self.assertEqual(companion.get_task_status("tsk-legacy-message")["summary"], "assistant result")
+
+        user_task = companion.submit_task("tsk-legacy-user", "test-project", "private prompt")
+        companion._handle_server_notification(
+            "item/updated",
+            {
+                "threadId": user_task["thread_id"],
+                "turnId": user_task["turn_id"],
+                "item": {"type": "message", "role": "user", "text": "private prompt"},
+            },
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": user_task["thread_id"], "turnId": user_task["turn_id"], "status": "completed"},
+        )
+        self.assertNotIn("private prompt", companion.get_task_status("tsk-legacy-user")["summary"])
+
     def test_failed_turn_is_reported_as_failure_with_server_error(self) -> None:
         db_path = os.path.join(self.workspace_dir, "failed-task.sqlite3")
         companion = CodexCompanion(
@@ -591,6 +623,104 @@ class TestCodexCompanion(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_remote_completion_event_excludes_raw_task_status_and_prompt(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9998", poll_interval=0.01)
+        task_id = "tsk-safe-completion"
+        prompt = "private user prompt"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": prompt}
+        client.get_task_status = lambda _task_id: {
+            "result": {
+                "task_id": task_id,
+                "status": "completed",
+                "thread_id": "thread-safe-completion",
+                "turn_id": "turn-safe-completion",
+                "prompt": prompt,
+                "summary": "assistant-only result",
+            }
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+        try:
+            client.add_event_listener(lambda event, data: events.append((event, data)))
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "codex.turn_completed")
+        self.assertEqual(events[0][1]["summary"], "assistant-only result")
+        self.assertNotIn("result", events[0][1])
+        self.assertNotIn(prompt, json.dumps(events[0][1]))
+
+    def test_remote_failure_event_uses_persisted_failure_summary(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9997", poll_interval=0.01)
+        task_id = "tsk-safe-failure"
+        prompt = "private user prompt"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": prompt}
+        client.get_task_status = lambda _task_id: {
+            "result": {
+                "task_id": task_id,
+                "status": "failed",
+                "thread_id": "thread-safe-failure",
+                "turn_id": "turn-safe-failure",
+                "prompt": prompt,
+                "summary": "task failed: validation did not pass",
+                "error": {"message": "internal transport detail"},
+            }
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+        try:
+            client.add_event_listener(lambda event, data: events.append((event, data)))
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "codex.failed")
+        self.assertEqual(events[0][1]["summary"], "task failed: validation did not pass")
+        self.assertNotIn("result", events[0][1])
+        self.assertNotIn(prompt, json.dumps(events[0][1]))
+        self.assertNotIn("internal transport detail", json.dumps(events[0][1]))
+
+    def test_restored_remote_notification_drops_legacy_raw_result(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9996", poll_interval=0.01)
+        task_id = "tsk-restored-safe"
+        prompt = "private recovered prompt"
+        client._pending_tasks[task_id] = {
+            "task_id": task_id,
+            "prompt": prompt,
+            "status": "completed",
+            "notification": {
+                "task_id": task_id,
+                "status": "completed",
+                "summary": "assistant result after restart",
+                "result": {"prompt": prompt, "last_output": "assistant result after restart"},
+            },
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+        try:
+            client.add_event_listener(lambda event, data: events.append((event, data)))
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "codex.turn_completed")
+        self.assertEqual(events[0][1]["summary"], "assistant result after restart")
+        self.assertNotIn("result", events[0][1])
+        self.assertNotIn(prompt, json.dumps(events[0][1]))
 
     # -------------------------------------------------------------------------
     # 10. Approval Schema Enums Mapping (Command & Patch)
