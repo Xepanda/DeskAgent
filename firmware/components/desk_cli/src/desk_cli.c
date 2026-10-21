@@ -87,7 +87,7 @@ static bool cli_parse_duration_ms(const char *text, uint32_t *out_value)
 }
 
 #ifdef ESP_PLATFORM
-#define PAIRING_WINDOW_TTL_US (120ULL * 1000ULL * 1000ULL)
+#define PAIRING_WINDOW_TTL_US (300ULL * 1000ULL * 1000ULL)
 #define PAIRING_CODE_SPACE 1000000U
 static esp_timer_handle_t s_pairing_expiry_timer = NULL;
 static SemaphoreHandle_t s_pairing_mutex = NULL;
@@ -179,7 +179,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"network", "SDK TCP/UDP server status: network [status]", cmd_network},
     {"wifi", "Read-only Wi-Fi status: wifi [status]", cmd_wifi},
     {"provisioning", "Read-only Tuya provisioning state", cmd_provisioning},
-    {"pairing", "Explicit SDK pairing window: pairing <open|cancel>", cmd_pairing},
+    {"pairing", "Explicit SDK pairing window: pairing <open|close>", cmd_pairing},
 };
 
 #ifdef ESP_PLATFORM
@@ -524,13 +524,13 @@ static void cmd_pairing(int argc, char *argv[])
 #ifdef ESP_PLATFORM
     if (argc == 2 && strcmp(argv[1], "open") == 0) {
         if (pairing_window_open() == 0) {
-            printf("Pairing window open for 120 seconds; read the code from the device display.\r\n");
+            printf("Pairing window open for 300 seconds; read the code from the device display.\r\n");
         } else {
             printf("Pairing window could not be opened; code cleared.\r\n");
         }
         return;
     }
-    if (argc == 2 && strcmp(argv[1], "cancel") == 0) {
+    if (argc == 2 && (strcmp(argv[1], "close") == 0 || strcmp(argv[1], "cancel") == 0)) {
         if (pairing_expiry_timer_ensure() == 0 &&
             xSemaphoreTake(s_pairing_mutex, portMAX_DELAY) == pdTRUE) {
             (void)esp_timer_stop(s_pairing_expiry_timer);
@@ -540,10 +540,10 @@ static void cmd_pairing(int argc, char *argv[])
             (void)desk_sdk_bridge_set_pairing_code(NULL);
             desk_tclaw_pairing_ui_clear();
         }
-        printf("Pairing window cancelled; code cleared.\r\n");
+        printf("Pairing window closed; code cleared.\r\n");
         return;
     }
-    printf("Usage: pairing <open|cancel>\r\n");
+    printf("Usage: pairing <open|close>\r\n");
 #else
     (void)argc; (void)argv;
     printf("Pairing window is available only on the device.\r\n");

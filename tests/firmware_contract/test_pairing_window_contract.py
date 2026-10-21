@@ -18,6 +18,7 @@ class TestPairingWindowContract(unittest.TestCase):
         )[0]
         for required in (
             'strcmp(argv[1], "open")',
+            'strcmp(argv[1], "close")',
             'strcmp(argv[1], "cancel")',
             "pairing_window_open()",
         ):
@@ -28,8 +29,11 @@ class TestPairingWindowContract(unittest.TestCase):
         opening = source.split("static int pairing_window_open(void)", 1)[1].split(
             "static const desk_cli_command_t s_default_cmds", 1
         )[0]
+        self.assertIn("PAIRING_WINDOW_TTL_US (300ULL * 1000ULL * 1000ULL)", source)
         for required in (
             "esp_random()",
+            "(UINT32_MAX / PAIRING_CODE_SPACE) * PAIRING_CODE_SPACE",
+            '"%06lu"',
             "desk_sdk_bridge_set_pairing_code",
             "esp_timer_start_once",
             "PAIRING_WINDOW_TTL_US",
@@ -52,6 +56,17 @@ class TestPairingWindowContract(unittest.TestCase):
         self.assertIn("s_pairing_expiry_deadline_us != 0", expiry)
         self.assertIn("esp_timer_get_time() >= s_pairing_expiry_deadline_us", expiry)
         self.assertIn("pairing_window_clear_locked()", expiry)
+
+    def test_close_stops_expiry_timer_and_clears_bridge_and_display(self) -> None:
+        source = CLI.read_text(encoding="utf-8")
+        command = source.rsplit("static void cmd_pairing(int argc, char *argv[])", 1)[1].split(
+            "static void cmd_wifi", 1
+        )[0]
+        close = command.split('strcmp(argv[1], "close")', 1)[1].split("return;", 1)[0]
+        self.assertIn("esp_timer_stop(s_pairing_expiry_timer)", close)
+        self.assertIn("pairing_window_clear_locked()", close)
+        self.assertIn("desk_sdk_bridge_set_pairing_code(NULL)", close)
+        self.assertIn("desk_tclaw_pairing_ui_clear()", close)
 
     def test_pairing_display_survives_normal_ui_refresh_without_changing_voice_input(self) -> None:
         source = TCLAW.read_text(encoding="utf-8")
