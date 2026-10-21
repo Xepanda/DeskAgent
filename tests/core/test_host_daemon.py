@@ -11,6 +11,7 @@ import unittest
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.request import urlopen, Request
+from urllib.error import HTTPError
 import json
 
 from host.desk_agent.main import DeskAgentHostApp, make_request_handler, ThreadedHTTPServer
@@ -23,6 +24,8 @@ class TestHostDaemon(unittest.TestCase):
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.db_path = Path(cls.temp_dir.name) / "test_host_daemon.db"
         cfg_file = Path(cls.temp_dir.name) / "config.json"
+        # Compatibility flag is intentionally true: CameraViewerService must still
+        # fail closed when no physical frame source is attached.
         cfg_file.write_text(json.dumps({"storage": {"db_path": str(cls.db_path)}, "camera": {"allow_synthetic": True, "auto_start_pipeline": True}}))
 
         # Initialize App
@@ -197,7 +200,7 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data2["result"]["task_id"], "tsk-host-codex-01")
 
     def test_camera_acquire_and_frame_endpoint(self) -> None:
-        """Verifies acquiring camera lease enables /api/camera/frame JPEG stream retrieval."""
+        """A lease without an attached physical camera source must not yield a fake JPEG."""
         # 1. Acquire lease
         acq_payload = {
             "schema_version": "1.0.0",
@@ -217,48 +220,99 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data["status"], "succeeded")
             self.assertTrue(data["result"]["granted"])
 
-        # Wait briefly for capture pipeline to produce first frame
-        time.sleep(0.15)
+        try:
+            # The capture pipeline has no frame source in this test. The endpoint
+            # must report unavailable even though the legacy synthetic flag is set.
+            frame_req = Request(f"http://127.0.0.1:{self.port}/api/camera/frame?client_id=web-viewer-01")
+            with self.assertRaises(HTTPError) as error:
+                urlopen(frame_req)
+            try:
+                self.assertEqual(error.exception.code, 503)
+                self.assertEqual(json.loads(error.exception.read().decode())["error"], "CAMERA_FRAME_UNAVAILABLE")
+            finally:
+                error.exception.close()
+        finally:
+            # Keep the shared class-level Host app isolated for later tests.
+            rel_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-cam-rel-01",
+                "operation": "resource.camera.release",
+                "arguments": {"client_id": "web-viewer-01"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            req_rel = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(rel_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req_rel) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "succeeded")
+                self.assertTrue(data["result"]["released"])
 
-        # 2. Fetch live frame
-        frame_req = Request(f"http://127.0.0.1:{self.port}/api/camera/frame?client_id=web-viewer-01")
-        with urlopen(frame_req) as frame_resp:
-            self.assertEqual(frame_resp.status, 200)
-            self.assertEqual(frame_resp.headers.get("Content-Type"), "image/jpeg")
-            self.assertIsNotNone(frame_resp.headers.get("X-Frame-Source"))
-            self.assertIn(frame_resp.headers.get("X-Frame-Hardware"), ("0", "1"))
-            raw_jpeg = frame_resp.read()
-            self.assertTrue(raw_jpeg.startswith(b"\xff\xd8"))
+    def test_camera_frame_without_lease_returns_no_active_lease(self) -> None:
+        request = Request(f"http://127.0.0.1:{self.port}/api/camera/frame?client_id=viewer-no-lease")
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request)
+        try:
+            self.assertEqual(error.exception.code, 403)
+            self.assertEqual(json.loads(error.exception.read().decode())["error"], "NO_ACTIVE_LEASE")
+        finally:
+            error.exception.close()
 
-        # 3. Release lease
-        rel_payload = {
+    def test_camera_frame_for_non_owner_returns_resource_busy(self) -> None:
+        acquire_payload = {
             "schema_version": "1.0.0",
-            "request_id": "req-cam-rel-01",
-            "operation": "resource.camera.release",
-            "arguments": {"client_id": "web-viewer-01"},
+            "request_id": "req-cam-owner-acq",
+            "operation": "resource.camera.acquire",
+            "arguments": {"client_id": "viewer-owner", "lease_duration_ms": 5000},
             "expires_at": "2030-01-01T00:00:00Z",
         }
-        req_rel = Request(
+        acquire_request = Request(
             f"http://127.0.0.1:{self.port}/api/rpc",
-            data=json.dumps(rel_payload).encode("utf-8"),
+            data=json.dumps(acquire_payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(req_rel) as resp:
-            data = json.loads(resp.read().decode())
-            self.assertEqual(data["status"], "succeeded")
-            self.assertTrue(data["result"]["released"])
+        with urlopen(acquire_request) as response:
+            self.assertTrue(json.loads(response.read().decode())["result"]["granted"])
+
+        try:
+            request = Request(f"http://127.0.0.1:{self.port}/api/camera/frame?client_id=viewer-other")
+            with self.assertRaises(HTTPError) as error:
+                urlopen(request)
+            try:
+                self.assertEqual(error.exception.code, 403)
+                self.assertEqual(json.loads(error.exception.read().decode())["error"], "RESOURCE_BUSY")
+            finally:
+                error.exception.close()
+        finally:
+            release_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-cam-owner-release",
+                "operation": "resource.camera.release",
+                "arguments": {"client_id": "viewer-owner"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            release_request = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(release_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(release_request) as response:
+                self.assertTrue(json.loads(response.read().decode())["result"]["released"])
 
     def test_snapshot_endpoint_retrieval(self) -> None:
-        """Verifies GET /snapshot returns fresh JPEG with anti-caching and frame headers."""
+        """GET /snapshot reports unavailable when the Host has no physical image source."""
         snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
-        with urlopen(snap_req) as snap_resp:
-            self.assertEqual(snap_resp.status, 200)
-            self.assertEqual(snap_resp.headers.get("Content-Type"), "image/jpeg")
-            self.assertIn("no-cache", snap_resp.headers.get("Cache-Control", ""))
-            self.assertIsNotNone(snap_resp.headers.get("X-Frame-Seq"))
-            raw_jpeg = snap_resp.read()
-            self.assertTrue(raw_jpeg.startswith(b"\xff\xd8"))
+        with self.assertRaises(HTTPError) as error:
+            urlopen(snap_req)
+        try:
+            self.assertEqual(error.exception.code, 404)
+        finally:
+            error.exception.close()
 
     def test_reminder_automatic_scheduler_delivery(self) -> None:
         """Verifies background ReminderScheduler automatically triggers ringing and outbox alert for due items."""

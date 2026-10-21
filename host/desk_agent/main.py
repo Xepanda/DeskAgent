@@ -7,6 +7,7 @@ Codex Companion Router, Camera Leased Viewer, and Envelope RPC Dispatcher.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
 from host.desk_agent.camera.camera_service import CameraViewerService
 from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
+from host.desk_agent.connectors.robot.official_camera_adapter import OfficialRobotCameraAdapter
 from companion.src.codex_companion import CodexCompanion
 
 logging.basicConfig(
@@ -46,7 +48,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class DeskAgentHostApp:
-    def __init__(self, config_path: Optional[str] = None) -> None:
+    def __init__(self, config_path: Optional[str] = None, *, managed_sdk_session: bool = False) -> None:
         self.config = self._load_config(config_path)
         self.start_time = time.time()
 
@@ -69,6 +71,7 @@ class DeskAgentHostApp:
             auto_start_pipeline=cam_cfg.get("auto_start_pipeline", False),
             allow_synthetic=cam_cfg.get("allow_synthetic", False),
         )
+        self.official_camera_adapter: Optional[OfficialRobotCameraAdapter] = None
 
         codex_cfg = self.config.get("codex", {})
         companion_url = codex_cfg.get("companion_url") or self.config.get("codex_companion", {}).get("endpoint")
@@ -103,7 +106,7 @@ class DeskAgentHostApp:
         # Robot Hardware Link / SDK Bridge Adapter
         robot_cfg = self.config.get("robot", {})
         self.robot_adapter: Optional[RobotAdapter] = None
-        if robot_cfg.get("enabled", True):
+        if robot_cfg.get("enabled", True) and not managed_sdk_session:
             self.robot_adapter = RobotAdapter(
                 host=robot_cfg.get("host", "127.0.0.1"),
                 tcp_port=robot_cfg.get("tcp_port", 37020),
@@ -365,6 +368,8 @@ class DeskAgentHostApp:
             self._scheduler_thread.join(timeout=2.0)
         if hasattr(self, "_delivery_thread") and self._delivery_thread.is_alive():
             self._delivery_thread.join(timeout=2.0)
+        if self.official_camera_adapter:
+            self.official_camera_adapter.close()
         if getattr(self, "robot_adapter", None):
             self.robot_adapter.stop()
         if getattr(self, "_ha_sub_stop", None):
@@ -615,7 +620,19 @@ class DeskAgentHostApp:
                 message=f"Camera lease is currently held by '{res.get('current_owner')}'",
                 details=res,
             )
-        if self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+        if self.official_camera_adapter is not None:
+            device_result = self.official_camera_adapter.acquire(
+                client_id, res.get("lease_duration_ms", 10000), target_fps=float(target_fps or res.get("target_fps", 2.0))
+            )
+            if not device_result.get("granted"):
+                self.camera_service.release_lease(client_id)
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code=device_result.get("reason", "DEVICE_ERROR"),
+                    message="Official SDK camera lease was not granted",
+                    details=device_result,
+                )
+        elif self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
             try:
                 ack = self._robot_client.send_command({
                     "type": "ctrl.camera.acquire",
@@ -648,7 +665,7 @@ class DeskAgentHostApp:
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")
         released = self.camera_service.release_lease(client_id)
-        if released and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+        if released and self.official_camera_adapter is None and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
             try:
                 self._robot_client.send_command({
                     "type": "ctrl.camera.release",
@@ -661,6 +678,33 @@ class DeskAgentHostApp:
     def register_robot_hardware_client(self, client: Any) -> None:
         """Registers the connected robot hardware / SDK bridge client."""
         self._robot_client = client
+
+    def register_official_sdk_camera_session(
+        self,
+        robot: Any,
+        *,
+        command_sender: Callable[[str, dict[str, Any], Optional[float]], dict[str, Any]],
+        on_disconnect: Optional[Callable[[Callable[[], None]], None]] = None,
+    ) -> OfficialRobotCameraAdapter:
+        """Attach an existing managed-SDK session; this method never starts a Runtime or connection."""
+        previous_teardown = self.camera_service.on_lease_released
+        adapter = OfficialRobotCameraAdapter(
+            robot,
+            send_command=command_sender,
+            ingest_frame=self.camera_service.ingest_robot_frame,
+            clear_frame=self.camera_service.release_lease,
+        )
+        self.official_camera_adapter = adapter
+
+        def release_device_lease(owner: str, reason: str) -> None:
+            if previous_teardown:
+                previous_teardown(owner, reason)
+            adapter.release(owner)
+
+        self.camera_service.on_lease_released = release_device_lease
+        if on_disconnect is not None:
+            on_disconnect(adapter.disconnect)
+        return adapter
 
     def has_robot_hardware_connected(self) -> bool:
         """Checks if physical robot hardware link is actively connected."""
@@ -942,7 +986,16 @@ def make_request_handler(app: DeskAgentHostApp):
                             self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
                             return
                         ephemeral_lease_acquired = True
-                        if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                        if app.official_camera_adapter is not None:
+                            device_acq = app.official_camera_adapter.acquire(effective_client, 5000, target_fps=10.0)
+                            if not device_acq.get("granted"):
+                                app.camera_service.release_lease(effective_client)
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": device_acq.get("reason", "DEVICE_UNAVAILABLE")}).encode())
+                                return
+                        elif app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
                             try:
                                 ack = app._robot_client.send_command({
                                     "type": "ctrl.camera.acquire",
@@ -968,7 +1021,22 @@ def make_request_handler(app: DeskAgentHostApp):
 
                     try:
                         initial_seq = getattr(app.camera_service, "_frame_seq", 0)
-                        if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                        if app.official_camera_adapter is not None:
+                            frame_info = None
+                            deadline = time.time() + 1.2
+                            while time.time() < deadline:
+                                candidate = app.camera_service.get_latest_frame(effective_client)
+                                if candidate is not None and candidate.get("frame_seq", 0) > initial_seq:
+                                    frame_info = candidate
+                                    break
+                                time.sleep(0.02)
+                            if frame_info is None:
+                                self.send_response(504)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "CAPTURE_TIMEOUT"}).encode())
+                                return
+                        elif app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
                             try:
                                 cap_ack = app._robot_client.send_command({"type": "ctrl.camera.capture"}, timeout=1.0)
                                 if not isinstance(cap_ack, dict) or cap_ack.get("type") != "sys.ack" or cap_ack.get("code") != 0:
@@ -1034,7 +1102,7 @@ def make_request_handler(app: DeskAgentHostApp):
                     finally:
                         if ephemeral_lease_acquired:
                             app.camera_service.release_lease(effective_client)
-                            if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                            if app.official_camera_adapter is None and app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
                                 try:
                                     app._robot_client.send_command({
                                         "type": "ctrl.camera.release",
@@ -1045,19 +1113,27 @@ def make_request_handler(app: DeskAgentHostApp):
                 else:
                     # /api/camera/frame strictly enforces existing lease ownership
                     effective_id = client_id or "web-client"
-                    frame_info = app.camera_service.get_latest_frame(effective_id)
-
-                    if not frame_info:
-                        is_busy = (
-                            app.camera_service.is_lease_valid()
-                            and client_id is not None
-                            and app.camera_service._active_lease_owner != client_id
-                        )
-                        err_code = "RESOURCE_BUSY" if is_busy else "NO_ACTIVE_LEASE"
+                    lease_valid = app.camera_service.is_lease_valid()
+                    if not lease_valid:
                         self.send_response(403)
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()
-                        self.wfile.write(json.dumps({"error": err_code}).encode())
+                        self.wfile.write(json.dumps({"error": "NO_ACTIVE_LEASE"}).encode())
+                        return
+
+                    if app.camera_service._active_lease_owner != effective_id:
+                        self.send_response(403)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                        return
+
+                    frame_info = app.camera_service.get_latest_frame(effective_id)
+                    if not frame_info:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "CAMERA_FRAME_UNAVAILABLE"}).encode())
                         return
 
                     self.send_response(200)
@@ -1108,6 +1184,63 @@ def make_request_handler(app: DeskAgentHostApp):
     return DeskAgentHTTPHandler
 
 
+def _serve_host(app: DeskAgentHostApp, host: str, port: int, *, shutdown_check: Optional[Callable[[], bool]] = None) -> None:
+    handler_cls = make_request_handler(app)
+    httpd = ThreadedHTTPServer((host, port), handler_cls)
+
+    def handle_signal(sig, frame):
+        logger.info("Received signal %s, shutting down...", sig)
+        httpd.shutdown()
+
+    if shutdown_check is None:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    logger.info("Desk Agent Host Daemon running on http://%s:%d", host, port)
+    try:
+        if shutdown_check is None:
+            httpd.serve_forever()
+        else:
+            thread = threading.Thread(target=httpd.serve_forever, name="desk-agent-http", daemon=True)
+            thread.start()
+            while thread.is_alive() and not shutdown_check():
+                thread.join(timeout=0.25)
+            if thread.is_alive():
+                httpd.shutdown()
+            thread.join(timeout=2.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.close()
+        httpd.server_close()
+        logger.info("Host daemon terminated cleanly.")
+
+
+async def _run_managed_application(config_path: Optional[str], host: str, port: int) -> None:
+    """Run the Host inside the one Runtime-authorized SDK managed Application session."""
+    from watcherobot.application import ApplicationContext
+
+    context = ApplicationContext.from_environment()
+    async with context:
+        app = DeskAgentHostApp(config_path=config_path, managed_sdk_session=True)
+        # Pinned SDK currently keeps the command transport private on ApplicationContext.
+        # This is a version-bound compatibility point: send_command itself is public on
+        # DaemonApplicationTransport, but ApplicationContext exposes no transport property.
+        transport = context._transport
+        app.register_official_sdk_camera_session(
+            context.robot,
+            command_sender=transport.send_command,
+        )
+        # A disconnect makes the next bounded SDK capture fail; the camera adapter
+        # then clears the Host lease/frame without replacing the SDK's private callback.
+        await asyncio.to_thread(
+            _serve_host,
+            app,
+            host,
+            port,
+            shutdown_check=lambda: context.shutdown_requested,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Desk Agent R1 Host Daemon")
     parser.add_argument("--config", "-c", type=str, help="Path to config.json")
@@ -1126,31 +1259,22 @@ def main() -> None:
             print(json.dumps({"status": "invalid", "error": str(exc)}), file=sys.stderr)
             sys.exit(1)
 
+    config_loader = DeskAgentHostApp.__new__(DeskAgentHostApp)
+    launch_config = config_loader._load_config(args.config)
+    port = args.port or launch_config.get("server", {}).get("port", 8088)
+    host = args.host or launch_config.get("server", {}).get("host", "127.0.0.1")
+    managed_env_names = (
+        "WATCHER_APP_ID",
+        "WATCHER_APP_RUN_CREDENTIAL",
+        "WATCHER_APP_DESKTOP_WS_URL",
+        "WATCHER_APP_DEVICE_WS_URL",
+    )
+    managed_environment_present = any(os.environ.get(name, "").strip() for name in managed_env_names)
+    if managed_environment_present:
+        asyncio.run(_run_managed_application(args.config, host, port))
+        return
     app = DeskAgentHostApp(config_path=args.config)
-    port = args.port or app.config.get("server", {}).get("port", 8088)
-    host = args.host or app.config.get("server", {}).get("host", "127.0.0.1")
-
-    handler_cls = make_request_handler(app)
-    httpd = ThreadedHTTPServer((host, port), handler_cls)
-
-    def handle_signal(sig, frame):
-        logger.info("Received signal %s, shutting down...", sig)
-        app.close()
-        httpd.shutdown()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    logger.info("Desk Agent Host Daemon running on http://%s:%d", host, port)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        app.close()
-        httpd.server_close()
-        logger.info("Host daemon terminated cleanly.")
+    _serve_host(app, host, port)
 
 
 if __name__ == "__main__":
