@@ -167,6 +167,29 @@ class TestCameraService(unittest.TestCase):
         self.assertNotIn("viewer", cam._active_stream_owners, "first-frame errors must release the reservation")
         cam.release_lease("viewer")
 
+    def test_mjpeg_wait_expiry_clears_lease_frame_and_stream_resources(self) -> None:
+        events = []
+        cam = CameraViewerService(
+            stale_threshold_ms=1000,
+            on_lease_released=lambda owner, reason: events.append((owner, reason)),
+        )
+        cam.acquire_lease("viewer", lease_ms=80)
+        stream = cam.iter_mjpeg("viewer", wait_timeout=0.5)
+
+        import threading
+        producer = threading.Thread(target=lambda: (time.sleep(0.01), cam.ingest_robot_frame(TEST_JPEG)))
+        producer.start()
+        self.assertIn(b"X-Frame-Seq: 1", next(stream))
+        producer.join()
+
+        with self.assertRaises(StopIteration):
+            next(stream)
+
+        self.assertIsNone(cam._active_lease_owner)
+        self.assertIsNone(cam._latest_jpeg)
+        self.assertNotIn("viewer", cam._active_stream_owners)
+        self.assertEqual(events, [("viewer", "expired")])
+
     def test_mjpeg_stream_admission_limits_owner_and_global_subscribers(self) -> None:
         cam = CameraViewerService()
         cam.acquire_lease("viewer", lease_ms=1000)

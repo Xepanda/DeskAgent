@@ -373,9 +373,13 @@ class CameraViewerService:
                         return
                     deadline = time.monotonic() + max(0.05, min(1.0, wait_timeout))
                     frame = None
+                    lease_expired = False
                     while True:
-                        if self._active_lease_owner != client_id or time.time() >= self._lease_expires_at:
+                        if self._active_lease_owner != client_id:
                             return
+                        if time.time() >= self._lease_expires_at:
+                            lease_expired = True
+                            break
                         now = time.monotonic()
                         if self._latest_jpeg is not None and self._frame_seq > last_seq:
                             age_ms = (time.time() - self._latest_frame_time) * 1000
@@ -392,10 +396,15 @@ class CameraViewerService:
                         if remaining <= 0:
                             break
                         self._frame_changed.wait(min(remaining, interval))
-                    if frame is None and first_frame:
+                    if not lease_expired and frame is None and first_frame:
                         raise CameraStreamFrameUnavailable("NO_FRESH_FRAME")
-                    if frame is None and not first_frame and time.monotonic() - last_valid_frame_at > self.stale_threshold_ms / 1000.0:
+                    if not lease_expired and frame is None and not first_frame and time.monotonic() - last_valid_frame_at > self.stale_threshold_ms / 1000.0:
                         return
+                if lease_expired:
+                    # Re-enter the standard expiry path outside the condition lock
+                    # so it clears the latest frame and invokes the teardown callback.
+                    self.is_lease_valid()
+                    return
                 if frame is None:
                     continue
                 first_frame = False
