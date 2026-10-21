@@ -66,6 +66,7 @@ obj/
 *.egg-info/
 .pio/
 .espressif/
+firmware/managed_components/
 sdkconfig.old
 *.bin
 *.elf
