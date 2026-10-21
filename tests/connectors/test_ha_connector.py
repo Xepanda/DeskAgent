@@ -317,6 +317,73 @@ class TestHAConnector(unittest.TestCase):
         self.assertTrue(res["state_confirmed"])
         self.assertEqual(res["observed_state"], "on")
 
+    def test_execute_distinguishes_observed_state_transition_from_target_confirmation(self) -> None:
+        """A matching final HA state may confirm the target without proving it changed or acted physically."""
+        observed = {"state": "on"}
+        baseline = {"state": "off"}
+        get_count = 0
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            nonlocal get_count
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                get_count += 1
+                state = baseline["state"] if get_count == 1 else observed["state"]
+                return 200, {"entity_id": "light.desk", "state": state, "attributes": {}}
+            return 500, None
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        res = ha.execute(
+            "light.desk", "turn_on",
+            wait_for_state={"expected_state": "on", "timeout_ms": 100},
+        )
+
+        self.assertTrue(res["accepted"])
+        self.assertTrue(res["state_confirmed"])
+        self.assertTrue(res["state_changed"])
+        self.assertIsNone(res["physical_action_confirmed"])
+
+        # If the observed target state already existed before service execution,
+        # target confirmation is true while the observed transition is false.
+        get_count = 0
+        observed["state"] = "on"
+        baseline["state"] = "on"
+        same_state_ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        same_state_res = same_state_ha.execute(
+            "light.desk", "turn_on",
+            wait_for_state={"expected_state": "on", "timeout_ms": 100},
+        )
+        self.assertTrue(same_state_res["state_confirmed"])
+        self.assertFalse(same_state_res["state_changed"])
+        self.assertIsNone(same_state_res["physical_action_confirmed"])
+
+    def test_execute_continues_when_pre_call_state_snapshot_is_unavailable(self) -> None:
+        """A failed observational read does not block an accepted command and cannot claim a transition."""
+        get_count = 0
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            nonlocal get_count
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                get_count += 1
+                if get_count == 1:
+                    return 503, {"message": "temporary state endpoint failure"}
+                return 200, {"entity_id": "light.desk", "state": "on", "attributes": {}}
+            return 500, None
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        res = ha.execute(
+            "light.desk", "turn_on",
+            wait_for_state={"expected_state": "on", "timeout_ms": 100},
+        )
+
+        self.assertTrue(res["accepted"])
+        self.assertTrue(res["state_confirmed"])
+        self.assertIsNone(res["state_changed"])
+        self.assertIsNone(res["physical_action_confirmed"])
+
     def test_execute_with_wait_for_state_timeout(self) -> None:
         """When state does NOT reach expected_state before timeout, state_confirmed is False."""
         def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):

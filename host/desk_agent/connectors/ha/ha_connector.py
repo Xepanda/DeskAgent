@@ -5,7 +5,7 @@ Implements real Home Assistant REST API interactions and WebSocket real-time eve
 1. Enforces strict domain, entity, and service allowlists and denylists.
 2. Interacts with Home Assistant via standard REST endpoints (/api/states, /api/services).
 3. Connects to Home Assistant WebSocket API (/api/websocket) for real-time state change streaming.
-4. Separates service acceptance (`accepted`) from observed physical state confirmation (`state_confirmed`).
+4. Separates HA service acceptance from observed entity-state changes and target-state confirmation.
 5. Reconciles state snapshots upon startup, WebSocket reconnect, and periodic polling.
 6. Rate limiting and error classification (401/403 PermissionError, 404 LookupError, 429/5xx ConnectionError).
 7. Supports transport injection and explicit mock mode for test isolation without polluting production.
@@ -71,6 +71,16 @@ def _normalize_confirmation_timeout_ms(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
         raise ValueError("wait_for_state.timeout_ms must be a finite, non-negative number")
     return min(float(value), float(MAX_STATE_CONFIRMATION_TIMEOUT_MS))
+
+
+def _state_snapshot_changed(before: Optional[Mapping[str, Any]], after: Optional[Mapping[str, Any]]) -> Optional[bool]:
+    """Compare HA-reported state and attributes; this does not establish physical device action."""
+    if before is None or after is None:
+        return None
+    return (
+        before.get("state") != after.get("state")
+        or before.get("attributes", {}) != after.get("attributes", {})
+    )
 
 KNOWN_ATTRIBUTE_KEYS = frozenset({
     "brightness",
@@ -606,7 +616,11 @@ class HAConnector:
         """
         Executes a service call on Home Assistant and verifies observed state.
 
-        - Separates accepted service call (`accepted`) from observed state (`state_confirmed`).
+        - `accepted` means HA returned success for the service request.
+        - `state_confirmed` means the requested state currently matches HA's observed entity snapshot.
+        - `state_changed` reports whether that snapshot differs from a best-effort pre-call snapshot.
+        - `physical_action_confirmed` is always None because this connector only observes HA state,
+          not independent physical feedback.
         - Polls entity state up to `timeout_ms` when `wait_for_state` is provided,
           leveraging real-time WebSocket state notification for instant confirmation when available.
         - Verifies both target state and target attributes (explicit or inferred from parameters).
@@ -643,13 +657,27 @@ class HAConnector:
                 if filtered:
                     expected_attributes = filtered
 
+        before_state: Optional[dict[str, Any]] = None
+        if wait_for_state is not None:
+            try:
+                before = self.get_state(entity_id)
+                before_state = dict(before)
+                if isinstance(before.get("attributes"), dict):
+                    before_state["attributes"] = dict(before["attributes"])
+            except Exception as err:
+                # A pre-call read is observational only; it must not block an otherwise
+                # permitted HA service request when the state endpoint is temporarily down.
+                logger.debug("Pre-service state check note for %s: %s", entity_id, err)
+
         # Handle mock mode or unconfigured daemon test
         if self.mock_mode or (self._is_default_unconfigured and "unittest" in sys.modules):
             target_state = "on" if "turn_on" in action else "off" if "turn_off" in action else "active"
             if expected_state is not None:
                 target_state = expected_state
 
-            current = self.get_state(entity_id)
+            current = dict(self.get_state(entity_id))
+            if isinstance(current.get("attributes"), dict):
+                current["attributes"] = dict(current["attributes"])
             current["state"] = target_state
             if parameters:
                 current.setdefault("attributes", {}).update(parameters)
@@ -665,6 +693,8 @@ class HAConnector:
                 "accepted": True,
                 "observed_state": current["state"],
                 "state_confirmed": state_confirmed,
+                "state_changed": _state_snapshot_changed(before_state, current) if wait_for_state is not None else None,
+                "physical_action_confirmed": None,
             }
 
         # 1. Trigger service call (First Stage: Acceptance)
@@ -674,6 +704,7 @@ class HAConnector:
         # 2. State verification (Second Stage: Confirmation)
         observed_state: Optional[str] = None
         state_confirmed = False
+        state_changed: Optional[bool] = None
 
         if wait_for_state is not None and (expected_state is not None or expected_attributes):
             deadline = time.monotonic() + (timeout_ms / 1000.0)
@@ -682,6 +713,7 @@ class HAConnector:
             try:
                 current_st = self.get_state(entity_id)
                 observed_state = current_st.get("state")
+                state_changed = _state_snapshot_changed(before_state, current_st)
                 if self._is_state_confirmed(current_st, expected_state, expected_attributes):
                     return {
                         "entity_id": entity_id,
@@ -689,6 +721,8 @@ class HAConnector:
                         "accepted": accepted,
                         "observed_state": observed_state,
                         "state_confirmed": True,
+                        "state_changed": state_changed,
+                        "physical_action_confirmed": None,
                     }
             except Exception as err:
                 logger.debug("Initial state check note: %s", err)
@@ -706,6 +740,7 @@ class HAConnector:
                 try:
                     current_st = self.get_state(entity_id)
                     observed_state = current_st.get("state")
+                    state_changed = _state_snapshot_changed(before_state, current_st)
                     if self._is_state_confirmed(current_st, expected_state, expected_attributes):
                         state_confirmed = True
                         break
@@ -716,6 +751,7 @@ class HAConnector:
             try:
                 current_st = self.get_state(entity_id)
                 observed_state = current_st.get("state")
+                state_changed = _state_snapshot_changed(before_state, current_st)
             except Exception:
                 observed_state = None
             state_confirmed = False
@@ -726,6 +762,8 @@ class HAConnector:
             "accepted": accepted,
             "observed_state": observed_state,
             "state_confirmed": state_confirmed,
+            "state_changed": state_changed,
+            "physical_action_confirmed": None,
         }
 
     def execute_service(
