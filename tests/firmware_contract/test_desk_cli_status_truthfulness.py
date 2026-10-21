@@ -78,7 +78,8 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn("cli_parse_finite_float", body)
         self.assertIn("cli_parse_duration_ms", body)
         self.assertIn("desk_hardware_motion_move_to(pan, tilt, duration_ms)", body)
-        self.assertIn("#ifdef ESP_PLATFORM\n        rc = desk_hardware_motion_move_to", body)
+        self.assertIn("#ifdef ESP_PLATFORM\n        desk_arbiter_status_t arb", body)
+        self.assertIn("desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE)", body)
         self.assertIn("Host HAL is a simulation", body)
         self.assertIn("accepted=true, state_confirmed=false", body)
         self.assertIn("Body move failed: rc=%d", body)
@@ -113,6 +114,17 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn("desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE)", motion)
         self.assertLess(motion.index("desk_arbiter_acquire("), motion.index("result = s_board_driver_ops->motion_move"))
         self.assertLess(motion.index("result = s_board_driver_ops->motion_move"), motion.index("if (need_release)"))
+
+    def test_local_cli_move_cannot_borrow_the_voice_motion_owner(self) -> None:
+        body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",
+                             "static void cmd_peripherals(int argc, char *argv[])\n{")
+        acquire = body.index("desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE")
+        move = body.index("desk_hardware_motion_move_to(pan, tilt, duration_ms)")
+        release = body.index("desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE)")
+        self.assertLess(acquire, move)
+        self.assertLess(move, release)
+        self.assertIn("if (arb != DESK_ARBITER_OK)", body)
+        self.assertIn("RESOURCE_BUSY", body)
 
     def test_body_stop_remains_emergency_and_reports_driver_failure(self) -> None:
         body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",

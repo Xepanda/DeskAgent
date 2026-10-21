@@ -416,7 +416,13 @@ static void cmd_body(int argc, char *argv[])
         }
         int rc;
 #ifdef ESP_PLATFORM
+        desk_arbiter_status_t arb = desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE, 50);
+        if (arb != DESK_ARBITER_OK) {
+            printf("Body move failed: rc=%d (accepted=false, RESOURCE_BUSY)\r\n", DESK_HW_ERR_BUSY);
+            return;
+        }
         rc = desk_hardware_motion_move_to(pan, tilt, duration_ms);
+        desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE);
 #else
         /* Host HAL is a simulation and must not report an accepted physical move. */
         rc = DESK_HW_ERR_UNAVAILABLE;
