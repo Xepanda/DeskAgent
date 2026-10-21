@@ -96,12 +96,34 @@ def compute_next_occurrence(
     local_dt = dt.astimezone(target_tz)
     rule = repeat_rule.strip().lower()
 
+    # Hourly and interval schedules describe elapsed time. Adding a timedelta
+    # directly to a ZoneInfo local datetime can skip/repeat an hour at DST
+    # transitions, so advance these rules on the UTC timeline instead.
+    elapsed_minutes: Optional[int] = None
+    if rule in ("hourly", "freq=hourly"):
+        elapsed_minutes = 60
+    elif rule.startswith("interval:"):
+        try:
+            elapsed_minutes = int(rule.split(":", 1)[1])
+        except ValueError:
+            return None
+    elif "interval=" in rule and "minutely" in rule:
+        try:
+            elapsed_minutes = int(
+                next(part for part in rule.split(";") if part.startswith("interval=")).split("=", 1)[1]
+            )
+        except (StopIteration, ValueError):
+            return None
+    if elapsed_minutes is not None:
+        if elapsed_minutes <= 0:
+            return None
+        next_utc = dt.astimezone(timezone.utc) + timedelta(minutes=elapsed_minutes)
+        return next_utc.isoformat().replace("+00:00", "Z")
+
     if rule in ("daily", "freq=daily"):
         next_dt = local_dt + timedelta(days=1)
     elif rule in ("weekly", "freq=weekly"):
         next_dt = local_dt + timedelta(days=7)
-    elif rule in ("hourly", "freq=hourly"):
-        next_dt = local_dt + timedelta(hours=1)
     elif rule == "weekdays":
         weekday = local_dt.weekday()
         if weekday < 4:  # Mon-Thu -> next day
@@ -112,19 +134,6 @@ def compute_next_occurrence(
             next_dt = local_dt + timedelta(days=2)
         else:  # Sunday -> Monday (+1 day)
             next_dt = local_dt + timedelta(days=1)
-    elif rule.startswith("interval:"):
-        try:
-            mins = int(rule.split(":", 1)[1])
-            next_dt = local_dt + timedelta(minutes=mins)
-        except ValueError:
-            return None
-    elif "interval=" in rule and "minutely" in rule:
-        try:
-            part = [p for p in rule.split(";") if p.startswith("interval=")][0]
-            mins = int(part.split("=")[1])
-            next_dt = local_dt + timedelta(minutes=mins)
-        except (IndexError, ValueError):
-            return None
     else:
         return None
 

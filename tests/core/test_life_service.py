@@ -734,6 +734,14 @@ class TestLifeService(unittest.TestCase):
         next_kw = compute_next_occurrence("2026-03-07T14:00:00Z", "daily", timezone_str="America/New_York")
         self.assertEqual(next_kw, "2026-03-08T13:00:00Z")
 
+        # Elapsed-time schedules remain hourly across the autumn DST fold.
+        # 01:30 EDT is 05:30 UTC; the next hourly occurrence is 06:30 UTC
+        # (01:30 EST), not 07:30 UTC (02:30 EST).
+        next_hourly_fold = compute_next_occurrence(
+            "2026-11-01T05:30:00Z", "hourly", tz_name="America/New_York"
+        )
+        self.assertEqual(next_hourly_fold, "2026-11-01T06:30:00Z")
+
     # -------------------------------------------------------------------------
     # 13. LifeService Close & Context Manager
     # -------------------------------------------------------------------------
