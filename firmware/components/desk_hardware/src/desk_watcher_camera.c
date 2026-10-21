@@ -264,7 +264,9 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
 
 #ifdef ESP_PLATFORM
     if (!s_camera_initialized || !s_spi_dev) {
-        return DESK_HW_ERR_UNAVAILABLE;
+        ESP_LOGE(TAG, "Capture unavailable: camera not ready initialized=%d spi_device=%s",
+                 s_camera_initialized, s_spi_dev ? "present" : "missing");
+        return DESK_WATCHER_CAMERA_ERR_NOT_READY;
     }
 
     if (!s_cam_mutex || xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
@@ -304,7 +306,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SPI bus acquire failed: %s (%d)", esp_err_to_name(err), (int)err);
         xSemaphoreGive(s_cam_mutex);
-        return DESK_HW_ERR_IO;
+        return DESK_WATCHER_CAMERA_ERR_SPI;
     }
 
     /* Step 1: Read 7-byte Base Header with CS kept active */
@@ -320,14 +322,36 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         ESP_LOGE(TAG, "SPI PTL header transfer failed: %s (%d)", esp_err_to_name(err), (int)err);
         spi_device_release_bus(s_spi_dev);
         xSemaphoreGive(s_cam_mutex);
-        return DESK_HW_ERR_IO;
+        return DESK_WATCHER_CAMERA_ERR_SPI;
+    }
+
+    uint8_t header_or = 0;
+    for (size_t i = 0; i < sizeof(base_header); ++i) header_or |= base_header[i];
+    if (header_or == 0) {
+        ESP_LOGE(TAG, "PTL empty response: raw=%02x%02x%02x%02x%02x%02x%02x",
+                 base_header[0], base_header[1], base_header[2], base_header[3],
+                 base_header[4], base_header[5], base_header[6]);
+        /* Close the current PTL transaction with the same trailing clock used
+         * for other rejected headers, then preserve EMPTY as the result. */
+        uint8_t dummy = 0;
+        spi_transaction_t close_trans = {
+            .length = 8,
+            .rxlength = 8,
+            .rx_buffer = &dummy,
+            .flags = 0,
+        };
+        (void)spi_device_transmit(s_spi_dev, &close_trans);
+        spi_device_release_bus(s_spi_dev);
+        xSemaphoreGive(s_cam_mutex);
+        return DESK_WATCHER_CAMERA_ERR_EMPTY;
     }
 
     uint32_t body_size = 0;
     int ptl_rc = desk_watcher_camera_parse_ptl_header(base_header, sizeof(base_header), &body_size);
     if (ptl_rc != 0) {
-        ESP_LOGE(TAG, "PTL header rejected: parser rc=%d magic=%02x%02x type=%02x size=%u",
-                 ptl_rc, base_header[0], base_header[1], base_header[2],
+        ESP_LOGE(TAG, "PTL header rejected: parser rc=%d raw=%02x%02x%02x%02x%02x%02x%02x size=%u",
+                 ptl_rc, base_header[0], base_header[1], base_header[2], base_header[3],
+                 base_header[4], base_header[5], base_header[6],
                  (unsigned)base_header[3] | ((unsigned)base_header[4] << 8) |
                  ((unsigned)base_header[5] << 16) | ((unsigned)base_header[6] << 24));
         /* Discard / close rejected packet by clocking 1 dummy byte without KEEP_ACTIVE */
@@ -357,7 +381,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         ESP_LOGE(TAG, "SPI PTL body transfer failed (body_size=%u): %s (%d)",
                  (unsigned)body_size, esp_err_to_name(err), (int)err);
         xSemaphoreGive(s_cam_mutex);
-        return DESK_HW_ERR_IO;
+        return DESK_WATCHER_CAMERA_ERR_SPI;
     }
 
     /* Step 3: Validate Media Header, CRC32, and extract JPEG */

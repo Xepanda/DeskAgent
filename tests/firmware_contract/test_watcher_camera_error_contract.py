@@ -26,11 +26,30 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
             "DESK_WATCHER_CAMERA_ERR_SYNC_IO",
             "DESK_WATCHER_CAMERA_ERR_PROTOCOL",
             "DESK_WATCHER_CAMERA_ERR_CRC",
+            "DESK_WATCHER_CAMERA_ERR_SPI",
+            "DESK_WATCHER_CAMERA_ERR_EMPTY",
         ):
             self.assertIn(error_name, header)
             self.assertIn(error_name, source)
-        for diagnostic in ("SYNC read failed", "PTL header rejected", "CRC mismatch", "SPI"):
+        for diagnostic in (
+            "SYNC read failed",
+            "SYNC timeout",
+            "PTL empty response",
+            "PTL header rejected",
+            "CRC mismatch",
+            "SPI PTL header transfer failed",
+            "SPI PTL body transfer failed",
+            "raw=%02x%02x%02x%02x%02x%02x%02x",
+        ):
             self.assertIn(diagnostic, source)
+
+    def test_zero_ptl_header_has_distinct_empty_error_and_spi_failures_keep_stage(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        self.assertIn("if (header_or == 0)", capture)
+        self.assertIn("return DESK_WATCHER_CAMERA_ERR_EMPTY", capture)
+        self.assertIn("return DESK_WATCHER_CAMERA_ERR_SPI", capture)
+        self.assertGreaterEqual(capture.count("return DESK_WATCHER_CAMERA_ERR_SPI"), 2)
 
     def test_himax_power_and_sync_guards_match_upstream_ptl_timing(self):
         source = CAMERA_C.read_text(encoding="utf-8")
