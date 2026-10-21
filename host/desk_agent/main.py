@@ -146,6 +146,8 @@ class DeskAgentHostApp:
 
             if hasattr(self.companion, "add_event_listener"):
                 self.companion.add_event_listener(_on_codex_event)
+                if hasattr(self.companion, "start"):
+                    self.companion.start()
 
             self.robot_adapter.start()
 
@@ -875,16 +877,17 @@ def make_request_handler(app: DeskAgentHostApp):
                 )
 
                 if is_snapshot_path:
-                    effective_client = client_id or "snapshot-viewer"
+                    ephemeral_lease_acquired = False
                     if app.camera_service.is_lease_valid():
-                        if client_id and app.camera_service._active_lease_owner != client_id:
+                        if not client_id or app.camera_service._active_lease_owner != client_id:
                             self.send_response(403)
                             self.send_header("Content-Type", "application/json")
                             self.end_headers()
                             self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
                             return
-                        effective_client = app.camera_service._active_lease_owner
+                        effective_client = client_id
                     else:
+                        effective_client = client_id or "snapshot-viewer"
                         acq = app.camera_service.acquire_lease(effective_client, lease_ms=5000)
                         if not acq.get("granted"):
                             self.send_response(403)
@@ -892,6 +895,7 @@ def make_request_handler(app: DeskAgentHostApp):
                             self.end_headers()
                             self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
                             return
+                        ephemeral_lease_acquired = True
                         if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
                             try:
                                 ack = app._robot_client.send_command({
@@ -916,56 +920,111 @@ def make_request_handler(app: DeskAgentHostApp):
                                 self.wfile.write(json.dumps({"error": "DEVICE_UNAVAILABLE"}).encode())
                                 return
 
-                    initial_seq = getattr(app.camera_service, "_frame_seq", 0)
-                    if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
-                        try:
-                            app._robot_client.send_command({"type": "ctrl.camera.capture"}, timeout=1.0)
-                        except Exception as e:
-                            logger.debug("Snapshot trigger to robot error: %s", e)
+                    try:
+                        initial_seq = getattr(app.camera_service, "_frame_seq", 0)
+                        if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                            try:
+                                cap_ack = app._robot_client.send_command({"type": "ctrl.camera.capture"}, timeout=1.0)
+                                if not isinstance(cap_ack, dict) or cap_ack.get("type") != "sys.ack" or cap_ack.get("code") != 0:
+                                    logger.warning("Robot rejected snapshot camera capture: %s", cap_ack)
+                                    self.send_response(503)
+                                    self.send_header("Content-Type", "application/json")
+                                    self.end_headers()
+                                    self.wfile.write(json.dumps({"error": "CAPTURE_FAILED"}).encode())
+                                    return
+                            except Exception as e:
+                                logger.warning("Snapshot capture dispatch error: %s", e)
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "CAPTURE_FAILED"}).encode())
+                                return
 
-                    frame_info = None
-                    deadline = time.time() + 1.2
-                    while time.time() < deadline:
-                        candidate = app.camera_service.get_latest_frame(effective_client)
-                        if candidate is not None:
-                            if candidate.get("frame_seq", 0) > initial_seq or candidate.get("is_hardware"):
-                                frame_info = candidate
-                                break
-                            elif frame_info is None:
-                                frame_info = candidate
-                        time.sleep(0.02)
+                            frame_info = None
+                            deadline = time.time() + 1.2
+                            while time.time() < deadline:
+                                candidate = app.camera_service.get_latest_frame(effective_client)
+                                if candidate is not None and candidate.get("frame_seq", 0) > initial_seq:
+                                    frame_info = candidate
+                                    break
+                                time.sleep(0.02)
 
-                    if frame_info is None:
-                        frame_info = app.camera_service.get_latest_frame(effective_client)
+                            if frame_info is None:
+                                logger.warning("Timed out waiting for fresh robot frame (initial_seq=%d)", initial_seq)
+                                self.send_response(504)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "CAPTURE_TIMEOUT"}).encode())
+                                return
+                        else:
+                            frame_info = None
+                            deadline = time.time() + 1.2
+                            while time.time() < deadline:
+                                candidate = app.camera_service.get_latest_frame(effective_client)
+                                if candidate is not None:
+                                    frame_info = candidate
+                                    break
+                                time.sleep(0.02)
+
+                            if frame_info is None:
+                                frame_info = app.camera_service.get_latest_frame(effective_client)
+
+                        if not frame_info:
+                            self.send_response(404)
+                            self.end_headers()
+                            return
+
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                        self.send_header("Pragma", "no-cache")
+                        self.send_header("Expires", "0")
+                        self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
+                        self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
+                        self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
+                        self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
+                        self.end_headers()
+                        self.wfile.write(frame_info["jpeg_data"])
+                    finally:
+                        if ephemeral_lease_acquired:
+                            app.camera_service.release_lease(effective_client)
+                            if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                                try:
+                                    app._robot_client.send_command({
+                                        "type": "ctrl.camera.release",
+                                        "client_id": effective_client,
+                                    }, timeout=0.5)
+                                except Exception:
+                                    pass
                 else:
                     # /api/camera/frame strictly enforces existing lease ownership
                     effective_id = client_id or "web-client"
                     frame_info = app.camera_service.get_latest_frame(effective_id)
 
-                if not frame_info:
-                    is_busy = (
-                        app.camera_service.is_lease_valid()
-                        and client_id is not None
-                        and app.camera_service._active_lease_owner != client_id
-                    )
-                    err_code = "RESOURCE_BUSY" if is_busy else "NO_ACTIVE_LEASE"
-                    self.send_response(403)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": err_code}).encode())
-                    return
+                    if not frame_info:
+                        is_busy = (
+                            app.camera_service.is_lease_valid()
+                            and client_id is not None
+                            and app.camera_service._active_lease_owner != client_id
+                        )
+                        err_code = "RESOURCE_BUSY" if is_busy else "NO_ACTIVE_LEASE"
+                        self.send_response(403)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": err_code}).encode())
+                        return
 
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-                self.send_header("Pragma", "no-cache")
-                self.send_header("Expires", "0")
-                self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
-                self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
-                self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
-                self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
-                self.end_headers()
-                self.wfile.write(frame_info["jpeg_data"])
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Expires", "0")
+                    self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
+                    self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
+                    self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
+                    self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
+                    self.end_headers()
+                    self.wfile.write(frame_info["jpeg_data"])
             else:
                 self.send_response(404)
                 self.end_headers()

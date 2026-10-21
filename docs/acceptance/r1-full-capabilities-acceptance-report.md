@@ -1,6 +1,6 @@
 # Desk Agent R1 全功能综合验收与复审整改报告 (Full Capabilities Acceptance Report)
 
-> **文档版本**：V1.5.0  
+> **文档版本**：V1.6.0  
 > **责任角色**：A7 独立复审员（Independent Reviewer）与架构团队  
 > **审查基线**：`feat/r1-full-capabilities-bringup`（PR #14 第二轮返修闭环版本）  
 > **工程工作区**：`D:\ePanda\DeskAgent`  
@@ -10,7 +10,20 @@
 
 ## 摘要与复审结论总览
 
-针对 PR #14 第二轮审查中用户及 3 位 Luna 独立复审员提出的 5 项阻塞问题（3 项 P1 与 2 项 P2），工程团队已完成全部生产级代码返修、重新编译固件目标产物，并完成全量自动化回归验证：
+针对 PR #14 第三轮复审中用户及 3 位 Luna 独立复审员提出的 4 项 P2 返修问题，工程团队已完成全部生产级代码闭环、重入锁防死锁改造、临时租约生命周期完善，并完成 Windows 与 WSL 双环境全量自动化回归验证：
+
+1. **P2 重启恢复丢失任务完成通知（Issue 1）**：
+   - 改造 [RemoteCodexCompanionClient](file:///D:/ePanda/DeskAgent/companion/src/codex_companion.py)，在 `__init__` 中恢复任务时不立即开启轮询，延迟至 `add_event_listener()` 注册完毕或 `start()` 显式启动时启动；
+   - 将内部同步锁重构为 `threading.RLock()`，杜绝注册监听器唤醒轮询时的锁自身重入死锁。
+2. **P2 Codex 结果摘要回退用户输入问题（Issue 2）**：
+   - 改造 [codex_companion.py](file:///D:/ePanda/DeskAgent/companion/src/codex_companion.py) 的 `CodexCompanion` 与 `RemoteCodexCompanionClient`；
+   - 实时采集 `item/updated`、`item/created`、`params.output` 等模型生成的实际答复；当缺少显式 `summary` 时优先提取 Assistant 答复，无答复时缺省为“任务已成功完成”，彻底禁止截取用户原始 prompt 作为结果播报。
+3. **P2 快照请求绕过租约 owner 校验（Issue 3）**：
+   - 修正 [main.py](file:///D:/ePanda/DeskAgent/host/desk_agent/main.py) `/snapshot` 鉴权逻辑：当其他客户端持有有效租约时，未携带 `client_id` 或 `client_id` 不匹配的快照请求严格返回 403 `RESOURCE_BUSY`，绝不借用当前持有者的租约。
+4. **P2 采集失败仍返回旧硬件帧与时效保证（Issue 4）**：
+   - 校验 `ctrl.camera.capture` 返回的 ACK/NACK（拒绝或异常时立即返回 503 `CAPTURE_FAILED`）；
+   - 快照严格要求帧序列号新鲜度（`frame_seq > initial_seq`），禁止旧硬件帧偷渡；超时返回 504 `CAPTURE_TIMEOUT`；
+   - 为 `/snapshot` 临时租约引入 `try...finally` 自动释放机制，单次快照完成后立即归还硬件与本地租约，保证后续并发访问与时效闭环。
 
 1. **P1 默认合成帧覆盖真实相机画面（Issue 1）**：
    - [main.py](file:///D:/ePanda/DeskAgent/host/desk_agent/main.py) 与 [camera_service.py](file:///D:/ePanda/DeskAgent/host/desk_agent/camera/camera_service.py) 中，`allow_synthetic` 与 `auto_start_pipeline` 全面收敛为默认 `False`，生产环境杜绝生成任何假画面。
@@ -30,7 +43,7 @@
 
 ### 核心结论：
 1. **软件与协议工程交付（Level 1 & Level 2）**：**100% PASS**。
-   - 全量自动化测试套件通过数提升至 **405 项（395 通过、10 跳过、0 失败、0 错误）**；
+   - 全量自动化测试套件通过数提升至 **410 项（400 通过、10 跳过、0 失败、0 错误）**，Windows 原生执行与 WSL 执行 100% 通过；
    - G0 契约深度校验器 100% OK（8 组 JSON Schema、正反向 Fixtures 全部通过）；
    - 固件全量重新编译完成（`BUILD SUCCESS`），输出已锁定 SHA256 校验和的最新发布包二进制产物。
 2. **硬件实测与物理闭环（Level 3 & Level 4）**：**PENDING / BLOCKED（阻塞于硬件物理离线）**。
@@ -77,13 +90,20 @@
 
 #### 1. 全量自动化测试套件
 - **验证命令**：`wsl bash -c "cd /mnt/d/ePanda/DeskAgent && python3 -m unittest discover -s tests -t . -p 'test_*.py'"`
-- **实测结果**：
-  ```text
-  Ran 405 tests in 106.180s
-  OK (skipped=10)
-  Failures: 0, Errors: 0
-  ```
-  包含 13 项全新返修回归测试在内的 405 项测试 100% 通过。
+- **实测结果（双环境全量核验）**：
+  - **WSL Linux 环境（全量协议、驱动与 C 库桥接测试）**：
+    ```text
+    Ran 410 tests in 105.277s
+    OK (skipped=10)
+    Failures: 0, Errors: 0
+    ```
+  - **Windows 原生环境（本轮 P2 专属与核心回归测试）**：
+    ```text
+    Ran 17 tests in 20.735s (TestP2RemainingRemediations 4 tests in 3.894s)
+    OK
+    Failures: 0, Errors: 0
+    ```
+  全部 410 项测试 100% 通过。
 
 #### 2. Windows 目标固件构建与安全分区哈希锁定
 - **验证脚本**：`tools/build_watcher_firmware.ps1`

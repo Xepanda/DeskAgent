@@ -157,7 +157,7 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
         self.codex_bin = codex_bin
         self.on_notification = on_notification
         self._proc: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._req_counter = 0
         self._pending: dict[int, threading.Event] = {}
         self._responses: dict[int, dict[str, Any]] = {}
@@ -615,11 +615,21 @@ class CodexCompanion:
                 }
                 self._pending_approvals[approval_id] = appr_dict
                 self._persist_approval(appr_dict)
-            elif method in ("turn/progress", "task/progress", "item/updated", "turn/step"):
+            elif method in ("turn/progress", "task/progress", "item/updated", "turn/step", "item/created", "item/completed"):
                 if task_id and task_id in self._tasks:
                     self._tasks[task_id]["progress"] = params.get("progress") or params.get("message") or "in_progress"
                     self._tasks[task_id]["state"] = "running"
                     self._tasks[task_id]["status"] = "running"
+                    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                    output_text = (
+                        params.get("output")
+                        or params.get("text")
+                        or item.get("text")
+                        or item.get("content")
+                        or item.get("formatted")
+                    )
+                    if output_text:
+                        self._tasks[task_id]["last_output"] = str(output_text).strip()
                     self._persist_task(self._tasks[task_id])
             elif method in ("turn/completed", "task/completed", "turn/finished"):
                 if task_id and task_id in self._tasks:
@@ -657,7 +667,24 @@ class CodexCompanion:
                         self._tasks[task_id]["status"] = "completed"
                         self._tasks[task_id]["state"] = "completed"
                         self._persist_task(self._tasks[task_id])
-                        summary = params.get("summary") or turn.get("summary") or self._tasks[task_id].get("prompt", "")[:60]
+                        turn_res = turn.get("result") if isinstance(turn.get("result"), dict) else {}
+                        summary = (
+                            params.get("summary")
+                            or turn.get("summary")
+                            or turn.get("output")
+                            or turn.get("response")
+                            or turn_res.get("summary")
+                            or turn_res.get("output")
+                            or params.get("output")
+                            or params.get("response")
+                            or self._tasks[task_id].get("last_output")
+                            or "任务已成功完成"
+                        )
+                        if isinstance(summary, dict):
+                            summary = summary.get("summary") or summary.get("text") or summary.get("message") or "任务已成功完成"
+                        summary = str(summary).strip()
+                        if not summary or summary == self._tasks[task_id].get("prompt", ""):
+                            summary = "任务已成功完成"
                         self._dispatch_event("codex.turn_completed", {
                             "task_id": task_id,
                             "status": "completed",
@@ -957,7 +984,7 @@ class RemoteCodexCompanionClient:
         self.poll_interval = poll_interval
         self.state_file_path = state_file_path
         self.workspaces: dict[str, str] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
         self._pending_tasks: dict[str, dict[str, Any]] = {}
         self._stop_event = threading.Event()
@@ -979,8 +1006,7 @@ class RemoteCodexCompanionClient:
                 with self._lock:
                     self._pending_tasks.update(data)
                 if self._pending_tasks:
-                    logger.info("Restored %d in-flight Codex tasks from %s", len(self._pending_tasks), p)
-                    self._ensure_polling_thread()
+                    logger.info("Restored %d in-flight Codex tasks from %s (polling deferred until listeners registered)", len(self._pending_tasks), p)
         except Exception as exc:
             logger.warning("Failed to load persisted remote Codex tasks from %s: %s", p, exc)
 
@@ -997,10 +1023,18 @@ class RemoteCodexCompanionClient:
         except Exception as exc:
             logger.warning("Failed to save remote Codex tasks to %s: %s", p, exc)
 
+    def start(self) -> None:
+        """Starts background poller if there are pending in-flight tasks and listeners registered."""
+        with self._lock:
+            if self._pending_tasks and self._event_listeners:
+                self._ensure_polling_thread()
+
     def add_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
         with self._lock:
             if cb not in self._event_listeners:
                 self._event_listeners.append(cb)
+            if self._pending_tasks:
+                self._ensure_polling_thread()
 
     def remove_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
         with self._lock:
@@ -1052,14 +1086,22 @@ class RemoteCodexCompanionClient:
                     with self._lock:
                         self._pending_tasks.pop(task_id, None)
                         self._save_persisted_tasks()
-                    summary = res.get("summary") or (
-                        res.get("result", {}).get("summary")
-                        if isinstance(res.get("result"), dict)
-                        else None
+                    res_dict = res.get("result") if isinstance(res.get("result"), dict) else {}
+                    summary = (
+                        res.get("summary")
+                        or res_dict.get("summary")
+                        or res_dict.get("output")
+                        or res_dict.get("response")
+                        or res.get("output")
+                        or res.get("response")
+                        or res.get("message")
+                        or "任务已成功完成"
                     )
-                    if not summary:
-                        prompt = task_meta.get("prompt", "")
-                        summary = prompt[:60] if prompt else f"Task {task_id} completed"
+                    if isinstance(summary, dict):
+                        summary = summary.get("summary") or summary.get("text") or summary.get("message") or "任务已成功完成"
+                    summary = str(summary).strip()
+                    if not summary or summary == task_meta.get("prompt", ""):
+                        summary = "任务已成功完成"
                     self._dispatch_event("codex.turn_completed", {
                         "task_id": task_id,
                         "status": "completed",

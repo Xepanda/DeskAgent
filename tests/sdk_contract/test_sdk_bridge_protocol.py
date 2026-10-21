@@ -2011,6 +2011,24 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("error", {}).get("code"), "RESOURCE_BUSY")
         self.assertEqual(resp.get("request_id"), "req-busy-correlate")
 
+    def test_camera_capture_without_active_lease_rejected_with_403(self) -> None:
+        """interfaces.md / arbitration: ctrl.camera.capture must be rejected with 403 NO_ACTIVE_LEASE when no lease is held."""
+        # Ensure any lease is released first
+        self._process_cmd({
+            "type": "ctrl.camera.release",
+            "request_id": "req-ensure-rel",
+            "data": {"client_id": "test-client-1"},
+        })
+        resp = self._process_cmd({
+            "type": "ctrl.camera.capture",
+            "request_id": "req-cap-nolease-01",
+            "data": {},
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 403)
+        self.assertEqual(resp.get("error", {}).get("code"), "NO_ACTIVE_LEASE")
+        self.assertEqual(resp.get("request_id"), "req-cap-nolease-01")
+
     # ------------------------------------------------------------------
     # WP3 -- TCP stream framing
     # ------------------------------------------------------------------
