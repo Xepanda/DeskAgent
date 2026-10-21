@@ -59,6 +59,50 @@ static uint32_t s_last_heartbeat_time = 0;
  * via desk_sdk_bridge_set_pairing_code(); never hardcoded, never logged. */
 static char s_expected_pairing_code[8] = "";
 static bool s_pairing_code_configured = false;
+static char s_pair_request_id[33] = "";
+static char s_pair_daemon_instance_id[33] = "";
+static char s_pair_target_mode[32] = "";
+static char s_pair_host[INET_ADDRSTRLEN] = "";
+static uint16_t s_pair_websocket_port = 0;
+static bool desk_sdk_is_lower_hex_64(const char *s);
+
+static bool desk_sdk_is_lower_hex_32(const char *s)
+{
+    if (!s || strlen(s) != 32) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len)
+{
+    if (!out_json || max_len == 0 || !s_paired ||
+        !desk_sdk_is_lower_hex_32(s_pair_request_id) ||
+        !desk_sdk_is_lower_hex_32(s_pair_daemon_instance_id) ||
+        !desk_sdk_is_lower_hex_64(s_active_pairing_token) ||
+        !(strcmp(s_pair_target_mode, "python_sdk") == 0 ||
+          strcmp(s_pair_target_mode, "desktop_link") == 0)) return -1;
+
+    int n = snprintf(out_json, max_len,
+        "{\"type\":\"sys.client.hello\",\"code\":0,\"data\":{"
+        "\"role\":\"hardware\",\"pairing_protocol\":\"watcher-lan-pairing\","
+        "\"pairing_version\":\"1.0\",\"pair_request_id\":\"%s\","
+        "\"daemon_instance_id\":\"%s\",\"session_token\":\"%s\",\"mode\":\"%s\"}}",
+        s_pair_request_id, s_pair_daemon_instance_id, s_active_pairing_token,
+        s_pair_target_mode);
+    return n >= 0 && (size_t)n < max_len ? n : -1;
+}
+
+int desk_sdk_bridge_get_pairing_target(char *host, size_t host_len, uint16_t *port)
+{
+    if (!host || host_len == 0 || !port || s_pair_host[0] == '\0' ||
+        s_pair_websocket_port == 0 || !s_paired) return -1;
+    if (strlen(s_pair_host) + 1 > host_len) return -1;
+    strcpy(host, s_pair_host);
+    *port = s_pair_websocket_port;
+    return 0;
+}
 
 /* True when the string is exactly 6 ASCII decimal digits (^[0-9]{6}$). */
 static bool desk_sdk_is_six_digits(const char *s)
@@ -871,6 +915,11 @@ void desk_sdk_bridge_reset(void)
     s_event_seq = 0;
     s_active_pairing_token[0] = '\0';
     s_paired = false;
+    s_pair_request_id[0] = '\0';
+    s_pair_daemon_instance_id[0] = '\0';
+    s_pair_target_mode[0] = '\0';
+    s_pair_host[0] = '\0';
+    s_pair_websocket_port = 0;
     s_auth_required = false;
     s_last_heartbeat_time = 0;
     desk_sdk_req_table_init();
@@ -1047,6 +1096,7 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
     }
     json_parse_str(udp_in, "target_mode", target_mode, sizeof(target_mode));
     json_parse_str(udp_in, "pairing_code", pairing_code, sizeof(pairing_code));
+    int32_t websocket_port = json_parse_int(udp_in, "websocket_port", -1);
 
     /* interfaces.md 6.4 / CR-001: never grant a pairing before the pairing code
      * has been validated against the explicitly provisioned device-side code.
@@ -1067,9 +1117,11 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
         return DESK_SDK_PAIRING_REJECTED;
     }
 
-    if (strlen(req_id) == 0 && strlen(daemon_id) == 0) {
-        strncpy(req_id, "req-pair-01", sizeof(req_id) - 1);
-        strncpy(daemon_id, "daemon-pair-01", sizeof(daemon_id) - 1);
+    if (!desk_sdk_is_lower_hex_32(req_id) || !desk_sdk_is_lower_hex_32(daemon_id) ||
+        websocket_port < 1 || websocket_port > 65535 ||
+        !(strcmp(target_mode, "python_sdk") == 0 || strcmp(target_mode, "desktop_link") == 0)) {
+        printf("[SDK-PAIR] pair.request rejected: malformed session metadata (request_id=%s)\n", req_id);
+        return DESK_SDK_PAIRING_REJECTED;
     }
 
     /* Validation passed: only now generate/issue a session token and pair. */
@@ -1077,6 +1129,10 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
     }
     s_paired = true;
+    memcpy(s_pair_request_id, req_id, sizeof(s_pair_request_id));
+    memcpy(s_pair_daemon_instance_id, daemon_id, sizeof(s_pair_daemon_instance_id));
+    snprintf(s_pair_target_mode, sizeof(s_pair_target_mode), "%s", target_mode);
+    s_pair_websocket_port = (uint16_t)websocket_port;
 
     char proto[64] = "";
     json_parse_str(udp_in, "protocol", proto, sizeof(proto));
@@ -2190,6 +2246,7 @@ int desk_sdk_pairing_server_poll(int timeout_ms)
              * (interfaces.md 6.4.4 -- no wire message type is defined). */
             if (desk_sdk_bridge_process_pairing_udp(s_pairing_buf, s_pairing_reply, sizeof(s_pairing_reply)) == DESK_SDK_PAIRING_OK &&
                 s_pairing_reply[0] != '\0') {
+                inet_ntop(AF_INET, &client_addr.sin_addr, s_pair_host, sizeof(s_pair_host));
                 sendto(s_pairing_udp_fd, s_pairing_reply, strlen(s_pairing_reply), 0,
                        (struct sockaddr *)&client_addr, addr_len);
             }

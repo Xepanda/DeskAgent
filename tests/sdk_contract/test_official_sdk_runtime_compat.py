@@ -41,6 +41,7 @@ try:
         PairAccept,
         PairRequest,
         encode_udp_message,
+        parse_hardware_hello,
         parse_udp_message,
     )
     HAVE_WATCHEROBOT = True
@@ -133,6 +134,9 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             ctypes.c_size_t,
         ]
 
+        cls.lib.desk_sdk_bridge_build_hardware_hello.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_build_hardware_hello.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+
         cls.lib.desk_sdk_bridge_set_pairing_code.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_set_pairing_code.argtypes = [ctypes.c_char_p]
 
@@ -159,6 +163,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
     def setUp(self) -> None:
         self.lib.desk_hardware_init()
         self.lib.desk_tclaw_init()
+        self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
         # The device-side expected pairing code must be provisioned explicitly;
         # without it pairing is fail-closed (interfaces.md 6.4 / CR-001).
@@ -200,6 +205,15 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(parsed_msg.target_mode, "python_sdk")
         self.assertEqual(len(parsed_msg.session_token), 64)
         self.assertTrue(all(c in "0123456789abcdef" for c in parsed_msg.session_token))
+
+        hello_buf = ctypes.create_string_buffer(512)
+        hello_len = self.lib.desk_sdk_bridge_build_hardware_hello(hello_buf, len(hello_buf))
+        self.assertGreater(hello_len, 0)
+        hello = parse_hardware_hello(hello_buf.value)
+        self.assertEqual(hello.pair_request_id, parsed_msg.request_id)
+        self.assertEqual(hello.daemon_instance_id, parsed_msg.daemon_instance_id)
+        self.assertEqual(hello.session_token, parsed_msg.session_token)
+        self.assertEqual(hello.mode, parsed_msg.target_mode)
 
     def test_official_udp_pairing_rejected_when_unprovisioned(self) -> None:
         """Fail-closed: an unprovisioned device must not answer with pair.accept."""

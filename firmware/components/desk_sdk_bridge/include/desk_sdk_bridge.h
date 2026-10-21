@@ -217,6 +217,20 @@ int desk_sdk_bridge_set_pairing_code(const char *code);
 bool desk_sdk_bridge_is_pairing_code_configured(void);
 
 /**
+ * @brief Build the strict official HardwareHello for the latest accepted pairing.
+ *
+ * This binds the first WebSocket application frame to the pairing request and
+ * token. The caller must send it as the first text frame on a WebSocket client
+ * connection to the source host and websocket_port from that same request.
+ * Returns -1 when no valid pairing session is available.
+ */
+int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len);
+
+/** @brief Return the host and WebSocket port from the last accepted request. */
+int desk_sdk_bridge_get_pairing_target(char *host, size_t host_len,
+                                       uint16_t *port);
+
+/**
  * @brief Parse top-level string field from JSON payload.
  *
  * Scans only top-level (depth==1) keys in a JSON object, ignoring any nested
