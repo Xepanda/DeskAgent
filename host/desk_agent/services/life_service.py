@@ -672,13 +672,27 @@ class LifeService:
         """
         now_str = self._now_utc_str()
         with self._lock, self._get_connection() as conn:
-            row = conn.execute("SELECT reminder_id FROM occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+            row = conn.execute(
+                "SELECT reminder_id, state FROM occurrences WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone()
             if not row:
                 raise KeyError(f"Occurrence '{occurrence_id}' not found")
 
             reminder_id = row["reminder_id"]
+            if row["state"] == "dismissed":
+                return {
+                    "reminder_id": reminder_id,
+                    "occurrence_id": occurrence_id,
+                    "status": "ringing_stopped",
+                }
+            if row["state"] != "ringing":
+                raise ValueError(
+                    f"Occurrence '{occurrence_id}' is not ringing (state={row['state']})"
+                )
             conn.execute(
-                "UPDATE occurrences SET state = 'dismissed', delivered_at = ? WHERE occurrence_id = ?",
+                "UPDATE occurrences SET state = 'dismissed', delivered_at = ? "
+                "WHERE occurrence_id = ? AND state = 'ringing'",
                 (now_str, occurrence_id),
             )
             self._cancel_reminder_alerts(conn, occurrence_id=occurrence_id)

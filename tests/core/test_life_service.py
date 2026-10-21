@@ -129,6 +129,7 @@ class TestLifeService(unittest.TestCase):
         occ_list = self.service.get_due_occurrences("2026-10-14T07:05:00Z")
         self.assertEqual(len(occ_list), 1)
         occ_id = occ_list[0]["occurrence_id"]
+        self.service.trigger_occurrence_to_outbox(occ_id)
 
         self.service.stop_ringing(occ_id)
         rem = self.service.get_reminder("rem-alarm-01")
@@ -144,6 +145,29 @@ class TestLifeService(unittest.TestCase):
         self.service.complete_reminder("rem-alarm-01")
         rem_completed = self.service.get_reminder("rem-alarm-01")
         self.assertEqual(rem_completed["status"], "completed")
+
+    def test_stop_ringing_does_not_dismiss_pending_occurrence(self) -> None:
+        self.service.create_reminder(
+            reminder_id="rem-pending-stop",
+            title="Future alert",
+            due_at="2026-10-14T07:00:00Z",
+        )
+        occurrence_id = self.service.get_all_occurrences("rem-pending-stop")[0]["occurrence_id"]
+
+        with self.assertRaisesRegex(ValueError, "not ringing"):
+            self.service.stop_ringing(occurrence_id)
+
+        self.assertEqual(self.service.get_all_occurrences("rem-pending-stop")[0]["state"], "pending")
+        self.assertEqual(self.service.get_reminder("rem-pending-stop")["status"], "scheduled")
+
+    def test_stop_ringing_ack_is_idempotent_for_dismissed_occurrence(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-repeat-ack")
+
+        first = self.service.stop_ringing(occurrence_id)
+        second = self.service.stop_ringing(occurrence_id)
+
+        self.assertEqual(first, second)
+        self.assertEqual(second["status"], "ringing_stopped")
 
     def _create_pending_reminder_alert(self, reminder_id: str) -> str:
         self.service.create_reminder(
