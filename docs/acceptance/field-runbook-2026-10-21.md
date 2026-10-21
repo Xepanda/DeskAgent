@@ -1,16 +1,17 @@
-# Desk Agent R1 现场验收 Runbook（2026-10-22 增量基线）
+# Desk Agent R1 现场验收 Runbook（2026-10-22 CLI 镜像增量基线）
 
 本 runbook 供后续 A1/A2/A3/A4/A5/A6/A7 按模块执行。记录的现场设备为 SenseCAP Watcher，串口约定 COM21；COM20 是 Himax 端口，**禁止将 COM20 用作刷机/设备控制端口**。同一时刻只允许一个操作者占用 COM21。任何刷写必须有当次明确授权，且使用已核验的 OTA application image；不得用合并 QIO 镜像写 OTA 分区，也不得用 `firmware/dist` 的旧文件替代当前归档镜像。
 
 ## 1. 当前基线和验收判定
 
-- 当前 camera-diagnostic OTA app：`.target_logging/camera-diagnostic-20261022/desk_agent_firmware.bin`，SHA-256 `BCDAFB90625F759C56FB8F69BBA1A9EF1CC2551DDDF295107DAB19FEAE5D6598`，1,898,096 bytes；2026-10-22 build 成功并 app-only 烧录至已从实机读取确认的 OTA0 `0x20000`，flash hash verify 成功。请勿使用 `firmware/dist` 旧产物。
-- **分区保护提示**：构建产出的 partition table 与实机分区表不一致；实机 OTA0 为 `0x20000`、6 MiB，model 为 `0xC20000`。本轮未写 partition table、bootloader 或 model。除 app-only 且地址经核对的操作外，先解决差异再操作。
+- **当前检查镜像（本轮新刷入 CLI app）**：2026-10-22 CLI 构建成功；OTA app 1,899,680 bytes，SHA-256 `C09E84798654C8071875D04901213B8979BF2032F1B14F921CF911A6F857BE65`。经 COM21 app-only 写入 OTA0 `0x20000` 并 verify hash 成功。此前 camera-diagnostic 镜像哈希 `BCDAFB90625F759C56FB8F69BBA1A9EF1CC255DDDF295107DAB19FEAE5D6598` 属于旧检查基线，不应再作为本轮 CLI 状态的镜像标识。请勿使用 `firmware/dist` 旧产物。
+- **分区保护提示**：构建产出的 partition table 与实机分区表不一致；实机 OTA0 为 `0x20000`、6 MiB，model 为 `0xC20000`。本轮未写 partition table、bootloader 或 model；COM20 未触碰。除 app-only 且地址经核对的操作外，先解决差异再操作。
 - 已恢复模型：`firmware/.build/bin/srmodels.bin`，SHA-256 `7C87DD7ADB5A7623907B6354D49BEA7F9289371262E6A57F15458FB8908C5814`。
-- 语音：本次 L3 已通过（用户确认可唤醒对话，日志有 KWS/ASR/NLG，麦克风帧持续增长且错误计数为 0）。后续重复性/恢复及 L4 全链路仍待验。
-- 相机：L3 失败。camera-diagnostic 固件一次真实 capture 得到 7-byte PTL header 全零、`rc=-25`、`out_len=0`，没有 JPEG；原始 COM21 捕获为 350 bytes。先观察供电/SYNC/CS/SCLK/MISO 与 HX6538 通信，不要盲目重复采集。
+- Wi-Fi / provisioning：当前 CLI 镜像 `wifi status` 为 `LINK_UP`；provisioning stage 为 `mqtt_online`，但 `authorize_read rc=-1`。这是 L3 单项状态观测，不代表云端授权或 Tuya AI 会话已可用。
+- 麦克风：当前 CLI 镜像显示 READY、running、895 frames、errors=0、peak=95，属于 L3 PCM 采集观测。用户此前确认的唤醒/对话发生在旧镜像上；当前 CLI 镜像尚未重新验证 WakeNet、ASR、多轮会话或回复播报。
+- 相机：L3 失败。当前 CLI 镜像日志显示 camera driver READY，但 PTL 空响应 `raw=00000000000000`、`rc=-25`、`out_len=0`，未取得 JPEG。先检查供电/SYNC/CS/SCLK/MISO 与 HX6538 通信，不要盲目重复采集。
 - A6 Host 相机页面：自动化页面测试是 L2；A3 SDK parser/managed adapter 使用 fake context 与有效 JPEG fixture 验证，也是 L2。设备没有真实 JPEG，且未连接官方 Runtime，故 Host 到浏览器的图像链路没有 L3/L4 证据。
-- STM32：当前仅 L2 静态/软件协议证据；L3 未验证，缺少接收计数、ACK 与实物动作。
+- STM32 / body UART：本轮真实发送小幅命令 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 显示 UART READY、cached setpoint 仍为 90/120、last formatted TX length=23 bytes。该 TX 长度只是发送帧记录，不是 STM32 RX/ACK；没有实物动作确认，动作未通过。日志：`.target_logging/com21-small-motion-test-20261022.log`。
 - HA：当前仅 L2 connector 测试；没有用户现有 HA 会话或物理设备动作证据。
 - 提醒：`LifeService` 23 项和定向 reminder catch-up 1 项通过；SQLite teardown 的 `WinError 32` 修复属 L2。强制 kill 崩溃恢复、真实 Host 重启、设备到期播报/确认未验。
 - SDK bridge：5 项 source-contract 检查通过；依赖本机 GCC 的 10 项用例被 skipped，没有执行结果，不等于构建或官方 SDK 互通通过。

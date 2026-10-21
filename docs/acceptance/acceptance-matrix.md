@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.6.0
+> 文档版本：V3.7.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
-> 状态：**2026-10-22 增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。语音/屏幕/基础音频有单项真机证据；本轮相机抓帧失败，STM32 与真实 HA/官方 SDK Runtime 尚无闭环证据；Codex 和提醒仍缺设备反馈闭环。Level 3 按单项记录，Level 4 整机闭环仍未完成。**
+> 状态：**2026-10-22 最新 CLI 镜像的增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 只有 UART READY/设定值而无 TX、ACK 或动作证据。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> V3.7.0 变更：更新 2026-10-22 CLI 镜像 app-only COM21 烧录 SHA/校验与最新真机状态；明确 Wi-Fi、麦克风为单项观测，MQTT 授权读取失败，相机返回全零 PTL、STM32 无接收或动作证据。
 > V3.6.0 变更：依据 2026-10-22 最新构建、设备刷写与串口日志，更新相机 `rc=-25`/7-byte PTL 全零失败，SDK fake parser 与真实 Runtime 边界、A5 本机真实 Codex 任务、A3 reminder teardown 修复、A4/STM32 状态及 A7 串口日志工具证据；所有结论按 L1-L4 分层，不将软件或单项实测扩写为整机通过。
 > V3.5.0 历史变更：曾记录 `verify_all.sh` 在 Step 2 失败以及 Reminder E2E teardown `WinError 32`；提醒清理问题已由 V3.6.0 的显式关闭修复。该历史快照不是当前全量回归结果。
 > V3.4.0 变更：加入 2026-10-21 真实硬件状态与按功能的证据级别；新增现场 Runbook，列出相机失败定位证据、逐项后续操作、通过证据及停止条件。旧版用例数为历史快照，不作为当前全量回归声明。
@@ -18,13 +19,15 @@
 
 | 功能 | 当前证据层级与状态 | 已有证据 | 缺少的验收证据 / 下一步 |
 | :--- | :--- | :--- | :--- |
-| 固件 build / flash | **L2 build 通过；L3 设备启动通过** | 2026-10-22 camera diagnostic app 构建成功并 app-only 刷入 OTA0；设备物理分区表为 OTA0 `0x20000`/6 MiB、model `0xC20000`。镜像 SHA-256 `BCDAFB90625F759C56FB8F69BBA1A9EF1CC2551DDDF295107DAB19FEAE5D6598`，大小 1,898,096 bytes；flash hash verify 成功。构建生成的 partition table 与设备实际表不一致，本次没有写入 partition table、bootloader 或 model 分区 | 归档对应启动日志和设备镜像读取校验；解决构建分区表与实机布局差异前禁止写分区表/bootloader；此项通过不代表所有功能通过 |
+| 固件 build / flash | **L2 build 通过；L3 app-only 烧录及 hash verify 通过** | **当前检查的是本轮新刷入的 CLI app 镜像**：构建成功，大小 1,899,680 bytes，SHA-256 `C09E84798654C8071875D04901213B8979BF2032F1B14F921CF911A6F857BE65`；COM21 写入 OTA0 `0x20000` 并 verify hash。实机分区布局与构建生成的 partition table 不一致，故未写 partition table、bootloader 或 model；COM20 未触碰 | 保留本次构建/烧录日志与实机分区读回记录；排除分区表差异后再考虑任何分区级变更。build/flash 通过不代表各功能通过 |
+| Wi-Fi / provisioning | **L3 单项状态观测；云端授权未通过** | 新 CLI 镜像启动后 `wifi status` 为 `LINK_UP`；provisioning 阶段报 `mqtt_online`，但 `authorize_read rc=-1` | 需定位授权读取失败并核对真实 MQTT/AI 会话；`LINK_UP` 或 `mqtt_online` 单独不代表 Tuya 会话/语音云服务闭环 |
 | 屏幕、基础提示音 | **L3 单项通过** | 用户现场确认屏幕显示文字、扬声器提示音可听 | 归档对应固件 SHA、完整启动日志和现场记录；尚未验证长稳、并发资源仲裁 |
-| 麦克风、唤醒与对话 | **L3 单项通过（此前现场确认）** | 用户最近确认设备可唤醒并对话；此前 COM21 日志记录 `wn9_nihaoxiaozhi_tts`、AFE、WakeNet、ASR/NLG，麦克风 PCM 帧持续增长且错误数为 0。新的 camera diagnostic 固件刷写后尚未重新进行该语音场景实测 | 在当前已刷镜像上复测重复唤醒与多轮问答并归档日志/听感；断网恢复、长稳和跨模块任务闭环未验证 |
+| 麦克风采集 | **L3 单项通过（当前镜像观测）** | 新 CLI 镜像日志显示麦克风 READY、`running`，累计 895 frames，errors=0，peak=95 | 这是 PCM 采集状态，不等于唤醒/ASR/语音对话已在本镜像复测；需再次现场唤醒及多轮问答并归档识别、会话、播报证据 |
+| 麦克风、唤醒与对话 | **L3 单项历史通过；当前 CLI 镜像唤醒/对话未验证** | 用户此前确认可唤醒并对话；该确认早于当前 CLI 镜像。当前镜像只有麦克风采集正常的观测 | 在当前已刷镜像上复测重复唤醒、多轮问答及回复播报；断网恢复、长稳和跨模块任务闭环未验证 |
 | 滚轮、按键与状态页 | **L3 用户确认，日志证据待归档** | 用户确认滚轮和按键可用；交互约定为滚轮滚动/选择只读状态页，短按/长按沿用 TuyaOpen 语音事件 | 归档每项输入事件日志及对应 UI 页面变化；覆盖快速旋转、反向、短按、长按 |
-| Himax 相机 | **L3 失败** | 2026-10-22 真实 `camera capture` 读到 PTL 头 7 bytes 全零，底层阶段日志为 `rc=-25`，`out_len=0`；没有 JPEG。原始串口捕获 350 bytes。此前 `rc=-2` 是不同的“未初始化/SPI 缺失”错误，不能混为同一故障 | 检查实际相机供电、SYNC、CS、SCLK、MISO 波形与 HX6538 通信；修复后导出并打开现场 JPEG，重复取帧并确认无泄漏/死锁。当前 L3 不通过 |
+| Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新 COM21 capture 日志显示 camera driver READY，但 PTL 返回空响应 `raw=00000000000000`，`rc=-25`、`out_len=0`；未取得 JPEG。此前旧镜像也观测到 7-byte 全零 PTL 头 | 检查相机供电及 SYNC/CS/SCLK/MISO 与 HX6538 通信；修复后导出并打开现场 JPEG，重复取帧并确认无泄漏/死锁。当前 L3 不通过 |
 | 相机 SDK parser / Host adapter | **L2 fake 集成通过；L3/L4 未验证** | 测试调用固定版本官方 SDK 的 WSPK parser 和图片回调，以有效 JPEG fixture 验证适配路径；A3 Host adapter 代码/测试使用 fake managed context。未连接官方 Runtime，也未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
-| STM32 / 机身动作 | **L2 静态/软件证据；L3 未验证** | 软件协议和 source-level 检查仅属 L2；没有实物接收计数、ACK 或动作观测。发送帧长度不等于 STM32 接收 | 核对线束、串口参数、STM32 固件协议；验证小幅动作、ACK 关联、超时安全停止及实物位置反馈 |
+| STM32 / 机身动作 | **L3 命令发送尝试超时；动作未执行验收** | 新 CLI 镜像发出 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 为 UART READY、cached setpoint 仍 90/120、last formatted TX length=23 bytes；没有 STM32 RX/ACK 或物理动作证据。TX 长度只代表发送帧记录 | 核对线束、串口参数与 STM32 协议；定位此命令超时，再验证真实 RX/ACK 关联、小幅动作与实物位置反馈，并验证通信故障安全停止 |
 | 官方 Python SDK | **L1 契约；L2 parser 测试通过；真实 Runtime L3 未验证** | 官方 SDK parser 对有效 fixture 的互操作测试通过；设备侧 pairing window 命令曾现场打开/取消。官方 Runtime 的真实 WebSocket 发现、配对、HardwareHello、能力注册、命令与媒体传输均未验 | 用未修改官方 SDK 连真实设备；错误配对码必须拒绝，正确配对后记录完整连接/命令/媒体/断线重连日志 |
 | Home Assistant | **L2 软件测试；L3/L4 未验证** | HA Connector 测试仅证明软件接口行为；没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
 | 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | LifeService 23 项及提醒相关 crash-recovery 测试 1 项通过；SQLite teardown `WinError 32` 已通过显式 close 修复并在 Windows 验证立即删除 DB 文件。该结果是受控测试中的 orderly teardown/recovery，不是强杀进程后的真实崩溃验证，也不代表设备播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
@@ -52,7 +55,9 @@
 - 最新相机复测：`.target_logging/com21-camera-after-guard-flash-20261021.log`。日志显示麦克风仍运行、PCM 错误数为 0，但相机未返回图像。
 - 上述路径属于本地忽略日志归档；合入前需确认文件仍在工作站，不应假定它们会随 Git 提交或 PR 自动分发。
 
-### 2026-10-22 增量证据与复核边界
+### 2026-10-22 camera-diagnostic 镜像记录（历史快照）
+
+以下记录对应此前 camera-diagnostic app，不是当前已刷入的 CLI app；当前状态以 §0 和下方“CLI 镜像现场增量”记录为准。
 
 | 工作包 | 本轮结果 | 证据层级 / 边界 |
 | :--- | :--- | :--- |
@@ -65,7 +70,19 @@
 | STM32 | 现有静态/模拟协议证据 | L2；未观测到 STM32 接收、ACK 或实物动作 |
 | A5 Codex | 真实本机 app-server 调用采用默认模型成功；隔离工作区修改/验证任务完成，Companion 重启后任务记录仍在 | 本机服务/Host L3 单项；设备触发和设备结果播报仍未完成，不能评 L4 |
 
-以上是指定增量工作的记录，不是本分支全量回归结果；本轮未重新运行 `verify_all.sh`，旧测试总数仍为历史快照。
+上述是旧镜像阶段的增量记录，不是本分支全量回归结果；当前 CLI 镜像的现场状态记录如下。
+
+### 2026-10-22 CLI 镜像现场增量（当前基线）
+
+| 检查项 | 结果 | 证据层级 / 边界 |
+| :--- | :--- | :--- |
+| CLI 固件构建与烧录 | 构建成功；app-only bin 1,899,680 bytes，SHA-256 `C09E84798654C8071875D04901213B8979BF2032F1B14F921CF911A6F857BE65`；COM21 写入 OTA0 `0x20000` 并 verify hash。因构建 partition table 与实机读取布局不一致，未写 table/bootloader/model；COM20 未触碰 | L2 build + L3 app flash/hash verification；不是整机功能通过 |
+| 网络 / provisioning | `wifi status LINK_UP`；provisioning `mqtt_online`，但 `authorize_read rc=-1` | L3 单项状态观测；云端授权与 Tuya AI 会话未验 |
+| 音频输入 | 麦克风 READY/running，895 frames、errors=0、peak=95 | L3 PCM 采集观测；当前镜像 WakeNet/ASR/多轮对话/回复播报未复验。此前用户确认对应旧镜像 |
+| 相机 | Driver READY；PTL empty response `raw=00000000000000`，`rc=-25`，`out_len=0`，无 JPEG | L3 失败；无真实图片 |
+| STM32 / body UART | `body move 91 120 500` 返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)、`accepted=false`；之后 `body status` 显示 UART READY、cached setpoint 90/120、last formatted TX length 23 bytes | L3 真实命令尝试失败；没有 RX/ACK/物理动作证据。TX 长度不等于 STM32 收到命令，设定值仍为 90/120 表明未确认目标状态。日志：`.target_logging/com21-small-motion-test-20261022.log` |
+
+本次为指定真机状态增量，不代表全量回归或端到端通过；整机 L4 仍未完成。
 
 ---
 
