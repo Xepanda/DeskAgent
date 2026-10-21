@@ -1,6 +1,6 @@
 """
 Contract tests for Watcher embedded hardware drivers:
-1. STM32 Coprocessor COBS framing (mcu_link wire contract) and strict ACK validation.
+1. STM32 frame packing and standalone legacy COBS utility helpers.
 2. Himax PTL camera 7-byte Base Header, 16-byte Media Header, CRC32, and multi-packet assembly.
 """
 
@@ -102,6 +102,12 @@ class TestWatcherHardwareContract(unittest.TestCase):
         ]
         cls.lib.desk_watcher_motion_pack_stop.restype = ctypes.c_size_t
 
+        cls.lib.desk_watcher_motion_parse_ack.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8)
+        ]
+        cls.lib.desk_watcher_motion_parse_ack.restype = ctypes.c_int
+
         # Camera functions
         cls.lib.desk_watcher_camera_parse_ptl_header.argtypes = [
             ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
@@ -117,7 +123,7 @@ class TestWatcherHardwareContract(unittest.TestCase):
         cls.lib.desk_watcher_camera_validate_frame.restype = ctypes.c_int
 
     def test_cobs_roundtrip_vectors(self) -> None:
-        """Verifies standard COBS encoding and decoding round-trip."""
+        """Verifies legacy utility helpers; the STM32 UART transaction does not use COBS."""
         test_cases = [
             b"Hello World",
             b"\x00",
@@ -150,7 +156,7 @@ class TestWatcherHardwareContract(unittest.TestCase):
             self.assertEqual(bytes(decoded[:dec_len.value]), data)
 
     def test_wire_framing_delimiter(self) -> None:
-        """Verifies that wire framing appends 0x00 delimiter and decodes accurately."""
+        """Verifies retained legacy framing helpers, not the ratified UART wire format."""
         payload = b"\xa5\x5a\x01\x02\x01\x01\x05\x00\x00\x00\x09\x00\x03\xb0\x04\x4c\x04\xc2\x01\x00\x01"
         crc = python_crc16_ccitt(payload)
         raw_frame = payload + struct.pack("<H", crc)
@@ -209,6 +215,31 @@ class TestWatcherHardwareContract(unittest.TestCase):
         calc_stop_crc = python_crc16_ccitt(raw_stop[:14])
         pkt_stop_crc = struct.unpack("<H", raw_stop[14:16])[0]
         self.assertEqual(calc_stop_crc, pkt_stop_crc)
+
+    def test_native_binary_ack_parser(self) -> None:
+        """UART ACKs are raw fixed-length frames, not COBS-delimited frames."""
+        payload = bytes([0xA5, 0x5A, 1, 2, 0, 2]) + struct.pack("<IH", 0x12345678, 4)
+        payload += struct.pack("<hh", 900, 1200)
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0xFF)
+
+        self.assertEqual(len(raw), 18)
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345678, ctypes.byref(nack)),
+            0,
+        )
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345679, ctypes.byref(nack)),
+            -5,
+        )
+
+        bad = (ctypes.c_uint8 * len(raw))(*raw)
+        bad[-1] ^= 0x01
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(bad, len(raw), 0x12345678, ctypes.byref(nack)),
+            -4,
+        )
 
     def test_camera_ptl_header_parsing(self) -> None:
         """Verifies Himax PTL 7-byte Base Header parsing and negative rejection."""

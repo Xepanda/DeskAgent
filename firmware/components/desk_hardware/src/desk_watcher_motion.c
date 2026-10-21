@@ -168,6 +168,7 @@ int desk_watcher_motion_init(void)
 
 int desk_watcher_motion_cobs_encode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len, size_t *out_len)
 {
+    /* Retained as a standalone compatibility utility; UART transactions use raw frames. */
     if (!src || !dst || !out_len) return -1;
     if (dst_len < src_len + (src_len / 254u) + 1u) return -2;
 
@@ -199,6 +200,7 @@ int desk_watcher_motion_cobs_encode(const uint8_t *src, size_t src_len, uint8_t 
 
 int desk_watcher_motion_cobs_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len, size_t *out_len)
 {
+    /* Retained as a standalone compatibility utility; UART transactions use raw frames. */
     if (!src || !dst || !out_len) return -1;
     size_t read_idx = 0;
     size_t write_idx = 0;
@@ -222,6 +224,7 @@ int desk_watcher_motion_cobs_decode(const uint8_t *src, size_t src_len, uint8_t 
 
 int desk_watcher_motion_wire_encode(const uint8_t *raw, size_t raw_len, uint8_t *wire, size_t wire_len, size_t *out_len)
 {
+    /* Legacy helper only. The ratified STM32 UART protocol has no COBS delimiter. */
     if (!raw || !wire || !out_len || wire_len < raw_len + 2) return -1;
     size_t cobs_len = 0;
     int err = desk_watcher_motion_cobs_encode(raw, raw_len, wire, wire_len - 1, &cobs_len);
@@ -233,9 +236,43 @@ int desk_watcher_motion_wire_encode(const uint8_t *raw, size_t raw_len, uint8_t 
 
 int desk_watcher_motion_wire_decode(const uint8_t *wire, size_t wire_len, uint8_t *raw, size_t raw_len, size_t *out_len)
 {
+    /* Legacy helper only. The ratified STM32 UART protocol has no COBS delimiter. */
     if (!wire || !raw || !out_len || wire_len < 2) return -1;
     if (wire[wire_len - 1] != 0x00) return -1;
     return desk_watcher_motion_cobs_decode(wire, wire_len - 1, raw, raw_len, out_len);
+}
+
+int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
+                                  uint32_t expected_seq, uint8_t *out_nack_code)
+{
+    if (!frame || !out_nack_code || frame_len < 14) return DESK_HW_ERR_INVALID_ARG;
+    *out_nack_code = 0;
+    if (frame[0] != MCU_FRAME_MAGIC0 || frame[1] != MCU_FRAME_MAGIC1 ||
+        frame[2] != MCU_FRAME_PROTO_VERSION || frame[3] != MCU_FRAME_CLASS_MOTION) {
+        return DESK_HW_ERR_IO;
+    }
+
+    uint16_t payload_len = (uint16_t)frame[10] | ((uint16_t)frame[11] << 8);
+    if (frame_len != (size_t)(12 + payload_len + 2)) return DESK_HW_ERR_IO;
+    uint16_t calc_crc = motion_calc_crc16(frame, 12 + payload_len);
+    uint16_t rx_crc = (uint16_t)frame[12 + payload_len] | ((uint16_t)frame[13 + payload_len] << 8);
+    if (calc_crc != rx_crc) return DESK_HW_ERR_IO;
+
+    uint32_t rx_seq = (uint32_t)frame[6] | ((uint32_t)frame[7] << 8) |
+                      ((uint32_t)frame[8] << 16) | ((uint32_t)frame[9] << 24);
+    if (rx_seq != expected_seq) return DESK_HW_ERR_BUSY;
+
+    uint8_t flags = frame[5];
+    uint8_t msg_id = frame[4];
+    if ((flags & MCU_FRAME_FLAG_NACK_RESP) || msg_id == MCU_MOTION_MSG_NACK) {
+        *out_nack_code = payload_len >= 1 ? frame[12] : 0;
+        return DESK_HW_ERR_IO;
+    }
+    if ((flags & MCU_FRAME_FLAG_ACK_RESP) && msg_id == MCU_MOTION_MSG_ACK) {
+        return DESK_HW_OK;
+    }
+    /* Valid command echoes and unrelated messages do not satisfy the request. */
+    return DESK_HW_ERR_BUSY;
 }
 
 size_t desk_watcher_motion_pack_move(float pan, float tilt, uint32_t duration_ms, uint32_t seq, uint8_t *out_buf)
@@ -259,14 +296,6 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         return DESK_HW_ERR_BUSY;
     }
 
-    /* Encode raw binary frame into official COBS wire frame with trailing 0x00 */
-    uint8_t wire_tx[64];
-    size_t wire_len = 0;
-    if (desk_watcher_motion_wire_encode(frame_data, frame_len, wire_tx, sizeof(wire_tx), &wire_len) != 0) {
-        xSemaphoreGive(s_motion_mutex);
-        return DESK_HW_ERR_INVALID_ARG;
-    }
-
     for (uint32_t attempt = 0; attempt <= MCU_MAX_RETRIES; ++attempt) {
         if (attempt > 0) {
             vTaskDelay(pdMS_TO_TICKS(MCU_RETRY_BACKOFF_MS));
@@ -275,15 +304,16 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         /* Flush RX buffer before transmission */
         uart_flush_input(UART_NUM_2);
 
-        int written = uart_write_bytes(UART_NUM_2, (const char *)wire_tx, wire_len);
-        if (written != (int)wire_len) {
+        int written = uart_write_bytes(UART_NUM_2, (const char *)frame_data, frame_len);
+        if (written != (int)frame_len) {
             xSemaphoreGive(s_motion_mutex);
             return DESK_HW_ERR_IO;
         }
 
         /* Wait up to MCU_ACK_TIMEOUT_MS (500ms) for ACK */
-        uint8_t wire_rx[64];
-        size_t wire_rx_len = 0;
+        uint8_t frame_rx[64];
+        size_t frame_rx_len = 0;
+        size_t expected_frame_len = 0;
         int64_t start_time = esp_timer_get_time();
 
         while ((esp_timer_get_time() - start_time) < (int64_t)(MCU_ACK_TIMEOUT_MS * 1000)) {
@@ -291,57 +321,47 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
             int r = uart_read_bytes(UART_NUM_2, &byte, 1, pdMS_TO_TICKS(10));
             if (r <= 0) continue;
 
-            if (wire_rx_len < sizeof(wire_rx)) {
-                wire_rx[wire_rx_len++] = byte;
-            } else {
-                wire_rx_len = 0;
+            /* Find the native 0xA5 0x5A frame sync, then consume its fixed header. */
+            if (frame_rx_len == 0 && byte != MCU_FRAME_MAGIC0) continue;
+            if (frame_rx_len == 1 && byte != MCU_FRAME_MAGIC1) {
+                frame_rx_len = byte == MCU_FRAME_MAGIC0 ? 1 : 0;
+                if (frame_rx_len == 1) frame_rx[0] = byte;
                 continue;
             }
+            if (frame_rx_len >= sizeof(frame_rx)) {
+                frame_rx_len = 0;
+                expected_frame_len = 0;
+                continue;
+            }
+            frame_rx[frame_rx_len++] = byte;
 
-            /* Process when delimiter byte 0x00 is received */
-            if (byte == 0x00 && wire_rx_len >= 2) {
-                uint8_t raw_rx[64];
-                size_t raw_rx_len = 0;
-                if (desk_watcher_motion_wire_decode(wire_rx, wire_rx_len, raw_rx, sizeof(raw_rx), &raw_rx_len) == 0 &&
-                    raw_rx_len >= 14) {
-                    
-                    if (raw_rx[0] == MCU_FRAME_MAGIC0 && raw_rx[1] == MCU_FRAME_MAGIC1 &&
-                        raw_rx[2] == MCU_FRAME_PROTO_VERSION && raw_rx[3] == MCU_FRAME_CLASS_MOTION) {
-                        
-                        uint16_t plen = (uint16_t)raw_rx[10] | ((uint16_t)raw_rx[11] << 8);
-                        if (raw_rx_len == (size_t)(12 + plen + 2)) {
-                            uint16_t calc_crc = motion_calc_crc16(raw_rx, 12 + plen);
-                            uint16_t rx_crc = (uint16_t)raw_rx[12 + plen] | ((uint16_t)raw_rx[13 + plen] << 8);
-                            if (calc_crc == rx_crc) {
-                                uint32_t rx_seq = (uint32_t)raw_rx[6] |
-                                                  ((uint32_t)raw_rx[7] << 8) |
-                                                  ((uint32_t)raw_rx[8] << 16) |
-                                                  ((uint32_t)raw_rx[9] << 24);
-                                if (rx_seq == expected_seq) {
-                                    uint8_t flags = raw_rx[5];
-                                    uint8_t msg_id = raw_rx[4];
-
-                                    if ((flags & MCU_FRAME_FLAG_NACK_RESP) || msg_id == MCU_MOTION_MSG_NACK) {
-                                        uint8_t err_code = (plen >= 1) ? raw_rx[12] : 0;
-                                        xSemaphoreGive(s_motion_mutex);
-                                        if (err_code == MCU_NACK_ERR_OUT_OF_BOUNDS || err_code == MCU_NACK_ERR_INVALID_PARAM) {
-                                            return DESK_HW_ERR_INVALID_ARG;
-                                        }
-                                        return DESK_HW_ERR_IO;
-                                    }
-
-                                    /* Enforce strict ACK: MUST have MCU_FRAME_FLAG_ACK_RESP and MCU_MOTION_MSG_ACK */
-                                    if ((flags & MCU_FRAME_FLAG_ACK_RESP) && msg_id == MCU_MOTION_MSG_ACK) {
-                                        xSemaphoreGive(s_motion_mutex);
-                                        return DESK_HW_OK;
-                                    }
-                                    /* Command echo (msg_id == SERVO_MOVE or SERVO_STOP) is ignored as echo */
-                                }
-                            }
-                        }
-                    }
+            if (frame_rx_len == 12) {
+                uint16_t payload_len = (uint16_t)frame_rx[10] | ((uint16_t)frame_rx[11] << 8);
+                expected_frame_len = 12 + payload_len + 2;
+                if (frame_rx[2] != MCU_FRAME_PROTO_VERSION ||
+                    frame_rx[3] != MCU_FRAME_CLASS_MOTION || expected_frame_len > sizeof(frame_rx)) {
+                    frame_rx_len = 0;
+                    expected_frame_len = 0;
+                    continue;
                 }
-                wire_rx_len = 0;
+            }
+
+            if (expected_frame_len && frame_rx_len == expected_frame_len) {
+                uint8_t nack_code = 0;
+                int ack_rc = desk_watcher_motion_parse_ack(frame_rx, frame_rx_len,
+                                                           expected_seq, &nack_code);
+                if (ack_rc == DESK_HW_OK) {
+                    xSemaphoreGive(s_motion_mutex);
+                    return DESK_HW_OK;
+                }
+                if (ack_rc == DESK_HW_ERR_IO && nack_code != 0) {
+                    xSemaphoreGive(s_motion_mutex);
+                    return (nack_code == MCU_NACK_ERR_OUT_OF_BOUNDS ||
+                            nack_code == MCU_NACK_ERR_INVALID_PARAM)
+                               ? DESK_HW_ERR_INVALID_ARG : DESK_HW_ERR_IO;
+                }
+                frame_rx_len = 0;
+                expected_frame_len = 0;
             }
         }
     }
