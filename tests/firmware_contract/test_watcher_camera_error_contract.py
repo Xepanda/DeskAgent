@@ -87,6 +87,20 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
         self.assertIn("#define CAM_MAX_PACKET_SZ         WATCHER_HX_PTL_BODY_CAPACITY", source)
         self.assertIn(".max_transfer_sz = CAM_MAX_PACKET_SZ", source)
 
+    def test_psram_ptl_body_uses_idf_external_ram_dma_flag(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        body_transfer = source.split("/* Step 2: Read complete body", 1)[1].split("/* Step 3:", 1)[0]
+        self.assertIn("esp_ptr_external_ram(s_ptl_body + prefetched)", body_transfer)
+        self.assertIn("SPI_TRANS_DMA_USE_PSRAM", body_transfer)
+
+    def test_empty_ptl_poll_records_raw_header_and_sync_observation(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        empty_poll = capture.split("if (header_or != 0) break;", 1)[1].split("if (empty_attempt + 1U >=", 1)[0]
+        self.assertIn("camera_sync_is_active", empty_poll)
+        self.assertIn("base_header[0]", empty_poll)
+        self.assertIn("sync read rc=%d", empty_poll)
+
 
 if __name__ == "__main__":
     unittest.main()

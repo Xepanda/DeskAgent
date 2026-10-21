@@ -579,7 +579,12 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         for (size_t i = 0; i < sizeof(base_header); ++i) header_or |= base_header[i];
         if (header_or != 0) break;
 
-        ESP_LOGW(TAG, "PTL empty FIFO poll %u/%u", empty_attempt + 1U, CAM_PTL_EMPTY_RETRY_LIMIT);
+        bool sync_active_after_read = false;
+        int sync_read_rc = camera_sync_is_active(&sync_active_after_read);
+        ESP_LOGW(TAG,
+                 "PTL empty FIFO poll %u/%u: raw=%02x%02x%02x%02x%02x%02x%02x sync=%d sync read rc=%d",
+                 empty_attempt + 1U, CAM_PTL_EMPTY_RETRY_LIMIT, base_header[0], base_header[1], base_header[2],
+                 base_header[3], base_header[4], base_header[5], base_header[6], sync_active_after_read, sync_read_rc);
         uint8_t dummy = 0;
         spi_transaction_t close_trans = {.length = 8, .rxlength = 8, .rx_buffer = &dummy, .flags = 0};
         (void)spi_device_transmit(s_spi_dev, &close_trans);
@@ -630,7 +635,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         .length = (body_size - prefetched) * 8,
         .rxlength = (body_size - prefetched) * 8,
         .rx_buffer = s_ptl_body + prefetched,
-        .flags = 0,
+        .flags = esp_ptr_external_ram(s_ptl_body + prefetched) ? SPI_TRANS_DMA_USE_PSRAM : 0,
     };
     err = spi_device_transmit(s_spi_dev, &body_trans);
     spi_device_release_bus(s_spi_dev);
