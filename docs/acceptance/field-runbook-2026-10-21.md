@@ -16,7 +16,7 @@
 - 2026-10-22 后续只读状态诊断：COM21 上的 `body status` 尝试读到 ESP32 ROM `DOWNLOAD(USB/UART0)`，未出现应用 CLI 状态，也没有任何 STM32 响应/状态证据；因此不能将其记录为 STM32 状态。之后执行非写入 `esptool chip_id` 并指定 `--after hard_reset`，应用重新启动。随后命令 `python tools/verification/capture_esp32s3_logs.py --capture --no-raw --port COM21 --baud 115200 --output-dir .target_logging/esp32s3-live-20261022` 只读采集 33.7 秒：820 raw bytes、解析 8 行，包含 transport connected 与 4 条 heap/PSRAM 事件；原始字节仅在内存中处理，未写入文件。该记录为 ESP32-S3 应用 UART/内存的 L3 单项观测。没有发送运动命令；STM32 当前状态仍未知；COM20 未触碰。
 - 应用恢复后，COM21 直接只读执行 `body status`，DTR/RTS 保持低电平。脱敏记录：`.target_logging/stm32-status-readonly/body-status-DTR-low-20261022.txt`。应用 CLI 返回 UART Driver State `READY`；cached setpoint Pan=90/Tilt=120 只是缓存值，不是物理反馈；last formatted TX length=0 bytes，不是 STM32 RX/ACK。该结果证明应用 CLI 有响应，但 STM32 peer/ACK 仍 UNKNOWN，物理状态未知。没有发送 move/stop。
 - HA：当前仅 L2 connector 测试；没有用户现有 HA 会话或物理设备动作证据。
-- 提醒：`LifeService` 23 项和定向 reminder catch-up 1 项通过；SQLite teardown 的 `WinError 32` 修复属 L2。强制 kill 崩溃恢复、真实 Host 重启、设备到期播报/确认未验。
+- 提醒 / 备忘（A3）：`LifeService` 30 tests passed。隔离服务生命周期 L3 smoke 使用三个独立 Python 子进程和临时 SQLite：create overdue-within-24h reminder + note → claim dispatching → process exit → restart 恢复唯一 pending、读取 note、进入 ringing → stop → restart 后确认 pending=0、status=`ringing_stopped`、occurrence=`dismissed`。该实验验证独立进程退出/重启间的 SQLite 持久化与状态恢复；不代表 Host 部署、设备播报/用户确认、离线补播策略或整机 L4。
 - SDK bridge：5 项 source-contract 检查通过；依赖本机 GCC 的 10 项用例被 skipped，没有执行结果，不等于构建或官方 SDK 互通通过。
 - 输入/UI：9 项软件 contract 测试；滚轮和按键已有用户现场确认，详细输入事件日志待归档。
 - Codex Companion：既有 app-server 默认模型调用及隔离工作区修改任务有本机真实服务证据。`6255657` 新增 Host managed SDK session 的 terminal summary→`ctrl.expression.set` 结果回传、outbox 幂等/退避、UTF-8 63-byte 截断；combined 定向回归为 166 passed、6 subtests passed（L2）。测试 ACK 只代表 `accepted`。`WATCHER_APP_*` real managed Runtime 尚未配置/启动，当前设备显示/播报及用户听感没有 L3 证据。
@@ -100,6 +100,8 @@ python -m unittest tests.e2e.test_p1_regression_gates
 通过证据：脱敏日志、实体 ID、HA 事件/状态时间戳、现场观察者确认；accepted 不能代替物理动作。
 
 ## 7. 提醒与备忘（L3/L4）
+
+已完成的隔离服务生命周期 L3 smoke：`LifeService` 30 tests passed；三个独立 Python 子进程 + 临时 SQLite 完成 create overdue-within-24h reminder + note → claim dispatching → process exit → restart 恢复唯一 pending/read note/ringing → stop → restart 后验证 pending=0、`ringing_stopped`、occurrence `dismissed`。此结果不覆盖真实 Host 部署、设备播报/确认或整机 L4。
 
 1. 在目标时区创建一个短时提醒和一条备忘，记录 Host 数据库路径、创建时刻和 ID（不记录敏感内容）。
 2. 重启 Host 服务，确认记录仍在；等待到期，确认 outbox occurrence 只产生一次并经真实设备显示/播报。

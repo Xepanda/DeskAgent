@@ -1,6 +1,6 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.27.0
+> 文档版本：V3.28.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
 > 状态：**2026-10-22 最新 CLI 镜像和当前全仓测试结果见 §0。用户最新现场确认当前设备已可通过唤醒词唤醒并进行对话；该证据未附设备日志，不能据此确认 ASR/TTS 细节、多轮会话、云端会话状态或恢复能力。相机仍未取到 JPEG，STM32 move/stop 均超时且没有 ACK/物理反馈，动作状态未知。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
@@ -8,6 +8,7 @@
 > V3.25.0 变更：补录恢复应用后在 COM21 以 DTR/RTS 保持低电平进行只读 `body status` 查询：UART Driver State `READY`、缓存 Pan=90/Tilt=120（非物理反馈）、last formatted TX length 0 bytes（非 RX/ACK）；STM32 peer/ACK 仍 UNKNOWN。该证据只证明应用 CLI 响应。另记录外部 ESP32 submodule 分区脚本补丁 commit `3680041...`：6 项测试、`py_compile` 与 diff-check 通过；标准 Tuya CLI build 使用项目 CSV，解码的 12 个分区与已知设备布局一致。未刷机；补丁未推送，也未包含在 DeskAgent PR。分区构建验证为 L2，物理功能缺口保持不变。
 > V3.26.0 变更：补录 DTR/RTS 保持低电平时直接通过 COM21 执行的最新只读 `camera capture`：PTL `raw=00000000000000`、`rc=-25`、`valid_frame=NO`、`out_len=0`。这是既有全零 PTL header 问题的再次观测，仍无 JPEG；不是 CRC 失败，未执行刷写。相机 L3 仍失败，L4 未验证。
 > V3.27.0 更正：外部 ESP32 submodule 补丁 `3680041...` 的 6 项测试、`py_compile` 和 diff-check 通过，但实际标准 Tuya CLI build 在构建前将 submodule 从补丁提交同步回 manifest pin `8cd2a15`，覆盖了本地补丁。该次构建因此生成 9 分区 stock map，hash `DE7EA934...898F8D`，与已知设备 12 分区 map hash `C6F7A192...A003ADFD` 不一致。此前 V3.25.0 关于标准 CLI 使用项目 CSV 并生成匹配 12 分区表的表述不成立，现予更正：现有匹配表归档二进制缺少可复现标准构建日志/来源证明；本次标准构建产物不得刷机，匹配分区表的 app flash 仍未验收。未执行刷写，未改写分区表、bootloader 或 model。
+> V3.28.0 变更：A3 `LifeService` 30 tests passed；另以三个独立 Python 子进程和临时 SQLite 实测：create overdue-within-24h reminder + note → claim dispatching → process exit → restart 恢复唯一 pending、读取 note 并进入 ringing → stop → restart 后验证 pending=0、status=`ringing_stopped`、occurrence=`dismissed`。证据为隔离服务生命周期 L3 smoke；不代表 Host 部署、设备播报/用户确认或整机 L4。
 > V3.23.0 变更：记录 PR #13 合入后的 WSL Python 3.12 全量回归（550 passed、2 skipped、44 subtests passed，140.36 秒）及相机/Host 定向测试（43 passed、9 subtests）。修正 3 项陈旧相机测试预期：测试注入真实帧源，同时保留无帧源时报告 unavailable 的行为。均为 L2 软件证据；设备仍返回全零 PTL header、未取得 JPEG，物理相机 L3 失败状态不变。保留 V3.22.0 HA 与 V3.21.0 语音记录。
 > V3.13.0 变更：更新 HA、Reminder/Core、Companion、SDK 与定向回归测试数字；记录提醒 fixture 使用动态近时值且符合 24h catch-up 窗口、SQLite 测试 teardown 显式关闭连接；校准只读状态页/旋钮按钮 UI 契约、无真实帧源时不产生合成相机帧，以及 OS RNG 字符串形状 smoke test 的证据边界。全仓 pytest 为 336 passed、193 errors、1 failed、15 subtests；errors 与 failed 均由 Windows 缺少 `gcc`、native C harness 无法启动导致。相机和 STM32 的 L3 阻塞仍未解除。
 > V3.14.0 变更：Companion 增至 53 项 L2 测试，覆盖 app-server `thread/resume` 重启时恢复非终态任务、确认 `cancelling` 终态及 active-writer 下 pending 重试；新代码/测试无真实默认模型及 throwaway workspace restart smoke 证据，设备回传 L4 仍未验证。
@@ -41,6 +42,7 @@
 | 麦克风采集 | **L3 单项通过（当前镜像观测）** | 新 CLI 镜像日志显示麦克风 READY、`running`，累计 895 frames，errors=0，peak=95 | 这是 PCM 采集状态，不等于唤醒/ASR/语音对话已在本镜像复测；需再次现场唤醒及多轮问答并归档识别、会话、播报证据 |
 | 麦克风、唤醒与对话 | **L3 单项用户现场确认；详细链路未由日志验证** | 用户于 2026-10-22 最新确认“现在可以唤醒对话了”，即当前设备能响应唤醒词并进行对话。该确认没有附带本轮设备日志或固件 SHA；此前已有 PCM 采集观测，但不能把它当作本次对话的日志佐证 | 归档匹配当前固件 SHA 的启动、WakeNet/KWS、ASR、Tuya AI session/MQTT、NLG/TTS 与扬声器播放日志；量化重复唤醒并验证多轮上下文、断网恢复和长稳。当前用户确认不代表这些细项已通过 |
 | 滚轮、按键与状态页 | **L2 源码契约检查；L3 仅有用户对滚轮/按键可用的确认** | UI 契约测试检查滚轮选择 HOME/AUDIO/CONNECTION/DEVICE 四个只读页、触摸打开/返回、短按/长按调用既有 TuyaOpen talk alert API；覆盖配对 overlay 时保留当前状态页显示。用户确认滚轮和按键可用，但无本轮逐项事件日志 | 归档真机滚轮、触摸、短按、长按输入事件和屏幕变化；源码契约测试不代表页面在当前镜像上的显示/交互已实机验收 |
+| 提醒与备忘 | **L3 隔离服务生命周期 smoke；Host/设备闭环未验** | `LifeService` 30 tests passed。三个独立 Python 子进程 + 临时 SQLite：创建 24h 内 overdue reminder 与 note，claim 为 dispatching 后进程退出；重启恢复唯一 pending、读取 note、状态 ringing；stop 后再次重启验证 pending=0、状态 `ringing_stopped`、occurrence `dismissed` | 仍需 Host 实际部署/服务重启，设备真实播报与用户确认、重复播报抑制和离线到期策略；隔离 smoke 不代表整机 L4 |
 | Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新直接 COM21 CLI capture（DTR/RTS 保持低）返回 `PTL empty response: raw=00000000000000`、`rc=-25`、`valid_frame=NO`、`out_len=0`；脱敏日志 `.target_logging/com21-camera-capture-DTR-low-20261022.log`。这是同一未解决的全零 PTL header，没有 JPEG；不属于 CRC 失败，也未执行刷写。driver `READY` 仅证明初始化路径、I2C expander 配置及 SPI bus/device 创建成功，没有 HX ID/应答探测。详见 `desk_watcher_camera.c:135-193,264-346` | 下一步先同步测量同一事务中的 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 与 HX 电源轨；保存探点、时基和电压。确认总线数据前不盲目重复取帧；修复后导出并打开现场 JPEG，验证连续帧与资源释放 |
 | 相机 SDK parser / Host adapter | **L2 集成通过；L3/L4 未验证** | PR #13 合入后相机/Host 定向测试共 43 passed、9 subtests。修正 3 项陈旧测试预期，让测试注入真实帧源；没有帧源时仍返回 unavailable/不产生帧。测试中的帧源是软件测试输入，不是设备采集；未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
 | CR-006 Host MJPEG stream | **L2 测试通过；L3 失败、L4 未验证** | `tests/camera`、Host route、SDK camera adapter 与 managed SDK startup 定向测试：43 passed、9 subtests。3 项陈旧测试预期已修正为注入真实帧源，同时保留无帧源时 unavailable 的行为；实现只消费真实硬件 JPEG，最高 2 FPS | 最新设备 capture 为全零 PTL header、`rc=-25`、`out_len=0`，无真实 JPEG。以上仅为 L2 软件证据；需取得可打开的现场 JPEG，经 Host 到浏览器验证帧新鲜度与断线恢复，才能验收实机链路。不能称全契约实机通过 |
