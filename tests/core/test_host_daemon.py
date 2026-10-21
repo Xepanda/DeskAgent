@@ -148,6 +148,44 @@ class TestHostDaemon(unittest.TestCase):
         previous = next(item for item in occurrences if item["occurrence_id"] == occurrence_id)
         self.assertEqual(previous["state"], "snoozed")
 
+    def test_reminder_stop_ringing_route_maps_stale_state_to_non_retryable_conflict(self) -> None:
+        reminder_id = "rem-daemon-stop-state-conflict"
+        self.app.life_service.create_reminder(
+            reminder_id=reminder_id,
+            title="Not ringing yet",
+            due_at="2035-01-01T00:00:00Z",
+        )
+        occurrence_id = self.app.life_service.get_all_occurrences(reminder_id)[0]["occurrence_id"]
+        req = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-daemon-stop-state-conflict",
+            operation="reminder.stop_ringing",
+            arguments={"occurrence_id": occurrence_id},
+            expires_at="2030-01-01T00:00:00Z",
+        )
+
+        response = self.app.router.dispatch(req)
+
+        self.assertEqual(response.status.value, "failed")
+        self.assertEqual(response.error["code"], "STATE_CONFLICT")
+        self.assertFalse(response.error["retryable"])
+        self.assertEqual(self.app.life_service.get_all_occurrences(reminder_id)[0]["state"], "pending")
+
+    def test_reminder_stop_ringing_route_preserves_missing_resource_error(self) -> None:
+        req = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-daemon-stop-missing",
+            operation="reminder.stop_ringing",
+            arguments={"occurrence_id": "occ-does-not-exist"},
+            expires_at="2030-01-01T00:00:00Z",
+        )
+
+        response = self.app.router.dispatch(req)
+
+        self.assertEqual(response.status.value, "failed")
+        self.assertEqual(response.error["code"], "RESOURCE_NOT_FOUND")
+        self.assertFalse(response.error["retryable"])
+
     def test_rpc_note_flow(self) -> None:
         note_payload = {
             "schema_version": "1.0.0",

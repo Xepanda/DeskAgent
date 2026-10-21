@@ -588,7 +588,22 @@ class DeskAgentHostApp:
         return ResponseEnvelope.create_success(req.request_id, item)
 
     def _handle_reminder_stop_ringing(self, req: RequestEnvelope) -> ResponseEnvelope:
-        item = self.life_service.stop_ringing(req.arguments["occurrence_id"])
+        try:
+            item = self.life_service.stop_ringing(req.arguments["occurrence_id"])
+        except KeyError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                "RESOURCE_NOT_FOUND",
+                str(exc),
+                retryable=False,
+            )
+        except ValueError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                "STATE_CONFLICT",
+                str(exc),
+                retryable=False,
+            )
         return ResponseEnvelope.create_success(req.request_id, item)
 
     def _handle_note_create(self, req: RequestEnvelope) -> ResponseEnvelope:
