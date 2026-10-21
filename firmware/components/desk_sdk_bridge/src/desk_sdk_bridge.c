@@ -1061,7 +1061,6 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
 
 static uint16_t s_camera_session_id = 100;
 static uint32_t s_camera_seq = 0;
-static uint16_t s_mic_session_id = 200;
 
 int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
                                      uint8_t flags,
@@ -1291,21 +1290,14 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         char role[32] = "";
         json_parse_str(json_in, "role", role, sizeof(role));
 
-        /* If role is hardware (as in runtime pair sequence), reply with official negotiated session ack */
+        /* Do not negotiate audio_uplink until capture, Opus encoding, WSPK
+         * uplink and session teardown are implemented end to end. */
         if (strcmp(role, "hardware") == 0) {
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
                      "\"type\":\"sys.client.hello\","
                      "\"role\":\"hardware\","
-                     "\"session_state\":\"connected\","
-                     "\"negotiated\":{"
-                     "\"audio_uplink\":{"
-                     "\"codec\":\"opus\","
-                     "\"sample_rate\":16000,"
-                     "\"channels\":1,"
-                     "\"frame_duration_ms\":60,"
-                     "\"packetization\":\"one_opus_packet_per_wspk\","
-                     "\"version\":1}}}}");
+                     "\"session_state\":\"connected\"}}");
             return 0;
         }
 
@@ -1314,13 +1306,11 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  DESK_SDK_CAP_INPUTS,
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_AUDIO_STREAM,
                  DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_AUDIO_STREAM_ALT,
                  DESK_SDK_CAP_EXPRESSION_ALT,
                  DESK_SDK_CAP_MCP_TOOLS);
         return 0;
@@ -1334,14 +1324,12 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  rid,
                  DESK_SDK_CAP_INPUTS,
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_AUDIO_STREAM,
                  DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_AUDIO_STREAM_ALT,
                  DESK_SDK_CAP_EXPRESSION_ALT,
                  DESK_SDK_CAP_MCP_TOOLS);
         return 0;
@@ -1554,25 +1542,18 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    /* Microphone open / close: ctrl.microphone.open / ctrl.microphone.close */
-    else if (strcmp(msg_type, "ctrl.microphone.open") == 0) {
+    /* Audio transport is unsupported until both directions have real media
+     * paths and the capture owner can be negotiated without stopping TClaw. */
+    else if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0 ||
+             strcmp(msg_type, "ctrl.audio.stop") == 0 ||
+             strcmp(msg_type, "ctrl.microphone.open") == 0 ||
+             strcmp(msg_type, "ctrl.microphone.close") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        int rate = json_parse_int(json_in, "sample_rate_hz", 16000);
-        desk_hardware_audio_record_start((uint32_t)rate);
-        s_mic_session_id = (s_mic_session_id % 65534) + 1;
         snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"session_id\":%u}}",
-                 rid, (unsigned int)s_mic_session_id);
-        return 0;
-    }
-
-    else if (strcmp(msg_type, "ctrl.microphone.close") == 0) {
-        char rid_scratch[128];
-        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        desk_hardware_audio_record_stop();
-        snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"status\":\"accepted\",\"accepted\":true}}",
+                 "{\"type\":\"sys.nack\",%s\"code\":501,\"error\":{"
+                 "\"code\":\"UNSUPPORTED_OPERATION\","
+                 "\"message\":\"SDK audio transport is not implemented on this device\"}}",
                  rid);
         return 0;
     }

@@ -482,9 +482,11 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         data = resp.get("data", {})
         self.assertEqual(data.get("role"), "device")
         caps = data.get("capabilities", [])
-        expected_caps = ["inputs", "motion", "camera", "audio.stream", "expression.audio_follow.v1", "mcp_tools"]
+        expected_caps = ["inputs", "motion", "camera", "expression.audio_follow.v1", "mcp_tools"]
         for cap in expected_caps:
             self.assertIn(cap, caps, f"Missing expected capability: {cap}")
+        self.assertNotIn("audio.stream", caps)
+        self.assertNotIn("audio_stream", caps)
 
     def test_motion_move_with_custom_angles(self) -> None:
         """Verifies motion command parses JSON arguments and sets hardware angles."""
@@ -1097,8 +1099,8 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(len(rsp["session_token"]), 64)
         self.assertTrue(all(c in "0123456789abcdef" for c in rsp["session_token"]))
 
-    def test_hardware_hello_handshake_with_audio_negotiation(self) -> None:
-        """Verifies sys.client.hello with role=hardware negotiates Opus audio uplink per contract."""
+    def test_hardware_hello_handshake_omits_unimplemented_audio_negotiation(self) -> None:
+        """Hardware hello omits Opus uplink until its media path exists."""
         hardware_hello = json.dumps({
             "type": "sys.client.hello",
             "code": 0,
@@ -1121,10 +1123,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(rsp["code"], 0)
         self.assertEqual(rsp["data"]["role"], "hardware")
         self.assertEqual(rsp["data"]["session_state"], "connected")
-        audio_up = rsp["data"]["negotiated"]["audio_uplink"]
-        self.assertEqual(audio_up["codec"], "opus")
-        self.assertEqual(audio_up["sample_rate"], 16000)
-        self.assertEqual(audio_up["channels"], 1)
+        self.assertNotIn("audio_uplink", rsp["data"].get("negotiated", {}))
 
     def test_media_frame_pack_and_unpack(self) -> None:
         """Verifies packaging complete WSPK binary media frames with Little-Endian headers."""
@@ -1968,9 +1967,9 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             ("camera.capture", "sys.ack", {"type": "ctrl.camera.capture", "data": {}}),
             ("camera.release", "sys.ack", {"type": "ctrl.camera.release",
                                            "data": {"client_id": "corr-client"}}),
-            ("microphone.open", "sys.ack", {"type": "ctrl.microphone.open",
+            ("microphone.open", "sys.nack", {"type": "ctrl.microphone.open",
                                             "data": {"sample_rate_hz": 16000}}),
-            ("microphone.close", "sys.ack", {"type": "ctrl.microphone.close", "data": {}}),
+            ("microphone.close", "sys.nack", {"type": "ctrl.microphone.close", "data": {}}),
             ("expression.play", "sys.ack", {"type": "ctrl.expression.play",
                                             "data": {"preset": "idle", "text": "correlate"}}),
             ("expression.audio_follow", "sys.ack", {"type": "ctrl.expression.audio_follow",

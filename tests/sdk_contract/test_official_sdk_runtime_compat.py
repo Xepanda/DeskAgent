@@ -537,8 +537,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(rc, 1)  # DESK_SDK_PAIRING_REJECTED
         self.assertEqual(out_buf.value, b"")
 
-    def test_official_hardware_hello_with_token(self) -> None:
-        """Verifies sys.client.hello with role=hardware carrying session_token succeeds and returns negotiated parameters."""
+    def test_official_hardware_hello_does_not_negotiate_unimplemented_audio(self) -> None:
+        """Hardware hello must not claim Opus uplink without its media path."""
         # Pair first to establish token
         out_buf = ctypes.create_string_buffer(1024)
         req_json = json.dumps({
@@ -573,8 +573,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(resp["code"], 0)
         self.assertEqual(resp["data"]["role"], "hardware")
         self.assertEqual(resp["data"]["session_state"], "connected")
-        self.assertEqual(resp["data"]["negotiated"]["audio_uplink"]["codec"], "opus")
-        self.assertEqual(resp["data"]["negotiated"]["audio_uplink"]["sample_rate"], 16000)
+        self.assertNotIn("audio_uplink", resp["data"].get("negotiated", {}))
 
     def test_official_desktop_hello_and_ready_get(self) -> None:
         """Verifies official Desktop hello and sys.sdk.ready.get capability negotiation."""
@@ -588,7 +587,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertIn("inputs", caps)
         self.assertIn("motion", caps)
         self.assertIn("camera", caps)
-        self.assertIn("audio.stream", caps)
+        self.assertNotIn("audio.stream", caps)
+        self.assertNotIn("audio_stream", caps)
         self.assertIn("expression.audio_follow.v1", caps)
 
         # sys.sdk.ready.get returns identical capabilities
@@ -694,28 +694,36 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             self.assertEqual(release_resp["code"], 0, release_resp)
             self.assertTrue(release_resp["data"]["accepted"], release_resp)
 
-    def test_official_microphone_lifecycle(self) -> None:
-        """Verifies ctrl.microphone.open returns session_id and close cleans up."""
-        # Open microphone
+    def test_official_microphone_open_is_explicitly_unsupported(self) -> None:
+        """Microphone control must not claim success without Opus WSPK uplink."""
         resp_open = self._exec_command({
             "type": "ctrl.microphone.open",
             "code": 0,
             "data": {"sample_rate_hz": 16000, "command_id": "cmd-mic-open-01"},
         })
-        self.assertEqual(resp_open["type"], "sys.ack")
-        self.assertEqual(resp_open["code"], 0)
-        session_id = resp_open["data"].get("session_id")
-        self.assertIsInstance(session_id, int)
-        self.assertGreater(session_id, 0)
+        self.assertEqual(resp_open["type"], "sys.nack")
+        self.assertEqual(resp_open["error"]["code"], "UNSUPPORTED_OPERATION")
 
-        # Close microphone
-        resp_close = self._exec_command({
+    def test_audio_playback_commands_are_explicitly_unsupported(self) -> None:
+        """PCM playback begin/stop must not silently accept a missing media path."""
+        for msg_type in ("ctrl.audio.stream.begin", "ctrl.audio.stop"):
+            with self.subTest(msg_type=msg_type):
+                response = self._exec_command({
+                    "type": msg_type,
+                    "code": 0,
+                    "data": {"stream_id": 1, "total_bytes": 320},
+                })
+                self.assertEqual(response["type"], "sys.nack")
+                self.assertEqual(response["error"]["code"], "UNSUPPORTED_OPERATION")
+
+    def test_official_microphone_close_is_explicitly_unsupported(self) -> None:
+        response = self._exec_command({
             "type": "ctrl.microphone.close",
             "code": 0,
-            "data": {"session_id": session_id, "command_id": "cmd-mic-close-01"},
+            "data": {"session_id": 1, "command_id": "cmd-mic-close-01"},
         })
-        self.assertEqual(resp_close["type"], "sys.ack")
-        self.assertEqual(resp_close["data"]["status"], "accepted")
+        self.assertEqual(response["type"], "sys.nack")
+        self.assertEqual(response["error"]["code"], "UNSUPPORTED_OPERATION")
 
     def test_official_expression_audio_follow(self) -> None:
         """Verifies ctrl.expression.audio_follow toggling."""

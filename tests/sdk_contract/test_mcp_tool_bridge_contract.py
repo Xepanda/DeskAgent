@@ -163,7 +163,7 @@ class TestMcpToolBridgeContract(unittest.TestCase):
     # 1. Capability Dictionary Reporting
     # -------------------------------------------------------------------------
     def test_capabilities_accurate_reporting(self) -> None:
-        """Verifies capabilities reported include inputs, motion, camera, audio_stream, expression, and mcp_tools."""
+        """Verifies implemented capabilities are reported and unsupported audio is omitted."""
         resp = self._exec_command({
             "type": "sys.client.hello",
             "data": {"role": "desktop", "version": "1.0"},
@@ -176,7 +176,8 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         self.assertIn("inputs", caps)
         self.assertIn("motion", caps)
         self.assertIn("camera", caps)
-        self.assertTrue("audio_stream" in caps or "audio.stream" in caps)
+        self.assertNotIn("audio_stream", caps)
+        self.assertNotIn("audio.stream", caps)
         self.assertTrue("expression" in caps or "expression.audio_follow.v1" in caps)
         self.assertIn("mcp_tools", caps)
 

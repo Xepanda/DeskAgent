@@ -4,7 +4,7 @@
  *
  * Implements standard WatcheRobot device protocol endpoints:
  * - sys.client.hello / sys.ack handshake and capabilities negotiation
- * - WSPK binary framing for audio/image streams
+ * - WSPK binary framing for image media (SDK audio transport is not advertised)
  * - Inputs event notifications (backtouch, screentouch, roller)
  * - Motion & Camera commands with strict resource arbitration
  * - Bidirectional RequestEnvelope / ResponseEnvelope tool routing
@@ -29,8 +29,6 @@ extern "C" {
 #define DESK_SDK_CAP_INPUTS        "inputs"
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
-#define DESK_SDK_CAP_AUDIO_STREAM  "audio.stream"
-#define DESK_SDK_CAP_AUDIO_STREAM_ALT "audio_stream"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
 #define DESK_SDK_CAP_EXPRESSION_ALT "expression"
 #define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"
@@ -273,7 +271,7 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
  * - ctrl.motion.move / ctrl.motion.stop -> sys.ack with CR-002 ACK-only semantics
  *   (status="accepted", accepted=true, state_confirmed=false)
  * - ctrl.camera.acquire / ctrl.camera.release / ctrl.camera.capture
- * - ctrl.microphone.open / ctrl.microphone.close
+ * - SDK audio transport controls currently return UNSUPPORTED_OPERATION
  * - ctrl.expression.play / ctrl.expression.set / ctrl.expression.audio_follow
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
