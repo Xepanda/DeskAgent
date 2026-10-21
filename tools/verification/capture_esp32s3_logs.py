@@ -199,11 +199,21 @@ class SerialLogCapture:
         *,
         clock: Callable[[], str] = utc_now,
         fsync: bool = True,
+        live_events: Optional[str | Path] = None,
     ) -> None:
         events_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         self._raw = RawByteSink(raw_path, fsync=fsync) if raw_path else None
         self._events_file: TextIO = events_path.open("x", encoding="utf-8", newline="\n")
+        self._live_events_file: Optional[TextIO] = None
+        self._live_events_is_stdout = live_events is not None and str(live_events).lower() in {"stdout", "-"}
+        if live_events is not None and not self._live_events_is_stdout:
+            live_path = Path(live_events)
+            if live_path.resolve() == events_path.resolve():
+                self._events_file.close()
+                raise ValueError("live events path must differ from the archived events path")
+            live_path.parent.mkdir(parents=True, exist_ok=True)
+            self._live_events_file = live_path.open("x", encoding="utf-8", newline="\n")
         self._summary_path = summary_path
         self._parser = IncrementalLogParser(clock=clock)
         self._clock = clock
@@ -242,6 +252,9 @@ class SerialLogCapture:
         self._write_events(self._parser.finish())
         self._events_file.flush()
         self._events_file.close()
+        if self._live_events_file:
+            self._live_events_file.flush()
+            self._live_events_file.close()
         if self._raw:
             self._raw.close()
         summary = self._summary()
@@ -252,14 +265,23 @@ class SerialLogCapture:
         return summary
 
     def _write_events(self, events: Iterable[dict[str, object]]) -> None:
+        wrote_events = False
         for event in events:
             category = str(event.get("category", "unknown"))
             timestamp = str(event.get("timestamp_utc", self._clock()))
             self._start_time = self._start_time or timestamp
             self._last_time = timestamp
             self._event_counts[category] += 1
-            self._events_file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
-        if events:
+            encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            self._events_file.write(encoded)
+            if self._live_events_is_stdout:
+                sys.stdout.write(encoded)
+                sys.stdout.flush()
+            elif self._live_events_file:
+                self._live_events_file.write(encoded)
+                self._live_events_file.flush()
+            wrote_events = True
+        if wrote_events:
             self._events_file.flush()
 
     def _summary(self) -> dict[str, object]:
@@ -312,10 +334,13 @@ def capture_port(
     max_reconnects: int = 5,
     read_timeout: float = 0.5,
     save_raw: bool = True,
+    live_events: Optional[str | Path] = None,
     serial_factory: Callable[..., object] = _open_serial,
 ) -> int:
+    if live_events is not None and str(live_events).lower() not in {"stdout", "-"} and Path(live_events).exists():
+        raise FileExistsError(f"live events output already exists: {live_events}")
     raw_path, events_path, summary_path = _new_output_paths(output_dir, port)
-    capture = SerialLogCapture(raw_path if save_raw else None, events_path, summary_path)
+    capture = SerialLogCapture(raw_path if save_raw else None, events_path, summary_path, live_events=live_events)
     serial_handle = None
     reconnects = 0
     ever_connected = False
@@ -352,9 +377,10 @@ def capture_port(
             except Exception:
                 pass
         summary = capture.close()
-    print(f"Raw capture:   {raw_path if save_raw else 'disabled (bytes processed in memory only)'}")
-    print(f"Event summary: {events_path}")
-    print(f"Counts:        {summary_path}")
+    report = sys.stderr if live_events is not None and str(live_events).lower() in {"stdout", "-"} else sys.stdout
+    print(f"Raw capture:   {raw_path if save_raw else 'disabled (bytes processed in memory only)'}", file=report)
+    print(f"Event summary: {events_path}", file=report)
+    print(f"Counts:        {summary_path}", file=report)
     if exit_code:
         print("Serial capture ended after disconnect; see transport event for details.", file=sys.stderr)
     return exit_code
@@ -383,6 +409,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-reconnects", type=int, default=5, help="maximum retry attempts when --reconnect is set")
     parser.add_argument("--read-timeout", type=float, default=0.5)
     parser.add_argument("--no-raw", action="store_true", help="do not persist raw serial bytes; write only redacted events and byte counts")
+    parser.add_argument(
+        "--live-events",
+        metavar="PATH|stdout",
+        help="also stream redacted JSONL events as they arrive to a new file or stdout (use --no-raw to avoid saving raw bytes)",
+    )
     return parser
 
 
@@ -405,6 +436,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             max_reconnects=args.max_reconnects,
             read_timeout=args.read_timeout,
             save_raw=not args.no_raw,
+            live_events=args.live_events,
         )
     if not args.parse_file.is_file():
         parser.error(f"raw input file does not exist: {args.parse_file}")

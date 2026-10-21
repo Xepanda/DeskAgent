@@ -203,6 +203,83 @@ class TestEsp32S3LogCapture(unittest.TestCase):
         self.assertNotIn("654321", events_text + summary_text)
         self.assertEqual(json.loads(summary_text)["raw_bytes"], len(b"I MQTT pairing_code=654321 state=connected\n"))
 
+    def test_live_stdout_events_are_flushed_on_arrival_redacted_and_machine_readable(self) -> None:
+        live_stdout = io.StringIO()
+
+        class FakeSerial:
+            reads = 0
+
+            def read(self, _size: int) -> bytes:
+                self.reads += 1
+                if self.reads == 1:
+                    return b"I MQTT pairing_code=654321 state=connected\n"
+                # Observe output before capture_port handles shutdown.
+                self.assert_live_line = live_stdout.getvalue()
+                raise KeyboardInterrupt
+
+            def close(self) -> None:
+                pass
+
+        serial = FakeSerial()
+        with tempfile.TemporaryDirectory() as temp_dir, contextlib.redirect_stdout(live_stdout), contextlib.redirect_stderr(io.StringIO()):
+            exit_code = capture_port(
+                "COMTEST",
+                115200,
+                Path(temp_dir),
+                save_raw=False,
+                live_events="stdout",
+                serial_factory=lambda **_: serial,
+            )
+
+        live_lines = live_stdout.getvalue().splitlines()
+        live_event = next(json.loads(line) for line in live_lines if '"category":"mqtt"' in line)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(live_event["category"], "mqtt")
+        self.assertNotIn("654321", live_stdout.getvalue())
+        self.assertTrue(serial.assert_live_line.startswith('{"timestamp_utc"'), "JSONL must be flushed before the next serial read")
+
+    def test_live_event_file_is_created_exclusively_and_includes_reconnect_events(self) -> None:
+        class FakeSerial:
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.chunks = list(chunks)
+
+            def read(self, _size: int) -> bytes:
+                if self.chunks:
+                    return self.chunks.pop(0)
+                raise OSError("fixture disconnect")
+
+            def close(self) -> None:
+                pass
+
+        serial_instances = [FakeSerial([b"I MQTT state=connected\n"]), FakeSerial([b"I ASR result: resumed\n"])]
+
+        def serial_factory(**_: object) -> FakeSerial:
+            return serial_instances.pop(0)
+
+        with tempfile.TemporaryDirectory() as temp_dir, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            root = Path(temp_dir)
+            live_path = root / "live" / "events.jsonl"
+            exit_code = capture_port(
+                "COMTEST",
+                115200,
+                root / "archive",
+                reconnect=True,
+                reconnect_delay=0,
+                max_reconnects=1,
+                save_raw=False,
+                live_events=live_path,
+                serial_factory=serial_factory,
+            )
+            live_events = [json.loads(line) for line in live_path.read_text(encoding="utf-8").splitlines()]
+            with self.assertRaises(FileExistsError):
+                capture_port("COMTEST", 115200, root / "archive2", live_events=live_path, serial_factory=serial_factory)
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(
+            [event.get("state") for event in live_events if event["category"] == "transport"],
+            ["connected", "disconnected", "reconnected", "disconnected"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
