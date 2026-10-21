@@ -14,12 +14,14 @@ Directly imports official SDK modules from the locked external repository to ver
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -47,6 +49,7 @@ try:
         parse_hardware_hello,
         parse_udp_message,
     )
+    import websockets
     HAVE_WATCHEROBOT = True
 except ImportError:
     HAVE_WATCHEROBOT = False
@@ -229,6 +232,79 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(hello.daemon_instance_id, parsed_msg.daemon_instance_id)
         self.assertEqual(hello.session_token, parsed_msg.session_token)
         self.assertEqual(hello.mode, parsed_msg.target_mode)
+
+    def test_generated_pairing_and_hello_are_accepted_by_official_runtime_server(self) -> None:
+        """Exercise C bridge pairing output against the pinned Runtime's real loopback WS server."""
+        # Importing the SDK's connections package eagerly imports its unrelated
+        # application process monitor (psutil). This test exercises only the
+        # official pairing authority and WebSocket listener, so keep that
+        # optional monitor dependency out of this focused harness when absent.
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+
+        request_id = "21a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "f730f29e670c49f7a3320c4314eb9805"
+        request = PairRequest(
+            request_id=request_id,
+            daemon_instance_id=daemon_id,
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+        )
+        pair_reply = ctypes.create_string_buffer(1024)
+        rc = self.lib.desk_sdk_bridge_process_pairing_udp(
+            encode_udp_message(request), pair_reply, len(pair_reply)
+        )
+        self.assertEqual(rc, 0)
+        pair_accept = parse_udp_message(pair_reply.value)
+        self.assertIsInstance(pair_accept, PairAccept)
+
+        hello_buf = ctypes.create_string_buffer(512)
+        self.assertGreater(
+            self.lib.desk_sdk_bridge_build_hardware_hello(hello_buf, len(hello_buf)), 0
+        )
+        hello_wire = hello_buf.value.decode("utf-8")
+        parse_hardware_hello(hello_wire)
+
+        pairing = DevicePairingSession(
+            daemon_instance_id=daemon_id,
+            request_id_factory=lambda: request_id,
+        )
+        pairing.start_pairing(
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+            now=0.0,
+        )
+        pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=1.0)
+
+        async def exercise_runtime() -> dict:
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=2.0)
+
+            server = ExternalWebSocketServer(
+                host="127.0.0.1",
+                port=0,
+                hardware_hello_authorizer=authorize,
+            )
+            await server.start()
+            try:
+                async with websockets.connect(server.url) as ws:
+                    await ws.send(hello_wire)
+                    return json.loads(await ws.recv())
+            finally:
+                await server.stop()
+
+        ack = asyncio.run(exercise_runtime())
+        self.assertEqual(ack["type"], "sys.ack")
+        self.assertEqual(ack["code"], 0)
+        self.assertEqual(ack["data"]["type"], "sys.client.hello")
+        self.assertEqual(ack["data"]["role"], "hardware")
+        self.assertEqual(pairing.snapshot()["state"], "connected")
 
     def test_official_udp_pairing_rejected_when_unprovisioned(self) -> None:
         """Fail-closed: an unprovisioned device must not answer with pair.accept."""
