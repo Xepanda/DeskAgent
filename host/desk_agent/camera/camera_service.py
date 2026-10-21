@@ -4,9 +4,9 @@ Desk Agent R1 LAN Camera Viewer Service.
 Provides secure local network JPEG frame viewing with:
 - Mutual exclusion single-viewer lease arbitration (RESOURCE_BUSY for concurrent viewers).
 - Automatic lease expiration and renewal support.
-- Hardened freshness tracking with stale frame blanking/masking (prevents old frames masquerading as live video).
+- Strict freshness tracking that makes stale frames unavailable.
 - Strict bounded latest-frame buffer (no disk writes, no video recordings, no audio streams).
-- Elimination of ungrounded fake synthetic frames when hardware camera is disconnected.
+- No synthetic frame generation when hardware camera is disconnected.
 - Teardown callbacks to stop hardware sensor DMA upon lease release or timeout.
 """
 
@@ -19,32 +19,25 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Standard black frame JPEG placeholder (JFIF 1x1 black pixel) used strictly when stream goes stale
-STALE_MASK_JPEG = (
-    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb\x00C\x00\x08\x06\x06"
-    b"\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a"
-    b"\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01"
-    b"\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00"
-    b"?\x00\xbf\x80\xff\xd9"
-)
+MAX_CAMERA_JPEG_BYTES = 128 * 1024
 
 LeaseReleaseCallback = Callable[[str, str], None]
 
 
 class FrameCapturePipeline:
-    """Frame capture pipeline coordinating real hardware sensor input or explicit simulation."""
+    """Frame capture pipeline for an attached physical camera source."""
 
-    def __init__(self, fps: float = 10.0, allow_synthetic: bool = True) -> None:
+    def __init__(self, fps: float = 10.0, allow_synthetic: bool = False) -> None:
         self.fps = max(1.0, min(30.0, fps))
-        self.allow_synthetic = allow_synthetic
+        # Kept as an ignored compatibility argument. A synthetic frame must
+        # never be presented as a camera result, even in local configuration.
+        self.allow_synthetic = False
         self._interval = 1.0 / self.fps
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._current_pan = 90.0
         self._current_tilt = 120.0
-        self._frame_counter = 0
         self._consumer: Optional[Callable[[bytes, bool], None]] = None
         self._frame_source: Optional[Callable[[], Optional[bytes]]] = None
 
@@ -78,31 +71,6 @@ class FrameCapturePipeline:
             self._current_pan = max(0.0, min(180.0, pan))
             self._current_tilt = max(100.0, min(140.0, tilt))
 
-    def _generate_dynamic_jpeg(self) -> bytes:
-        """Generates dynamic JPEG placeholder ONLY when synthetic frames are explicitly permitted."""
-        now = time.time()
-        self._frame_counter += 1
-        comment = f"DeskAgent R1 Camera | seq={self._frame_counter} | t={now:.4f} | pan={self._current_pan:.1f} | tilt={self._current_tilt:.1f}".encode("utf-8")
-        com_len = len(comment) + 2
-        com_marker = b"\xff\xfe" + com_len.to_bytes(2, "big") + comment
-
-        soi_app0 = (
-            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00"
-            b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a"
-            b"\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342"
-        )
-        sof0 = b"\xff\xc0\x00\x0b\x08\x00\x40\x00\x40\x01\x01\x11\x00"
-        dht = (
-            b"\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00"
-            b"\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b"
-        )
-        scan_data = (
-            b"\xff\xda\x00\x08\x01\x01\x00\x00?\x00"
-            + bytes([(self._frame_counter + i * 7) & 0x7F for i in range(16)])
-            + b"\xff\xd9"
-        )
-        return soi_app0 + com_marker + sof0 + dht + scan_data
-
     def _capture_loop(self) -> None:
         while self._running:
             try:
@@ -115,10 +83,6 @@ class FrameCapturePipeline:
                             is_hw = True
                     except Exception as src_err:
                         logger.debug("Hardware frame source error: %s", src_err)
-
-                if not frame and self.allow_synthetic:
-                    frame = self._generate_dynamic_jpeg()
-                    is_hw = False
 
                 if frame is not None and self._consumer and self._running:
                     try:
@@ -143,7 +107,9 @@ class CameraViewerService:
         self.stale_threshold_ms = stale_threshold_ms
         self.on_lease_released = on_lease_released
         self.auto_start_pipeline = auto_start_pipeline
-        self.allow_synthetic = allow_synthetic
+        # Keep the old config attribute for callers, but synthetic output is
+        # intentionally disabled regardless of configuration.
+        self.allow_synthetic = False
 
         self._lock = threading.RLock()
         self._active_lease_owner: Optional[str] = None
@@ -154,7 +120,7 @@ class CameraViewerService:
         self._latest_frame_time: float = 0.0
         self._frame_seq: int = 0
         self._is_hardware_frame: bool = False
-        self.pipeline = FrameCapturePipeline(fps=10.0, allow_synthetic=allow_synthetic)
+        self.pipeline = FrameCapturePipeline(fps=10.0, allow_synthetic=False)
 
     def update_motion_coordinates(self, pan: float, tilt: float) -> None:
         """Updates gimbal pan/tilt overlay on the active camera feed."""
@@ -189,24 +155,17 @@ class CameraViewerService:
         duration = (lease_ms or self.default_lease_ms) / 1000.0
         now = time.time()
 
+        expired_owner = None
         with self._lock:
-            # Check if active lease held by another client
+            expired_owner = self._expire_lease_locked(now)
             if self._active_lease_owner and self._active_lease_owner != client_id:
-                if now < self._lease_expires_at:
-                    return {
-                        "granted": False,
-                        "reason": "RESOURCE_BUSY",
-                        "current_owner": self._active_lease_owner,
-                        "remaining_ms": int((self._lease_expires_at - now) * 1000),
-                    }
-                else:
-                    # Previous lease expired, trigger teardown callback for previous owner
-                    prev_owner = self._active_lease_owner
-                    self._active_lease_owner = None
-                    self.pipeline.stop()
-                    self._trigger_teardown(prev_owner, "expired")
+                return {
+                    "granted": False,
+                    "reason": "RESOURCE_BUSY",
+                    "current_owner": self._active_lease_owner,
+                    "remaining_ms": int((self._lease_expires_at - now) * 1000),
+                }
 
-            # Grant lease or renew
             self._active_lease_owner = client_id
             self._lease_expires_at = now + duration
 
@@ -214,11 +173,7 @@ class CameraViewerService:
                 self.pipeline.fps = max(0.5, min(30.0, float(target_fps)))
                 self.pipeline._interval = 1.0 / self.pipeline.fps
 
-            # Start active capture pipeline if configured
-            if self.auto_start_pipeline:
-                self.pipeline.start(self.push_frame)
-
-            return {
+            result = {
                 "granted": True,
                 "client_id": client_id,
                 "lease_id": f"lease-{client_id}",
@@ -226,6 +181,13 @@ class CameraViewerService:
                 "expires_at": self._lease_expires_at,
                 "target_fps": self.pipeline.fps,
             }
+
+        if expired_owner:
+            self.pipeline.stop()
+            self._trigger_teardown(expired_owner, "expired")
+        if self.auto_start_pipeline:
+            self.pipeline.start(self.push_frame)
+        return result
 
     def release_lease(self, client_id: str) -> bool:
         """Explicitly releases camera viewing lease."""
@@ -235,26 +197,33 @@ class CameraViewerService:
                 self._active_lease_owner = None
                 self._lease_expires_at = 0.0
                 self._latest_jpeg = None
-                self.pipeline.stop()
-                self._trigger_teardown(owner, "explicit_release")
-                return True
-            return False
+                self._is_hardware_frame = False
+            else:
+                return False
+        self.pipeline.stop()
+        self._trigger_teardown(owner, "explicit_release")
+        return True
 
     def is_lease_valid(self) -> bool:
         """Checks if current camera lease is valid and active."""
         with self._lock:
-            if not self._active_lease_owner:
-                return False
-            now = time.time()
-            if now >= self._lease_expires_at:
-                owner = self._active_lease_owner
-                self._active_lease_owner = None
-                self._lease_expires_at = 0.0
-                self._latest_jpeg = None
-                self.pipeline.stop()
-                self._trigger_teardown(owner, "expired")
-                return False
-            return True
+            owner = self._expire_lease_locked(time.time())
+            valid = self._active_lease_owner is not None
+        if owner:
+            self.pipeline.stop()
+            self._trigger_teardown(owner, "expired")
+        return valid
+
+    def _expire_lease_locked(self, now: float) -> Optional[str]:
+        """Clears expired owner/frame state; caller performs teardown after unlock."""
+        if self._active_lease_owner and now >= self._lease_expires_at:
+            owner = self._active_lease_owner
+            self._active_lease_owner = None
+            self._lease_expires_at = 0.0
+            self._latest_jpeg = None
+            self._is_hardware_frame = False
+            return owner
+        return None
 
     def _trigger_teardown(self, owner: str, reason: str) -> None:
         if self.on_lease_released:
@@ -268,8 +237,17 @@ class CameraViewerService:
         Receives captured JPEG frame from device hardware or fallback pipeline.
         Only stores the latest frame if an active lease exists.
         """
+        if not isinstance(jpeg_data, bytes) or not (4 <= len(jpeg_data) <= MAX_CAMERA_JPEG_BYTES):
+            logger.warning("Rejected camera payload with invalid size/type")
+            return
+        if jpeg_data[:2] != b"\xff\xd8" or jpeg_data[-2:] != b"\xff\xd9":
+            logger.warning("Rejected camera payload without JPEG SOI/EOI markers")
+            return
+
+        if not self.is_lease_valid():
+            return
         with self._lock:
-            if self.is_lease_valid():
+            if self._active_lease_owner and time.time() < self._lease_expires_at:
                 # Never let a synthetic frame overwrite a non-stale live hardware frame
                 if not is_hardware and getattr(self, "_is_hardware_frame", False) and self._latest_jpeg is not None:
                     now = time.time()
@@ -285,8 +263,10 @@ class CameraViewerService:
         Retrieves latest frame for authenticated lease owner.
         Applies stale frame masking/blanking if frame age exceeds threshold.
         """
+        if not self.is_lease_valid():
+            return None
         with self._lock:
-            if not self.is_lease_valid() or self._active_lease_owner != client_id:
+            if self._active_lease_owner != client_id or time.time() >= self._lease_expires_at:
                 return None
 
             if self._latest_jpeg is None:
@@ -297,15 +277,9 @@ class CameraViewerService:
             is_stale = age_ms > self.stale_threshold_ms
 
             if is_stale:
-                return {
-                    "frame_seq": self._frame_seq,
-                    "jpeg_data": STALE_MASK_JPEG,
-                    "frame_age_ms": age_ms,
-                    "is_stale": True,
-                    "is_masked": True,
-                    "source": "stale_mask",
-                    "is_hardware": False,
-                }
+                # A stale image is unavailable, not a usable snapshot. This
+                # prevents consumers from mistaking an old scene for live data.
+                return None
 
             is_hw = getattr(self, "_is_hardware_frame", False)
             return {
@@ -314,7 +288,7 @@ class CameraViewerService:
                 "frame_age_ms": age_ms,
                 "is_stale": False,
                 "is_masked": False,
-                "source": "hardware_sensor" if is_hw else "synthetic_pipeline",
+                "source": "hardware_sensor" if is_hw else "external_source",
                 "is_hardware": is_hw,
             }
 
@@ -329,26 +303,31 @@ class CameraViewerService:
         If no active lease is held, auto-acquires a short ephemeral lease and awaits
         a fresh frame from the capture pipeline.
         """
-        with self._lock:
-            if self.is_lease_valid():
-                # An active lease is held: caller must explicitly match the lease owner
+        acquired_ephemeral = False
+        if self.is_lease_valid():
+            with self._lock:
+                # An active lease is held: caller must explicitly match the lease owner.
                 if not client_id or client_id != self._active_lease_owner:
                     return None
                 effective_client = client_id
-            else:
-                # No active lease is held: acquire ephemeral lease
-                effective_client = client_id if client_id else "snapshot-viewer"
-                acq = self.acquire_lease(effective_client, lease_ms=auto_acquire_ms)
-                if not acq.get("granted"):
-                    return None
+        else:
+            effective_client = client_id if client_id else "snapshot-viewer"
+            acq = self.acquire_lease(effective_client, lease_ms=auto_acquire_ms)
+            if not acq.get("granted"):
+                return None
+            acquired_ephemeral = True
 
-        # Check latest frame, waiting briefly if pipeline is starting
-        frame = self.get_latest_frame(effective_client)
-        if frame is None and self.pipeline._running:
-            deadline = time.time() + 0.25
-            while time.time() < deadline:
-                time.sleep(0.02)
-                frame = self.get_latest_frame(effective_client)
-                if frame is not None:
-                    break
-        return frame
+        try:
+            # Check latest frame, waiting briefly if a physical source is starting.
+            frame = self.get_latest_frame(effective_client)
+            if frame is None and self.pipeline._running:
+                deadline = time.time() + 0.25
+                while time.time() < deadline:
+                    time.sleep(0.02)
+                    frame = self.get_latest_frame(effective_client)
+                    if frame is not None:
+                        break
+            return frame
+        finally:
+            if acquired_ephemeral:
+                self.release_lease(effective_client)

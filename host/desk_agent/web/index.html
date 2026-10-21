@@ -27,17 +27,21 @@
     <div style="display:flex; align-items:center; gap:8px;">
       <input id="tokenInput" type="password" placeholder="Access Token (局域网鉴权)" style="background:#1e293b; border:1px solid #475569; color:#f8fafc; padding:6px 10px; border-radius:4px; font-size:12px; width:160px;" />
       <button class="btn" style="padding:6px 12px; font-size:12px;" onclick="saveToken()">保存认证</button>
-      <div>状态: <span class="badge badge-green">在线 (Online)</span></div>
+      <div>相机: <span class="badge" id="cameraConnectionStatus">未连接</span></div>
     </div>
   </div>
 
   <div class="grid">
     <div class="card">
-      <h3>局域网实时摄像头与云台</h3>
+      <h3>局域网单帧摄像头与云台</h3>
       <div class="viewer">
-        <div id="videoPlaceholder">正在获取租约与摄像头画面...</div>
-        <img id="cameraFrame" style="display:none; width:100%; height:100%; object-fit:contain;" alt="Camera Stream" />
-        <div class="overlay-status" id="frameStats">FPS: -- | 延迟: -- ms | 租约: 激活</div>
+        <div id="videoPlaceholder">正在获取相机租约...</div>
+        <img id="cameraFrame" style="display:none; width:100%; height:100%; object-fit:contain;" alt="最新相机单帧" />
+        <div class="overlay-status" id="frameStats">租约: 等待 | 相机: 不可用</div>
+      </div>
+      <div style="display:flex; gap:8px; margin-top:10px;">
+        <button class="btn" id="refreshCamera" onclick="refreshSnapshot()" disabled>拍摄新单帧</button>
+        <button class="btn btn-stop" id="closeCamera" onclick="releaseCameraLease()" disabled>关闭查看并释放租约</button>
       </div>
       <div class="controls">
         <div></div>
@@ -70,8 +74,13 @@
   <script>
     const clientId = "web-client-" + Math.random().toString(36).substring(2, 9);
     let leaseActive = false;
+    let leaseAcquired = false;
     let heartbeatTimer = null;
-    let frameTimer = null;
+    let snapshotTimer = null;
+    let frameExpiryTimer = null;
+    let snapshotInFlight = false;
+    let currentObjectUrl = null;
+    let lastFrameSeq = null;
     let currentPan = 90;
     let currentTilt = 120;
 
@@ -97,10 +106,11 @@
       acquireCameraLease();
     }
 
-    async function rpcCall(operation, args = {}) {
+    async function rpcCall(operation, args = {}, keepalive = false) {
       try {
         const resp = await fetch("/api/rpc", {
           method: "POST",
+          keepalive,
           headers: getAuthHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             schema_version: "1.0.0",
@@ -126,97 +136,140 @@
       const res = await rpcCall("resource.camera.acquire", { client_id: clientId, lease_duration_ms: 10000 });
       if (res.status === "succeeded" && res.result && res.result.granted) {
         leaseActive = true;
-        document.getElementById("frameStats").innerText = "租约: 激活 (Active) | 帧率: 连接中";
-        startPolling();
+        leaseAcquired = true;
+        document.getElementById("refreshCamera").disabled = false;
+        document.getElementById("closeCamera").disabled = false;
+        document.getElementById("cameraConnectionStatus").innerText = "等待首帧";
+        document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 等待真实 JPEG";
+        startSnapshotLoop();
       } else {
         leaseActive = false;
+        leaseAcquired = false;
         const reason = res.error ? res.error.message : (res.result ? res.result.reason : "未知错误");
-        document.getElementById("videoPlaceholder").innerText = "无法获取租约: " + reason;
+        hideFrame("无法获取相机租约: " + reason);
         document.getElementById("frameStats").innerText = "租约: 被拒绝 (" + reason + ")";
+        document.getElementById("cameraConnectionStatus").innerText = "不可用";
       }
     }
 
     async function releaseCameraLease() {
-      if (leaseActive) {
-        await rpcCall("resource.camera.release", { client_id: clientId });
-        leaseActive = false;
-        clearInterval(heartbeatTimer);
-        clearInterval(frameTimer);
-        const img = document.getElementById("cameraFrame");
-        img.style.display = "none";
-        const placeholder = document.getElementById("videoPlaceholder");
-        placeholder.style.display = "block";
-        placeholder.innerText = "查看会话已关闭";
-        document.getElementById("frameStats").innerText = "租约: 已释放";
+      const hadLease = leaseAcquired;
+      leaseActive = false;
+      leaseAcquired = false;
+      clearInterval(heartbeatTimer);
+      clearTimeout(snapshotTimer);
+      clearTimeout(frameExpiryTimer);
+      document.getElementById("refreshCamera").disabled = true;
+      document.getElementById("closeCamera").disabled = true;
+      hideFrame("查看已关闭，相机不可用");
+      document.getElementById("frameStats").innerText = "租约: 已释放";
+      document.getElementById("cameraConnectionStatus").innerText = "已断开";
+      if (hadLease) await rpcCall("resource.camera.release", { client_id: clientId }, true);
+    }
+
+    function hideFrame(message) {
+      clearTimeout(frameExpiryTimer);
+      const img = document.getElementById("cameraFrame");
+      img.style.display = "none";
+      img.removeAttribute("src");
+      if (currentObjectUrl) {
+        URL.revokeObjectURL(currentObjectUrl);
+        currentObjectUrl = null;
+      }
+      const placeholder = document.getElementById("videoPlaceholder");
+      placeholder.style.display = "block";
+      placeholder.innerText = message;
+    }
+
+    function markLeaseUnavailable(message) {
+      leaseActive = false;
+      clearInterval(heartbeatTimer);
+      clearTimeout(snapshotTimer);
+      document.getElementById("refreshCamera").disabled = true;
+      hideFrame(message);
+      document.getElementById("frameStats").innerText = "租约: 不可用 | 相机: 已断开";
+      document.getElementById("cameraConnectionStatus").innerText = "不可用";
+    }
+
+    async function refreshSnapshot() {
+      if (!leaseActive || snapshotInFlight) return;
+      snapshotInFlight = true;
+      clearTimeout(snapshotTimer);
+      const button = document.getElementById("refreshCamera");
+      button.disabled = true;
+      try {
+        const url = "/api/camera/snapshot?client_id=" + encodeURIComponent(clientId) + "&t=" + Date.now();
+        const resp = await fetch(url, { headers: getAuthHeaders(), cache: "no-store" });
+        if (!leaseActive) return;
+        if (resp.status === 200) {
+          const source = resp.headers.get("X-Frame-Source") || "unknown";
+          const isHardware = resp.headers.get("X-Frame-Hardware") === "1";
+          const ageMs = Number(resp.headers.get("X-Frame-Age-Ms"));
+          const frameSeq = resp.headers.get("X-Frame-Seq") || "--";
+          const blob = await resp.blob();
+          if (!isHardware || source !== "hardware_sensor" || !Number.isFinite(ageMs) || ageMs > 2000 || blob.type !== "image/jpeg") {
+            hideFrame("相机不可用：没有新鲜的硬件 JPEG");
+            document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 无新鲜硬件帧";
+            document.getElementById("cameraConnectionStatus").innerText = "不可用";
+            return;
+          }
+          try {
+            const decoded = await createImageBitmap(blob);
+            decoded.close();
+          } catch (decodeError) {
+            hideFrame("相机不可用：收到的 JPEG 无法解码");
+            document.getElementById("cameraConnectionStatus").innerText = "不可用";
+            return;
+          }
+          if (!leaseActive) return;
+          hideFrame("正在显示最新硬件帧...");
+          currentObjectUrl = URL.createObjectURL(blob);
+          const img = document.getElementById("cameraFrame");
+          img.src = currentObjectUrl;
+          img.style.display = "block";
+          document.getElementById("videoPlaceholder").style.display = "none";
+          lastFrameSeq = frameSeq;
+          document.getElementById("frameStats").innerText = `租约: 激活 | 帧序号: #${frameSeq} | 新鲜度: ${ageMs} ms`;
+          document.getElementById("cameraConnectionStatus").innerText = "已连接";
+          frameExpiryTimer = setTimeout(() => {
+            if (leaseActive && lastFrameSeq === frameSeq) {
+              hideFrame("画面已过期，等待下一张新帧...");
+              document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 等待新帧";
+              document.getElementById("cameraConnectionStatus").innerText = "等待新帧";
+            }
+          }, Math.max(0, 2000 - ageMs));
+        } else if (resp.status === 401) {
+          markLeaseUnavailable("401 未授权：请检查 Access Token");
+        } else {
+          const errorBody = await resp.json().catch(() => ({}));
+          const reason = errorBody.error || `HTTP ${resp.status}`;
+          hideFrame(`相机不可用：${reason}`);
+          document.getElementById("frameStats").innerText = `租约: ${leaseActive ? "激活" : "不可用"} | 相机: ${reason}`;
+          document.getElementById("cameraConnectionStatus").innerText = "不可用";
+          if (resp.status === 403 && reason !== "NO_ACTIVE_LEASE") markLeaseUnavailable(`相机租约不可用：${reason}`);
+        }
+      } catch (e) {
+        console.error("Snapshot request failed:", e);
+        hideFrame("相机不可用：Host 连接中断，等待恢复");
+        document.getElementById("frameStats").innerText = "租约: 等待恢复 | 相机: 不可用";
+        document.getElementById("cameraConnectionStatus").innerText = "连接中断";
+      } finally {
+        snapshotInFlight = false;
+        button.disabled = !leaseActive;
+        if (leaseActive) snapshotTimer = setTimeout(refreshSnapshot, 5000);
       }
     }
 
-    function startPolling() {
+    function startSnapshotLoop() {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
-      if (frameTimer) clearInterval(frameTimer);
-
-      // Heartbeat lease renewal every 5 seconds
       heartbeatTimer = setInterval(async () => {
         if (!leaseActive) return;
         const res = await rpcCall("resource.camera.acquire", { client_id: clientId, lease_duration_ms: 10000 });
         if (res.status !== "succeeded" || !res.result || !res.result.granted) {
-          leaseActive = false;
-          clearInterval(frameTimer);
-          const img = document.getElementById("cameraFrame");
-          img.style.display = "none";
-          const placeholder = document.getElementById("videoPlaceholder");
-          placeholder.style.display = "block";
-          placeholder.innerText = "租约失效已断开";
-          document.getElementById("frameStats").innerText = "租约续订失败，已断开";
+          markLeaseUnavailable("相机租约续订失败");
         }
       }, 5000);
-
-      // Active live frame retrieval (5 fps)
-      frameTimer = setInterval(async () => {
-        if (!leaseActive) return;
-        try {
-          const t0 = performance.now();
-          const resp = await fetch("/api/camera/frame?client_id=" + clientId, {
-            headers: getAuthHeaders()
-          });
-          if (resp.status === 200) {
-            const blob = await resp.blob();
-            const latency = Math.round(performance.now() - t0);
-            const frameSeq = resp.headers.get("X-Frame-Seq") || "--";
-            const source = resp.headers.get("X-Frame-Source") || "hardware";
-            const isHw = resp.headers.get("X-Frame-Hardware") === "1";
-            const sourceLabel = isHw ? "硬件传感器 (Hardware)" : (source === "stale_mask" ? "已遮罩 (Stale Masked)" : "合成通道 (Synthetic)");
-
-            const img = document.getElementById("cameraFrame");
-            const placeholder = document.getElementById("videoPlaceholder");
-            img.src = URL.createObjectURL(blob);
-            img.style.display = "block";
-            placeholder.style.display = "none";
-            document.getElementById("frameStats").innerText = `租约: 激活 (Active) | 帧序号: #${frameSeq} | 来源: ${sourceLabel} | 延迟: ${latency} ms`;
-          } else if (resp.status === 204 || resp.status === 404) {
-            // Lease is valid but camera has not captured a frame yet
-            const placeholder = document.getElementById("videoPlaceholder");
-            placeholder.style.display = "block";
-            placeholder.innerText = "租约已激活，等待摄像头首帧采集...";
-            document.getElementById("frameStats").innerText = "租约: 激活 (Active) | 等待首帧采集";
-          } else if (resp.status === 401) {
-            leaseActive = false;
-            clearInterval(frameTimer);
-            document.getElementById("videoPlaceholder").innerText = "⚠️ 401 未授权：请在右上角输入合法的 Access Token 并保存认证";
-          } else if (resp.status === 403) {
-            leaseActive = false;
-            clearInterval(frameTimer);
-            const img = document.getElementById("cameraFrame");
-            img.style.display = "none";
-            const placeholder = document.getElementById("videoPlaceholder");
-            placeholder.style.display = "block";
-            placeholder.innerText = "无有效租约，画面已遮盖";
-            document.getElementById("frameStats").innerText = "租约已过期或被抢占";
-          }
-        } catch (e) {
-          console.error("Frame pull error:", e);
-        }
-      }, 200);
+      refreshSnapshot();
     }
 
     async function sendMotion(action) {
@@ -236,7 +289,7 @@
       console.log("Motion response:", res);
     }
 
-    // Auto-acquire on load and release on unload
+    // Auto-acquire on load and release the lease when the page is hidden/closed.
     window.addEventListener("load", () => {
       const savedToken = localStorage.getItem("desk_agent_token");
       if (savedToken) {
@@ -244,7 +297,7 @@
       }
       acquireCameraLease();
     });
-    window.addEventListener("beforeunload", releaseCameraLease);
+    window.addEventListener("pagehide", () => { releaseCameraLease(); });
   </script>
 </body>
 </html>
