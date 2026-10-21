@@ -123,6 +123,18 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn("Body emergency stop failed: rc=%d", body)
         self.assertIn("physical stop is unconfirmed", body)
 
+    def test_cli_rejects_truncated_lines_and_ignored_extra_arguments(self) -> None:
+        execute = self.source.split("int desk_cli_exec(const char *cmd_line)\n{", 1)[1].split(
+            "void desk_cli_echo(", 1
+        )[0]
+
+        self.assertIn("command_length >= CLI_LINE_MAX_LEN", execute)
+        self.assertIn("Command rejected: input exceeds %u bytes", execute)
+        self.assertIn("maximum %u arguments supported", execute)
+        self.assertIn("if (*p)", execute)
+        self.assertLess(execute.index("command_length >= CLI_LINE_MAX_LEN"), execute.index("strncpy("))
+        self.assertLess(execute.index("maximum %u arguments supported"), execute.index("/* Find command */"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -560,7 +560,14 @@ static void cmd_wifi(int argc, char *argv[])
 
 int desk_cli_exec(const char *cmd_line)
 {
-    if (!cmd_line || strlen(cmd_line) == 0) return 0;
+    if (!cmd_line) return 0;
+
+    size_t command_length = strlen(cmd_line);
+    if (command_length == 0) return 0;
+    if (command_length >= CLI_LINE_MAX_LEN) {
+        printf("Command rejected: input exceeds %u bytes.\r\n", (unsigned)(CLI_LINE_MAX_LEN - 1));
+        return -1;
+    }
 
     char line_copy[CLI_LINE_MAX_LEN];
     strncpy(line_copy, cmd_line, sizeof(line_copy) - 1);
@@ -582,6 +589,11 @@ int desk_cli_exec(const char *cmd_line)
             *p++ = '\0';
             while (*p && isspace((unsigned char)*p)) p++;
         }
+    }
+
+    if (*p) {
+        printf("Command rejected: maximum %u arguments supported.\r\n", (unsigned)CLI_MAX_ARGS);
+        return -1;
     }
 
     if (argc == 0) return 0;
