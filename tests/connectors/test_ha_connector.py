@@ -104,6 +104,27 @@ class TestHAConnector(unittest.TestCase):
         self.assertTrue(ha.is_domain_allowed("light.bedroom"))
         self.assertFalse(ha.is_domain_allowed("switch.heater"))
 
+    def test_hard_denied_domains_cannot_be_reenabled_by_configuration(self) -> None:
+        """Safety domains stay blocked even when an app config allowlists their domain and service."""
+        for domain, entity_id, action in (
+            ("lock", "lock.front_door", "unlock"),
+            ("alarm_control_panel", "alarm_control_panel.house", "alarm_disarm"),
+            ("camera", "camera.front_door", "turn_on"),
+            ("update", "update.firmware", "install"),
+        ):
+            with self.subTest(domain=domain):
+                ha = HAConnector(
+                    allowed_domains=[domain],
+                    allowed_services=[f"{domain}.{action}"],
+                    mock_mode=True,
+                )
+                self.assertFalse(ha.is_domain_allowed(entity_id))
+                self.assertFalse(ha.is_entity_allowed(entity_id))
+                with self.assertRaises(PermissionError):
+                    ha.get_state(entity_id)
+                with self.assertRaises(PermissionError):
+                    ha.execute(entity_id, action)
+
     def test_denied_entities_enforcement(self) -> None:
         ha = HAConnector(
             base_url="http://localhost:8123",
@@ -626,6 +647,58 @@ class TestHAConnector(unittest.TestCase):
             sent = [json.loads(message) for message in connected_ws.sent]
             self.assertEqual(sent[0]["type"], "auth")
             self.assertEqual(sent[-1]["type"], "subscribe_events")
+        finally:
+            stop_sub()
+            ha.close()
+
+    def test_websocket_reconnect_reconciliation_notifies_missed_state_changes(self) -> None:
+        """A state change during a short outage is delivered when the authoritative snapshot is reconciled."""
+        connected_ws = MockWebSocketClient([
+            json.dumps({"type": "auth_required", "ha_version": "2026.10"}),
+            json.dumps({"type": "auth_ok", "ha_version": "2026.10"}),
+            json.dumps({"id": 1, "type": "result", "success": True, "result": None}),
+        ])
+        state = {"value": "off"}
+        first_state_read = threading.Event()
+        first_ws_attempt = threading.Event()
+        attempts = 0
+        delivered: list[tuple[str, Optional[str], Optional[str]]] = []
+        delivered_event = threading.Event()
+
+        def ws_factory(url: str) -> MockWebSocketClient:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_ws_attempt.set()
+                raise ConnectionError("simulated brief HA outage")
+            return connected_ws
+
+        def transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "GET":
+                first_state_read.set()
+                return 200, [{"entity_id": "light.desk", "state": state["value"]}]
+            return 200, []
+
+        def on_change(entity_id: str, old_state: Optional[str], new_state: Optional[str]) -> None:
+            delivered.append((entity_id, old_state, new_state))
+            if (entity_id, old_state, new_state) == ("light.desk", "off", "on"):
+                delivered_event.set()
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            transport=transport,
+            ws_factory=ws_factory,
+        )
+        stop_sub = ha.subscribe_state_changes(on_change, interval_sec=60)
+        try:
+            self.assertTrue(first_ws_attempt.wait(timeout=1))
+            self.assertTrue(first_state_read.wait(timeout=1))
+            # The long polling interval makes this transition occur between the
+            # outage snapshot and WebSocket reconnection.
+            state["value"] = "on"
+            self.assertTrue(delivered_event.wait(timeout=3))
+            self.assertIn(("light.desk", "off", "on"), delivered)
         finally:
             stop_sub()
             ha.close()

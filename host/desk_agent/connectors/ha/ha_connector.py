@@ -236,7 +236,10 @@ class HAConnector:
         if not isinstance(entity_id, str) or not ENTITY_ID_REGEX.match(entity_id):
             return False
         domain = entity_id.split(".", 1)[0]
-        return domain in self.allowed_domains
+        # These domains are hard safety exclusions. A deployment allowlist may
+        # narrow ordinary domains, but must not re-enable locks, alarms,
+        # cameras, or update entities through configuration.
+        return domain not in DEFAULT_DENIED_DOMAINS and domain in self.allowed_domains
 
     def is_entity_allowed(self, entity_id: str) -> bool:
         """Enforces domain-level allowlist, entity-level allowlist, and entity-level denylist."""
