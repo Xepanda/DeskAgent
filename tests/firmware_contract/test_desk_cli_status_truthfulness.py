@@ -98,6 +98,22 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn("DESK_MOTION_TILT_MIN_DEG", motion)
         self.assertIn("DESK_MOTION_TILT_MAX_DEG", motion)
 
+    def test_body_move_uses_hal_internal_motion_arbitration(self) -> None:
+        cli_body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",
+                                 "static void cmd_peripherals(int argc, char *argv[])\n{")
+        hardware = HARDWARE_C.read_text(encoding="utf-8")
+        motion = hardware.split("int desk_hardware_motion_move_to(", 1)[1].split(
+            "int desk_hardware_motion_stop(", 1
+        )[0]
+
+        self.assertIn("desk_hardware_motion_move_to(pan, tilt, duration_ms)", cli_body)
+        self.assertIn("desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL)", motion)
+        self.assertIn("desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE, 50)", motion)
+        self.assertIn("current != DESK_OWNER_SDK_REMOTE && current != DESK_OWNER_TCLAW_VOICE", motion)
+        self.assertIn("desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SDK_REMOTE)", motion)
+        self.assertLess(motion.index("desk_arbiter_acquire("), motion.index("result = s_board_driver_ops->motion_move"))
+        self.assertLess(motion.index("result = s_board_driver_ops->motion_move"), motion.index("if (need_release)"))
+
     def test_body_stop_remains_emergency_and_reports_driver_failure(self) -> None:
         body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",
                              "static void cmd_peripherals(int argc, char *argv[])\n{")
