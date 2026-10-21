@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.33.0
+> 文档版本：V3.34.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
 > 状态：**2026-10-22 最新只读 COM21 日志约 32 秒仅见 transport connected 与每 10 秒 heap/PSRAM 事件（heap 22335 bytes、PSRAM 7074160 bytes）；`--no-raw` 未落盘原始字节，也未见 WakeNet/KWS/ASR/TTS。用户现场确认设备现在可唤醒并对话，按单项 L3 用户观察记录；日志未提供模型/识别/会话/多轮/播放细节，不构成语音 L4。设备仍运行上次 app-only 镜像（SHA-256 `2308F...`）。隔离 worktree 的 camera/board C source objects 在 Ninja `[250/294]`、`[251/294]` 编译成功，但整体构建仍因 `app_main.c.o` 阶段缺少 ignored `main/include/tuya_config_secrets.h` 而失败；未完成全量 link、未产出本轮可烧录 bin、未刷机，未复制或读取凭据。STM32 peer/ACK 与相机 JPEG 仍 UNKNOWN/未通过，整机 L4 未完成。PR #14 仍 open、未合并；COM20 未触碰。**
+> V3.34.0 变更：补录真实默认模型 app-server 任务（未传模型参数，服务端完成，SQLite model 为 NULL，隔离 workspace 产物精确匹配）作为 Companion 本地节点 L3；明确不代表设备回传或动作。更新 A5 timeout recovery/notification race 后 `tests/companion` 56 passed、三套件合计 63 passed/2 subtests 的 L2 结果。将超时状态标为持久化 `start_unknown` 并可由 `resume` 协调（L2；no-turn 仍 pending），修正 orphan risk 无人管理的过时措辞；本次真实任务未触发 timeout。保持真实设备回传未验。
 > V3.33.0 变更：更新 A2 Runtime+C interop（13 passed）与 WebSocket source（8 passed）L2 证据；更新 A5 timeout recovery/notification race 修复后 56 passed（L2，不代表本次修复经真实 app-server 或设备回传验收）；记录 A4 live HA 尚未在 Windows 开发机实测、只读 runbook 需在泰山派执行；将用户现场“现在可以唤醒对话了”记为单项 L3 用户确认，同时保留最新串口日志未见唤醒/识别/播报事件及缺详细会话/多轮日志的边界。另录隔离固件构建中 camera/board source object 单项编译 L2 成功，但整体构建仍失败；新增回归不计入早前 166/13 组合数。PR #14 仍 open、未合并。
 > V3.32.0 变更：补录 managed isolated worktree 固件构建日志：CMake configure 成功，Ninja 运行至 `[243/294]` `app_main.c.o` 编译阶段，因 checkout 缺少 ignored `main/include/tuya_config_secrets.h` 而失败；未复制/读取凭据、未产出本轮可烧录 bin、未刷机。将此失败与此前 Ninja `failed recompaction: Permission denied` 记录分开保留。
 > V3.31.0 变更：补录 A5 真实 app-server `thread/resume` 对隔离非终态任务的恢复对账 smoke（Companion 本地服务恢复 L3，不代表设备回传），并记录超时 `thread/start` 可能留下无 SQLite 任务行的 orphan thread 风险；补录官方 SDK Runtime WSL 测试 12 passed、1 deselected，其中 C client/media/reconnect 端到端测试因导入 Windows Pillow `.pyd` 失败而阻塞；另行记录 STM32 CLI 软件修复 26 passed。新增/补充的 26 项与 SDK 12 项均不计入 V3.30 的 166 passed、13 subtests 原组合回归。代码已推送至仍 open、未合并的 PR #14（head `8a81fef`）；本轮 image 未刷入设备。保持设备语音、相机 JPEG、STM32 实物动作与整机 L4 未通过/未验证。
@@ -55,7 +56,7 @@
 | 官方 Python SDK | **L1 契约；L2 Runtime+C interop 与 WebSocket source 测试通过；真机 Runtime L3 未验证** | 本轮 WSL `test_official_sdk_runtime_compat.py` **13 passed**（包含 Runtime+C interop）；WebSocket source suite **8 passed**。均为软件/源码测试，未由未修改官方 SDK 完成真机发现、配对、HardwareHello、命令、媒体与断线重连。该结果不计入此前 166/13 组合回归 | 用未修改官方 SDK 连真机，验证错误配对拒绝、正确配对、命令/媒体与断线重连 |
 | Home Assistant | **L2 软件测试；现场 L3/L4 未验证** | 本轮 HA connector 软件测试仍为 L2。Windows 开发机没有可用 production config 或可达 HA endpoint；已补只读验证 runbook [HA live validation](ha-live-validation-runbook.md)，要求在泰山派使用现有配置验证状态发现和事件订阅。未调用 HA service，未改变 automation，也未读取/复制 token | 在泰山派按 runbook 现场执行只读发现与事件订阅；随后另行授权和验收受限 service call、物理动作、离线/超时情形 |
 | 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | 前次提醒/Core 定向套件报告 **61 passed、4 subtests passed**；本轮组合回归另覆盖 Host reminders。此前测试中两条 E2E due fixture 使用运行时近时值，DB teardown 先关闭 `LifeService`。均为软件测试，不代表真机播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
-| Windows Companion / Codex | **最新 timeout recovery/notification race 回归 L2；真实 app-server 与设备回传未验** | 最新 timeout recovery/notification race 修复后 **56 passed（L2）**。此前隔离 throwaway SQLite 的 `thread/resume` smoke（`.target_logging/a5-cancel-live-20261022/resume-audit.json`）证明当时 Companion 本地恢复逻辑，不代表本次修复经真实 app-server 复验或设备反馈。长 `thread/start` >10 秒超时且 SQLite 无任务行的 orphan thread 风险仍待解决 | 针对最新修复执行真实 app-server 非终态恢复/通知竞态 smoke；随后验证设备任务结果显示/播报与用户确认 |
+| Windows Companion / Codex | **真实默认模型 app-server 任务 L3 本地节点通过；timeout/recovery 回归 L2；设备回传未验** | `.target_logging/a5-default-model-live-20261022/final-live/result.json` 显示 `model_argument_supplied=false`、wire `turn/start` 未传 `model`、app-server completed、SQLite `model=NULL`；隔离 workspace 的 README 精确匹配预期内容，任务没有 timeout。该证据证明 Companion 本地任务调用/落盘与 workspace 结果，不证明设备回传或物理动作。timeout recovery/notification race 修复后 `tests/companion` 56 passed；超时会持久化 `start_unknown`，可由后续 `resume` 协调；若无 turn，状态仍 pending。此前 `thread/resume` audit 是另一条隔离 smoke，不替代设备反馈验收 | 覆盖真实 app-server timeout 后 `start_unknown` 经 resume reconciliation 的运行时路径；验证任务结果回到设备显示/播报并由用户确认 |
 | ESP32-S3 串口日志读取 | **L2 工具测试通过；本轮 L3 只读 UART 观测有限** | COM21 被动捕获约 32 秒，只有 transport connected 与每 10 秒 heap/PSRAM 事件（heap 22335 bytes、PSRAM 7074160 bytes）；使用 `--no-raw` 未落盘原始字节，未见 WakeNet/KWS/ASR/TTS。CR-009 将现行能力限定为 UART-only，网络日志契约未定义/不支持。详见 [CR-009](../implementation/CR-009-esp32s3-network-log-source.md) 与 [现场 Runbook](field-runbook-2026-10-21.md) | 网络日志需先经 A0 定义契约并由 A1/A7 分别实现/验收；当前仅可使用脱敏 UART 采集。完成当前镜像语音复测并记录相应事件，长稳另行验收 |
 | 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散；语音、屏幕、Codex 本机任务等是各自单项证据 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
 
@@ -119,10 +120,10 @@ V3.30 组合定向回归（WSL）保持 **166 passed、13 subtests passed**，�
 | STM32 CLI 与 body protocol 追加软件回归（独立于上述组合） | **26 passed** | A1 CLI owner 修复与 `desk_cli`、`stm32_uart`、body protocol 定向回归；属于 L2 软件证据，不证明 STM32 实机 RX/ACK、动作或故障安全停止；不计入 166/13 |
 | A2 Runtime+C interop 追加回归（独立于上述组合） | **13 passed** | WSL 软件互操作测试，L2；不计入 166/13，不代表未修改 SDK 已连接真机 |
 | A2 WebSocket source 追加回归（独立于上述组合） | **8 passed** | WSL 源码测试，L2；不计入 166/13，不代表设备 WebSocket Runtime 实测 |
-| A5 timeout recovery/notification race 追加回归（独立于上述组合） | **56 passed** | 修复后的 Companion 软件回归，L2；不计入 166/13，当前修复尚无真实 app-server 或设备回传验收 |
+| A5 timeout recovery/notification race 追加回归（独立于上述组合） | `tests/companion`: **56 passed**；加入 managed outbox delivery 与 feedback adapter 后 **63 passed、2 subtests passed** | 软件回归属 L2，不计入 166/13；真实默认模型 app-server smoke 单独为 Companion 本地节点 L3，不含设备回传 |
 | HA Connector | **37 passed、4 subtests passed** | 包含 polling subscriber callback isolation 回归；软件 connector 测试仍为 L2，没有真实 HA 会话或物理设备动作 |
 | Reminder / Core | **61 passed，4 subtests passed** | 动态提醒 fixture 覆盖 24h catch-up 策略；DB teardown 先关闭 LifeService。仍是软件验证，不代表设备播报 |
-| A5 Companion | **组合中的 27 项与最新 56 项均为 L2** | timeout recovery/notification race fix 后 56 passed；这是软件回归。此前 `inProgress` task + app-server `thread/resume` recovery audit 是早先本地服务 smoke，不作为最新修复的真实 app-server 复验，也不代表设备回传 |
+| A5 Companion | **组合中的 27 项和最新 56/63 项软件回归为 L2；默认模型真实任务为本地 L3** | 真实任务未提供模型参数，app-server 完成 turn，SQLite `model=NULL`，隔离 workspace README 精确匹配；见 `.target_logging/a5-default-model-live-20261022/final-live/result.json`。这是本地节点证据，不代表设备回传或动作。超时状态持久化为 `start_unknown`，后续 `resume` 可协调；no-turn 情况仍 pending |
 | A2 SDK | **SDK source 8 项纳入组合；Runtime+C interop 13 passed、WebSocket source 8 passed 为独立追加 L2** | 追加测试通过，但没有完成未修改官方 SDK 对真机的连接与收发；独立追加数字不计入 166/13 |
 | 更新后的跨模块定向回归 | **19 passed** | L2 软件集成；不升级为 Level 3/4 设备闭环 |
 | 全仓 pytest（WSL Python 3.12） | **550 passed、2 skipped、44 subtests passed；140.36 秒** | PR #13 合入后的全量软件回归，属 L2。两个 skip 仍按各自说明适用；这不是硬件或服务端 E2E 证据 |
