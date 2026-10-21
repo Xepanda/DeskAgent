@@ -122,6 +122,31 @@ class TestWatcherHardwareContract(unittest.TestCase):
         ]
         cls.lib.desk_watcher_camera_validate_frame.restype = ctypes.c_int
 
+        class CameraControlState(ctypes.Structure):
+            _fields_ = [
+                ("result", ctypes.c_uint32),
+                ("generation", ctypes.c_uint32),
+                ("mode", ctypes.c_uint32),
+                ("model", ctypes.c_uint32),
+                ("debug", ctypes.c_uint32),
+                ("error", ctypes.c_uint32),
+            ]
+
+        class CameraResync(ctypes.Structure):
+            _fields_ = [("bytes", ctypes.c_uint8 * 7), ("used", ctypes.c_size_t)]
+
+        cls.CameraControlState = CameraControlState
+        cls.CameraResync = CameraResync
+        cls.lib.desk_watcher_camera_parse_control_state.argtypes = [
+            ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(CameraControlState)
+        ]
+        cls.lib.desk_watcher_camera_parse_control_state.restype = ctypes.c_int
+        cls.lib.desk_watcher_camera_resync_push.argtypes = [
+            ctypes.POINTER(CameraResync), ctypes.c_uint8, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32)
+        ]
+        cls.lib.desk_watcher_camera_resync_push.restype = ctypes.c_bool
+
     def test_cobs_roundtrip_vectors(self) -> None:
         """Verifies legacy utility helpers; the STM32 UART transaction does not use COBS."""
         test_cases = [
@@ -312,6 +337,40 @@ class TestWatcherHardwareContract(unittest.TestCase):
             (ctypes.c_uint8 * 7)(*bad_size), 7, ctypes.byref(body_size)
         )
         self.assertEqual(rc_sz, -4)
+
+    def test_camera_control_status_requires_matching_request_id_and_valid_fields(self) -> None:
+        state = self.CameraControlState()
+        self.assertEqual(
+            self.lib.desk_watcher_camera_parse_control_state(
+                b"WV1 STATE 17 0 42 0 0 0 0", 17, ctypes.byref(state)
+            ),
+            0,
+        )
+        self.assertEqual((state.generation, state.mode, state.model, state.error), (42, 0, 0, 0))
+        self.assertNotEqual(
+            self.lib.desk_watcher_camera_parse_control_state(
+                b"WV1 STATE 18 0 42 0 0 0 0", 17, ctypes.byref(state)
+            ),
+            0,
+        )
+        self.assertNotEqual(
+            self.lib.desk_watcher_camera_parse_control_state(
+                b"WV1 STATE 17 0 42 9 0 0 0", 17, ctypes.byref(state)
+            ),
+            0,
+        )
+
+    def test_camera_ptl_resync_finds_header_across_byte_boundaries(self) -> None:
+        scanner = self.CameraResync()
+        body_size = ctypes.c_uint32(0)
+        header = b"\xC0\x5A\x01" + struct.pack("<I", 1024)
+        found = False
+        for byte in b"noise" + header:
+            found = self.lib.desk_watcher_camera_resync_push(
+                ctypes.byref(scanner), byte, 128 * 1024, ctypes.byref(body_size)
+            )
+        self.assertTrue(found)
+        self.assertEqual(body_size.value, 1024)
 
     def test_camera_ptl_frame_assembly_and_crc32(self) -> None:
         """Verifies complete PTL Media Header validation, CRC32, and JPEG extraction."""

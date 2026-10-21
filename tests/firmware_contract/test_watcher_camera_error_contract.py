@@ -34,7 +34,7 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
         for diagnostic in (
             "SYNC read failed",
             "SYNC timeout",
-            "PTL empty response",
+            "PTL empty FIFO poll",
             "PTL header rejected",
             "CRC mismatch",
             "SPI PTL header transfer failed",
@@ -46,10 +46,32 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
     def test_zero_ptl_header_has_distinct_empty_error_and_spi_failures_keep_stage(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
-        self.assertIn("if (header_or == 0)", capture)
-        self.assertIn("return DESK_WATCHER_CAMERA_ERR_EMPTY", capture)
-        self.assertIn("return DESK_WATCHER_CAMERA_ERR_SPI", capture)
-        self.assertGreaterEqual(capture.count("return DESK_WATCHER_CAMERA_ERR_SPI"), 2)
+        self.assertIn("if (header_or != 0) break", capture)
+        self.assertIn("CAM_PTL_EMPTY_RETRY_LIMIT", capture)
+        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", capture)
+        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI)", capture)
+        self.assertGreaterEqual(capture.count("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI)"), 2)
+
+    def test_hx_uart_handshake_precedes_ready_and_capture_mode_is_restored(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        init = source.split("int desk_watcher_camera_init(", 1)[1].split("static uint32_t ptl_media_crc32", 1)[0]
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1].split("int desk_watcher_camera_deinit", 1)[0]
+        self.assertIn("UART_NUM_1", source)
+        self.assertIn("GPIO_NUM_17", source)
+        self.assertIn("GPIO_NUM_18", source)
+        self.assertIn("WATCHER_CAM_HX_UART_BAUD  921600", source)
+        self.assertIn("uart_is_driver_installed(WATCHER_CAM_HX_UART)", source)
+        self.assertLess(init.index("camera_control_init()"), init.index("s_camera_initialized = true"))
+        self.assertIn("camera_control_mode(1U, 0U)", capture)
+        self.assertIn("camera_control_mode(0U, 0U)", source)
+
+    def test_ptl_resync_is_time_and_work_bounded_and_shared_spi_is_not_freed(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        self.assertIn("CAM_PTL_RESYNC_TIMEOUT_MS 50U", source)
+        self.assertIn("CAM_PTL_RESYNC_MAX_CHUNKS 256U", source)
+        self.assertIn("n < CAM_PTL_RESYNC_MAX_CHUNKS", source)
+        self.assertIn("if (s_spi_bus_owned)", source)
+        self.assertIn("s_spi_bus_owned = err == ESP_OK", source)
 
     def test_himax_power_and_sync_guards_match_upstream_ptl_timing(self):
         source = CAMERA_C.read_text(encoding="utf-8")
