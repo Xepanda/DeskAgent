@@ -22,6 +22,9 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -176,20 +179,27 @@ class TestE2EFaultInjection(unittest.TestCase):
     # 2. Sudden Crash & SQLite WAL Durability & Reminder Catch-up
     # -------------------------------------------------------------------------
     def test_crash_recovery_and_reminder_catchup(self) -> None:
-        """Simulates abrupt process crash, verifying WAL durability and missed reminder catch-up on reboot."""
-        # Phase 1: Service instance creates recurring reminder
-        srv1 = LifeService(self.db_path)
-        rem1 = srv1.create_reminder(
-            reminder_id="rem-morning-tea",
-            title="Drink morning tea",
-            due_at="2026-10-16T08:00:00Z",
-            repeat_rule="daily",
+        """Uses os._exit in a child process to prove SQLite WAL recovery after an unclean exit."""
+        child = r"""
+import os, sys
+from host.desk_agent.services.life_service import LifeService
+service = LifeService(sys.argv[1])
+assert service._get_connection().execute('PRAGMA journal_mode').fetchone()[0].lower() == 'wal'
+service.create_reminder('rem-morning-tea', 'Drink morning tea', '2026-10-16T08:00:00Z', repeat_rule='daily')
+service.queue_outbox_message('system.log', {'event': 'service_started'})
+os._exit(0)
+"""
+        crashed = subprocess.run(
+            [sys.executable, "-c", child, str(self.db_path)],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        self.assertEqual(rem1["status"], "scheduled")
-
-        srv1.queue_outbox_message("system.log", {"event": "service_started"})
-        # Abrupt crash: terminate without clean close() or WAL checkpoint
-        del srv1
+        self.assertEqual(crashed.returncode, 0, crashed.stderr)
+        wal_path = Path(f"{self.db_path}-wal")
+        self.assertTrue(wal_path.exists(), "unclean child exit must leave an uncheckpointed WAL sidecar")
+        self.assertGreater(wal_path.stat().st_size, 0, "WAL must contain committed reminder/outbox frames")
 
         # Phase 2: Service reboots after downtime (current time is 09:30:00Z, 1.5h late)
         srv2 = LifeService(self.db_path)
