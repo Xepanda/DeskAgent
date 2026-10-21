@@ -1,20 +1,23 @@
-# Desk Agent R1 现场验收 Runbook（2026-10-21 基线）
+# Desk Agent R1 现场验收 Runbook（2026-10-22 增量基线）
 
 本 runbook 供后续 A1/A2/A3/A4/A5/A6/A7 按模块执行。记录的现场设备为 SenseCAP Watcher，串口约定 COM21；COM20 是 Himax 端口，**禁止将 COM20 用作刷机/设备控制端口**。同一时刻只允许一个操作者占用 COM21。任何刷写必须有当次明确授权，且使用已核验的 OTA application image；不得用合并 QIO 镜像写 OTA 分区，也不得用 `firmware/dist` 的旧文件替代当前归档镜像。
 
 ## 1. 当前基线和验收判定
 
-- 已有 OTA app：`firmware/.target_logging/p0-2-camera-guards-20261021/desk_agent_firmware.bin`，SHA-256 `A0ABD911C7DFD643B419674767E539DF0057CB15F5E09C1280F343BABCB375E3`。
+- 当前 camera-diagnostic OTA app：`.target_logging/camera-diagnostic-20261022/desk_agent_firmware.bin`，SHA-256 `BCDAFB90625F759C56FB8F69BBA1A9EF1CC2551DDDF295107DAB19FEAE5D6598`，1,898,096 bytes；2026-10-22 build 成功并 app-only 烧录至已从实机读取确认的 OTA0 `0x20000`，flash hash verify 成功。请勿使用 `firmware/dist` 旧产物。
+- **分区保护提示**：构建产出的 partition table 与实机分区表不一致；实机 OTA0 为 `0x20000`、6 MiB，model 为 `0xC20000`。本轮未写 partition table、bootloader 或 model。除 app-only 且地址经核对的操作外，先解决差异再操作。
 - 已恢复模型：`firmware/.build/bin/srmodels.bin`，SHA-256 `7C87DD7ADB5A7623907B6354D49BEA7F9289371262E6A57F15458FB8908C5814`。
 - 语音：本次 L3 已通过（用户确认可唤醒对话，日志有 KWS/ASR/NLG，麦克风帧持续增长且错误计数为 0）。后续重复性/恢复及 L4 全链路仍待验。
-- 相机：L3 失败。PTL 头仍为全零，未获得 JPEG；停止盲目重复采集，先观察总线信号。
-- A6 Host 相机页面：13 项测试通过（L2）；由于设备没有提供 JPEG，页面没有真实图像的 L3 证据。
-- STM32：有 2 项 raw UART 静态检查；一次交叉构建生成镜像成功，但镜像未烧录。L3 未验证，缺少接收 ACK 与实物动作证据。
-- HA：HA Connector 30 项软件测试；提醒/Host 相关测试 37 项合计，但 Reminder E2E teardown 仍见 `WinError 32`，不可记为全绿。真实用户服务/物理动作/设备播报未验证。
+- 相机：L3 失败。camera-diagnostic 固件一次真实 capture 得到 7-byte PTL header 全零、`rc=-25`、`out_len=0`，没有 JPEG；原始 COM21 捕获为 350 bytes。先观察供电/SYNC/CS/SCLK/MISO 与 HX6538 通信，不要盲目重复采集。
+- A6 Host 相机页面：自动化页面测试是 L2；A3 SDK parser/managed adapter 使用 fake context 与有效 JPEG fixture 验证，也是 L2。设备没有真实 JPEG，且未连接官方 Runtime，故 Host 到浏览器的图像链路没有 L3/L4 证据。
+- STM32：当前仅 L2 静态/软件协议证据；L3 未验证，缺少接收计数、ACK 与实物动作。
+- HA：当前仅 L2 connector 测试；没有用户现有 HA 会话或物理设备动作证据。
+- 提醒：`LifeService` 23 项和定向 reminder catch-up 1 项通过；SQLite teardown 的 `WinError 32` 修复属 L2。强制 kill 崩溃恢复、真实 Host 重启、设备到期播报/确认未验。
 - SDK bridge：5 项 source-contract 检查通过；依赖本机 GCC 的 10 项用例被 skipped，没有执行结果，不等于构建或官方 SDK 互通通过。
 - 输入/UI：9 项软件 contract 测试；滚轮和按键已有用户现场确认，详细输入事件日志待归档。
-- Codex Companion：省略模型参数的真实只读 app-server 调用通过；真实工作区修改、审批/取消/失败恢复与设备反馈未验。
-- 官方 Python SDK 互通：契约及部分适配代码不等于官方 SDK 真机互通；L3 未通过。
+- Codex Companion：真实 app-server 默认模型调用及隔离工作区修改/验证任务通过，任务记录跨 Companion 重启保留；属本机单项证据。审批/取消/失败恢复及设备触发和设备反馈未验。
+- 官方 Python SDK 互通：官方 parser 对 fixture 的 10 项互操作测试通过（L2）；pairing window CLI 曾打开/取消。真实 Runtime WebSocket 发现、配对、HardwareHello、能力注册及命令/媒体闭环未验。
+- ESP32-S3 日志：A7 logger 7 项测试通过（L2）；COM21 原始采集 350 bytes，捕获本轮相机失败日志（L3 单项观测）。采集成功不代表日志范围之外的模块正常。
 - 系统验证脚本：最近一次 `verify_all.sh` 在 Step 2 失败，Step 3–8 未运行；本轮不得报告全套门禁通过。
 
 只有结果、证据和设备反馈都满足表中门槛，才将对应能力标为通过。设备成功启动、函数返回成功、帧长度非零、HTTP 200 或 SDK 安装成功都不能单独作为该能力的通过证据。

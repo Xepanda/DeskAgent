@@ -1,34 +1,38 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.4.0
+> 文档版本：V3.6.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
-> 状态：**2026-10-21 现场增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。语音/屏幕/基础音频有真机证据；相机取帧失败；STM32 尚无实物证据；HA、提醒与 Codex 的真实业务闭环未完成。Level 3 按单项记录，Level 4 整机闭环仍未完成。**
-> V3.5.0 变更：更新本轮复核的软件测试数量与构建/实机证据；注明 `verify_all.sh` 本轮在 Step 2 失败，后续阶段未运行；保留 Reminder E2E teardown `WinError 32` 未解决状态。
+> 状态：**2026-10-22 增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。语音/屏幕/基础音频有单项真机证据；本轮相机抓帧失败，STM32 与真实 HA/官方 SDK Runtime 尚无闭环证据；Codex 和提醒仍缺设备反馈闭环。Level 3 按单项记录，Level 4 整机闭环仍未完成。**
+> V3.6.0 变更：依据 2026-10-22 最新构建、设备刷写与串口日志，更新相机 `rc=-25`/7-byte PTL 全零失败，SDK fake parser 与真实 Runtime 边界、A5 本机真实 Codex 任务、A3 reminder teardown 修复、A4/STM32 状态及 A7 串口日志工具证据；所有结论按 L1-L4 分层，不将软件或单项实测扩写为整机通过。
+> V3.5.0 历史变更：曾记录 `verify_all.sh` 在 Step 2 失败以及 Reminder E2E teardown `WinError 32`；提醒清理问题已由 V3.6.0 的显式关闭修复。该历史快照不是当前全量回归结果。
 > V3.4.0 变更：加入 2026-10-21 真实硬件状态与按功能的证据级别；新增现场 Runbook，列出相机失败定位证据、逐项后续操作、通过证据及停止条件。旧版用例数为历史快照，不作为当前全量回归声明。
 > V3.3.0 变更：新增 A7 **真实固件跨层链路**证据 `tests/e2e/test_real_firmware_motion_fault_chain.py`（在真实编译 C 驱动中注入故障，经真实 C 协议桥接 → 真实 `RobotAdapter` → 真实 `DeskAgentHostApp`，断言**最外层响应信封**；并显式区分 direct C / real C protocol / Python fake-device / 全链路四类证据）；修复 `tests/e2e/test_g1_official_sdk_and_tuya_interop.py` 的 TCP 分帧假设缺陷（新增 `_recv_line()` 跨 `recv()` 累积读取助手，替换三处单次 `recv()` 读整行）；`verify_all.sh` 阶段 5 纳入跨层链路；按实测校准全量用例数为 295 项、并按套件逐一校准（firmware_contract 30 / sdk_contract 73 / camera 9 / companion 40 / connectors 26 / core 61 / e2e 47 / 顶层 9）。  
 > V3.2.0 变更：新增 A7 跨模块 P1 回归门禁 `tests/e2e/test_p1_regression_gates.py`（PR #11 整改：驱动故障绝不伪成功、无 ACK 超时绝不报完成、乱序并发 ACK 不串线、超时后迟到 ACK 不污染新请求、真实 socket 流分帧、配对 fail-closed、Companion 局域网启动门禁、既有链路无回归）；`verify_all.sh` 由 7 阶段扩展为 8 阶段并将回归门禁纳入总控执行；校准全量用例数为实测 268 项（并发安全整改后复测）
 
 ---
 
-## 0. 当前现场验收状态（2026-10-21）
+## 0. 当前现场验收状态（2026-10-22）
 
 本节优先于文档中早期的“设备未接入/所有硬件待测”快照。只记录本轮已提供的实机日志和用户现场确认，不将软件测试扩写成硬件通过。
 
 | 功能 | 当前证据层级与状态 | 已有证据 | 缺少的验收证据 / 下一步 |
 | :--- | :--- | :--- | :--- |
+| 固件 build / flash | **L2 build 通过；L3 设备启动通过** | 2026-10-22 camera diagnostic app 构建成功并 app-only 刷入 OTA0；设备物理分区表为 OTA0 `0x20000`/6 MiB、model `0xC20000`。镜像 SHA-256 `BCDAFB90625F759C56FB8F69BBA1A9EF1CC2551DDDF295107DAB19FEAE5D6598`，大小 1,898,096 bytes；flash hash verify 成功。构建生成的 partition table 与设备实际表不一致，本次没有写入 partition table、bootloader 或 model 分区 | 归档对应启动日志和设备镜像读取校验；解决构建分区表与实机布局差异前禁止写分区表/bootloader；此项通过不代表所有功能通过 |
 | 屏幕、基础提示音 | **L3 单项通过** | 用户现场确认屏幕显示文字、扬声器提示音可听 | 归档对应固件 SHA、完整启动日志和现场记录；尚未验证长稳、并发资源仲裁 |
-| 麦克风、唤醒与对话 | **L3 单项通过（本次观测）** | COM21 记录 `wn9_nihaoxiaozhi_tts` 加载、AFE 初始化、WakeNet 检出、ASR/NLG 输出；用户确认已能唤醒并对话。模型分区恢复后音频状态记录 `mic_running=1`、PCM 帧持续增长、错误数为 0 | 在稳定的当前固件上做重复唤醒和多轮问答，归档完整日志、固件/模型 SHA 和现场听感；未验证断网恢复、长时运行或跨模块任务闭环 |
-| 滚轮、按键与状态页 | **L3 用户确认，日志证据待归档** | 用户确认滚轮和按键可用；交互约定为滚轮滚动/选择只读状态页，短按/长按沿用 TuyaOpen 语音事件 | 归档每项输入事件日志及对应 UI 页面变化；覆盖快速旋转、反向、短按、长按，不应改变语音事件语义 |
-| Himax 相机 | **L3 未通过** | 烧录后连续两次真实采集均为 `PTL header rejected: parser rc=-2 magic=0000 type=00 size=0`、`rc=-20, out_len=0`；没有得到 JPEG。时序调整后故障仍在 | 先用示波器/逻辑分析仪检查供电、SYNC、CS、SCLK、MISO；确认头字节后再导出并打开 JPEG。不得用初始化成功或模拟帧代替真实图像 |
-| STM32 / 机身动作 | **L3 未验证** | 当前没有实物 ACK/接收计数或动作观测证据；发送帧长度不能算 STM32 接收 | 先核对接线、串口参数和协议，再进行小幅动作、ACK 关联、超时安全停止和实物位置观测 |
-| 官方 Python SDK | **L1 契约有定义；L2/L3 互通未通过验收** | 已识别官方 Runtime 等待设备主动 WebSocket 连接，固件现状/适配仍需以 A2 最终实现核验 | 用未修改官方 SDK 真机发现、错误配对码拒绝、正确配对、HardwareHello、能力注册、命令/结果/媒体收发、断线重连全程留日志 |
-| Home Assistant | **L2 软件测试；L3/L4 未验证** | HA Connector 本轮复核 30 项；不代表连接了用户现有 HA 或物理设备执行 | 用真实 HA 和低风险灯/插座验证发现、受限服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
-| 提醒 / Host 服务 | **L2 软件测试；L3/L4 未验证，E2E 清理问题未解决** | 本轮 LifeService/Host daemon 相关测试 37 项合计；Reminder E2E teardown 仍出现 `WinError 32`，故不可将其报告为全绿。此结果不代表真实设备播报或现场重启恢复 | 修复/定位 Windows 测试清理时序并复跑；另在真实 Host/设备创建提醒、重启服务并观察到期、播报、确认去重；记录时区、离线错过处理和持久化状态 |
-| Windows Companion / Codex | **L3 单次服务调用通过；L4 未完成** | 省略模型参数调用 app-server 成功；Companion 16 项测试通过 | 隔离测试工程中实跑任务修改/验证、审批、失败和取消、重启恢复；将 assistant 结果送到设备显示/播报并现场确认 |
-| 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散，语音单项已真实运行 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
+| 麦克风、唤醒与对话 | **L3 单项通过（此前现场确认）** | 用户最近确认设备可唤醒并对话；此前 COM21 日志记录 `wn9_nihaoxiaozhi_tts`、AFE、WakeNet、ASR/NLG，麦克风 PCM 帧持续增长且错误数为 0。新的 camera diagnostic 固件刷写后尚未重新进行该语音场景实测 | 在当前已刷镜像上复测重复唤醒与多轮问答并归档日志/听感；断网恢复、长稳和跨模块任务闭环未验证 |
+| 滚轮、按键与状态页 | **L3 用户确认，日志证据待归档** | 用户确认滚轮和按键可用；交互约定为滚轮滚动/选择只读状态页，短按/长按沿用 TuyaOpen 语音事件 | 归档每项输入事件日志及对应 UI 页面变化；覆盖快速旋转、反向、短按、长按 |
+| Himax 相机 | **L3 失败** | 2026-10-22 真实 `camera capture` 读到 PTL 头 7 bytes 全零，底层阶段日志为 `rc=-25`，`out_len=0`；没有 JPEG。原始串口捕获 350 bytes。此前 `rc=-2` 是不同的“未初始化/SPI 缺失”错误，不能混为同一故障 | 检查实际相机供电、SYNC、CS、SCLK、MISO 波形与 HX6538 通信；修复后导出并打开现场 JPEG，重复取帧并确认无泄漏/死锁。当前 L3 不通过 |
+| 相机 SDK parser / Host adapter | **L2 fake 集成通过；L3/L4 未验证** | 测试调用固定版本官方 SDK 的 WSPK parser 和图片回调，以有效 JPEG fixture 验证适配路径；A3 Host adapter 代码/测试使用 fake managed context。未连接官方 Runtime，也未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
+| STM32 / 机身动作 | **L2 静态/软件证据；L3 未验证** | 软件协议和 source-level 检查仅属 L2；没有实物接收计数、ACK 或动作观测。发送帧长度不等于 STM32 接收 | 核对线束、串口参数、STM32 固件协议；验证小幅动作、ACK 关联、超时安全停止及实物位置反馈 |
+| 官方 Python SDK | **L1 契约；L2 parser 测试通过；真实 Runtime L3 未验证** | 官方 SDK parser 对有效 fixture 的互操作测试通过；设备侧 pairing window 命令曾现场打开/取消。官方 Runtime 的真实 WebSocket 发现、配对、HardwareHello、能力注册、命令与媒体传输均未验 | 用未修改官方 SDK 连真实设备；错误配对码必须拒绝，正确配对后记录完整连接/命令/媒体/断线重连日志 |
+| Home Assistant | **L2 软件测试；L3/L4 未验证** | HA Connector 测试仅证明软件接口行为；没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
+| 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | LifeService 23 项及提醒相关 crash-recovery 测试 1 项通过；SQLite teardown `WinError 32` 已通过显式 close 修复并在 Windows 验证立即删除 DB 文件。该结果是受控测试中的 orderly teardown/recovery，不是强杀进程后的真实崩溃验证，也不代表设备播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
+| Windows Companion / Codex | **L3 本机真实 Codex 任务通过；设备闭环 L4 未完成** | app-server 省略模型参数真实调用成功；隔离工作区任务修改 `app.py`、命令退出 0、任务状态跨 Companion 重启持久化；assistant-only 输出筛选有单测。未验证设备下达任务及设备显示/播报结果 | 实测审批、失败、取消与重启恢复，并贯通设备请求→Codex 修改隔离工程→验证→真实结果回设备显示/播报 |
+| ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 真实捕获通过** | A7 新增只读串口采集/解析工具，7 项测试通过；COM21 原始捕获 350 bytes，内含本轮相机 PTL 全零及 `rc=-25` 诊断。日志工具没有证明语音、STM32 或其他事件正常 | 归档原始日志与脱敏事件摘要；后续采集需明确端口/波特率/时间窗，并确认不会并发占用 COM21 |
+| 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散；语音、屏幕、Codex 本机任务等是各自单项证据 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
 
-### 本轮回归数字与构建状态（2026-10-21）
+### 2026-10-21 回归数字与构建状态（历史快照）
 
 | 范围 | 本轮数字/结果 | 证据边界 |
 | :--- | :--- | :--- |
@@ -48,6 +52,21 @@
 - 最新相机复测：`.target_logging/com21-camera-after-guard-flash-20261021.log`。日志显示麦克风仍运行、PCM 错误数为 0，但相机未返回图像。
 - 上述路径属于本地忽略日志归档；合入前需确认文件仍在工作站，不应假定它们会随 Git 提交或 PR 自动分发。
 
+### 2026-10-22 增量证据与复核边界
+
+| 工作包 | 本轮结果 | 证据层级 / 边界 |
+| :--- | :--- | :--- |
+| 固件 camera-diagnostic build | TuyaOpen 固件构建命令 exit code 0；归档 app 为 `.target_logging/camera-diagnostic-20261022/desk_agent_firmware.bin`，SHA-256 `BCDAFB90625F759C56FB8F69BBA1A9EF1CC2551DDDF295107DAB19FEAE5D6598` | L2 构建通过。输出 partition table 与设备实测表不同；本轮只写 app 到已核对 OTA0 `0x20000`，没有写分区表、bootloader 或 model。不可据此推断分区配置已统一 |
+| 相机错误诊断 | 烧录后一次真实 capture：7-byte PTL header 全零，`rc=-25`，`out_len=0`；没有 JPEG | L3 失败。350-byte 原始采集可用于复核；具体电气根因未确认 |
+| ESP32-S3 serial logger | `tests.e2e.test_esp32s3_log_capture`：7 tests passed；工具对 COM21 原始捕获 350 bytes 并解析相机错误事件 | 测试为 L2；串口采集本身为 L3 观测证据，不证明未出现的其他事件正常 |
+| SDK 图像 parser | `tests.sdk_contract.test_official_sdk_firmware_wspk_interop` 与 `test_wspk_framing`：10 tests passed；使用官方 SDK parser、有效 JPEG fixture | L2 fake fixture/parser interoperability；没有设备 JPEG、WebSocket 或 Runtime 会话 |
+| A3 reminder | `tests.core.test_life_service` 23 tests；crash-recovery/catchup 定向测试 1 test 通过 | L2。Windows DB teardown 修复已验证；强制 kill 的崩溃恢复及设备播报未验证 |
+| A4 HA | 既有 HA connector 软件用例通过 | L2；无真实 HA 服务会话或物理动作证据 |
+| STM32 | 现有静态/模拟协议证据 | L2；未观测到 STM32 接收、ACK 或实物动作 |
+| A5 Codex | 真实本机 app-server 调用采用默认模型成功；隔离工作区修改/验证任务完成，Companion 重启后任务记录仍在 | 本机服务/Host L3 单项；设备触发和设备结果播报仍未完成，不能评 L4 |
+
+以上是指定增量工作的记录，不是本分支全量回归结果；本轮未重新运行 `verify_all.sh`，旧测试总数仍为历史快照。
+
 ---
 
 ## 1. 证据分层标准与总体状态 (Evidence Layering)
@@ -56,7 +75,7 @@
 
 | 证据层级 | 验收范围与含义 | 当前结论 | 关键依据与测试输出 | 绝对不能代表什么 |
 | :--- | :--- | :---: | :--- | :--- |
-| **Level 1：公开源码 / 契约标准** | JSON Schema (Draft 2020-12)、25 个 fixtures、13 个稳定错误码、动态 ISO 8601 时钟契约 | **100% PASS** | `contracts/validator/validate.py` 深度校验通过 | 不能代表物理板卡具备该 capability 或在线部署成功 |
+| **Level 1：公开源码 / 契约标准** | JSON Schema (Draft 2020-12)、25 个 fixtures、13 个稳定错误码、动态 ISO 8601 时钟契约 | **契约检查通过** | `contracts/validator/validate.py` 深度校验通过 | 不能代表物理板卡具备该 capability 或在线部署成功 |
 | **Level 2：模拟 PoC / 协议对齐** | C 固件驱动报文、SDK 协议、RobotAdapter、真实 Host 进程与伪设备组成的 TCP 链路、跨模块回归、C 驱动故障跨层、Python 核心、HA/Codex 软件接口、故障注入与压力测试 | **此前快照 295 项通过；不是当前分支的全量结果** | 下方 §2 记录的是当时命令及输出；本次后续改动需重跑对应套件，必要时重跑全量 | 无法证明真机、真实 HA/SDK/Codex 业务和物理动作 |
 | **Level 3：单项硬件 / 节点实测** | ESP32-S3 语音/屏幕/输入、Himax 相机、STM32 动作、Windows Companion、真实 HA 与 Host | **部分单项通过；相机失败；STM32/真实 HA 等未验证** | 见 §0 和 [现场 Runbook](field-runbook-2026-10-21.md)；未实测项仍存在 | 单项实测不能代表系统端到端或长稳 |
 | **Level 4：端到端闭环与恢复验收** | 真实语音唤醒→外部工具/服务执行→真实结果→设备反馈，断网/服务退出/重启后恢复 | **未完成** | 当前缺少贯通真实服务动作、设备反馈及故障恢复的一条完整关联证据 | 不能代表所有未知硬件版本或生产环境 |
@@ -143,7 +162,7 @@
 ```
 - 脚本依序运行契约检查、本机 C 构建、Python 测试、真实 Host+伪设备链路、跨模块回归、部署预检和状态矩阵静态检查。它不连接硬件或真实外部服务。
 - **本轮最近一次执行在 Step 2（C 固件原生 HAL / SDK Bridge 构建）失败并退出。Step 3–8 未运行，因此本轮没有全套结果。**
-- 先前版本记录的 295 项或其他全量数均为历史快照，不作为当前分支的通过结果。当前已复核的分项数字见 §0 的“本轮回归数字与构建状态”。
+- 先前版本记录的 295 项或其他全量数均为历史快照，不作为当前分支的通过结果。2026-10-21 的分项数字见 §0 的“历史快照”表；2026-10-22 指定增量证据见同节“增量证据与复核边界”。
 - 脚本成功结束也只能表示其配置的自动化门禁通过；L3 按单项证据记录，L4 仍需真实端到端与恢复验收。
 
 ### 2.5 A7 真实链路端到端套件证据明细 (`tests/e2e/test_real_chain_tclaw_to_host.py`)
