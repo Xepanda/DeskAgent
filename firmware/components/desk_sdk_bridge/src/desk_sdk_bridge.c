@@ -60,6 +60,7 @@ static uint32_t s_last_heartbeat_time = 0;
 static char s_expected_pairing_code[8] = "";
 static bool s_pairing_code_configured = false;
 static unsigned s_pairing_failed_attempts = 0;
+static uint64_t s_pairing_code_expires_at_ms = 0;
 static pthread_mutex_t s_pairing_code_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char s_pair_request_id[33] = "";
 static char s_pair_daemon_instance_id[33] = "";
@@ -67,6 +68,33 @@ static char s_pair_target_mode[32] = "";
 static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
 static bool desk_sdk_is_lower_hex_64(const char *s);
+
+#define DESK_SDK_PAIRING_CODE_TTL_MS (5ULL * 60ULL * 1000ULL)
+
+#ifdef DESK_SDK_TESTING
+static uint64_t s_test_monotonic_now_ms;
+
+void desk_sdk_test_set_monotonic_ms(uint64_t now_ms)
+{
+    s_test_monotonic_now_ms = now_ms;
+}
+
+static bool desk_sdk_monotonic_now_ms(uint64_t *now_ms)
+{
+    if (!now_ms) return false;
+    *now_ms = s_test_monotonic_now_ms;
+    return true;
+}
+#else
+static bool desk_sdk_monotonic_now_ms(uint64_t *now_ms)
+{
+    if (!now_ms) return false;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0) return false;
+    *now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+    return true;
+}
+#endif
 
 static bool desk_sdk_is_lower_hex_32(const char *s)
 {
@@ -146,6 +174,25 @@ static void desk_sdk_pairing_code_clear_locked(void)
     memset(s_expected_pairing_code, 0, sizeof(s_expected_pairing_code));
     s_pairing_code_configured = false;
     s_pairing_failed_attempts = 0;
+    s_pairing_code_expires_at_ms = 0;
+}
+
+static bool desk_sdk_pairing_code_expire_if_needed_locked(void)
+{
+    uint64_t now_ms = 0;
+    if (!s_pairing_code_configured) return true;
+    if (!desk_sdk_monotonic_now_ms(&now_ms) || now_ms >= s_pairing_code_expires_at_ms) {
+        desk_sdk_pairing_code_clear_locked();
+        return true;
+    }
+    return false;
+}
+
+static void desk_sdk_pairing_code_expire_if_needed(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    (void)desk_sdk_pairing_code_expire_if_needed_locked();
+    pthread_mutex_unlock(&s_pairing_code_mutex);
 }
 
 static void desk_sdk_pairing_code_failed_attempt_locked(void)
@@ -171,18 +218,32 @@ int desk_sdk_bridge_set_pairing_code(const char *code)
         pthread_mutex_unlock(&s_pairing_code_mutex);
         return -1;
     }
+    uint64_t now_ms = 0;
+    if (!desk_sdk_monotonic_now_ms(&now_ms) || UINT64_MAX - now_ms < DESK_SDK_PAIRING_CODE_TTL_MS) {
+        desk_sdk_pairing_code_clear_locked();
+        pthread_mutex_unlock(&s_pairing_code_mutex);
+        return -1;
+    }
     memset(s_expected_pairing_code, 0, sizeof(s_expected_pairing_code));
     memcpy(s_expected_pairing_code, code, 7);
     s_pairing_code_configured = true;
     s_pairing_failed_attempts = 0;
+    s_pairing_code_expires_at_ms = now_ms + DESK_SDK_PAIRING_CODE_TTL_MS;
     pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
+}
+
+void desk_sdk_bridge_clear_pairing_code(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    desk_sdk_pairing_code_clear_locked();
+    pthread_mutex_unlock(&s_pairing_code_mutex);
 }
 
 bool desk_sdk_bridge_is_pairing_code_configured(void)
 {
     pthread_mutex_lock(&s_pairing_code_mutex);
-    bool configured = s_pairing_code_configured;
+    bool configured = !desk_sdk_pairing_code_expire_if_needed_locked();
     pthread_mutex_unlock(&s_pairing_code_mutex);
     return configured;
 }
@@ -935,6 +996,9 @@ int desk_sdk_bridge_init(void)
     s_client_fd = -1;
     s_bound_port = 0;
     s_last_heartbeat_time = 0;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    desk_sdk_pairing_code_clear_locked();
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
     return 0;
@@ -953,11 +1017,11 @@ void desk_sdk_bridge_reset(void)
     s_pair_target_mode[0] = '\0';
     s_pair_host[0] = '\0';
     s_pair_websocket_port = 0;
+    desk_sdk_pairing_code_clear_locked();
     pthread_mutex_unlock(&s_pairing_code_mutex);
     s_auth_required = false;
     s_last_heartbeat_time = 0;
     desk_sdk_req_table_init();
-    /* Provisioned expected pairing code intentionally survives a reset. */
     desk_sdk_socket_rx_reset();
 }
 
@@ -1138,7 +1202,7 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     /* interfaces.md 6.4 / CR-001: never grant a pairing before the pairing code
      * has been validated against the explicitly provisioned device-side code.
  * diagnostics contain only a reason and request_id. */
-    if (!s_pairing_code_configured) {
+    if (desk_sdk_pairing_code_expire_if_needed_locked()) {
         printf("[SDK-PAIR] pair.request rejected: reason=window_closed request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
@@ -2310,6 +2374,7 @@ int desk_sdk_pairing_server_get_port(void)
 
 int desk_firmware_poll(int timeout_ms)
 {
+    desk_sdk_pairing_code_expire_if_needed();
     int half = timeout_ms / 2;
     if (half < 1) half = 1;
     desk_sdk_socket_server_poll(half);

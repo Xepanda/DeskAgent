@@ -188,8 +188,10 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
  *
  * The request's `pairing_code` is validated (6 digits, exact match) against the
  * device-side expected code provisioned via desk_sdk_bridge_set_pairing_code().
- * The provisioned code is an ephemeral pairing window: five malformed or
- * mismatching attempts close it, and a successful PairAccept consumes it.
+ * The provisioned code is RAM-only and expires after five minutes of monotonic
+ * time. Five malformed or mismatching attempts close it, and a successful
+ * PairAccept consumes it. Bridge initialization/reset and explicit cancellation
+ * clear the code; it is never persisted or logged.
  * Fail-closed: when no expected code is configured, or the code is malformed or
  * mismatching, DESK_SDK_PAIRING_REJECTED is returned and udp_out is NOT written
  * (no `pair.accept`, no `session_token`, no `s_paired`). See interfaces.md 6.4.
@@ -203,14 +205,17 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
  * @brief Provision the device-side expected pairing code (6 decimal digits).
  *
  * This is the ONLY authoritative source for the expected code; no production
- * pairing code is ever hardcoded. The code is never logged (redacted per the
- * official redact_sensitive_fields rule). Passing NULL (or an empty string)
- * clears the configuration, which makes pairing fail-closed again.
+ * pairing code is ever hardcoded. The code remains in RAM for at most five
+ * minutes of monotonic time and is never logged. A successful pairing consumes
+ * it. Passing NULL (or an empty string) clears the configuration.
  *
  * @param code 6-digit code matching ^[0-9]{6}$, or NULL/"" to clear.
  * @return 0 on success, -1 if `code` is non-NULL and not exactly 6 digits.
  */
 int desk_sdk_bridge_set_pairing_code(const char *code);
+
+/** @brief Explicitly cancel the active pairing window and erase its RAM code. */
+void desk_sdk_bridge_clear_pairing_code(void);
 
 /**
  * @brief Report whether an expected pairing code has been provisioned.

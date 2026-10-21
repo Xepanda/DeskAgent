@@ -130,6 +130,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             "-fPIC",
             "-O2",
             "-Wall",
+            "-DDESK_SDK_TESTING",
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
@@ -346,6 +347,12 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     def setUp(self) -> None:
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock.argtypes = [ctypes.c_uint64]
+        set_clock.restype = None
+        set_clock(1_000)
+        self.lib.desk_firmware_poll.argtypes = [ctypes.c_int]
+        self.lib.desk_firmware_poll.restype = ctypes.c_int
         self.lib.desk_hardware_init()
         self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
@@ -2252,6 +2259,58 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
 
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_pairing_code_expires_after_five_minutes_of_monotonic_time(self) -> None:
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock.argtypes = [ctypes.c_uint64]
+        set_clock.restype = None
+        set_clock(1_000)
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        set_clock(1_000 + 5 * 60 * 1_000 - 1)
+        self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        set_clock(1_000 + 5 * 60 * 1_000)
+        self.lib.desk_firmware_poll(0)
+        # The periodic production poll must zero the expired RAM window even
+        # if monotonic time is subsequently moved backwards in this test.
+        set_clock(1_001)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_pairing_code_clear_api_and_bridge_init_clear_ram_window(self) -> None:
+        clear_code = self.lib.desk_sdk_bridge_clear_pairing_code
+        clear_code.argtypes = []
+        clear_code.restype = None
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        clear_code()
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        self.lib.desk_sdk_bridge_reset()
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_init(), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+    def test_pairing_code_is_consumed_after_success(self) -> None:
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock.argtypes = [ctypes.c_uint64]
+        set_clock.restype = None
+        set_clock(50_000)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(reply)["type"], "pair.accept")
         self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
         rc, reply = self._process_pairing(self._official_pair_request("123456"))
         self.assertNotEqual(rc, 0)
