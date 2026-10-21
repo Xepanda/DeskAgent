@@ -438,8 +438,10 @@ class CameraViewerService:
                 return None
 
             now = time.time()
-            age_ms = int((now - self._latest_frame_time) * 1000)
-            is_stale = age_ms > self.stale_threshold_ms
+            age_ms_exact = max(0.0, (now - self._latest_frame_time) * 1000)
+            # Compare the unrounded age so a frame at (for example) 2000.5 ms
+            # cannot pass a 2000 ms freshness limit after integer truncation.
+            is_stale = age_ms_exact > self.stale_threshold_ms
 
             if is_stale:
                 # A stale image is unavailable, not a usable snapshot. This
@@ -450,7 +452,7 @@ class CameraViewerService:
             return {
                 "frame_seq": self._frame_seq,
                 "jpeg_data": self._latest_jpeg,
-                "frame_age_ms": age_ms,
+                "frame_age_ms": int(age_ms_exact),
                 "is_stale": False,
                 "is_masked": False,
                 "source": "hardware_sensor" if is_hw else "external_source",

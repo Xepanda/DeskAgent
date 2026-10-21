@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 
 from host.desk_agent.camera.camera_service import (
     CameraStreamCapacityError,
@@ -39,6 +40,19 @@ class TestCameraService(unittest.TestCase):
 
         time.sleep(0.06)
         self.assertIsNone(cam.get_latest_frame("viewer"), "A stale frame must not be returned or masked as a usable image")
+        cam.release_lease("viewer")
+
+    def test_frame_fractionally_over_freshness_limit_is_rejected(self) -> None:
+        cam = CameraViewerService(stale_threshold_ms=2000)
+        cam.acquire_lease("viewer", lease_ms=10000)
+        cam.ingest_robot_frame(TEST_JPEG)
+        frame_time = cam._latest_frame_time
+
+        # The previous int-before-compare implementation truncated 2000.5 ms
+        # to 2000 and incorrectly exposed the frame as fresh.
+        with patch("host.desk_agent.camera.camera_service.time.time", return_value=frame_time + 2.0005):
+            self.assertIsNone(cam.get_latest_frame("viewer"))
+
         cam.release_lease("viewer")
 
     def test_invalid_or_oversized_jpeg_is_not_published(self) -> None:
