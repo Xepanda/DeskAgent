@@ -50,6 +50,10 @@ desk_tclaw_state_t desk_tclaw_get_state(void);
  */
 bool desk_tclaw_is_initialized(void);
 
+/* Short-lived display-only overlay used while an operator pairing window is open. */
+int desk_tclaw_pairing_ui_set_code(const char *code);
+void desk_tclaw_pairing_ui_clear(void);
+
 /**
  * @brief Inject synthetic user text into TClaw session (for automated testing).
  */

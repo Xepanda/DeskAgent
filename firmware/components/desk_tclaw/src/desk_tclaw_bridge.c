@@ -128,6 +128,8 @@ typedef enum {
 static watcher_ui_page_t s_ui_focus = WATCHER_UI_PAGE_HOME;
 static bool s_ui_overlay_active = false;
 static bool s_ui_page_open = false;
+static bool s_pairing_ui_active = false;
+static char s_pairing_ui_code[7] = {0};
 static char s_ui_home_preset[32] = "idle";
 static char s_ui_home_status[64] = "Ready";
 
@@ -144,9 +146,12 @@ static const char *watcher_ui_page_name(watcher_ui_page_t page)
 
 static int watcher_ui_render(void)
 {
-    if (!s_ui_overlay_active) return DESK_HW_OK;
-
     char status[64] = "";
+    if (s_pairing_ui_active) {
+        snprintf(status, sizeof(status), "PAIR %s", s_pairing_ui_code);
+        return desk_hardware_display_set_expression(s_ui_home_preset, status);
+    }
+    if (!s_ui_overlay_active) return DESK_HW_OK;
     if (!s_ui_page_open) {
         snprintf(status, sizeof(status), "MENU %s", watcher_ui_page_name(s_ui_focus));
     } else {
@@ -186,11 +191,33 @@ static int watcher_ui_render(void)
     return desk_hardware_display_set_expression(s_ui_home_preset, status);
 }
 
+int desk_tclaw_pairing_ui_set_code(const char *code)
+{
+    if (!code || strlen(code) != 6) return DESK_HW_ERR_INVALID_ARG;
+    for (size_t i = 0; i < 6; ++i) {
+        if (code[i] < '0' || code[i] > '9') return DESK_HW_ERR_INVALID_ARG;
+    }
+    memcpy(s_pairing_ui_code, code, sizeof(s_pairing_ui_code));
+    s_pairing_ui_active = true;
+    return watcher_ui_render();
+}
+
+void desk_tclaw_pairing_ui_clear(void)
+{
+    memset(s_pairing_ui_code, 0, sizeof(s_pairing_ui_code));
+    s_pairing_ui_active = false;
+    if (s_ui_overlay_active) {
+        (void)watcher_ui_render();
+    } else {
+        (void)desk_hardware_display_set_expression(s_ui_home_preset, s_ui_home_status);
+    }
+}
+
 static int desk_tclaw_update_screen(const char *preset, const char *status)
 {
     const char *safe_preset = preset ? preset : "idle";
     const char *safe_status = status ? status : "";
-    if (s_ui_overlay_active) {
+    if (s_ui_overlay_active || s_pairing_ui_active) {
         snprintf(s_ui_home_preset, sizeof(s_ui_home_preset), "%s", safe_preset);
         snprintf(s_ui_home_status, sizeof(s_ui_home_status), "%s", safe_status);
         return watcher_ui_render();
@@ -240,7 +267,8 @@ static void watcher_ui_input_event(desk_touch_target_t target,
             s_ui_overlay_active = false;
             s_ui_page_open = false;
             s_ui_focus = WATCHER_UI_PAGE_HOME;
-            (void)desk_hardware_display_set_expression(s_ui_home_preset, s_ui_home_status);
+            if (s_pairing_ui_active) (void)watcher_ui_render();
+            else (void)desk_hardware_display_set_expression(s_ui_home_preset, s_ui_home_status);
         }
     }
 }

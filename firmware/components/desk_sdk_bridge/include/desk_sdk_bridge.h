@@ -85,6 +85,7 @@ typedef enum {
 #define DESK_SDK_PAIRING_OK        0
 #define DESK_SDK_PAIRING_REJECTED  1
 #define DESK_SDK_PAIRING_ERR_ARG  (-1)
+#define DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS 5
 
 #pragma pack(push, 1)
 typedef struct {
@@ -189,6 +190,8 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
  *
  * The request's `pairing_code` is validated (6 digits, exact match) against the
  * device-side expected code provisioned via desk_sdk_bridge_set_pairing_code().
+ * The provisioned code is an ephemeral pairing window: five malformed or
+ * mismatching attempts close it, and a successful PairAccept consumes it.
  * Fail-closed: when no expected code is configured, or the code is malformed or
  * mismatching, DESK_SDK_PAIRING_REJECTED is returned and udp_out is NOT written
  * (no `pair.accept`, no `session_token`, no `s_paired`). See interfaces.md 6.4.

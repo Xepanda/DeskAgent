@@ -59,6 +59,8 @@ static uint32_t s_last_heartbeat_time = 0;
  * via desk_sdk_bridge_set_pairing_code(); never hardcoded, never logged. */
 static char s_expected_pairing_code[8] = "";
 static bool s_pairing_code_configured = false;
+static unsigned s_pairing_failed_attempts = 0;
+static pthread_mutex_t s_pairing_code_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char s_pair_request_id[33] = "";
 static char s_pair_daemon_instance_id[33] = "";
 static char s_pair_target_mode[32] = "";
@@ -77,12 +79,17 @@ static bool desk_sdk_is_lower_hex_32(const char *s)
 
 int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len)
 {
-    if (!out_json || max_len == 0 || !s_paired ||
+    if (!out_json || max_len == 0) return -1;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    if (!s_paired ||
         !desk_sdk_is_lower_hex_32(s_pair_request_id) ||
         !desk_sdk_is_lower_hex_32(s_pair_daemon_instance_id) ||
         !desk_sdk_is_lower_hex_64(s_active_pairing_token) ||
         !(strcmp(s_pair_target_mode, "python_sdk") == 0 ||
-          strcmp(s_pair_target_mode, "desktop_link") == 0)) return -1;
+          strcmp(s_pair_target_mode, "desktop_link") == 0)) {
+        pthread_mutex_unlock(&s_pairing_code_mutex);
+        return -1;
+    }
 
     int n = snprintf(out_json, max_len,
         "{\"type\":\"sys.client.hello\",\"code\":0,\"data\":{"
@@ -91,16 +98,22 @@ int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len)
         "\"daemon_instance_id\":\"%s\",\"session_token\":\"%s\",\"mode\":\"%s\"}}",
         s_pair_request_id, s_pair_daemon_instance_id, s_active_pairing_token,
         s_pair_target_mode);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return n >= 0 && (size_t)n < max_len ? n : -1;
 }
 
 int desk_sdk_bridge_get_pairing_target(char *host, size_t host_len, uint16_t *port)
 {
-    if (!host || host_len == 0 || !port || s_pair_host[0] == '\0' ||
-        s_pair_websocket_port == 0 || !s_paired) return -1;
-    if (strlen(s_pair_host) + 1 > host_len) return -1;
+    if (!host || host_len == 0 || !port) return -1;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    if (s_pair_host[0] == '\0' || s_pair_websocket_port == 0 || !s_paired ||
+        strlen(s_pair_host) + 1 > host_len) {
+        pthread_mutex_unlock(&s_pairing_code_mutex);
+        return -1;
+    }
     strcpy(host, s_pair_host);
     *port = s_pair_websocket_port;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
 }
 
@@ -128,39 +141,50 @@ static bool desk_sdk_secure_equals(const char *a, const char *b)
     return diff == 0;
 }
 
-/* Official redact_sensitive_fields rule: session_token -> [redacted:<last4>]. */
-static void desk_sdk_redact_token(const char *token, char *out, size_t out_len)
+static void desk_sdk_pairing_code_clear_locked(void)
 {
-    if (!out || out_len == 0) return;
-    size_t n = token ? strlen(token) : 0;
-    if (n == 0) {
-        snprintf(out, out_len, "[redacted]");
-    } else if (n >= 4) {
-        snprintf(out, out_len, "[redacted:%s]", token + (n - 4));
-    } else {
-        snprintf(out, out_len, "[redacted]");
+    memset(s_expected_pairing_code, 0, sizeof(s_expected_pairing_code));
+    s_pairing_code_configured = false;
+    s_pairing_failed_attempts = 0;
+}
+
+static void desk_sdk_pairing_code_failed_attempt_locked(void)
+{
+    if (s_pairing_failed_attempts < DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS) {
+        ++s_pairing_failed_attempts;
+    }
+    if (s_pairing_failed_attempts >= DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS) {
+        desk_sdk_pairing_code_clear_locked();
     }
 }
 
 int desk_sdk_bridge_set_pairing_code(const char *code)
 {
+    pthread_mutex_lock(&s_pairing_code_mutex);
     if (!code || code[0] == '\0') {
-        s_expected_pairing_code[0] = '\0';
-        s_pairing_code_configured = false;
+        desk_sdk_pairing_code_clear_locked();
+        pthread_mutex_unlock(&s_pairing_code_mutex);
         return 0;
     }
     if (!desk_sdk_is_six_digits(code)) {
         /* Reject malformed provisioning input; keep the previous configuration. */
+        pthread_mutex_unlock(&s_pairing_code_mutex);
         return -1;
     }
+    memset(s_expected_pairing_code, 0, sizeof(s_expected_pairing_code));
     memcpy(s_expected_pairing_code, code, 7);
     s_pairing_code_configured = true;
+    s_pairing_failed_attempts = 0;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
 }
 
 bool desk_sdk_bridge_is_pairing_code_configured(void)
 {
-    return s_pairing_code_configured;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    bool configured = s_pairing_code_configured;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return configured;
 }
 
 #ifdef ESP_PLATFORM
@@ -222,7 +246,9 @@ int desk_sdk_bridge_set_pairing_token(const char *token)
 {
     if (!token) {
         /* No value supplied: mint a fresh credential (always 64 lowercase hex). */
+        pthread_mutex_lock(&s_pairing_code_mutex);
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
+        pthread_mutex_unlock(&s_pairing_code_mutex);
         return 0;
     }
 
@@ -233,22 +259,26 @@ int desk_sdk_bridge_set_pairing_token(const char *token)
         return -1;
     }
 
+    pthread_mutex_lock(&s_pairing_code_mutex);
     memcpy(s_active_pairing_token, token, sizeof(s_active_pairing_token));
     /* R9 (interfaces.md 6.6): this provisioning entry point sets credential
      * material ONLY. `s_paired` means "a client has successfully completed a
      * pairing handshake" and may only be set by the validated pairing path in
      * desk_sdk_bridge_process_pairing_udp() (interfaces.md 6.4). */
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
 }
 
 int desk_sdk_bridge_get_pairing_token(char *token, size_t max_len)
 {
     if (!token || max_len == 0) return -1;
+    pthread_mutex_lock(&s_pairing_code_mutex);
     if (s_active_pairing_token[0] == '\0') {
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
     }
     strncpy(token, s_active_pairing_token, max_len - 1);
     token[max_len - 1] = '\0';
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
 }
 
@@ -915,6 +945,7 @@ void desk_sdk_bridge_reset(void)
     desk_sdk_ws_client_close();
     s_client_connected = false;
     s_event_seq = 0;
+    pthread_mutex_lock(&s_pairing_code_mutex);
     s_active_pairing_token[0] = '\0';
     s_paired = false;
     s_pair_request_id[0] = '\0';
@@ -922,6 +953,7 @@ void desk_sdk_bridge_reset(void)
     s_pair_target_mode[0] = '\0';
     s_pair_host[0] = '\0';
     s_pair_websocket_port = 0;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     s_auth_required = false;
     s_last_heartbeat_time = 0;
     desk_sdk_req_table_init();
@@ -1080,7 +1112,7 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
 }
 
 /* UDP Pairing (watcher_lan_pairing_v1 on port 37021) */
-int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len)
+static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *udp_out, size_t max_out_len)
 {
     if (!udp_in || !udp_out || max_out_len < 128) return DESK_SDK_PAIRING_ERR_ARG;
 
@@ -1106,51 +1138,41 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
 
     /* interfaces.md 6.4 / CR-001: never grant a pairing before the pairing code
      * has been validated against the explicitly provisioned device-side code.
-     * pairing_code is never logged in clear text (redact_sensitive_fields). */
+ * diagnostics contain only a reason and request_id. */
     if (!s_pairing_code_configured) {
-        printf("[SDK-PAIR] pair.request rejected: no expected pairing code provisioned "
-               "(pairing_code=[redacted], request_id=%s)\n", req_id);
+        printf("[SDK-PAIR] pair.request rejected: reason=window_closed request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
     if (!desk_sdk_is_six_digits(pairing_code)) {
-        printf("[SDK-PAIR] pair.request rejected: malformed pairing_code "
-               "(pairing_code=[redacted], request_id=%s)\n", req_id);
+        desk_sdk_pairing_code_failed_attempt_locked();
+        printf("[SDK-PAIR] pair.request rejected: reason=malformed_code request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
     if (!desk_sdk_secure_equals(pairing_code, s_expected_pairing_code)) {
-        printf("[SDK-PAIR] pair.request rejected: pairing_code mismatch "
-               "(pairing_code=[redacted], request_id=%s)\n", req_id);
+        desk_sdk_pairing_code_failed_attempt_locked();
+        printf("[SDK-PAIR] pair.request rejected: reason=code_mismatch request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
 
     if (!desk_sdk_is_lower_hex_32(req_id) || !desk_sdk_is_lower_hex_32(daemon_id) ||
         websocket_port < 1 || websocket_port > 65535 ||
         !(strcmp(target_mode, "python_sdk") == 0 || strcmp(target_mode, "desktop_link") == 0)) {
-        printf("[SDK-PAIR] pair.request rejected: malformed session metadata (request_id=%s)\n", req_id);
+        printf("[SDK-PAIR] pair.request rejected: reason=malformed_metadata request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
 
-    /* Validation passed: only now generate/issue a session token and pair. */
+    /* Validation passed: only now generate/issue a session token. */
     if (s_active_pairing_token[0] == '\0') {
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
     }
-    s_paired = true;
-    memcpy(s_pair_request_id, req_id, sizeof(s_pair_request_id));
-    memcpy(s_pair_daemon_instance_id, daemon_id, sizeof(s_pair_daemon_instance_id));
-    snprintf(s_pair_target_mode, sizeof(s_pair_target_mode), "%s", target_mode);
-    s_pair_websocket_port = (uint16_t)websocket_port;
 
     char proto[64] = "";
     json_parse_str(udp_in, "protocol", proto, sizeof(proto));
 
-    char redacted_token[32];
-    desk_sdk_redact_token(s_active_pairing_token, redacted_token, sizeof(redacted_token));
-    printf("[SDK-PAIR] pair.accept issued (session_token=%s, request_id=%s)\n",
-           redacted_token, req_id);
-
     /* Strict official watcher-lan-pairing protocol check per PairAccept contract */
+    int reply_len;
     if (strcmp(proto, "watcher-lan-pairing") == 0) {
-        snprintf(udp_out, max_out_len,
+        reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"protocol\":\"watcher-lan-pairing\","
                  "\"version\":\"1.0\","
@@ -1163,7 +1185,7 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
                  strlen(target_mode) > 0 ? target_mode : "python_sdk",
                  s_active_pairing_token);
     } else {
-        snprintf(udp_out, max_out_len,
+        reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"status\":\"accepted\","
                  "\"device_id\":\"desk_agent_r1\","
@@ -1184,7 +1206,29 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
                  s_active_pairing_token);
     }
 
+    if (reply_len < 0 || (size_t)reply_len >= max_out_len) {
+        udp_out[0] = '\0';
+        printf("[SDK-PAIR] pair.request rejected: reason=reply_too_small request_id=%s\n", req_id);
+        return DESK_SDK_PAIRING_REJECTED;
+    }
+
+    s_paired = true;
+    memcpy(s_pair_request_id, req_id, sizeof(s_pair_request_id));
+    memcpy(s_pair_daemon_instance_id, daemon_id, sizeof(s_pair_daemon_instance_id));
+    snprintf(s_pair_target_mode, sizeof(s_pair_target_mode), "%s", target_mode);
+    s_pair_websocket_port = (uint16_t)websocket_port;
+    desk_sdk_pairing_code_clear_locked();
+    printf("[SDK-PAIR] pair.accept issued: reason=validated request_id=%s\n", req_id);
+
     return DESK_SDK_PAIRING_OK;
+}
+
+int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    int rc = desk_sdk_bridge_process_pairing_udp_locked(udp_in, udp_out, max_out_len);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return rc;
 }
 
 /* Command processing */

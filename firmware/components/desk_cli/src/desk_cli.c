@@ -23,6 +23,10 @@
 #ifdef ESP_PLATFORM
 #include "netmgr.h"
 #include "esp_system.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
 #define DESK_DIAG_BSS EXT_RAM_BSS_ATTR
@@ -54,6 +58,84 @@ static void cmd_peripherals(int argc, char *argv[]);
 static void cmd_network(int argc, char *argv[]);
 static void cmd_wifi(int argc, char *argv[]);
 static void cmd_provisioning(int argc, char *argv[]);
+static void cmd_pairing(int argc, char *argv[]);
+
+#ifdef ESP_PLATFORM
+#define PAIRING_WINDOW_TTL_US (120ULL * 1000ULL * 1000ULL)
+#define PAIRING_CODE_SPACE 1000000U
+static esp_timer_handle_t s_pairing_expiry_timer = NULL;
+static SemaphoreHandle_t s_pairing_mutex = NULL;
+static char s_pairing_code[7] = {0};
+static int64_t s_pairing_expiry_deadline_us = 0;
+
+static void pairing_window_clear_locked(void)
+{
+    (void)desk_sdk_bridge_set_pairing_code(NULL);
+    memset(s_pairing_code, 0, sizeof(s_pairing_code));
+    s_pairing_expiry_deadline_us = 0;
+    desk_tclaw_pairing_ui_clear();
+}
+
+static void pairing_window_expired(void *arg)
+{
+    (void)arg;
+    if (!s_pairing_mutex || xSemaphoreTake(s_pairing_mutex, portMAX_DELAY) != pdTRUE) return;
+    /* An old callback queued before a reopen must not clear the new code. */
+    if (s_pairing_expiry_deadline_us != 0 &&
+        esp_timer_get_time() >= s_pairing_expiry_deadline_us) {
+        pairing_window_clear_locked();
+    }
+    xSemaphoreGive(s_pairing_mutex);
+}
+
+static int pairing_expiry_timer_ensure(void)
+{
+    if (!s_pairing_mutex) {
+        s_pairing_mutex = xSemaphoreCreateMutex();
+        if (!s_pairing_mutex) return -1;
+    }
+    if (s_pairing_expiry_timer) return 0;
+    const esp_timer_create_args_t args = {
+        .callback = pairing_window_expired,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pairing_expiry",
+    };
+    return (int)esp_timer_create(&args, &s_pairing_expiry_timer);
+}
+
+static int pairing_window_open(void)
+{
+    if (pairing_expiry_timer_ensure() != 0) return -1;
+    if (xSemaphoreTake(s_pairing_mutex, portMAX_DELAY) != pdTRUE) return -1;
+    (void)esp_timer_stop(s_pairing_expiry_timer);
+    pairing_window_clear_locked();
+
+    /* Rejection sampling keeps all six-digit decimal codes equally likely. */
+    const uint32_t range_limit = (UINT32_MAX / PAIRING_CODE_SPACE) * PAIRING_CODE_SPACE;
+    uint32_t random_value;
+    do {
+        random_value = esp_random();
+    } while (random_value >= range_limit);
+    snprintf(s_pairing_code, sizeof(s_pairing_code), "%06lu",
+             (unsigned long)(random_value % PAIRING_CODE_SPACE));
+
+    if (desk_sdk_bridge_set_pairing_code(s_pairing_code) != 0 ||
+        desk_tclaw_pairing_ui_set_code(s_pairing_code) != 0) {
+        pairing_window_clear_locked();
+        xSemaphoreGive(s_pairing_mutex);
+        return -1;
+    }
+    s_pairing_expiry_deadline_us = esp_timer_get_time() + (int64_t)PAIRING_WINDOW_TTL_US;
+    if (esp_timer_start_once(s_pairing_expiry_timer, PAIRING_WINDOW_TTL_US) != ESP_OK) {
+        pairing_window_clear_locked();
+        xSemaphoreGive(s_pairing_mutex);
+        return -1;
+    }
+    xSemaphoreGive(s_pairing_mutex);
+    return 0;
+}
+#endif
 
 static const desk_cli_command_t s_default_cmds[] = {
 #ifndef ESP_PLATFORM
@@ -71,6 +153,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"network", "SDK TCP/UDP server status: network [status]", cmd_network},
     {"wifi", "Read-only Wi-Fi status: wifi [status]", cmd_wifi},
     {"provisioning", "Read-only Tuya provisioning state", cmd_provisioning},
+    {"pairing", "Explicit SDK pairing window: pairing <open|cancel>", cmd_pairing},
 };
 
 #ifdef ESP_PLATFORM
@@ -320,6 +403,37 @@ static void cmd_provisioning(int argc, char *argv[])
     (void)argc; (void)argv;
     printf("Provisioning stage: %s\r\n", s_provisioning_stage);
     printf("Last error: stage=%s rc=%d\r\n", s_provisioning_error_stage, s_provisioning_error_code);
+}
+
+static void cmd_pairing(int argc, char *argv[])
+{
+#ifdef ESP_PLATFORM
+    if (argc == 2 && strcmp(argv[1], "open") == 0) {
+        if (pairing_window_open() == 0) {
+            printf("Pairing window open for 120 seconds; read the code from the device display.\r\n");
+        } else {
+            printf("Pairing window could not be opened; code cleared.\r\n");
+        }
+        return;
+    }
+    if (argc == 2 && strcmp(argv[1], "cancel") == 0) {
+        if (pairing_expiry_timer_ensure() == 0 &&
+            xSemaphoreTake(s_pairing_mutex, portMAX_DELAY) == pdTRUE) {
+            (void)esp_timer_stop(s_pairing_expiry_timer);
+            pairing_window_clear_locked();
+            xSemaphoreGive(s_pairing_mutex);
+        } else {
+            (void)desk_sdk_bridge_set_pairing_code(NULL);
+            desk_tclaw_pairing_ui_clear();
+        }
+        printf("Pairing window cancelled; code cleared.\r\n");
+        return;
+    }
+    printf("Usage: pairing <open|cancel>\r\n");
+#else
+    (void)argc; (void)argv;
+    printf("Pairing window is available only on the device.\r\n");
+#endif
 }
 
 static void cmd_wifi(int argc, char *argv[])

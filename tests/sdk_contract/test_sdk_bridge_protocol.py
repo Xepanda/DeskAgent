@@ -2179,6 +2179,46 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertEqual(reply, "")
 
+    def test_pairing_code_window_closes_after_five_failures_and_is_consumed_on_success(self) -> None:
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        for _ in range(5):
+            rc, reply = self._process_pairing(self._official_pair_request("123456"))
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(reply, "")
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        # A sixth request cannot use the old code after the window locks.
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+        # A1 can explicitly open a fresh ephemeral window with the existing setter.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(reply)["type"], "pair.accept")
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_concurrent_pair_requests_consume_code_exactly_once(self) -> None:
+        import concurrent.futures
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        request = self._official_pair_request("123456")
+
+        def pair_once() -> tuple[int, str]:
+            return self._process_pairing(request)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _index: pair_once(), range(8)))
+
+        successes = [(rc, reply) for rc, reply in results if rc == 0]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(json.loads(successes[0][1])["type"], "pair.accept")
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
     def test_pairing_rejected_on_missing_code(self) -> None:
         """A pair.request without a pairing_code must be rejected."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
@@ -2203,6 +2243,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         rc_ok, reply_ok = self._process_pairing(self._official_pair_request("123456"))
         self.assertEqual(rc_ok, 0)
         self.assertEqual(json.loads(reply_ok)["type"], "pair.accept")
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
 
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
         self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
@@ -2221,8 +2262,8 @@ class TestSdkBridgeProtocol(unittest.TestCase):
                     self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(bad), -1)
                 self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
 
-    def test_pairing_logs_are_redacted(self) -> None:
-        """pairing_code and session_token must never appear in clear text in logs."""
+    def test_pairing_logs_contain_only_reason_and_request_id(self) -> None:
+        """Pairing diagnostics include reason/request id and never credentials."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
 
         with capture_c_stdout() as tmp:
@@ -2231,12 +2272,14 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             token = json.loads(reply)["session_token"]
 
         logged = read_captured(tmp)
-        self.assertIn("[redacted", logged, "expected a redacted diagnostic log line")
-        self.assertNotIn("123456", logged, "pairing_code must never be logged in clear text")
+        self.assertIn("reason=validated", logged)
+        self.assertIn("request_id=21a9dbf05ea3443480e62076f79a3b12", logged)
+        self.assertNotIn("123456", logged, "pairing_code must never be logged")
         self.assertNotIn(token, logged, "session_token must never be logged in clear text")
+        self.assertNotIn("session_token", logged)
 
-    def test_pairing_rejection_logs_are_redacted(self) -> None:
-        """Rejection diagnostics must redact the supplied pairing code."""
+    def test_pairing_rejection_logs_contain_only_reason_and_request_id(self) -> None:
+        """Rejection diagnostics contain only a reason and request id."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
 
         with capture_c_stdout() as tmp:
@@ -2245,8 +2288,12 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             self.assertEqual(reply, "")
 
         logged = read_captured(tmp)
+        self.assertIn("reason=code_mismatch", logged)
+        self.assertIn("request_id=21a9dbf05ea3443480e62076f79a3b12", logged)
         self.assertNotIn("123456", logged, "supplied pairing_code must never be logged")
         self.assertNotIn("654321", logged, "provisioned pairing_code must never be logged")
+        self.assertNotIn("pairing_code", logged)
+        self.assertNotIn("token", logged)
 
     # ------------------------------------------------------------------
     # R9 -- set_pairing_token() sets credentials only, never the paired state

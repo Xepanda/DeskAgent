@@ -203,6 +203,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         out_buf = ctypes.create_string_buffer(1024)
         rc = self.lib.desk_sdk_bridge_process_pairing_udp(wire_bytes, out_buf, 1024)
         self.assertEqual(rc, 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured(),
+                         "a successful PairAccept must consume the ephemeral code window")
 
         # 3. Parse reply using official SDK parse_udp_message parser
         reply_raw = out_buf.value
