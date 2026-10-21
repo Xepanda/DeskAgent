@@ -9,7 +9,7 @@
 - 已恢复模型：`firmware/.build/bin/srmodels.bin`，SHA-256 `7C87DD7ADB5A7623907B6354D49BEA7F9289371262E6A57F15458FB8908C5814`。
 - Wi-Fi / provisioning：当前 CLI 镜像 `wifi status` 为 `LINK_UP`；provisioning stage 为 `mqtt_online`，但 `authorize_read rc=-1`。这是 L3 单项状态观测，不代表云端授权或 Tuya AI 会话已可用。
 - 麦克风：当前 CLI 镜像显示 READY、running、895 frames、errors=0、peak=95，属于 L3 PCM 采集观测。用户此前确认的唤醒/对话发生在旧镜像上；当前 CLI 镜像尚未重新验证 WakeNet、ASR、多轮会话或回复播报。
-- 相机：L3 失败。当前 CLI 镜像日志显示 camera driver READY，但 PTL 空响应 `raw=00000000000000`、`rc=-25`、`out_len=0`，未取得 JPEG。先检查供电/SYNC/CS/SCLK/MISO 与 HX6538 通信，不要盲目重复采集。
+- 相机：L3 失败。当前 CLI 镜像日志显示 camera driver READY，但该状态只表示初始化路径、I2C expander 配置以及 SPI bus/device 创建成功；代码没有 HX ID/应答探测，因此 READY 不证明传感器已就绪。capture 命中同步后，7-byte SPI header 传输返回 `ESP_OK`，读数仍全零 (`raw=00000000000000`)，随后映射为 `rc=-25`、`out_len=0`，未取得 JPEG。来源：`firmware/components/desk_hardware/src/desk_watcher_camera.c:135-193,264-346`。现场无示波器/逻辑分析仪证据。
 - A6 Host 相机页面：自动化页面测试是 L2；A3 SDK parser/managed adapter 使用 fake context 与有效 JPEG fixture 验证，也是 L2。设备没有真实 JPEG，且未连接官方 Runtime，故 Host 到浏览器的图像链路没有 L3/L4 证据。
 - STM32 / body UART：本轮真实发送小幅命令 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 显示 UART READY、cached setpoint 仍为 90/120、last formatted TX length=23 bytes。该 TX 长度只是发送帧记录，不是 STM32 RX/ACK；没有实物动作确认，动作未通过。日志：`.target_logging/com21-small-motion-test-20261022.log`。
 - HA：当前仅 L2 connector 测试；没有用户现有 HA 会话或物理设备动作证据。
@@ -60,8 +60,8 @@ python -m unittest tests.e2e.test_p1_regression_gates
 
 1. 不重复盲目 capture。保持当前已知镜像和模型分区，禁止触碰 COM20、禁止写入未识别分区。
 2. 根据当前板卡原理图/接线确认相机供电、地、排线方向及电平；不能仅凭 GPIO 名称猜测电源脚或总线脚。
-3. 由硬件操作者在相机总线测试点采集上电及一次 capture 的供电、SYNC、CS、SCLK、MISO 波形；记录探头位置、采样率、时间基准和电压。
-4. 对照协议判断：供电稳定；SYNC 边沿及 CS 窗口存在；SCLK 有脉冲；MISO 返回预期 PTL 起始字节（此前日志报告 magic=`0000`，期望头需以当前 HX6538 协议实现为准）。如果 MISO 持续全零，先查供电、复位、连接和总线方向，不要改解析器掩盖错误。
+3. 下一次只进行一次有仪器同步观测的 capture：同时探测 SPI CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA expander SYNC bit 6，以及 HX 电源轨。记录探头位置、采样率、时间基准和电压；当前没有这些波形证据。
+4. 对照同一次 capture 的波形判断：HX 电源轨稳定；PCA SYNC bit 6 与 CS 窗口/边沿顺序正确；SCLK 有预期脉冲；MOSI 有请求数据；MISO 是否返回非零/协议预期 PTL header。当前实现的 `READY` 只代表初始化、expander 配置和 SPI bus/device 创建成功，没有 HX ID/应答探测。已知失败路径是同步命中后 7-byte SPI read 返回 `ESP_OK`，但数据全零，再由代码返回 `rc=-25`；不可把它说成 SPI API 传输失败，也不可仅凭 READY 判断传感器就绪。若 MISO 仍全零，先定位电源、复位、连接、CS/SYNC 与总线方向，不改解析器来掩盖电气问题。
 
 ### 取帧和通过证据
 

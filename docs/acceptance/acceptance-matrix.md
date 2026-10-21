@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.7.0
+> 文档版本：V3.8.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
 > 状态：**2026-10-22 最新 CLI 镜像的增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 只有 UART READY/设定值而无 TX、ACK 或动作证据。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> V3.8.0 变更：说明 camera `READY` 不代表 HX 传感器就绪；记录同步命中后 SPI header read 返回 `ESP_OK` 但七字节全零并映射为 `rc=-25`；列出同一次 capture 的下一步同步示波测量点，并标记现场尚无波形证据。
 > V3.7.0 变更：更新 2026-10-22 CLI 镜像 app-only COM21 烧录 SHA/校验与最新真机状态；明确 Wi-Fi、麦克风为单项观测，MQTT 授权读取失败，相机返回全零 PTL、STM32 无接收或动作证据。
 > V3.6.0 变更：依据 2026-10-22 最新构建、设备刷写与串口日志，更新相机 `rc=-25`/7-byte PTL 全零失败，SDK fake parser 与真实 Runtime 边界、A5 本机真实 Codex 任务、A3 reminder teardown 修复、A4/STM32 状态及 A7 串口日志工具证据；所有结论按 L1-L4 分层，不将软件或单项实测扩写为整机通过。
 > V3.5.0 历史变更：曾记录 `verify_all.sh` 在 Step 2 失败以及 Reminder E2E teardown `WinError 32`；提醒清理问题已由 V3.6.0 的显式关闭修复。该历史快照不是当前全量回归结果。
@@ -25,7 +26,7 @@
 | 麦克风采集 | **L3 单项通过（当前镜像观测）** | 新 CLI 镜像日志显示麦克风 READY、`running`，累计 895 frames，errors=0，peak=95 | 这是 PCM 采集状态，不等于唤醒/ASR/语音对话已在本镜像复测；需再次现场唤醒及多轮问答并归档识别、会话、播报证据 |
 | 麦克风、唤醒与对话 | **L3 单项历史通过；当前 CLI 镜像唤醒/对话未验证** | 用户此前确认可唤醒并对话；该确认早于当前 CLI 镜像。当前镜像只有麦克风采集正常的观测 | 在当前已刷镜像上复测重复唤醒、多轮问答及回复播报；断网恢复、长稳和跨模块任务闭环未验证 |
 | 滚轮、按键与状态页 | **L3 用户确认，日志证据待归档** | 用户确认滚轮和按键可用；交互约定为滚轮滚动/选择只读状态页，短按/长按沿用 TuyaOpen 语音事件 | 归档每项输入事件日志及对应 UI 页面变化；覆盖快速旋转、反向、短按、长按 |
-| Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新 COM21 capture 日志显示 camera driver READY，但 PTL 返回空响应 `raw=00000000000000`，`rc=-25`、`out_len=0`；未取得 JPEG。此前旧镜像也观测到 7-byte 全零 PTL 头 | 检查相机供电及 SYNC/CS/SCLK/MISO 与 HX6538 通信；修复后导出并打开现场 JPEG，重复取帧并确认无泄漏/死锁。当前 L3 不通过 |
+| Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新 COM21 capture 日志显示 driver `READY`，但该状态仅证明初始化路径、I2C expander 配置及 SPI bus/device 创建成功；没有 HX ID/应答探测，不证明传感器就绪。capture 命中同步后，7-byte SPI header transfer 返回 `ESP_OK`，采样数据仍全零 (`raw=00000000000000`)，随后返回 `rc=-25`、`out_len=0`；未取得 JPEG。详见 `desk_watcher_camera.c:135-193,264-346`。现场尚无示波器/逻辑分析仪波形证据 | 下一次 capture 必须同步测量同一事务中的 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 与 HX 电源轨；保存探点、时基和电压。确认总线数据前不盲目重复取帧；修复后导出并打开现场 JPEG，验证连续帧与资源释放 |
 | 相机 SDK parser / Host adapter | **L2 fake 集成通过；L3/L4 未验证** | 测试调用固定版本官方 SDK 的 WSPK parser 和图片回调，以有效 JPEG fixture 验证适配路径；A3 Host adapter 代码/测试使用 fake managed context。未连接官方 Runtime，也未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
 | STM32 / 机身动作 | **L3 命令发送尝试超时；动作未执行验收** | 新 CLI 镜像发出 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 为 UART READY、cached setpoint 仍 90/120、last formatted TX length=23 bytes；没有 STM32 RX/ACK 或物理动作证据。TX 长度只代表发送帧记录 | 核对线束、串口参数与 STM32 协议；定位此命令超时，再验证真实 RX/ACK 关联、小幅动作与实物位置反馈，并验证通信故障安全停止 |
 | 官方 Python SDK | **L1 契约；L2 parser 测试通过；真实 Runtime L3 未验证** | 官方 SDK parser 对有效 fixture 的互操作测试通过；设备侧 pairing window 命令曾现场打开/取消。官方 Runtime 的真实 WebSocket 发现、配对、HardwareHello、能力注册、命令与媒体传输均未验 | 用未修改官方 SDK 连真实设备；错误配对码必须拒绝，正确配对后记录完整连接/命令/媒体/断线重连日志 |
@@ -79,7 +80,7 @@
 | CLI 固件构建与烧录 | 构建成功；app-only bin 1,899,680 bytes，SHA-256 `C09E84798654C8071875D04901213B8979BF2032F1B14F921CF911A6F857BE65`；COM21 写入 OTA0 `0x20000` 并 verify hash。因构建 partition table 与实机读取布局不一致，未写 table/bootloader/model；COM20 未触碰 | L2 build + L3 app flash/hash verification；不是整机功能通过 |
 | 网络 / provisioning | `wifi status LINK_UP`；provisioning `mqtt_online`，但 `authorize_read rc=-1` | L3 单项状态观测；云端授权与 Tuya AI 会话未验 |
 | 音频输入 | 麦克风 READY/running，895 frames、errors=0、peak=95 | L3 PCM 采集观测；当前镜像 WakeNet/ASR/多轮对话/回复播报未复验。此前用户确认对应旧镜像 |
-| 相机 | Driver READY；PTL empty response `raw=00000000000000`，`rc=-25`，`out_len=0`，无 JPEG | L3 失败；无真实图片 |
+| 相机 | Driver READY；PTL empty response `raw=00000000000000`，`rc=-25`，`out_len=0`，无 JPEG。READY 只表明初始化路径、expander 配置及 SPI bus/device 创建成功；未探测 HX ID/应答。同步命中后 7-byte SPI header read 返回 ESP_OK 但全零，才映射为 `rc=-25` | L3 失败；无真实图片。现场没有 scope/logic-analyzer 波形证据；下次必须在同一次 capture 同步观测 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 和 HX 电源轨 |
 | STM32 / body UART | `body move 91 120 500` 返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)、`accepted=false`；之后 `body status` 显示 UART READY、cached setpoint 90/120、last formatted TX length 23 bytes | L3 真实命令尝试失败；没有 RX/ACK/物理动作证据。TX 长度不等于 STM32 收到命令，设定值仍为 90/120 表明未确认目标状态。日志：`.target_logging/com21-small-motion-test-20261022.log` |
 
 本次为指定真机状态增量，不代表全量回归或端到端通过；整机 L4 仍未完成。
