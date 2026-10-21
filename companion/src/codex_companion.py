@@ -39,6 +39,17 @@ from typing import Any, Callable, Mapping, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_task_summary(candidate: Any, prompt: Any, fallback: str) -> str:
+    """Normalize a task summary and redact any echoed original prompt."""
+    if isinstance(candidate, dict):
+        candidate = candidate.get("summary") or candidate.get("text") or candidate.get("message")
+    summary = str(candidate or "").strip()
+    prompt_text = str(prompt or "").strip()
+    if prompt_text and prompt_text in summary:
+        summary = summary.replace(prompt_text, "[user request omitted]").strip()
+    return summary or fallback
+
 KNOWN_DECISION_KEYWORDS = {
     "accept", "acceptforsession", "decline", "cancel", "approved", "denied", "abort", "approve", "reject"
 }
@@ -357,13 +368,7 @@ class CodexCompanion:
     @staticmethod
     def _safe_terminal_summary(task: dict[str, Any], candidate: Any, fallback: str) -> str:
         """Return terminal text without echoing the user's original prompt."""
-        if isinstance(candidate, dict):
-            candidate = candidate.get("summary") or candidate.get("text") or candidate.get("message")
-        summary = str(candidate or "").strip()
-        prompt = str(task.get("prompt") or "").strip()
-        if prompt and prompt in summary:
-            summary = summary.replace(prompt, "[user request omitted]").strip()
-        return summary or fallback
+        return _safe_task_summary(candidate, task.get("prompt"), fallback)
 
     def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> None:
         with self._lock:
@@ -1393,16 +1398,13 @@ class RemoteCodexCompanionClient:
                     }
                     event_payload["task_id"] = task_id
                     summary = event_payload.get("summary")
-                    if isinstance(summary, dict):
-                        summary = summary.get("summary") or summary.get("text") or summary.get("message")
-                    summary = str(summary or "").strip()
-                    if not summary or summary == task_meta.get("prompt", ""):
-                        if event_type == "codex.failed":
-                            summary = f"Task {task_id} failed"
-                        elif event_type == "codex.interrupted":
-                            summary = f"Task {task_id} interrupted"
-                        else:
-                            summary = "任务已成功完成"
+                    if event_type == "codex.failed":
+                        fallback = f"Task {task_id} failed"
+                    elif event_type == "codex.interrupted":
+                        fallback = f"Task {task_id} interrupted"
+                    else:
+                        fallback = "任务已成功完成"
+                    summary = _safe_task_summary(summary, task_meta.get("prompt"), fallback)
                     event_payload["summary"] = summary
                     with self._lock:
                         task_meta["notification"] = event_payload
@@ -1446,11 +1448,7 @@ class RemoteCodexCompanionClient:
                         or res.get("message")
                         or "任务已成功完成"
                     )
-                    if isinstance(summary, dict):
-                        summary = summary.get("summary") or summary.get("text") or summary.get("message") or "任务已成功完成"
-                    summary = str(summary).strip()
-                    if not summary or summary == task_meta.get("prompt", ""):
-                        summary = "任务已成功完成"
+                    summary = _safe_task_summary(summary, task_meta.get("prompt"), "任务已成功完成")
 
                     event_payload = {
                         "task_id": task_id,
@@ -1471,6 +1469,7 @@ class RemoteCodexCompanionClient:
 
                 elif task_status in ("interrupted", "cancelled"):
                     summary = res_dict.get("summary") or res.get("summary") or f"Task {task_id} interrupted"
+                    summary = _safe_task_summary(summary, task_meta.get("prompt"), f"Task {task_id} interrupted")
                     event_payload = {
                         "task_id": task_id,
                         "status": "interrupted",
@@ -1500,11 +1499,7 @@ class RemoteCodexCompanionClient:
                         or res.get("error")
                         or f"Task {task_id} failed"
                     )
-                    if isinstance(err_msg, dict):
-                        err_msg = err_msg.get("message") or err_msg.get("summary") or f"Task {task_id} failed"
-                    err_msg = str(err_msg).strip()
-                    if not err_msg or err_msg == task_meta.get("prompt", ""):
-                        err_msg = f"Task {task_id} failed"
+                    err_msg = _safe_task_summary(err_msg, task_meta.get("prompt"), f"Task {task_id} failed")
                     event_payload = {
                         "task_id": task_id,
                         "status": "failed",

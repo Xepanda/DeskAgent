@@ -679,7 +679,7 @@ class TestCodexCompanion(unittest.TestCase):
                 "thread_id": "thread-safe-completion",
                 "turn_id": "turn-safe-completion",
                 "prompt": prompt,
-                "summary": "assistant-only result",
+                "summary": f"assistant response echoed request: {prompt}",
             }
         }
         events: list[tuple[str, dict[str, Any]]] = []
@@ -693,7 +693,10 @@ class TestCodexCompanion(unittest.TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][0], "codex.turn_completed")
-        self.assertEqual(events[0][1]["summary"], "assistant-only result")
+        self.assertEqual(
+            events[0][1]["summary"],
+            "assistant response echoed request: [user request omitted]",
+        )
         self.assertNotIn("result", events[0][1])
         self.assertNotIn(prompt, json.dumps(events[0][1]))
 
