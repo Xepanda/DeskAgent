@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.8.0
+> 文档版本：V3.9.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
-> 状态：**2026-10-22 最新 CLI 镜像的增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 只有 UART READY/设定值而无 TX、ACK 或动作证据。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> 状态：**2026-10-22 最新 CLI 镜像的增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 小幅动作命令已尝试但超时且无 ACK/动作证据。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> V3.9.0 变更：记录 `6255657` Host managed SDK session 的 Codex terminal summary→`ctrl.expression.set` 软件链路、outbox 幂等/退避与 UTF-8 截断行为及定向回归结果；明确该证据为 L2，未启动真实 `WATCHER_APP_*` Runtime，也没有当前设备/声音 L3 证据。
 > V3.8.0 变更：说明 camera `READY` 不代表 HX 传感器就绪；记录同步命中后 SPI header read 返回 `ESP_OK` 但七字节全零并映射为 `rc=-25`；列出同一次 capture 的下一步同步示波测量点，并标记现场尚无波形证据。
 > V3.7.0 变更：更新 2026-10-22 CLI 镜像 app-only COM21 烧录 SHA/校验与最新真机状态；明确 Wi-Fi、麦克风为单项观测，MQTT 授权读取失败，相机返回全零 PTL、STM32 无接收或动作证据。
 > V3.6.0 变更：依据 2026-10-22 最新构建、设备刷写与串口日志，更新相机 `rc=-25`/7-byte PTL 全零失败，SDK fake parser 与真实 Runtime 边界、A5 本机真实 Codex 任务、A3 reminder teardown 修复、A4/STM32 状态及 A7 串口日志工具证据；所有结论按 L1-L4 分层，不将软件或单项实测扩写为整机通过。
@@ -32,7 +33,7 @@
 | 官方 Python SDK | **L1 契约；L2 parser 测试通过；真实 Runtime L3 未验证** | 官方 SDK parser 对有效 fixture 的互操作测试通过；设备侧 pairing window 命令曾现场打开/取消。官方 Runtime 的真实 WebSocket 发现、配对、HardwareHello、能力注册、命令与媒体传输均未验 | 用未修改官方 SDK 连真实设备；错误配对码必须拒绝，正确配对后记录完整连接/命令/媒体/断线重连日志 |
 | Home Assistant | **L2 软件测试；L3/L4 未验证** | HA Connector 测试仅证明软件接口行为；没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
 | 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | LifeService 23 项及提醒相关 crash-recovery 测试 1 项通过；SQLite teardown `WinError 32` 已通过显式 close 修复并在 Windows 验证立即删除 DB 文件。该结果是受控测试中的 orderly teardown/recovery，不是强杀进程后的真实崩溃验证，也不代表设备播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
-| Windows Companion / Codex | **L3 本机真实 Codex 任务通过；设备闭环 L4 未完成** | app-server 省略模型参数真实调用成功；隔离工作区任务修改 `app.py`、命令退出 0、任务状态跨 Companion 重启持久化；assistant-only 输出筛选有单测。未验证设备下达任务及设备显示/播报结果 | 实测审批、失败、取消与重启恢复，并贯通设备请求→Codex 修改隔离工程→验证→真实结果回设备显示/播报 |
+| Windows Companion / Codex | **L3 本机真实 Codex 任务单项通过；新 managed-session 结果回传仅 L2；设备闭环 L4 未完成** | 既有 app-server 默认模型调用及隔离工作区修改任务有本机真实服务证据。`6255657` 新增的 terminal summary→`ctrl.expression.set`、outbox 幂等/退避与 UTF-8 63-byte 截断由定向回归覆盖，测试只将响应 ACK 判为 `accepted`；`WATCHER_APP_*` real managed Runtime 未配置/启动。未验证当前设备实际显示/发声或用户听到 | 启动真实 managed Runtime 并连接设备，确认 terminal summary 经真实 Host/SDK 送达；观察设备播报并由用户确认听感，同时覆盖失败、重复 outbox、断线重试及超长 UTF-8 文本 |
 | ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 真实捕获通过** | A7 新增只读串口采集/解析工具，7 项测试通过；COM21 原始捕获 350 bytes，内含本轮相机 PTL 全零及 `rc=-25` 诊断。日志工具没有证明语音、STM32 或其他事件正常 | 归档原始日志与脱敏事件摘要；后续采集需明确端口/波特率/时间窗，并确认不会并发占用 COM21 |
 | 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散；语音、屏幕、Codex 本机任务等是各自单项证据 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
 
@@ -82,6 +83,7 @@
 | 音频输入 | 麦克风 READY/running，895 frames、errors=0、peak=95 | L3 PCM 采集观测；当前镜像 WakeNet/ASR/多轮对话/回复播报未复验。此前用户确认对应旧镜像 |
 | 相机 | Driver READY；PTL empty response `raw=00000000000000`，`rc=-25`，`out_len=0`，无 JPEG。READY 只表明初始化路径、expander 配置及 SPI bus/device 创建成功；未探测 HX ID/应答。同步命中后 7-byte SPI header read 返回 ESP_OK 但全零，才映射为 `rc=-25` | L3 失败；无真实图片。现场没有 scope/logic-analyzer 波形证据；下次必须在同一次 capture 同步观测 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 和 HX 电源轨 |
 | STM32 / body UART | `body move 91 120 500` 返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)、`accepted=false`；之后 `body status` 显示 UART READY、cached setpoint 90/120、last formatted TX length 23 bytes | L3 真实命令尝试失败；没有 RX/ACK/物理动作证据。TX 长度不等于 STM32 收到命令，设定值仍为 90/120 表明未确认目标状态。日志：`.target_logging/com21-small-motion-test-20261022.log` |
+| Codex terminal summary 设备反馈 | `6255657` 在 Host managed SDK session 将 Codex terminal summary 编为 `ctrl.expression.set`；outbox 去重/幂等、退避和 UTF-8 63-byte 截断行为纳入实现 | combined 定向回归报告 166 passed、6 subtests passed，证据为 L2；测试中的 ACK 只代表 `accepted`。`WATCHER_APP_*` real managed Runtime 未配置/启动，无当前设备显示/声音或用户听感 L3 证据 |
 
 本次为指定真机状态增量，不代表全量回归或端到端通过；整机 L4 仍未完成。
 

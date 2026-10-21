@@ -16,7 +16,7 @@
 - 提醒：`LifeService` 23 项和定向 reminder catch-up 1 项通过；SQLite teardown 的 `WinError 32` 修复属 L2。强制 kill 崩溃恢复、真实 Host 重启、设备到期播报/确认未验。
 - SDK bridge：5 项 source-contract 检查通过；依赖本机 GCC 的 10 项用例被 skipped，没有执行结果，不等于构建或官方 SDK 互通通过。
 - 输入/UI：9 项软件 contract 测试；滚轮和按键已有用户现场确认，详细输入事件日志待归档。
-- Codex Companion：真实 app-server 默认模型调用及隔离工作区修改/验证任务通过，任务记录跨 Companion 重启保留；属本机单项证据。审批/取消/失败恢复及设备触发和设备反馈未验。
+- Codex Companion：既有 app-server 默认模型调用及隔离工作区修改任务有本机真实服务证据。`6255657` 新增 Host managed SDK session 的 terminal summary→`ctrl.expression.set` 结果回传、outbox 幂等/退避、UTF-8 63-byte 截断；combined 定向回归为 166 passed、6 subtests passed（L2）。测试 ACK 只代表 `accepted`。`WATCHER_APP_*` real managed Runtime 尚未配置/启动，当前设备显示/播报及用户听感没有 L3 证据。
 - 官方 Python SDK 互通：官方 parser 对 fixture 的 10 项互操作测试通过（L2）；pairing window CLI 曾打开/取消。真实 Runtime WebSocket 发现、配对、HardwareHello、能力注册及命令/媒体闭环未验。
 - ESP32-S3 日志：A7 logger 7 项测试通过（L2）；COM21 原始采集 350 bytes，捕获本轮相机失败日志（L3 单项观测）。采集成功不代表日志范围之外的模块正常。
 - 系统验证脚本：最近一次 `verify_all.sh` 在 Step 2 失败，Step 3–8 未运行；本轮不得报告全套门禁通过。
@@ -102,6 +102,8 @@ python -m unittest tests.e2e.test_p1_regression_gates
 通过证据：DB 状态前后快照（脱敏）、Host 投递日志、设备播放/显示及用户确认、无重复播报；软件定时器测试仍仅为 L2。
 
 ## 8. Companion / Codex（L3 单服务与 L4 设备闭环）
+
+当前代码已包含 `6255657` 的 managed-session terminal summary→`ctrl.expression.set` 发送逻辑以及 outbox 幂等、退避、UTF-8 63-byte 截断；combined 定向回归记录为 166 passed、6 subtests passed（L2）。这不表示真实 `WATCHER_APP_*` Runtime 已连接，测试 ACK 仅能说明 `accepted`，不能说明设备实际播报或用户听到。完成 L3 前须先配置并启动真实 Runtime，再在设备现场确认显示/声音。
 
 1. 仅使用隔离测试工程和用户可销毁的测试分支/副本。先验证省略模型参数时真实 app-server 默认模型调用成功，并保存 thread/turn 标识和 assistant 输出。
 2. 提交一项无副作用的文件修改任务，检查 diff 属于隔离目录且由 assistant 输出说明；运行目标验证并读取退出码。
