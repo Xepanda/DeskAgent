@@ -635,7 +635,10 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         .length = (body_size - prefetched) * 8,
         .rxlength = (body_size - prefetched) * 8,
         .rx_buffer = s_ptl_body + prefetched,
-        .flags = esp_ptr_external_ram(s_ptl_body + prefetched) ? SPI_TRANS_DMA_USE_PSRAM : 0,
+        /* IDF 5.4 has no PSRAM transaction flag. With DMA enabled and the
+         * default flags, spi_master stages non-DMA-capable RX buffers through
+         * MALLOC_CAP_DMA memory and copies the received bytes back. */
+        .flags = 0,
     };
     err = spi_device_transmit(s_spi_dev, &body_trans);
     spi_device_release_bus(s_spi_dev);

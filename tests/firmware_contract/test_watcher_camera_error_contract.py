@@ -87,11 +87,12 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
         self.assertIn("#define CAM_MAX_PACKET_SZ         WATCHER_HX_PTL_BODY_CAPACITY", source)
         self.assertIn(".max_transfer_sz = CAM_MAX_PACKET_SZ", source)
 
-    def test_psram_ptl_body_uses_idf_external_ram_dma_flag(self):
+    def test_psram_ptl_body_uses_idf54_driver_bounce_buffer(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         body_transfer = source.split("/* Step 2: Read complete body", 1)[1].split("/* Step 3:", 1)[0]
-        self.assertIn("esp_ptr_external_ram(s_ptl_body + prefetched)", body_transfer)
-        self.assertIn("SPI_TRANS_DMA_USE_PSRAM", body_transfer)
+        self.assertIn(".flags = 0", body_transfer)
+        self.assertNotIn("SPI_TRANS_DMA_USE_PSRAM", body_transfer)
+        self.assertIn("IDF 5.4 has no PSRAM transaction flag", source)
 
     def test_empty_ptl_poll_records_raw_header_and_sync_observation(self):
         source = CAMERA_C.read_text(encoding="utf-8")
