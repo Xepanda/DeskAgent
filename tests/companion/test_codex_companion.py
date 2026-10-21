@@ -121,7 +121,8 @@ class TestCodexCompanion(unittest.TestCase):
 
         # 4. Cancel task
         cancel_res = companion.cancel_task("tsk-turn-01", reason="User requested interrupt")
-        self.assertEqual(cancel_res["status"], "cancelled")
+        self.assertEqual(cancel_res["status"], "cancelling")
+        self.assertEqual(companion.get_task_status("tsk-turn-01")["status"], "cancelling")
 
         # Verify initialize request structure aligned with codex-cli 0.161.0
         init_call = next(m for m in sent_messages if m["method"] == "initialize")
@@ -650,7 +651,7 @@ class TestCodexCompanion(unittest.TestCase):
 
             # 5. Cancel task
             cancel_res = client.cancel_task("tsk-rem-01", reason="Testing cancel")
-            self.assertEqual(cancel_res["status"], "cancelled")
+            self.assertEqual(cancel_res["status"], "cancelling")
 
             # 6. Auth failure with invalid token
             bad_client = RemoteCodexCompanionClient(
@@ -902,7 +903,7 @@ class TestCodexCompanion(unittest.TestCase):
 
         task_st3 = comp3.get_task_status("tsk-persist-100")
         self.assertIsNotNone(task_st3)
-        self.assertEqual(task_st3["status"], "cancelled")
+        self.assertEqual(task_st3["status"], "cancelling")
 
         pending3 = comp3.get_pending_approvals("tsk-persist-100")
         self.assertEqual(len(pending3), 0)
@@ -950,8 +951,255 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(params["reason"], "Timed out")
         self.assertNotIn("thread_id", params)
         self.assertNotIn("turn_id", params)
-
         companion.close()
+
+    def test_initialize_resumes_persisted_running_thread_and_restores_turn_correlation(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-running.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-resume-running", "test-project", "run a task")
+        original.close()
+
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        class ResumeTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                calls.append((method, dict(params)))
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": "inProgress", "items": [],
+                    }]}}
+                return {}
+
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=ResumeTransport(),
+            db_path=db_file,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        resumed.add_event_listener(lambda event, data: events.append((event, data)))
+        resumed.initialize()
+
+        self.assertEqual([method for method, _ in calls], ["initialize", "thread/resume"])
+        resume_params = calls[1][1]
+        self.assertEqual(resume_params["threadId"], task["thread_id"])
+        self.assertEqual(resume_params["cwd"], self.workspace_dir)
+        self.assertFalse(resume_params["excludeTurns"])
+        self.assertEqual(resumed._turn_to_task[task["turn_id"]], "tsk-resume-running")
+        self.assertEqual(resumed.get_task_status("tsk-resume-running")["status"], "running")
+        self.assertEqual(resumed.get_task_status("tsk-resume-running")["recovery_status"], "reconnected")
+
+        resumed._handle_server_notification(
+            "turn/completed",
+            {"threadId": task["thread_id"], "turn": {"id": task["turn_id"], "status": "completed"}},
+        )
+        self.assertEqual(resumed.get_task_status("tsk-resume-running")["status"], "completed")
+        self.assertEqual([event for event, _ in events], ["codex.turn_completed"])
+        resumed.close()
+
+    def test_resume_reconciles_schema_terminal_turns_without_using_user_items_as_output(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-terminal.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        tasks = {
+            key: original.submit_task(key, "test-project", "private prompt")
+            for key in ("tsk-resume-completed", "tsk-resume-failed", "tsk-resume-interrupted")
+        }
+        cancel_result = original.cancel_task("tsk-resume-interrupted", reason="user requested stop")
+        self.assertEqual(cancel_result["status"], "cancelling")
+        self.assertEqual(original.get_task_status("tsk-resume-interrupted")["status"], "cancelling")
+        original.close()
+
+        statuses = {
+            tasks["tsk-resume-completed"]["thread_id"]: ("completed", [
+                {"type": "userMessage", "text": "private prompt"},
+                {"type": "agentMessage", "text": "assistant result after restart"},
+            ]),
+            tasks["tsk-resume-failed"]["thread_id"]: ("failed", []),
+            tasks["tsk-resume-interrupted"]["thread_id"]: ("interrupted", []),
+        }
+
+        class ResumeTerminalTransport(JsonRpcTransport):
+            companion: Optional[CodexCompanion] = None
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    status, items = statuses[params["threadId"]]
+                    task = next(value for value in tasks.values() if value["thread_id"] == params["threadId"])
+                    if status == "completed":
+                        items.append({"type": "message", "text": "ambiguous non-assistant text"})
+                    if status == "completed" and self.companion is not None:
+                        self.companion._handle_server_notification("turn/completed", {
+                            "threadId": params["threadId"],
+                            "turn": {"id": task["turn_id"], "status": status, "items": items},
+                        })
+                    return {"thread": {"id": params["threadId"], "turns": [{
+                        "id": task["turn_id"], "status": status, "items": items,
+                        "error": {"message": "server error"} if status == "failed" else None,
+                    }]}}
+                return {}
+
+        terminal_transport = ResumeTerminalTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=terminal_transport,
+            db_path=db_file,
+        )
+        terminal_transport.companion = resumed
+        events: list[tuple[str, dict[str, Any]]] = []
+        resumed.add_event_listener(lambda event, data: events.append((event, data)))
+        resumed.initialize()
+
+        self.assertEqual(resumed.get_task_status("tsk-resume-completed")["status"], "completed")
+        self.assertEqual(resumed.get_task_status("tsk-resume-completed")["summary"], "assistant result after restart")
+        self.assertNotIn("private prompt", json.dumps(events))
+        self.assertEqual(sum(event == "codex.turn_completed" for event, _ in events), 1)
+        self.assertEqual(resumed.get_task_status("tsk-resume-failed")["status"], "failed")
+        self.assertEqual(resumed.get_task_status("tsk-resume-interrupted")["status"], "interrupted")
+        self.assertEqual([event for event, _ in events], [
+            "codex.turn_completed", "codex.failed", "codex.interrupted",
+        ])
+        resumed.close()
+
+    def test_nonterminal_thread_is_resumed_after_each_companion_restart(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-twice.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-resume-twice", "test-project", "run a task")
+        original.close()
+
+        resume_calls = 0
+
+        class ResumeTwiceTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                nonlocal resume_calls
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    resume_calls += 1
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": "inProgress", "items": [],
+                    }]}}
+                return {}
+
+        for _ in range(2):
+            companion = CodexCompanion(
+                allowed_workspaces=self.workspaces,
+                transport=ResumeTwiceTransport(),
+                db_path=db_file,
+            )
+            companion.initialize()
+            self.assertEqual(companion.get_task_status("tsk-resume-twice")["status"], "running")
+            self.assertEqual(companion.get_task_status("tsk-resume-twice")["recovery_status"], "reconnected")
+            companion.close()
+        self.assertEqual(resume_calls, 2)
+
+    def test_active_writer_resume_conflict_stays_pending_and_can_be_retried(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-active-writer.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-active-writer", "test-project", "run a task")
+        original.close()
+
+        class ResumeTransport(JsonRpcTransport):
+            attempts = 0
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    self.attempts += 1
+                    if self.attempts == 1:
+                        raise RuntimeError("Codex JSON-RPC error: {'code': -32600, 'message': 'thread already has an active writer'}")
+                    if self.attempts == 2:
+                        return {"error": {"code": -32600, "message": "thread already has an active writer"}}
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": "inProgress", "items": [],
+                    }]}}
+                return {}
+
+        transport = ResumeTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        resumed.initialize()
+
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "pending")
+        self.assertEqual(status["recovery_error_kind"], "active_writer")
+        self.assertFalse(status["summary"])
+        self.assertEqual(resumed.get_pending_approvals("tsk-active-writer"), [])
+
+        recovered = resumed.recover_pending_tasks()
+        self.assertEqual(recovered, {"reconnected": 0, "reconciled": 0, "pending": 1})
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "pending")
+        self.assertEqual(status["recovery_error_kind"], "active_writer")
+
+        recovered = resumed.recover_pending_tasks()
+        self.assertEqual(recovered, {"reconnected": 1, "reconciled": 0, "pending": 0})
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "reconnected")
+        self.assertNotIn("recovery_error_kind", status)
+        self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 0, "pending": 0})
+        self.assertEqual(transport.attempts, 3)
+        resumed.close()
+
+    def test_legacy_cancelled_task_is_not_resumed(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "legacy-cancelled.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        original.submit_task("tsk-legacy-cancelled", "test-project", "already cancelled")
+        with original._lock:
+            task = original._tasks["tsk-legacy-cancelled"]
+            task["status"] = task["state"] = "cancelled"
+            original._persist_task(task)
+        original.close()
+
+        class NoResumeTransport(JsonRpcTransport):
+            resume_calls = 0
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    self.resume_calls += 1
+                return {}
+
+        transport = NoResumeTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        resumed.initialize()
+        self.assertEqual(transport.resume_calls, 0)
+        self.assertEqual(resumed.get_task_status("tsk-legacy-cancelled")["status"], "cancelled")
+        resumed.close()
 
 
 if __name__ == "__main__":

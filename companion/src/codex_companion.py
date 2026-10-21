@@ -321,11 +321,14 @@ class CodexCompanion:
         self.codex_bin = codex_bin
         self._transport = transport
         self._initialized = False
+        self._last_recovery_counts = {"reconnected": 0, "reconciled": 0, "pending": 0}
         self._tasks: dict[str, dict[str, Any]] = {}
         self._pending_approvals: dict[str, dict[str, Any]] = {}
         self._thread_to_task: dict[str, str] = {}
         self._turn_to_task: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._initialize_lock = threading.Lock()
+        self._recovery_lock = threading.Lock()
         self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
 
         if db_path is None:
@@ -704,12 +707,14 @@ class CodexCompanion:
                     elif raw_status in ("interrupted", "cancelled"):
                         self._tasks[task_id]["status"] = "interrupted"
                         self._tasks[task_id]["state"] = "interrupted"
-                        self._persist_task(self._tasks[task_id])
                         summary = self._safe_terminal_summary(
                             self._tasks[task_id],
                             params.get("summary") or turn.get("summary"),
                             f"Task {task_id} interrupted",
                         )
+                        self._tasks[task_id]["summary"] = summary
+                        self._tasks[task_id]["last_output"] = summary
+                        self._persist_task(self._tasks[task_id])
                         self._dispatch_event("codex.interrupted", {
                             "task_id": task_id,
                             "status": "interrupted",
@@ -724,6 +729,7 @@ class CodexCompanion:
                             or turn.get("response")
                             or turn_res.get("summary")
                             or turn_res.get("output")
+                            or self._assistant_text_from_items(turn.get("items"))
                             or params.get("output")
                             or params.get("response")
                             or self._tasks[task_id].get("last_output")
@@ -762,21 +768,224 @@ class CodexCompanion:
 
     def initialize(self) -> dict[str, Any]:
         """Performs JSON-RPC initialize handshake with Codex app-server."""
-        with self._lock:
-            if not self._initialized:
-                transport = self._get_transport()
-                resp = transport.send_request(
-                    "initialize",
-                    {
-                        "clientInfo": {"name": "desk-agent-companion", "version": "0.1.0"},
-                        "capabilities": {},
-                    },
-                )
-                if resp is None or (isinstance(resp, dict) and "error" in resp):
-                    raise ConnectionError(f"Codex app-server initialization failed: {resp}")
+        with self._initialize_lock:
+            with self._lock:
+                initialized = self._initialized
+            if initialized:
+                return {"capabilities": {}}
+
+            transport = self._get_transport()
+            resp = transport.send_request(
+                "initialize",
+                {
+                    "clientInfo": {"name": "desk-agent-companion", "version": "0.1.0"},
+                    "capabilities": {},
+                },
+            )
+            if resp is None or (isinstance(resp, dict) and "error" in resp):
+                raise ConnectionError(f"Codex app-server initialization failed: {resp}")
+            with self._lock:
                 self._initialized = True
-                return resp
-            return {"capabilities": {}}
+
+        # Do not hold the state lock across RPCs: thread/resume may emit
+        # notifications before its response, and the transport reader must be
+        # able to correlate those notifications while this request is pending.
+        self._last_recovery_counts = self._recover_pending_tasks()
+        return resp
+
+    def recover_pending_tasks(self) -> dict[str, int]:
+        """Reconnects persisted non-terminal tasks to their app-server threads.
+
+        Resume errors, including active-writer conflicts, leave the original
+        task status untouched and mark recovery pending so callers can retry.
+        """
+        if not self._initialized:
+            self.initialize()
+            return dict(self._last_recovery_counts)
+
+        self._last_recovery_counts = self._recover_pending_tasks()
+        return dict(self._last_recovery_counts)
+
+    def _recover_pending_tasks(self) -> dict[str, int]:
+        counts = {"reconnected": 0, "reconciled": 0, "pending": 0}
+        # Keep legacy persisted ``cancelled`` tasks terminal for compatibility.
+        # New cancellation requests use ``cancelling`` until the server reports
+        # an authoritative interrupted terminal turn.
+        terminal_statuses = {"completed", "failed", "interrupted", "cancelled", "succeeded", "error"}
+        with self._recovery_lock:
+            with self._lock:
+                candidates = [
+                    dict(task)
+                    for task in self._tasks.values()
+                    if str(task.get("status") or task.get("state") or "").lower() not in terminal_statuses
+                    and task.get("recovery_status") in (None, "pending")
+                ]
+
+            transport = self._get_transport()
+            for task_snapshot in candidates:
+                task_id = task_snapshot["task_id"]
+                thread_id = task_snapshot.get("thread_id")
+                turn_id = task_snapshot.get("turn_id")
+                with self._lock:
+                    task = self._tasks.get(task_id)
+                    if task is None:
+                        continue
+                    task["recovery_status"] = "pending"
+                    task["recovery_attempts"] = int(task.get("recovery_attempts", 0)) + 1
+                    task.pop("recovery_error_kind", None)
+
+                if not thread_id:
+                    self._set_recovery_pending(task_id, "missing_thread_id")
+                    counts["pending"] += 1
+                    continue
+
+                try:
+                    response = transport.send_request("thread/resume", {
+                        "threadId": thread_id,
+                        "cwd": task_snapshot.get("target_dir") or None,
+                        "excludeTurns": False,
+                    })
+                except Exception as exc:
+                    error_text = str(exc).lower()
+                    error_kind = "active_writer" if "already has an active writer" in error_text else "resume_error"
+                    self._set_recovery_pending(task_id, error_kind)
+                    counts["pending"] += 1
+                    logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
+                    continue
+
+                if isinstance(response, dict) and isinstance(response.get("error"), dict):
+                    error_text = str(response["error"].get("message") or "").lower()
+                    error_kind = "active_writer" if "already has an active writer" in error_text else "resume_error"
+                    self._set_recovery_pending(task_id, error_kind)
+                    counts["pending"] += 1
+                    logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
+                    continue
+
+                thread = response.get("thread") if isinstance(response, dict) else None
+                if not isinstance(thread, dict):
+                    self._set_recovery_pending(task_id, "missing_thread")
+                    counts["pending"] += 1
+                    continue
+
+                resumed_thread_id = thread.get("id") or thread_id
+                if resumed_thread_id != thread_id:
+                    self._set_recovery_pending(task_id, "thread_mismatch")
+                    counts["pending"] += 1
+                    continue
+
+                with self._lock:
+                    current = self._tasks.get(task_id)
+                    if current is None:
+                        continue
+                    self._thread_to_task[thread_id] = task_id
+
+                turns = thread.get("turns")
+                if not isinstance(turns, list):
+                    self._set_recovery_pending(task_id, "missing_turns")
+                    counts["pending"] += 1
+                    continue
+
+                matching_turn = next((
+                    turn for turn in turns
+                    if isinstance(turn, dict) and turn_id and turn.get("id") == turn_id
+                ), None)
+                if matching_turn is None:
+                    self._set_recovery_pending(task_id, "turn_not_found")
+                    counts["pending"] += 1
+                    continue
+
+                with self._lock:
+                    self._turn_to_task[turn_id] = task_id
+                turn_status = str(matching_turn.get("status") or "").lower()
+
+                with self._lock:
+                    current = self._tasks.get(task_id)
+                    current_status = str((current or {}).get("status") or "").lower()
+                if current_status in terminal_statuses:
+                    # A notification may arrive before the resume RPC response.
+                    # Keep its authoritative result and avoid duplicate events.
+                    with self._lock:
+                        current = self._tasks.get(task_id)
+                        if current is not None:
+                            current["recovery_status"] = "reconciled"
+                            current.pop("recovery_error_kind", None)
+                            self._persist_task(current)
+                    counts["reconciled"] += 1
+                    continue
+
+                if turn_status == "inprogress":
+                    with self._lock:
+                        current = self._tasks.get(task_id)
+                        if current is not None:
+                            current["recovery_status"] = "reconnected"
+                            current.pop("recovery_error_kind", None)
+                            self._persist_task(current)
+                    counts["reconnected"] += 1
+                    continue
+
+                if turn_status not in {"completed", "failed", "interrupted"}:
+                    self._set_recovery_pending(task_id, "unknown_turn_status")
+                    counts["pending"] += 1
+                    continue
+
+                terminal_turn = dict(matching_turn)
+                assistant_text = self._assistant_text_from_items(terminal_turn.get("items"))
+                params: dict[str, Any] = {"threadId": thread_id, "turnId": turn_id, "turn": terminal_turn}
+                if assistant_text:
+                    params["summary"] = assistant_text
+                self._handle_server_notification("turn/completed", params)
+                with self._lock:
+                    current = self._tasks.get(task_id)
+                    if current is not None:
+                        current["recovery_status"] = "reconciled"
+                        current.pop("recovery_error_kind", None)
+                        self._persist_task(current)
+                counts["reconciled"] += 1
+
+        return counts
+
+    def _set_recovery_pending(self, task_id: str, error_kind: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task["recovery_status"] = "pending"
+            task["recovery_error_kind"] = error_kind
+            # Persist the task's existing status and output without translating
+            # a reconnect problem into a task failure or completion.
+            self._persist_task(task)
+
+    @staticmethod
+    def _assistant_text_from_items(items: Any) -> Optional[str]:
+        if not isinstance(items, list):
+            return None
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            role = item.get("role") or item.get("author")
+            if item_type == "userMessage" or role == "user":
+                continue
+            if not (
+                item_type in ("agentMessage", "assistantMessage")
+                or role in ("assistant", "agent")
+            ):
+                continue
+            text = item.get("text") or item.get("formatted")
+            if not text:
+                content = item.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts = [
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    ]
+                    text = "".join(parts).strip()
+            if text:
+                return str(text).strip()
+        return None
 
     def _ensure_initialized(self) -> None:
         if not self._initialized:
@@ -905,10 +1114,10 @@ class CodexCompanion:
         transport.send_request("turn/interrupt", params)
 
         with self._lock:
-            task["state"] = "cancelled"
-            task["status"] = "cancelled"
+            task["state"] = "cancelling"
+            task["status"] = "cancelling"
             self._persist_task(task)
-        return {"task_id": task_id, "turn_id": turn_id, "status": "cancelled", "reason": reason}
+        return {"task_id": task_id, "turn_id": turn_id, "status": "cancelling", "reason": reason}
 
     def request_approval(
         self,
