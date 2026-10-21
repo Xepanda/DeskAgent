@@ -5,7 +5,12 @@ from __future__ import annotations
 import time
 import unittest
 
-from host.desk_agent.camera.camera_service import CameraViewerService
+from host.desk_agent.camera.camera_service import (
+    CameraStreamCapacityError,
+    CameraStreamFrameUnavailable,
+    CameraStreamLeaseError,
+    CameraViewerService,
+)
 
 
 TEST_JPEG = b"\xff\xd8test-image-payload\xff\xd9"
@@ -115,6 +120,90 @@ class TestCameraService(unittest.TestCase):
         cam.update_motion_coordinates(200.0, 80.0)
         self.assertEqual(cam.pipeline._current_pan, 180.0)
         self.assertEqual(cam.pipeline._current_tilt, 100.0)
+
+    def test_mjpeg_requires_current_owner_and_initial_fresh_hardware_frame(self) -> None:
+        cam = CameraViewerService()
+        with self.assertRaises(CameraStreamLeaseError) as no_lease:
+            cam.iter_mjpeg("viewer")
+        self.assertEqual(no_lease.exception.code, "NO_ACTIVE_LEASE")
+        cam.acquire_lease("owner", lease_ms=1000)
+        with self.assertRaises(CameraStreamLeaseError) as wrong_owner:
+            cam.iter_mjpeg("viewer")
+        self.assertEqual(wrong_owner.exception.code, "RESOURCE_BUSY")
+        stream = cam.iter_mjpeg("owner", wait_timeout=0.05)
+        with self.assertRaises(CameraStreamFrameUnavailable) as no_frame:
+            next(stream)
+        self.assertEqual(no_frame.exception.code, "NO_FRESH_FRAME")
+        cam.release_lease("owner")
+
+    def test_mjpeg_yields_only_new_physical_jpegs_and_stops_when_lease_released(self) -> None:
+        cam = CameraViewerService(stale_threshold_ms=300)
+        cam.acquire_lease("viewer", lease_ms=1000)
+        cam.ingest_robot_frame(TEST_JPEG)
+        stream = cam.iter_mjpeg("viewer", wait_timeout=0.2)
+
+        def publish_new_frame() -> None:
+            time.sleep(0.02)
+            cam.ingest_robot_frame(TEST_JPEG)
+
+        import threading
+        producer = threading.Thread(target=publish_new_frame)
+        producer.start()
+        part = next(stream)
+        producer.join()
+        self.assertIn(b"Content-Type: image/jpeg", part)
+        self.assertIn(b"X-Frame-Seq: 2", part)
+        self.assertTrue(part.endswith(TEST_JPEG + b"\r\n"))
+        cam.release_lease("viewer")
+        self.assertRaises(StopIteration, next, stream)
+
+    def test_mjpeg_rejects_external_or_stale_frame(self) -> None:
+        cam = CameraViewerService(stale_threshold_ms=20)
+        cam.acquire_lease("viewer", lease_ms=1000)
+        cam.push_frame(TEST_JPEG, is_hardware=False)
+        stream = cam.iter_mjpeg("viewer", wait_timeout=0.05)
+        with self.assertRaises(CameraStreamFrameUnavailable):
+            next(stream)
+        self.assertNotIn("viewer", cam._active_stream_owners, "first-frame errors must release the reservation")
+        cam.release_lease("viewer")
+
+    def test_mjpeg_stream_admission_limits_owner_and_global_subscribers(self) -> None:
+        cam = CameraViewerService()
+        cam.acquire_lease("viewer", lease_ms=1000)
+        stream = cam.iter_mjpeg("viewer")
+        with self.assertRaises(CameraStreamCapacityError) as duplicate:
+            cam.iter_mjpeg("viewer")
+        self.assertEqual(duplicate.exception.code, "STREAM_ALREADY_ACTIVE")
+        stream.close()  # close before first next must release its reservation
+        self.assertNotIn("viewer", cam._active_stream_owners)
+
+        cam._active_stream_owners.update({"reserved-a", "reserved-b", "reserved-c", "reserved-d"})
+        with self.assertRaises(CameraStreamCapacityError) as full:
+            cam.iter_mjpeg("viewer")
+        self.assertEqual(full.exception.code, "STREAM_CAPACITY")
+        cam._active_stream_owners.clear()
+        cam.release_lease("viewer")
+
+    def test_mjpeg_wire_part_uses_exact_crlf_and_content_length(self) -> None:
+        cam = CameraViewerService()
+        cam.acquire_lease("viewer", lease_ms=1000)
+        stream = cam.iter_mjpeg("viewer", wait_timeout=0.2)
+        import threading
+        producer = threading.Thread(target=lambda: (time.sleep(0.02), cam.ingest_robot_frame(TEST_JPEG)))
+        producer.start()
+        part = next(stream)
+        producer.join()
+        expected = (
+            b"--deskagent-frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            + f"Content-Length: {len(TEST_JPEG)}\r\n".encode()
+            + b"X-Frame-Seq: 1\r\nX-Frame-Age-Ms: "
+        )
+        self.assertTrue(part.startswith(expected))
+        self.assertIn(b"\r\n\r\n" + TEST_JPEG + b"\r\n", part)
+        stream.close()
+        self.assertNotIn("viewer", cam._active_stream_owners)
+        cam.release_lease("viewer")
 
 
 if __name__ == "__main__":

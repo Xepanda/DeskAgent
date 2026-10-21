@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.9.0
+> 文档版本：V3.12.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
 > 状态：**2026-10-22 最新 CLI 镜像的增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 小幅动作命令已尝试但超时且无 ACK/动作证据。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> V3.12.0 变更：记录 CR-006 最终交叉测试为 52 passed、9 subtests passed，inline JS 与 diff 检查通过；复审无新增 Critical/Important。该项为 L2，真实相机 `rc=-25/out_len=0`，L3 失败、L4 未验证，不能称全契约实机通过。补充本轮 COM21 只读 ESP32-S3 日志采集的两条事件及证据范围。
 > V3.9.0 变更：记录 `6255657` Host managed SDK session 的 Codex terminal summary→`ctrl.expression.set` 软件链路、outbox 幂等/退避与 UTF-8 截断行为及定向回归结果；明确该证据为 L2，未启动真实 `WATCHER_APP_*` Runtime，也没有当前设备/声音 L3 证据。
 > V3.8.0 变更：说明 camera `READY` 不代表 HX 传感器就绪；记录同步命中后 SPI header read 返回 `ESP_OK` 但七字节全零并映射为 `rc=-25`；列出同一次 capture 的下一步同步示波测量点，并标记现场尚无波形证据。
 > V3.7.0 变更：更新 2026-10-22 CLI 镜像 app-only COM21 烧录 SHA/校验与最新真机状态；明确 Wi-Fi、麦克风为单项观测，MQTT 授权读取失败，相机返回全零 PTL、STM32 无接收或动作证据。
@@ -29,12 +30,13 @@
 | 滚轮、按键与状态页 | **L3 用户确认，日志证据待归档** | 用户确认滚轮和按键可用；交互约定为滚轮滚动/选择只读状态页，短按/长按沿用 TuyaOpen 语音事件 | 归档每项输入事件日志及对应 UI 页面变化；覆盖快速旋转、反向、短按、长按 |
 | Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新 COM21 capture 日志显示 driver `READY`，但该状态仅证明初始化路径、I2C expander 配置及 SPI bus/device 创建成功；没有 HX ID/应答探测，不证明传感器就绪。capture 命中同步后，7-byte SPI header transfer 返回 `ESP_OK`，采样数据仍全零 (`raw=00000000000000`)，随后返回 `rc=-25`、`out_len=0`；未取得 JPEG。详见 `desk_watcher_camera.c:135-193,264-346`。现场尚无示波器/逻辑分析仪波形证据 | 下一次 capture 必须同步测量同一事务中的 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 与 HX 电源轨；保存探点、时基和电压。确认总线数据前不盲目重复取帧；修复后导出并打开现场 JPEG，验证连续帧与资源释放 |
 | 相机 SDK parser / Host adapter | **L2 fake 集成通过；L3/L4 未验证** | 测试调用固定版本官方 SDK 的 WSPK parser 和图片回调，以有效 JPEG fixture 验证适配路径；A3 Host adapter 代码/测试使用 fake managed context。未连接官方 Runtime，也未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
+| CR-006 Host MJPEG stream | **L2 测试通过；最终复审无新增 Critical/Important；L3 失败、L4 未验证** | `tests/camera`、Host route、SDK camera adapter 与 managed SDK startup 交叉测试：52 passed、9 subtests passed；inline JS `node --check -`、`git diff --check` 通过。实现只消费真实硬件 JPEG，最高 2 FPS | 最新设备 capture 为 `rc=-25`、`out_len=0`，无真实 JPEG。以上仅为 L2 软件证据；需取得可打开的现场 JPEG，经 Host 到浏览器验证帧新鲜度与断线恢复，才能验收实机链路。不能称全契约实机通过 |
 | STM32 / 机身动作 | **L3 命令发送尝试超时；动作未执行验收** | 新 CLI 镜像发出 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 为 UART READY、cached setpoint 仍 90/120、last formatted TX length=23 bytes；没有 STM32 RX/ACK 或物理动作证据。TX 长度只代表发送帧记录 | 核对线束、串口参数与 STM32 协议；定位此命令超时，再验证真实 RX/ACK 关联、小幅动作与实物位置反馈，并验证通信故障安全停止 |
 | 官方 Python SDK | **L1 契约；L2 parser 测试通过；真实 Runtime L3 未验证** | 官方 SDK parser 对有效 fixture 的互操作测试通过；设备侧 pairing window 命令曾现场打开/取消。官方 Runtime 的真实 WebSocket 发现、配对、HardwareHello、能力注册、命令与媒体传输均未验 | 用未修改官方 SDK 连真实设备；错误配对码必须拒绝，正确配对后记录完整连接/命令/媒体/断线重连日志 |
 | Home Assistant | **L2 软件测试；L3/L4 未验证** | HA Connector 测试仅证明软件接口行为；没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
 | 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | LifeService 23 项及提醒相关 crash-recovery 测试 1 项通过；SQLite teardown `WinError 32` 已通过显式 close 修复并在 Windows 验证立即删除 DB 文件。该结果是受控测试中的 orderly teardown/recovery，不是强杀进程后的真实崩溃验证，也不代表设备播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
 | Windows Companion / Codex | **L3 本机真实 Codex 任务单项通过；新 managed-session 结果回传仅 L2；设备闭环 L4 未完成** | 既有 app-server 默认模型调用及隔离工作区修改任务有本机真实服务证据。`6255657` 新增的 terminal summary→`ctrl.expression.set`、outbox 幂等/退避与 UTF-8 63-byte 截断由定向回归覆盖，测试只将响应 ACK 判为 `accepted`；`WATCHER_APP_*` real managed Runtime 未配置/启动。未验证当前设备实际显示/发声或用户听到 | 启动真实 managed Runtime 并连接设备，确认 terminal summary 经真实 Host/SDK 送达；观察设备播报并由用户确认听感，同时覆盖失败、重复 outbox、断线重试及超长 UTF-8 文本 |
-| ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 真实捕获通过** | A7 新增只读串口采集/解析工具，7 项测试通过；COM21 原始捕获 350 bytes，内含本轮相机 PTL 全零及 `rc=-25` 诊断。日志工具没有证明语音、STM32 或其他事件正常 | 归档原始日志与脱敏事件摘要；后续采集需明确端口/波特率/时间窗，并确认不会并发占用 COM21 |
+| ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 只读日志观测** | A7 logger 7 项测试通过。本轮命令 `python tools/verification/capture_esp32s3_logs.py --capture --port COM21 --baud 115200 --output-dir .target_logging/esp32s3-live-20261022` 只读占用 COM21 约 4.85 秒，捕获 205 raw bytes、解析 2 行：transport connected、free heap 22,703 / PSRAM 7,074,164 bytes；offline replay exit 0 并复现事件。证据目录 `.target_logging/esp32s3-live-20261022/` | 仅覆盖这两条日志；不代表其他模块状态、语音/相机/STM32功能或长稳通过 |
 | 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散；语音、屏幕、Codex 本机任务等是各自单项证据 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
 
 ### 2026-10-21 回归数字与构建状态（历史快照）

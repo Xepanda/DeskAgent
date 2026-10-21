@@ -10,7 +10,7 @@
 - Wi-Fi / provisioning：当前 CLI 镜像 `wifi status` 为 `LINK_UP`；provisioning stage 为 `mqtt_online`，但 `authorize_read rc=-1`。这是 L3 单项状态观测，不代表云端授权或 Tuya AI 会话已可用。
 - 麦克风：当前 CLI 镜像显示 READY、running、895 frames、errors=0、peak=95，属于 L3 PCM 采集观测。用户此前确认的唤醒/对话发生在旧镜像上；当前 CLI 镜像尚未重新验证 WakeNet、ASR、多轮会话或回复播报。
 - 相机：L3 失败。当前 CLI 镜像日志显示 camera driver READY，但该状态只表示初始化路径、I2C expander 配置以及 SPI bus/device 创建成功；代码没有 HX ID/应答探测，因此 READY 不证明传感器已就绪。capture 命中同步后，7-byte SPI header 传输返回 `ESP_OK`，读数仍全零 (`raw=00000000000000`)，随后映射为 `rc=-25`、`out_len=0`，未取得 JPEG。来源：`firmware/components/desk_hardware/src/desk_watcher_camera.c:135-193,264-346`。现场无示波器/逻辑分析仪证据。
-- A6 Host 相机页面：自动化页面测试是 L2；A3 SDK parser/managed adapter 使用 fake context 与有效 JPEG fixture 验证，也是 L2。设备没有真实 JPEG，且未连接官方 Runtime，故 Host 到浏览器的图像链路没有 L3/L4 证据。
+- CR-006 Host MJPEG：相机 service、浏览器 UI 与 `/api/camera/stream` 路由交叉测试为 L2（`python -m pytest tests/camera tests/core/test_host_daemon.py tests/connectors/test_official_robot_camera_adapter.py tests/core/test_managed_sdk_startup.py -q`：52 passed、9 subtests passed；inline JS `node --check -` 与 `git diff --check` 通过）。A3/A6 已修复此前 review 提出的问题，最终复审无新增 Critical/Important。实现只转发真实硬件 JPEG，最高 2 FPS，不合成或复用旧帧。当前设备最新真实 capture 为 `rc=-25`、`out_len=0`，无 JPEG，因此相机 L3 仍失败，L4 未验证；这是 L2 软件验证，不能称全契约实机通过。
 - STM32 / body UART：本轮真实发送小幅命令 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 显示 UART READY、cached setpoint 仍为 90/120、last formatted TX length=23 bytes。该 TX 长度只是发送帧记录，不是 STM32 RX/ACK；没有实物动作确认，动作未通过。日志：`.target_logging/com21-small-motion-test-20261022.log`。
 - HA：当前仅 L2 connector 测试；没有用户现有 HA 会话或物理设备动作证据。
 - 提醒：`LifeService` 23 项和定向 reminder catch-up 1 项通过；SQLite teardown 的 `WinError 32` 修复属 L2。强制 kill 崩溃恢复、真实 Host 重启、设备到期播报/确认未验。
@@ -18,7 +18,7 @@
 - 输入/UI：9 项软件 contract 测试；滚轮和按键已有用户现场确认，详细输入事件日志待归档。
 - Codex Companion：既有 app-server 默认模型调用及隔离工作区修改任务有本机真实服务证据。`6255657` 新增 Host managed SDK session 的 terminal summary→`ctrl.expression.set` 结果回传、outbox 幂等/退避、UTF-8 63-byte 截断；combined 定向回归为 166 passed、6 subtests passed（L2）。测试 ACK 只代表 `accepted`。`WATCHER_APP_*` real managed Runtime 尚未配置/启动，当前设备显示/播报及用户听感没有 L3 证据。
 - 官方 Python SDK 互通：官方 parser 对 fixture 的 10 项互操作测试通过（L2）；pairing window CLI 曾打开/取消。真实 Runtime WebSocket 发现、配对、HardwareHello、能力注册及命令/媒体闭环未验。
-- ESP32-S3 日志：A7 logger 7 项测试通过（L2）；COM21 原始采集 350 bytes，捕获本轮相机失败日志（L3 单项观测）。采集成功不代表日志范围之外的模块正常。
+- ESP32-S3 日志：A7 logger 7 项测试通过（L2）。本轮命令 `python tools/verification/capture_esp32s3_logs.py --capture --port COM21 --baud 115200 --output-dir .target_logging/esp32s3-live-20261022` 只读占用 COM21 约 4.85 秒，原始采集 205 bytes、解析 2 行：transport connected、free heap 22,703 / PSRAM 7,074,164 bytes；offline replay exit 0 并复现事件。证据目录 `.target_logging/esp32s3-live-20261022/`。这是两条设备日志的 L3 单项观测，不覆盖其他模块，也不代表长稳通过。
 - 系统验证脚本：最近一次 `verify_all.sh` 在 Step 2 失败，Step 3–8 未运行；本轮不得报告全套门禁通过。
 
 只有结果、证据和设备反馈都满足表中门槛，才将对应能力标为通过。设备成功启动、函数返回成功、帧长度非零、HTTP 200 或 SDK 安装成功都不能单独作为该能力的通过证据。

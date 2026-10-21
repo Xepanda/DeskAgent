@@ -23,12 +23,18 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, ResponseStatus
 from host.desk_agent.core.router import Router
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
-from host.desk_agent.camera.camera_service import CameraViewerService
+from host.desk_agent.camera.camera_service import (
+    CameraStreamCapacityError,
+    CameraStreamFrameUnavailable,
+    CameraStreamLeaseError,
+    CameraViewerService,
+)
 from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
 from host.desk_agent.connectors.robot.official_camera_adapter import OfficialRobotCameraAdapter
 from host.desk_agent.connectors.robot.managed_codex_feedback_adapter import ManagedCodexFeedbackAdapter
@@ -975,6 +981,14 @@ def make_request_handler(app: DeskAgentHostApp):
                             return True
             return False
 
+        def _check_stream_auth(self) -> bool:
+            """Camera streams accept configured credentials only as a Bearer header."""
+            auth_token = app.config.get("auth_token")
+            if not auth_token:
+                return True
+            auth_hdr = self.headers.get("Authorization", "")
+            return auth_hdr.startswith("Bearer ") and auth_hdr[7:].strip() == auth_token
+
         def do_GET(self) -> None:
             if self.path in ("/", "/index.html"):
                 if index_html_path.exists():
@@ -1004,8 +1018,24 @@ def make_request_handler(app: DeskAgentHostApp):
                 or self.path.startswith("/snapshot.jpg?")
                 or self.path.startswith("/api/camera/snapshot")
                 or self.path.startswith("/api/camera/frame")
+                or self.path == "/api/camera/stream"
+                or self.path.startswith("/api/camera/stream?")
             ):
-                if not self._check_auth():
+                is_stream_request = (
+                    self.path == "/api/camera/stream"
+                    or self.path.startswith("/api/camera/stream?")
+                )
+                if is_stream_request and "token" in parse_qs(
+                    urlsplit(self.path).query, keep_blank_values=True
+                ):
+                    request_parts = self.requestline.split(" ", 2)
+                    if len(request_parts) == 3:
+                        self.requestline = (
+                            f"{request_parts[0]} {urlsplit(request_parts[1]).path}"
+                            f"?token=[REDACTED] {request_parts[2]}"
+                        )
+                is_authorized = self._check_stream_auth() if is_stream_request else self._check_auth()
+                if not is_authorized:
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -1027,6 +1057,98 @@ def make_request_handler(app: DeskAgentHostApp):
                     or self.path.startswith("/snapshot.jpg?")
                     or self.path.startswith("/api/camera/snapshot")
                 )
+
+                is_stream_path = (
+                    self.path == "/api/camera/stream"
+                    or self.path.startswith("/api/camera/stream?")
+                )
+
+                if is_stream_path:
+                    query_values = parse_qs(
+                        urlsplit(self.path).query, keep_blank_values=True
+                    ).get("client_id", [])
+                    if len(query_values) != 1 or not query_values[0].strip():
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"INVALID_CLIENT_ID"}')
+                        return
+                    client_id = query_values[0].strip()
+
+                    stream = None
+                    stream_admitted = False
+                    stream_ready = False
+                    try:
+                        stream = iter(app.camera_service.iter_mjpeg(client_id))
+                        stream_admitted = True
+                        first_part = next(stream)
+                        stream_ready = True
+                    except CameraStreamCapacityError as exc:
+                        self.send_response(429)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": exc.code}).encode())
+                        return
+                    except CameraStreamLeaseError as exc:
+                        self.send_response(403)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": exc.code}).encode())
+                        return
+                    except CameraStreamFrameUnavailable as exc:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "error": "CAMERA_FRAME_UNAVAILABLE",
+                            "reason": exc.code,
+                        }).encode())
+                        return
+                    except StopIteration:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"CAMERA_FRAME_UNAVAILABLE"}')
+                        return
+                    except Exception:
+                        logger.exception("Camera stream could not start")
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"CAMERA_STREAM_UNAVAILABLE"}')
+                        return
+                    finally:
+                        # Failed first-frame attempts free only the subscriber slot;
+                        # lease ownership is managed by the explicit lease API.
+                        if not stream_ready and stream_admitted:
+                            if stream is not None:
+                                stream.close()
+
+                    try:
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type",
+                            "multipart/x-mixed-replace; boundary=deskagent-frame",
+                        )
+                        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                        self.send_header("Pragma", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(first_part)
+                        self.wfile.flush()
+                        while True:
+                            try:
+                                part = next(stream)
+                            except StopIteration:
+                                break
+                            self.wfile.write(part)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        logger.debug("Camera stream client disconnected: %s", client_id)
+                    finally:
+                        if stream is not None:
+                            stream.close()
+                    return
 
                 if is_snapshot_path:
                     ephemeral_lease_acquired = False

@@ -2,7 +2,7 @@
 Desk Agent R1 LAN Camera Viewer Service.
 
 Provides secure local network JPEG frame viewing with:
-- Mutual exclusion single-viewer lease arbitration (RESOURCE_BUSY for concurrent viewers).
+        - Mutual exclusion single-viewer lease arbitration (RESOURCE_BUSY for concurrent viewers).
 - Automatic lease expiration and renewal support.
 - Strict freshness tracking that makes stale frames unavailable.
 - Strict bounded latest-frame buffer (no disk writes, no video recordings, no audio streams).
@@ -15,13 +15,68 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Iterator
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 MAX_CAMERA_JPEG_BYTES = 128 * 1024
+MAX_CAMERA_STREAMS = 4
+MAX_CAMERA_STREAMS_PER_OWNER = 1
 
 LeaseReleaseCallback = Callable[[str, str], None]
+
+
+class CameraStreamError(RuntimeError):
+    """Pre-stream failure that an HTTP adapter can map before sending headers."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class CameraStreamLeaseError(CameraStreamError):
+    pass
+
+
+class CameraStreamFrameUnavailable(CameraStreamError):
+    pass
+
+
+class CameraStreamCapacityError(CameraStreamError):
+    pass
+
+
+class _ReservedCameraStream(Iterator[bytes]):
+    """Iterator wrapper that releases its reservation on every terminal path."""
+
+    def __init__(self, iterator: Iterator[bytes], on_close: Callable[[], None]) -> None:
+        self._iterator = iterator
+        self._on_close = on_close
+        self._closed = False
+
+    def __iter__(self) -> "_ReservedCameraStream":
+        return self
+
+    def __next__(self) -> bytes:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._iterator)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._iterator, "close", None)
+            if close:
+                close()
+        finally:
+            self._on_close()
 
 
 class FrameCapturePipeline:
@@ -112,6 +167,7 @@ class CameraViewerService:
         self.allow_synthetic = False
 
         self._lock = threading.RLock()
+        self._frame_changed = threading.Condition(self._lock)
         self._active_lease_owner: Optional[str] = None
         self._lease_expires_at: float = 0.0
 
@@ -120,6 +176,7 @@ class CameraViewerService:
         self._latest_frame_time: float = 0.0
         self._frame_seq: int = 0
         self._is_hardware_frame: bool = False
+        self._active_stream_owners: set[str] = set()
         self.pipeline = FrameCapturePipeline(fps=10.0, allow_synthetic=False)
 
     def update_motion_coordinates(self, pan: float, tilt: float) -> None:
@@ -198,6 +255,7 @@ class CameraViewerService:
                 self._lease_expires_at = 0.0
                 self._latest_jpeg = None
                 self._is_hardware_frame = False
+                self._frame_changed.notify_all()
             else:
                 return False
         self.pipeline.stop()
@@ -222,6 +280,7 @@ class CameraViewerService:
             self._lease_expires_at = 0.0
             self._latest_jpeg = None
             self._is_hardware_frame = False
+            self._frame_changed.notify_all()
             return owner
         return None
 
@@ -257,6 +316,103 @@ class CameraViewerService:
                 self._latest_frame_time = time.time()
                 self._is_hardware_frame = is_hardware
                 self._frame_seq += 1
+                self._frame_changed.notify_all()
+
+    def iter_mjpeg(
+        self,
+        client_id: str,
+        *,
+        boundary: str = "deskagent-frame",
+        target_fps: float = 2.0,
+        wait_timeout: float = 0.5,
+    ) -> Iterator[bytes]:
+        """Yield fresh physical JPEG parts while the caller owns the camera lease.
+
+        Admission is synchronous: one stream per owner, at most four globally.
+        Duplicate owners raise STREAM_ALREADY_ACTIVE; global exhaustion raises
+        STREAM_CAPACITY. The iterator starts after the currently buffered frame, so it never replays
+        a snapshot as the first stream frame. Each wait is bounded, allowing lease
+        expiry and generator close to be observed promptly without a background task.
+        """
+        fps = max(0.1, min(2.0, float(target_fps)))
+        interval = 1.0 / fps
+        with self._lock:
+            owner = None
+            if self._active_lease_owner != client_id or time.time() >= self._lease_expires_at:
+                owner = self._expire_lease_locked(time.time())
+                error = "NO_ACTIVE_LEASE" if owner or self._active_lease_owner is None else "RESOURCE_BUSY"
+            else:
+                error = None
+            if error is None and client_id in self._active_stream_owners:
+                raise CameraStreamCapacityError("STREAM_ALREADY_ACTIVE")
+            if error is None and len(self._active_stream_owners) >= MAX_CAMERA_STREAMS:
+                raise CameraStreamCapacityError("STREAM_CAPACITY")
+            if error is None:
+                self._active_stream_owners.add(client_id)
+            last_seq = self._frame_seq
+        if owner:
+            self.pipeline.stop()
+            self._trigger_teardown(owner, "expired")
+        if error:
+            raise CameraStreamLeaseError(error)
+
+        def release_reservation() -> None:
+            with self._lock:
+                self._active_stream_owners.discard(client_id)
+
+        def stream() -> Iterator[bytes]:
+            nonlocal last_seq
+            last_emit = 0.0
+            first_frame = True
+            last_valid_frame_at = time.monotonic()
+            while True:
+                if not self.is_lease_valid():
+                    return
+                with self._frame_changed:
+                    if self._active_lease_owner != client_id:
+                        return
+                    deadline = time.monotonic() + max(0.05, min(1.0, wait_timeout))
+                    frame = None
+                    while True:
+                        if self._active_lease_owner != client_id or time.time() >= self._lease_expires_at:
+                            return
+                        now = time.monotonic()
+                        if self._latest_jpeg is not None and self._frame_seq > last_seq:
+                            age_ms = (time.time() - self._latest_frame_time) * 1000
+                            if age_ms <= self.stale_threshold_ms and self._is_hardware_frame:
+                                candidate = {
+                                    "jpeg_data": self._latest_jpeg,
+                                    "frame_seq": self._frame_seq,
+                                    "frame_age_ms": max(0, int(age_ms)),
+                                }
+                                if now - last_emit >= interval:
+                                    frame = candidate
+                                    break
+                        remaining = deadline - now
+                        if remaining <= 0:
+                            break
+                        self._frame_changed.wait(min(remaining, interval))
+                    if frame is None and first_frame:
+                        raise CameraStreamFrameUnavailable("NO_FRESH_FRAME")
+                    if frame is None and not first_frame and time.monotonic() - last_valid_frame_at > self.stale_threshold_ms / 1000.0:
+                        return
+                if frame is None:
+                    continue
+                first_frame = False
+                last_valid_frame_at = time.monotonic()
+                last_seq = frame["frame_seq"]
+                last_emit = time.monotonic()
+                jpeg = frame["jpeg_data"]
+                part = (
+                    f"--{boundary}\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    f"Content-Length: {len(jpeg)}\r\n"
+                    f"X-Frame-Seq: {frame['frame_seq']}\r\n"
+                    f"X-Frame-Age-Ms: {frame['frame_age_ms']}\r\n\r\n"
+                ).encode("ascii") + jpeg + b"\r\n"
+                yield part
+
+        return _ReservedCameraStream(stream(), release_reservation)
 
     def get_latest_frame(self, client_id: str) -> Optional[dict[str, Any]]:
         """

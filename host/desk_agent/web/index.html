@@ -33,14 +33,14 @@
 
   <div class="grid">
     <div class="card">
-      <h3>局域网 JPEG 持续预览（约 1 帧/秒）与云台</h3>
+      <h3>局域网 JPEG 持续预览（最高 2 帧/秒）与云台</h3>
       <div class="viewer">
         <div id="videoPlaceholder">正在获取相机租约...</div>
         <img id="cameraFrame" style="display:none; width:100%; height:100%; object-fit:contain;" alt="最新相机 JPEG 帧" />
         <div class="overlay-status" id="frameStats">租约: 等待 | 相机: 不可用</div>
       </div>
       <div style="display:flex; gap:8px; margin-top:10px;">
-        <button class="btn" id="refreshCamera" onclick="refreshSnapshot()" disabled>立即刷新画面</button>
+        <button class="btn" id="refreshCamera" onclick="restartCameraStream()" disabled>重新连接画面</button>
         <button class="btn btn-stop" id="closeCamera" onclick="releaseCameraLease()" disabled>关闭查看并释放租约</button>
       </div>
       <div class="controls">
@@ -76,11 +76,9 @@
     let leaseActive = false;
     let leaseAcquired = false;
     let heartbeatTimer = null;
-    let snapshotTimer = null;
     let frameExpiryTimer = null;
-    let snapshotInFlight = false;
-    let snapshotAbortController = null;
-    const SNAPSHOT_POLL_MS = 1000;
+    let streamAbortController = null;
+    let streamTask = null;
     let currentObjectUrl = null;
     let lastFrameSeq = null;
     let currentPan = 90;
@@ -143,7 +141,7 @@
         document.getElementById("closeCamera").disabled = false;
         document.getElementById("cameraConnectionStatus").innerText = "等待首帧";
         document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 等待真实 JPEG";
-        startSnapshotLoop();
+        startLeaseHeartbeat();
       } else {
         leaseActive = false;
         leaseAcquired = false;
@@ -159,9 +157,8 @@
       leaseActive = false;
       leaseAcquired = false;
       clearInterval(heartbeatTimer);
-      clearTimeout(snapshotTimer);
       clearTimeout(frameExpiryTimer);
-      if (snapshotAbortController) snapshotAbortController.abort();
+      stopCameraStream();
       document.getElementById("refreshCamera").disabled = true;
       document.getElementById("closeCamera").disabled = true;
       hideFrame("查看已关闭，相机不可用");
@@ -185,91 +182,217 @@
     }
 
     function markLeaseUnavailable(message) {
+      const hadLease = leaseAcquired;
       leaseActive = false;
+      leaseAcquired = false;
       clearInterval(heartbeatTimer);
-      clearTimeout(snapshotTimer);
+      stopCameraStream();
       document.getElementById("refreshCamera").disabled = true;
       hideFrame(message);
       document.getElementById("frameStats").innerText = "租约: 不可用 | 相机: 已断开";
       document.getElementById("cameraConnectionStatus").innerText = "不可用";
+      if (hadLease) rpcCall("resource.camera.release", { client_id: clientId }, true);
     }
 
-    async function refreshSnapshot() {
-      if (!leaseActive || snapshotInFlight) return;
-      snapshotInFlight = true;
-      clearTimeout(snapshotTimer);
-      const button = document.getElementById("refreshCamera");
-      button.disabled = true;
-      snapshotAbortController = new AbortController();
-      const requestController = snapshotAbortController;
-      const requestTimeout = setTimeout(() => requestController.abort(), 4000);
-      try {
-        const url = "/api/camera/snapshot?client_id=" + encodeURIComponent(clientId) + "&t=" + Date.now();
-        const resp = await fetch(url, { headers: getAuthHeaders(), cache: "no-store", signal: requestController.signal });
-        if (!leaseActive) return;
-        if (resp.status === 200) {
-          const source = resp.headers.get("X-Frame-Source") || "unknown";
-          const isHardware = resp.headers.get("X-Frame-Hardware") === "1";
-          const ageMs = Number(resp.headers.get("X-Frame-Age-Ms"));
-          const frameSeq = resp.headers.get("X-Frame-Seq") || "--";
-          const blob = await resp.blob();
-          if (!isHardware || source !== "hardware_sensor" || !Number.isFinite(ageMs) || ageMs > 2000 || blob.type !== "image/jpeg") {
-            hideFrame("相机不可用：没有新鲜的硬件 JPEG");
-            document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 无新鲜硬件帧";
-            document.getElementById("cameraConnectionStatus").innerText = "不可用";
-            return;
-          }
-          try {
-            const decoded = await createImageBitmap(blob);
-            decoded.close();
-          } catch (decodeError) {
-            hideFrame("相机不可用：收到的 JPEG 无法解码");
-            document.getElementById("cameraConnectionStatus").innerText = "不可用";
-            return;
-          }
-          if (!leaseActive) return;
-          hideFrame("正在显示最新硬件帧...");
-          currentObjectUrl = URL.createObjectURL(blob);
-          const img = document.getElementById("cameraFrame");
-          img.src = currentObjectUrl;
-          img.style.display = "block";
-          document.getElementById("videoPlaceholder").style.display = "none";
-          lastFrameSeq = frameSeq;
-          document.getElementById("frameStats").innerText = `租约: 激活 | 帧序号: #${frameSeq} | 新鲜度: ${ageMs} ms`;
-          document.getElementById("cameraConnectionStatus").innerText = "已连接";
-          frameExpiryTimer = setTimeout(() => {
-            if (leaseActive && lastFrameSeq === frameSeq) {
-              hideFrame("画面已过期，等待下一张新帧...");
-              document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 等待新帧";
-              document.getElementById("cameraConnectionStatus").innerText = "等待新帧";
-            }
-          }, Math.max(0, 2000 - ageMs));
-        } else if (resp.status === 401) {
-          markLeaseUnavailable("401 未授权：请检查 Access Token");
-        } else {
-          const errorBody = await resp.json().catch(() => ({}));
-          const reason = errorBody.error || `HTTP ${resp.status}`;
-          hideFrame(`相机不可用：${reason}`);
-          document.getElementById("frameStats").innerText = `租约: ${leaseActive ? "激活" : "不可用"} | 相机: ${reason}`;
-          document.getElementById("cameraConnectionStatus").innerText = "不可用";
-          if (resp.status === 403 && reason !== "NO_ACTIVE_LEASE") markLeaseUnavailable(`相机租约不可用：${reason}`);
-        }
-      } catch (e) {
-        if (!leaseActive) return;
-        console.error("Snapshot request failed:", e);
-        hideFrame("相机不可用：Host 连接中断，等待恢复");
-        document.getElementById("frameStats").innerText = "租约: 等待恢复 | 相机: 不可用";
-        document.getElementById("cameraConnectionStatus").innerText = "连接中断";
-      } finally {
-        clearTimeout(requestTimeout);
-        if (snapshotAbortController === requestController) snapshotAbortController = null;
-        snapshotInFlight = false;
-        button.disabled = !leaseActive;
-        if (leaseActive) snapshotTimer = setTimeout(refreshSnapshot, SNAPSHOT_POLL_MS);
+    function stopCameraStream() {
+      if (streamAbortController) streamAbortController.abort();
+      streamAbortController = null;
+      streamTask = null;
+    }
+
+    function concatBytes(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a); out.set(b, a.length);
+      return out;
+    }
+
+    function findBytes(haystack, needle) {
+      outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) if (haystack[i + j] !== needle[j]) continue outer;
+        return i;
       }
+      return -1;
     }
 
-    function startSnapshotLoop() {
+    function startsWithBytes(value, prefix) {
+      if (value.length < prefix.length) return false;
+      for (let i = 0; i < prefix.length; i++) if (value[i] !== prefix[i]) return false;
+      return true;
+    }
+
+    function parseMjpegBuffer(buffer, boundary) {
+      const encoder = new TextEncoder();
+      const partPrefix = encoder.encode("--" + boundary + "\r\n");
+      const headerDelimiter = new Uint8Array([13, 10, 13, 10]);
+      const nextPartPrefix = encoder.encode("\r\n--" + boundary + "\r\n");
+      const parts = [];
+      let rest = buffer;
+      while (rest.length) {
+        if (rest.length < partPrefix.length) break;
+        if (!startsWithBytes(rest, partPrefix)) throw new Error("MJPEG boundary 不匹配");
+        const headerStart = partPrefix.length;
+        const headerEndRelative = findBytes(rest.slice(headerStart), headerDelimiter);
+        if (headerEndRelative < 0) break;
+        const headerEnd = headerStart + headerEndRelative;
+        let headerText;
+        try {
+          headerText = new TextDecoder("ascii", { fatal: true }).decode(rest.slice(headerStart, headerEnd));
+        } catch (_) {
+          throw new Error("MJPEG part headers 不是有效文本");
+        }
+        const lines = headerText.split("\r\n");
+        const contentType = (lines.find(line => /^content-type:/i.test(line)) || "").split(":").slice(1).join(":").trim().toLowerCase();
+        const length = Number((headerText.match(/(?:^|\r\n)Content-Length:\s*(\d+)(?:\r\n|$)/i) || [])[1]);
+        const seq = (headerText.match(/(?:^|\r\n)X-Frame-Seq:\s*(\d+)(?:\r\n|$)/i) || [])[1];
+        const ageMs = Number((headerText.match(/(?:^|\r\n)X-Frame-Age-Ms:\s*(\d+)(?:\r\n|$)/i) || [])[1]);
+        const bodyStart = headerEnd + headerDelimiter.length;
+        if (contentType !== "image/jpeg") throw new Error("MJPEG part Content-Type 无效");
+        if (!Number.isInteger(length) || length <= 0 || length > 131072 || !seq || !Number.isFinite(ageMs)) throw new Error("MJPEG part headers 无效");
+        const separatorStart = bodyStart + length;
+        const availableSeparator = rest.slice(separatorStart, Math.min(rest.length, separatorStart + nextPartPrefix.length));
+        for (let i = 0; i < availableSeparator.length; i++) {
+          if (availableSeparator[i] !== nextPartPrefix[i]) throw new Error("MJPEG part 缺少 CRLF/boundary");
+        }
+        if (rest.length < bodyStart + length + nextPartPrefix.length) break;
+        const jpeg = rest.slice(bodyStart, bodyStart + length);
+        const separator = rest.slice(bodyStart + length, bodyStart + length + nextPartPrefix.length);
+        if (!startsWithBytes(separator, nextPartPrefix)) throw new Error("MJPEG part 缺少 CRLF/boundary");
+        if (jpeg[0] !== 255 || jpeg[1] !== 216 || jpeg[jpeg.length - 2] !== 255 || jpeg[jpeg.length - 1] !== 217) throw new Error("MJPEG part 不是完整 JPEG");
+        parts.push({ jpeg, seq, ageMs });
+        rest = rest.slice(bodyStart + length + 2);
+      }
+      return { parts, remainder: rest };
+    }
+
+    async function renderStreamFrame(jpeg, seq, ageMs) {
+      if (!leaseActive || ageMs > 2000) return;
+      const blob = new Blob([jpeg], { type: "image/jpeg" });
+      try {
+        const decoded = await createImageBitmap(blob);
+        decoded.close();
+      } catch (_) { return; }
+      if (!leaseActive) return;
+      clearTimeout(frameExpiryTimer);
+      if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+      currentObjectUrl = URL.createObjectURL(blob);
+      const img = document.getElementById("cameraFrame");
+      img.src = currentObjectUrl;
+      img.style.display = "block";
+      document.getElementById("videoPlaceholder").style.display = "none";
+      lastFrameSeq = seq;
+      document.getElementById("frameStats").innerText = `租约: 激活 | 帧序号: #${seq} | 新鲜度: ${ageMs} ms`;
+      document.getElementById("cameraConnectionStatus").innerText = "已连接";
+      frameExpiryTimer = setTimeout(() => {
+        if (leaseActive && lastFrameSeq === seq) {
+          hideFrame("画面已过期，相机不可用");
+          document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 等待新鲜帧";
+          document.getElementById("cameraConnectionStatus").innerText = "不可用";
+        }
+      }, Math.max(0, 2000 - ageMs));
+    }
+
+    async function consumeMjpeg(response, controller, boundary) {
+      if (!response.body) throw new Error("浏览器不支持流式响应");
+      const reader = response.body.getReader();
+      let buffer = new Uint8Array(0);
+      while (leaseActive && !controller.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer = concatBytes(buffer, value);
+        const parsed = parseMjpegBuffer(buffer, boundary);
+        buffer = parsed.remainder;
+        for (const part of parsed.parts) await renderStreamFrame(part.jpeg, part.seq, part.ageMs);
+        if (buffer.length > 262144) throw new Error("MJPEG 缓冲区超限");
+      }
+      await reader.cancel().catch(() => {});
+    }
+
+    function waitForRetry(delayMs, signal) {
+      return new Promise(resolve => {
+        if (signal.aborted) return resolve();
+        let timer;
+        const onAbort = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        };
+        timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, delayMs);
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+
+    function markStreamRetrying(message) {
+      hideFrame(message);
+      document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 正在重连";
+      document.getElementById("cameraConnectionStatus").innerText = "正在重连";
+    }
+
+    function cancelResponseBody(response) {
+      if (response.body) response.body.cancel().catch(() => {});
+    }
+
+    async function startCameraStream() {
+      stopCameraStream();
+      if (!leaseActive) return;
+      const controller = new AbortController();
+      streamAbortController = controller;
+      hideFrame("正在连接相机流...");
+      document.getElementById("cameraConnectionStatus").innerText = "连接中";
+      streamTask = (async () => {
+        let retry = 0;
+        while (leaseActive && !controller.signal.aborted) {
+          try {
+            const url = "/api/camera/stream?client_id=" + encodeURIComponent(clientId);
+            const response = await fetch(url, { headers: getAuthHeaders(), cache: "no-store", signal: controller.signal });
+            if (!leaseActive || controller.signal.aborted) return;
+            if (response.status === 401 || response.status === 403) {
+              cancelResponseBody(response);
+              return markLeaseUnavailable(`相机租约/鉴权不可用：HTTP ${response.status}`);
+            }
+            if (response.status === 429 || response.status === 503) {
+              cancelResponseBody(response);
+              const message = response.status === 429
+                ? "相机流订阅正在释放，保留租约并重试..."
+                : "相机暂时没有新鲜帧，保留租约并重试...";
+              markStreamRetrying(message);
+            } else if (!response.ok) {
+              cancelResponseBody(response);
+              return markLeaseUnavailable(`相机不可用：HTTP ${response.status}`);
+            } else {
+              const contentType = response.headers.get("Content-Type") || "";
+              const match = contentType.match(/^multipart\/x-mixed-replace\s*;\s*boundary=(?:"([^"]+)"|([^;\s]+))(?:\s*;.*)?$/i);
+              if (!match) {
+                cancelResponseBody(response);
+                return markLeaseUnavailable("相机不可用：MJPEG Content-Type/boundary 无效");
+              }
+              const boundary = match[1] || match[2];
+              await consumeMjpeg(response, controller, boundary);
+              if (!leaseActive || controller.signal.aborted) return;
+              markStreamRetrying("相机流已结束，保留租约并重连...");
+            }
+            retry++;
+            await waitForRetry(Math.min(5000, 500 * (2 ** Math.min(retry - 1, 4))), controller.signal);
+          } catch (err) {
+            if (!leaseActive || controller.signal.aborted) return;
+            if (!(err instanceof TypeError)) {
+              console.error("Camera stream protocol failed:", err);
+              return markLeaseUnavailable("相机不可用：MJPEG 流格式错误");
+            }
+            console.warn("Camera stream temporarily disconnected:", err);
+            markStreamRetrying("Host 暂时连接中断，保留租约并重试...");
+            retry++;
+            await waitForRetry(Math.min(5000, 500 * (2 ** Math.min(retry - 1, 4))), controller.signal);
+          }
+        }
+      })();
+    }
+
+    function restartCameraStream() { if (leaseActive) startCameraStream(); }
+
+    function startLeaseHeartbeat() {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = setInterval(async () => {
         if (!leaseActive) return;
@@ -278,7 +401,7 @@
           markLeaseUnavailable("相机租约续订失败");
         }
       }, 5000);
-      refreshSnapshot();
+      startCameraStream();
     }
 
     async function sendMotion(action) {

@@ -13,8 +13,14 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 import json
+from types import SimpleNamespace
 
 from host.desk_agent.main import DeskAgentHostApp, make_request_handler, ThreadedHTTPServer
+from host.desk_agent.camera.camera_service import (
+    CameraStreamCapacityError,
+    CameraStreamFrameUnavailable,
+    CameraStreamLeaseError,
+)
 from host.desk_agent.core.models import RequestEnvelope
 
 
@@ -642,6 +648,164 @@ class TestHostDaemon(unittest.TestCase):
         self.assertFalse(res["state_confirmed"])
         self.assertIsNone(res["error_code"])
         self.assertTrue(res["emergency"])
+
+
+class TestCameraStreamRoute(unittest.TestCase):
+    def setUp(self) -> None:
+        class StreamService:
+            def __init__(self):
+                self.calls = []
+                self.error = None
+                self.break_after_first = False
+                self.end_after_first = False
+                self.iterator_closed = False
+                self.active_lease_owner = "viewer-1"
+
+            def iter_mjpeg(self, client_id, **kwargs):
+                self.calls.append(("iter", client_id, kwargs))
+                if self.error and not isinstance(self.error, CameraStreamFrameUnavailable):
+                    raise self.error
+
+                def stream():
+                    try:
+                        if isinstance(self.error, CameraStreamFrameUnavailable):
+                            raise self.error
+                        yield b"--deskagent-frame\r\nContent-Type: image/jpeg\r\n\r\nfirst\r\n"
+                        if self.break_after_first:
+                            raise BrokenPipeError("simulated client disconnect")
+                        if self.end_after_first:
+                            return
+                        yield b"--deskagent-frame\r\nContent-Type: image/jpeg\r\n\r\nsecond\r\n"
+                    finally:
+                        self.iterator_closed = True
+
+                return stream()
+
+            def release_lease(self, client_id):
+                self.calls.append(("release", client_id, self.iterator_closed))
+                self.active_lease_owner = None
+                return True
+
+        self.service = StreamService()
+        app = SimpleNamespace(config={"auth_token": "stream-test-token"}, camera_service=self.service)
+        self.access_logs = []
+        handler = make_request_handler(app)
+
+        def capture_log(_handler, message, *args):
+            self.access_logs.append(message % args)
+
+        handler.log_message = capture_log
+        self.server = ThreadedHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}/api/camera/stream"
+        self.url = f"{self.base_url}?client_id=viewer-1"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_stream_auth_precedes_service_and_stream_releases_owner(self) -> None:
+        with self.assertRaises(HTTPError) as unauthorized:
+            urlopen(self.url, timeout=2)
+        self.assertEqual(unauthorized.exception.code, 401)
+        self.assertEqual(self.service.calls, [])
+
+        query_token_url = f"{self.base_url}?client_id=viewer-1&token=stream-test-token"
+        with self.assertRaises(HTTPError) as query_token_response:
+            urlopen(query_token_url, timeout=2)
+        self.assertEqual(query_token_response.exception.code, 401)
+        self.assertEqual(self.service.calls, [])
+        self.assertTrue(any("[REDACTED]" in line for line in self.access_logs))
+        self.assertFalse(any("stream-test-token" in line for line in self.access_logs))
+
+        custom_header = Request(self.url, headers={"X-Desk-Agent-Token": "stream-test-token"})
+        with self.assertRaises(HTTPError) as custom_header_response:
+            urlopen(custom_header, timeout=2)
+        self.assertEqual(custom_header_response.exception.code, 401)
+        self.assertEqual(self.service.calls, [])
+
+        request = Request(self.url, headers={"Authorization": "Bearer stream-test-token"})
+        with urlopen(request, timeout=3) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers.get_content_type(), "multipart/x-mixed-replace")
+            self.assertIn("boundary=deskagent-frame", response.headers["Content-Type"])
+            body = response.read()
+        self.assertIn(b"first", body)
+        self.assertIn(b"second", body)
+        self.assertEqual(self.service.calls[0][0:2], ("iter", "viewer-1"))
+        self.assertTrue(self.service.iterator_closed)
+        self.assertFalse(any(call[0] == "release" for call in self.service.calls))
+        self.assertEqual(self.service.active_lease_owner, "viewer-1")
+
+    def test_rejects_missing_empty_and_duplicate_client_ids_before_service_call(self) -> None:
+        urls = (
+            self.base_url,
+            f"{self.base_url}?client_id=",
+            f"{self.base_url}?client_id=%20%20",
+            f"{self.base_url}?client_id=one&client_id=two",
+        )
+        for url in urls:
+            with self.subTest(url=url):
+                request = Request(url, headers={"Authorization": "Bearer stream-test-token"})
+                with self.assertRaises(HTTPError) as response:
+                    urlopen(request, timeout=2)
+                self.assertEqual(response.exception.code, 400)
+                self.assertEqual(json.loads(response.exception.read().decode())["error"], "INVALID_CLIENT_ID")
+        self.assertEqual(self.service.calls, [])
+
+    def test_decodes_client_id_using_standard_query_parser(self) -> None:
+        request = Request(
+            f"{self.base_url}?client_id=view%2Der-1",
+            headers={"Authorization": "Bearer stream-test-token"},
+        )
+        with urlopen(request, timeout=3) as response:
+            self.assertEqual(response.status, 200)
+            response.read()
+        self.assertEqual(self.service.calls[0][0:2], ("iter", "view-er-1"))
+
+    def test_stream_service_errors_map_before_response_headers(self) -> None:
+        cases = (
+            (CameraStreamLeaseError("NO_ACTIVE_LEASE"), 403, "NO_ACTIVE_LEASE"),
+            (CameraStreamLeaseError("RESOURCE_BUSY"), 403, "RESOURCE_BUSY"),
+            (CameraStreamCapacityError("STREAM_ALREADY_ACTIVE"), 429, "STREAM_ALREADY_ACTIVE"),
+            (CameraStreamCapacityError("STREAM_CAPACITY"), 429, "STREAM_CAPACITY"),
+            (CameraStreamFrameUnavailable("NO_FRESH_FRAME"), 503, "CAMERA_FRAME_UNAVAILABLE"),
+        )
+        for error, expected_status, expected_code in cases:
+            with self.subTest(error=error):
+                self.service.calls.clear()
+                self.service.error = error
+                request = Request(self.url, headers={"Authorization": "Bearer stream-test-token"})
+                with self.assertRaises(HTTPError) as response:
+                    urlopen(request, timeout=2)
+                self.assertEqual(response.exception.code, expected_status)
+                self.assertEqual(response.exception.headers.get_content_type(), "application/json")
+                body = json.loads(response.exception.read().decode())
+                self.assertEqual(body["error"], expected_code)
+                self.assertFalse(any(call[0] == "release" for call in self.service.calls))
+                self.assertEqual(self.service.active_lease_owner, "viewer-1")
+
+    def test_normal_stale_stream_end_keeps_camera_lease(self) -> None:
+        self.service.end_after_first = True
+        request = Request(self.url, headers={"Authorization": "Bearer stream-test-token"})
+        with urlopen(request, timeout=3) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn(b"first", response.read())
+        self.assertTrue(self.service.iterator_closed)
+        self.assertFalse(any(call[0] == "release" for call in self.service.calls))
+        self.assertEqual(self.service.active_lease_owner, "viewer-1")
+
+    def test_stream_iterator_disconnect_closes_iterator_and_releases_lease(self) -> None:
+        self.service.break_after_first = True
+        request = Request(self.url, headers={"Authorization": "Bearer stream-test-token"})
+        with urlopen(request, timeout=3) as response:
+            self.assertEqual(response.status, 200)
+            self.assertIn(b"first", response.read())
+        self.assertTrue(self.service.iterator_closed)
+        self.assertFalse(any(call[0] == "release" for call in self.service.calls))
+        self.assertEqual(self.service.active_lease_owner, "viewer-1")
 
 
 if __name__ == "__main__":
