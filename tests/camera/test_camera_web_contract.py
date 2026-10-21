@@ -32,6 +32,21 @@ class TestCameraWebContract(unittest.TestCase):
         self.assertIn('"resource.camera.release"', source)
         self.assertIn("keepalive", source)
 
+    def test_viewer_polls_fresh_jpegs_continuously_without_overlapping_requests(self) -> None:
+        source = WEB.read_text(encoding="utf-8")
+        self.assertIn("const SNAPSHOT_POLL_MS = 1000", source)
+        self.assertIn("snapshotInFlight", source)
+        self.assertIn("setTimeout(refreshSnapshot, SNAPSHOT_POLL_MS)", source)
+        self.assertIn("cache: \"no-store\"", source)
+
+    def test_disconnect_expiry_and_page_exit_clear_or_stop_the_viewer(self) -> None:
+        source = WEB.read_text(encoding="utf-8")
+        self.assertIn("frameExpiryTimer", source)
+        self.assertIn("clearTimeout(snapshotTimer)", source)
+        self.assertIn("snapshotAbortController", source)
+        self.assertIn("snapshotAbortController.abort()", source)
+        self.assertIn("releaseCameraLease(true)", source)
+
 
 if __name__ == "__main__":
     unittest.main()
