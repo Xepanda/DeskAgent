@@ -435,7 +435,19 @@ class HAConnector:
 
                 # Reconcile authoritative states upon connection/reconnection
                 try:
-                    self.reconcile_states()
+                    report = self.reconcile_states()
+                    # The polling fallback pauses as soon as the WebSocket is
+                    # authenticated. Surface transitions observed by this
+                    # reconnect snapshot so a short outage cannot silently
+                    # consume a state change between poll intervals.
+                    with self._subscribers_lock:
+                        active_subs = list(self._subscribers)
+                    for change in report["reconciled_changes"]:
+                        for cb in active_subs:
+                            try:
+                                cb(change["entity_id"], change["old_state"], change["new_state"])
+                            except Exception as cb_err:
+                                logger.exception("Error in HA reconnect state subscriber: %s", cb_err)
                 except Exception as rec_err:
                     logger.debug("Reconciliation on WS connect: %s", rec_err)
 

@@ -542,7 +542,8 @@ class TestHAConnector(unittest.TestCase):
 
         def on_change(eid: str, old_st: Optional[str], new_st: Optional[str]) -> None:
             received_events.append((eid, old_st, new_st))
-            event_received.set()
+            if (eid, old_st, new_st) == ("light.desk", "off", "on"):
+                event_received.set()
 
         def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
             return 200, [{"entity_id": "light.desk", "state": "off"}]
@@ -582,8 +583,7 @@ class TestHAConnector(unittest.TestCase):
             }))
 
             self.assertTrue(event_received.wait(timeout=2.0))
-            self.assertEqual(len(received_events), 1)
-            self.assertEqual(received_events[0], ("light.desk", "off", "on"))
+            self.assertIn(("light.desk", "off", "on"), received_events)
         finally:
             stop_sub()
             ha.close()
