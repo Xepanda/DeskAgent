@@ -12,8 +12,10 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
+import os
 import tempfile
 import unittest
+import gc
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from host.desk_agent.services.life_service import LifeService
@@ -602,6 +604,23 @@ class TestLifeService(unittest.TestCase):
             s.create_reminder("rem-cm-01", "Context Test", "2026-10-15T12:00:00Z")
             self.assertIsNotNone(s._conn)
         self.assertIsNone(s._conn)
+
+    def test_discarded_service_releases_sqlite_file_without_gc(self) -> None:
+        """Dropping a service must release its SQLite handle on Windows without a GC sweep."""
+        if os.name != "nt":
+            self.skipTest("Windows prevents unlinking an open SQLite database")
+        db_path = Path(self.temp_dir.name) / "discarded_service.db"
+        service = LifeService(db_path)
+        service.create_reminder("rem-drop", "Release handle", "2026-10-15T12:00:00Z")
+
+        del service
+        try:
+            db_path.unlink()
+        except PermissionError:
+            gc.collect()
+            if db_path.exists():
+                db_path.unlink()
+            self.fail("LifeService leaked its SQLite connection until cyclic garbage collection")
 
 
 if __name__ == "__main__":

@@ -192,6 +192,14 @@ class LifeService:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
+    def __del__(self) -> None:
+        """Release the SQLite handle when callers drop the service without close()."""
+        try:
+            self.close()
+        except Exception:
+            # Destructors must not raise during interpreter shutdown.
+            pass
+
     def _get_connection(self) -> sqlite3.Connection:
         if self._conn is None:
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
