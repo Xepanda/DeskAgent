@@ -80,6 +80,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-o",
             cls.so_path,
         ]
@@ -119,6 +120,11 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         cls.lib.desk_sdk_bridge_init.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_init.argtypes = []
+
+        cls.lib.desk_sdk_ws_client_is_connected.restype = ctypes.c_bool
+        cls.lib.desk_sdk_ws_client_is_connected.argtypes = []
+        cls.lib.desk_sdk_ws_client_send_text.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_send_text.argtypes = [ctypes.c_char_p]
 
         cls.lib.desk_sdk_bridge_process_command.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_process_command.argtypes = [
@@ -169,6 +175,10 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         # without it pairing is fail-closed (interfaces.md 6.4 / CR-001).
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
         self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+    def test_websocket_client_starts_offline_and_refuses_unpaired_send(self) -> None:
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+        self.assertNotEqual(self.lib.desk_sdk_ws_client_send_text(b'{"type":"sys.ping"}'), 0)
 
     def _exec_command(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")

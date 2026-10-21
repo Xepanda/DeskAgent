@@ -69,6 +69,7 @@ typedef enum {
  * framing (<4sBBHII) is unaffected.
  */
 #define DESK_SDK_MAX_FRAME_LEN 8192
+#define DESK_WSPK_MAX_FRAME_SIZE (DESK_WSPK_MAX_PAYLOAD_SIZE + DESK_WSPK_HEADER_SIZE)
 
 /**
  * @brief Return codes for desk_sdk_bridge_process_pairing_udp().
@@ -229,6 +230,22 @@ int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len);
 /** @brief Return the host and WebSocket port from the last accepted request. */
 int desk_sdk_bridge_get_pairing_target(char *host, size_t host_len,
                                        uint16_t *port);
+
+/* RFC6455 device client used by the firmware poll loop. */
+typedef enum {
+    DESK_SDK_WS_OFFLINE = 0,
+    DESK_SDK_WS_CONNECTING,
+    DESK_SDK_WS_HANDSHAKE,
+    DESK_SDK_WS_HELLO_SENT,
+    DESK_SDK_WS_CONNECTED
+} desk_sdk_ws_state_t;
+int desk_sdk_ws_client_connect_paired(void);
+int desk_sdk_ws_client_poll(int timeout_ms);
+int desk_sdk_ws_client_send_text(const char *text);
+int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len);
+bool desk_sdk_ws_client_is_connected(void);
+desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void);
+void desk_sdk_ws_client_close(void);
 
 /**
  * @brief Parse top-level string field from JSON payload.

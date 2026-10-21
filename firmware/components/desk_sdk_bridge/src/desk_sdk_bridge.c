@@ -894,6 +894,7 @@ bool desk_sdk_bridge_is_heartbeat_alive(uint32_t timeout_sec)
 
 int desk_sdk_bridge_init(void)
 {
+    desk_sdk_ws_client_close();
     s_client_connected = false;
     s_event_seq = 0;
     s_outbound_cb = NULL;
@@ -911,6 +912,7 @@ int desk_sdk_bridge_init(void)
 
 void desk_sdk_bridge_reset(void)
 {
+    desk_sdk_ws_client_close();
     s_client_connected = false;
     s_event_seq = 0;
     s_active_pairing_token[0] = '\0';
@@ -929,7 +931,7 @@ void desk_sdk_bridge_reset(void)
 
 bool desk_sdk_bridge_is_connected(void)
 {
-    return s_client_connected;
+    return s_client_connected || desk_sdk_ws_client_is_connected();
 }
 
 int desk_sdk_bridge_register_outbound(desk_sdk_outbound_send_cb_t cb, void *user_data)
@@ -1054,7 +1056,11 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
     int rc = desk_sdk_bridge_pack_media_frame(frame_type, flags, stream_id, sequence,
                                               payload, payload_len, target_buf, target_size, &packed_len);
     if (rc == 0) {
-        if (s_client_fd >= 0) {
+        if (packed_len > DESK_WSPK_MAX_FRAME_SIZE) {
+            rc = -4;
+        } else if (desk_sdk_ws_client_is_connected()) {
+            if (desk_sdk_ws_client_send_binary(target_buf, packed_len) != 0) rc = -3;
+        } else if (s_client_fd >= 0) {
             /* WSPK framing is unchanged; only the write path now guarantees the
              * full frame is transmitted (interfaces.md 6.3.5). */
             if (desk_sdk_socket_write_all(s_client_fd, target_buf, packed_len) != 0) {
@@ -1062,7 +1068,7 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
                 rc = -3;
             }
         }
-        if (s_outbound_cb) {
+        if (rc == 0 && s_outbound_cb) {
             s_outbound_cb((const char *)target_buf, packed_len, s_outbound_user_data);
         }
     }
@@ -1692,7 +1698,9 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
         s_outbound_cb(event_buf, strlen(event_buf), s_outbound_user_data);
     }
 
-    if (s_client_fd >= 0) {
+    if (desk_sdk_ws_client_is_connected()) {
+        desk_sdk_ws_client_send_text(event_buf);
+    } else if (s_client_fd >= 0) {
         desk_sdk_socket_send_line(event_buf);
     }
 
@@ -1756,7 +1764,9 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
         s_outbound_cb(formatted, strlen(formatted), s_outbound_user_data);
     }
 
-    if (s_client_fd >= 0) {
+    if (desk_sdk_ws_client_is_connected()) {
+        desk_sdk_ws_client_send_text(formatted);
+    } else if (s_client_fd >= 0) {
         desk_sdk_socket_send_line(formatted);
     }
 
@@ -1822,7 +1832,9 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
         ret = s_outbound_cb(payload_to_send, strlen(payload_to_send), s_outbound_user_data);
     }
 
-    if (s_client_fd >= 0) {
+    if (desk_sdk_ws_client_is_connected()) {
+        desk_sdk_ws_client_send_text(payload_to_send);
+    } else if (s_client_fd >= 0) {
         size_t len = strlen(payload_to_send);
         if (desk_sdk_socket_write_all(s_client_fd, payload_to_send, len) != 0) {
             desk_sdk_socket_client_close();
@@ -2249,6 +2261,7 @@ int desk_sdk_pairing_server_poll(int timeout_ms)
                 inet_ntop(AF_INET, &client_addr.sin_addr, s_pair_host, sizeof(s_pair_host));
                 sendto(s_pairing_udp_fd, s_pairing_reply, strlen(s_pairing_reply), 0,
                        (struct sockaddr *)&client_addr, addr_len);
+                desk_sdk_ws_client_connect_paired();
             }
         }
     }
@@ -2276,6 +2289,7 @@ int desk_firmware_poll(int timeout_ms)
     if (half < 1) half = 1;
     desk_sdk_socket_server_poll(half);
     desk_sdk_pairing_server_poll(half);
+    desk_sdk_ws_client_poll(half);
     return 0;
 }
 
