@@ -76,3 +76,42 @@ A0/A1 需确认产品与 STM32 契约预期是拒绝输入还是钳位输入，�
 - **A7**：依据冻结后的契约执行并归档可重复的 HIL 测试，确保记录可关联当前 ESP32/STM32 镜像与设备身份。
 
 只有来源核对、契约一致、当前板 ACK 收发、受控动作及 stop 安全结果均有可复核证据后，才可关闭相关硬件验收项。若 STM32 固件或协议来源无法取得，CR 保持 OPEN，STM32 兼容性和机身动作标记为未验证。
+
+---
+
+## 6. A0 只读源码对账（2026-10-22）
+
+本节只确认仓库代码与测试表达了什么，不确认 STM32 固件采用相同协议，也不代表当前设备 UART 已收发成功。源码行号以本次工作树为准。
+
+### 6.1 当前 Watcher 板的动作路径
+
+`firmware/components/desk_hardware/src/desk_watcher_board.c:745-778` 在板初始化中调用 `desk_watcher_motion_init()`，并将 `.motion_move`、`.motion_stop` 指向 `desk_watcher_motion_move()` / `desk_watcher_motion_stop()`。因此当前 Watcher board ops 的动作路径进入 `desk_watcher_motion.c`。`desk_hardware.c` 同时包含协议打包、默认 UART 传输和接收处理，但它不是仅凭源码就能替代上述实际 board-op 路径的证据；应根据当前固件构建配置和启动日志进一步确认最终注册/调用链。
+
+### 6.2 帧、CRC 与序号重试
+
+- `desk_watcher_motion.c:57-97,100-120` 生成未做 COBS 封装的 `A5 5A` 原生帧：12-byte header、LE 序号/载荷长度、MOVE 9-byte payload 或 STOP 2-byte payload，尾部附 CRC16；CRC 实现为 init `0xFFFF`、poly `0x1021`，低字节先发（同文件 `41-55`）。MOVE/STOP 的帧格式和 `docs/implementation/r3a-stm32-protocol-adjudication.md` §3-5 与原生帧契约一致。该驱动中的 COBS helper (`175-249`) 不在发送路径上；`motion_send_and_wait_ack()` 将 `frame_data` 原样传给 UART (`319-323`)。
+- `desk_watcher_motion.c:314-387` 每次尝试重发同一 `frame_data`，总尝试数为初次发送加 `MCU_MAX_RETRIES` 次；超时常量和契约文件仍需同版本核对。TX 完整写入只是本端写入成功，不证明 STM32 接收。
+- `desk_watcher_motion.c:251-291` 的 ACK parser 检查魔数、版本、class、精确总长度和 CRC；随后要求 `rx_seq == expected_seq`。NACK 需满足 NACK flag 或 ID 且 payload 长度恰为 2；ACK 要求 flags 恰为 `ACK_RESP`、payload 长度恰为 4，并接受通用 ACK ID `0x00` 或回显 MOVE/STOP ID。由此可确认驱动实现允许 ACK echo；不能据此确认 STM32 实际发送哪一种。
+- 同仓库 `desk_hardware.c:834-896` 是另一套接收实现：验证 CRC 后按序号关联 ACK/NACK，但 ACK 条件为 ID 命中**或** ACK flag 命中，且没有对 ACK flags/payload length 作与上面相同的精确限制。`r3a` 文档/依赖锁称 `desk_hardware.c` 是权威活动实现，而 Watcher board ops 指向 `desk_watcher_motion.c`；需要 A0/A1 根据实际构建产物和调用日志确认活动路径，并统一重复实现的契约，避免“一份契约、两种验收行为”。
+
+### 6.3 角度边界与停止语义
+
+- `desk_watcher_motion.c:394-405` 直接调用时会拒绝超范围 pan/tilt；其内部 pack helper (`57-69`) 仍会 clamp。`desk_hardware.c:1043-1052` 的外层硬件 API 会先 clamp 再委托 board driver，所以通过该外层 API 时，传给 Watcher driver 的值应已在范围内。两者并非同一个入口语义：若产品规范要求统一行为，需核对调用方是否存在绕过外层 API 的路径，并由 A0 决定契约是 clamp 还是 reject。静态代码不能证明机械限位安全。
+- Watcher STOP 打包 `mode=DECEL/EMERGENCY` 与 `CANCEL_ALL` (`desk_watcher_motion.c:100-120`)，之后等待与其序号关联的 ACK (`407-412`)。ACK 只能依 CR-002 解释为 accepted；源码和当前日志都不能证明舵机已停或机身已静止。失败/超时也不能当成停止成功。
+
+### 6.4 测试与板级证据边界
+
+- `tests/firmware_contract/test_stm32_body_protocol.py:329-599` 覆盖 CRC golden vector、MOVE/STOP 帧、角度/duration clamp、ACK/NACK、错误 CRC、帧长度/魔数和序号匹配等 host 原生 C harness 场景；这是 L2，不是 STM32 firmware interop。
+- `tests/firmware_contract/test_stm32_uart_native_frame_contract.py` 与 `test_watcher_hardware_contract.py` 是源码/host harness 合约检查，也不提供目标 UART 的 RX 证据。
+- 当前可追溯现场记录仍是本 CR §1 的 COM21 `body move`、`body stop` 均 `rc=-3`、未见 RX/ACK/物理反馈；验收矩阵 §0 已明确 `Last Packet Length` 是格式化/发送帧记录而非 STM32 RX 计数，UART READY 只说明初始化。此现场结果不能确定命令是否到达，也不能确定 stop 是否执行。
+- 本次只读审计没有运行硬件命令、占用 COM21/COM20、发送 STM32 动作帧或读取凭据；也没有新的 Level 3/4 证据。
+
+### 6.5 下一步现场证据（保持无动作直至安全状态确认）
+
+1. 先补当前 PCB/SKU/线束与适配原理图版本、STM32 固件来源/版本/hash；按 §4 核对 TX/RX/GND、电平和波特率，不通过软件命令推断接线正确。
+2. 在不向执行器发送 move/stop 的前提下，用独立逻辑分析仪或已验证的只读接收路径观察 STM32 TX/RX 空闲及启动字节，归档带时间戳的原始波形/字节和设备、固件身份。仅 UART READY 或 ESP32 的 TX 计数不足以通过。
+3. 对照权威 STM32 协议来源，先统一 ACK ID/flags/payload 长度、角度边界、序号回绕和 retry 语义，并为两套实现增加相同负例/正例覆盖；确认同一协议实现被当前构建实际选用。
+4. 当前 stop 无 ACK 且动作状态未知。在任何新的动作之前，须由现场人员通过独立目视/机械安全确认设备静止、执行器工作区域清空、可用物理断电/急停手段就位，并明确现场验证窗口。此前置条件未满足时不发动作命令。
+5. 仅在安全预检完成并有现场监督后，先采集可区分的原始 TX/RX（不发送动作的链路观察优先）；若后续最小动作验证获得明确授权且确认安全，每条命令都要求同序号、正确 CRC 的 STM32 响应和独立可见的动作/停止观察。任一超时、坏帧、错序、意外动作或无法确认静止即中止；不得把软件 stop 重试当作安全急停。
+
+**A0 结论：**源码实现大体符合 `A5 5A` / CRC16-CCITT-FALSE / 32-bit 序号关联 / 同序号重试的冻结契约，但 ACK 回包集合和角度边界在不同接口/契约载体中有差异，且存在两套可能行为不同的固件实现。仓库测试只证明 L2。因当前设备两条动作命令均超时且没有 STM32 RX/ACK、固件身份或物理状态证据，CR-007 继续 OPEN；当前板协议兼容、动作执行与安全停止均未验证。
