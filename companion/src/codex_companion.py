@@ -612,6 +612,14 @@ class CodexCompanion:
             thread_id = params.get("threadId") or params.get("thread_id")
             turn_id = params.get("turnId") or params.get("turn_id")
             task_id = params.get("task_id") or self._resolve_task_id(thread_id, turn_id)
+            if task_id and task_id in self._tasks:
+                current_task = self._tasks[task_id]
+                if thread_id and not current_task.get("thread_id"):
+                    current_task["thread_id"] = thread_id
+                if turn_id:
+                    current_task["turn_id"] = turn_id
+                    self._turn_to_task[turn_id] = task_id
+                self._persist_task(current_task)
 
             if method in (
                 "approval/request",
@@ -894,13 +902,23 @@ class CodexCompanion:
                     turn for turn in turns
                     if isinstance(turn, dict) and turn_id and turn.get("id") == turn_id
                 ), None)
+                if matching_turn is None and not turn_id and str(task_snapshot.get("status")).lower() == "start_unknown":
+                    # A timed-out turn/start has no returned turn ID. Threads
+                    # are created per Companion task, so their newest turn is
+                    # the authoritative candidate for this task.
+                    matching_turn = next((turn for turn in reversed(turns) if isinstance(turn, dict) and turn.get("id")), None)
                 if matching_turn is None:
                     self._set_recovery_pending(task_id, "turn_not_found")
                     counts["pending"] += 1
                     continue
 
+                resolved_turn_id = str(matching_turn.get("id") or turn_id)
                 with self._lock:
-                    self._turn_to_task[turn_id] = task_id
+                    current = self._tasks.get(task_id)
+                    if current is not None and not current.get("turn_id"):
+                        current["turn_id"] = resolved_turn_id
+                        self._persist_task(current)
+                    self._turn_to_task[resolved_turn_id] = task_id
                 turn_status = str(matching_turn.get("status") or "").lower()
 
                 with self._lock:
@@ -922,6 +940,8 @@ class CodexCompanion:
                     with self._lock:
                         current = self._tasks.get(task_id)
                         if current is not None:
+                            current["state"] = "running"
+                            current["status"] = "running"
                             current["recovery_status"] = "reconnected"
                             current.pop("recovery_error_kind", None)
                             self._persist_task(current)
@@ -935,7 +955,7 @@ class CodexCompanion:
 
                 terminal_turn = dict(matching_turn)
                 assistant_text = self._assistant_text_from_items(terminal_turn.get("items"))
-                params: dict[str, Any] = {"threadId": thread_id, "turnId": turn_id, "turn": terminal_turn}
+                params: dict[str, Any] = {"threadId": thread_id, "turnId": resolved_turn_id, "turn": terminal_turn}
                 if assistant_text:
                     params["summary"] = assistant_text
                 self._handle_server_notification("turn/completed", params)
@@ -1041,6 +1061,23 @@ class CodexCompanion:
                 if not appr.get("task_id") and appr.get("thread_id") == thread_id:
                     appr["task_id"] = task_id
 
+            # Persist the thread association before turn/start. The app-server
+            # may create a turn and then time out before returning its ID; the
+            # durable thread ID lets startup recovery reconcile that outcome.
+            task_dict = {
+                "task_id": task_id,
+                "workspace_alias": workspace_alias,
+                "target_dir": target_dir,
+                "thread_id": thread_id,
+                "turn_id": "",
+                "prompt": prompt,
+                "model": model,
+                "state": "starting",
+                "status": "starting",
+            }
+            self._tasks[task_id] = task_dict
+            self._persist_task(task_dict)
+
         # 2. Start turn (Codex app-server uses threadId and input array)
         turn_params = {
             "threadId": thread_id,
@@ -1050,7 +1087,22 @@ class CodexCompanion:
         }
         if model is not None:
             turn_params["model"] = model
-        turn_res = transport.send_request("turn/start", turn_params)
+        try:
+            turn_res = transport.send_request("turn/start", turn_params)
+        except Exception:
+            # The request may have reached app-server even when its response
+            # did not. Preserve the task and thread so resume can discover the
+            # actual turn; do not report a false terminal failure.
+            with self._lock:
+                # A progress/terminal notification can beat the timed-out
+                # response. Preserve its authoritative state and turn ID.
+                if task_dict.get("status") == "starting":
+                    task_dict["state"] = "start_unknown"
+                    task_dict["status"] = "start_unknown"
+                    task_dict["recovery_status"] = "pending"
+                    task_dict["recovery_error_kind"] = "turn_start_outcome_unknown"
+                self._persist_task(task_dict)
+            raise
         if "turn" in turn_res and isinstance(turn_res["turn"], dict):
             turn_id = turn_res["turn"].get("id", f"trn_{task_id[:8]}_01")
             state = turn_res["turn"].get("status", "running")
@@ -1064,18 +1116,16 @@ class CodexCompanion:
                 if not appr.get("task_id") and (appr.get("turn_id") == turn_id or appr.get("thread_id") == thread_id):
                     appr["task_id"] = task_id
                     self._persist_approval(appr)
-            task_dict = {
-                "task_id": task_id,
-                "workspace_alias": workspace_alias,
-                "target_dir": target_dir,
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "prompt": prompt,
-                "model": model,
-                "state": state,
-                "status": state,
-            }
-            self._tasks[task_id] = task_dict
+            task_dict["turn_id"] = turn_id
+            # Notifications can be delivered synchronously before turn/start
+            # returns. Keep their newer running or terminal state and output;
+            # use the RPC state only while the task is still awaiting its
+            # first notification.
+            if task_dict.get("status") == "starting":
+                task_dict["state"] = state
+                task_dict["status"] = state
+            task_dict.pop("recovery_error_kind", None)
+            task_dict.pop("recovery_status", None)
             self._persist_task(task_dict)
 
         return {
@@ -1111,6 +1161,15 @@ class CodexCompanion:
                 raise KeyError(f"Task '{task_id}' not found")
             thread_id = task["thread_id"]
             turn_id = task["turn_id"]
+
+        if not thread_id or not turn_id:
+            self.recover_pending_tasks()
+            with self._lock:
+                task = self._tasks.get(task_id)
+                thread_id = (task or {}).get("thread_id")
+                turn_id = (task or {}).get("turn_id")
+            if not thread_id or not turn_id:
+                raise RuntimeError("Task startup is not reconciled yet; cancellation is unavailable")
 
         transport = self._get_transport()
         params: dict[str, Any] = {"threadId": thread_id, "turnId": turn_id}

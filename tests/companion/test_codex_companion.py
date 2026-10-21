@@ -1042,6 +1042,98 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual([event for event, _ in events], ["codex.turn_completed"])
         resumed.close()
 
+    def test_turn_start_timeout_persists_thread_and_recovers_actual_turn(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "turn-start-timeout.db")
+
+        class DelayedTurnStartTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": "thr-start-timeout"}
+                if method == "turn/start":
+                    raise TimeoutError("app-server timed out waiting for turn/start")
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DelayedTurnStartTransport(),
+            db_path=db_file,
+        )
+        with self.assertRaises(TimeoutError):
+            companion.submit_task("tsk-start-timeout", "test-project", "private prompt")
+
+        status = companion.get_task_status("tsk-start-timeout")
+        self.assertIsNotNone(status)
+        self.assertEqual(status["thread_id"], "thr-start-timeout")
+        self.assertEqual(status["status"], "start_unknown")
+        self.assertEqual(status["summary"], "")
+        self.assertEqual(status["last_output"], "")
+        companion.close()
+
+        class ResumeTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    return {"thread": {"id": params["threadId"], "turns": [{
+                        "id": "trn-created-despite-timeout",
+                        "status": "inProgress",
+                        "items": [],
+                    }]}}
+                if method == "turn/interrupt":
+                    if params["turnId"] != "trn-created-despite-timeout":
+                        raise AssertionError("recovery did not restore the actual turn ID")
+                    return {"interrupted": True}
+                return {}
+
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=ResumeTransport(),
+            db_path=db_file,
+        )
+        resumed.initialize()
+        recovered = resumed.get_task_status("tsk-start-timeout")
+        self.assertEqual(recovered["turn_id"], "trn-created-despite-timeout")
+        self.assertEqual(recovered["status"], "running")
+        self.assertEqual(recovered["recovery_status"], "reconnected")
+        self.assertEqual(resumed.cancel_task("tsk-start-timeout")["status"], "cancelling")
+        resumed.close()
+
+    def test_turn_start_response_does_not_overwrite_synchronous_terminal_notification(self) -> None:
+        companion: CodexCompanion
+
+        class NotificationBeforeTurnStartResponseTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": "thr-notification-race"}
+                if method == "turn/start":
+                    companion._handle_server_notification("turn/completed", {
+                        "threadId": params["threadId"],
+                        "turnId": "trn-notification-race",
+                        "status": "completed",
+                        "summary": "assistant completed result",
+                    })
+                    return {"turn_id": "trn-notification-race", "state": "inProgress"}
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=NotificationBeforeTurnStartResponseTransport(),
+            db_path=":memory:",
+        )
+        result = companion.submit_task("tsk-notification-race", "test-project", "private prompt")
+        status = companion.get_task_status("tsk-notification-race")
+        self.assertEqual(result["turn_id"], "trn-notification-race")
+        self.assertEqual(status["turn_id"], "trn-notification-race")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["summary"], "assistant completed result")
+        self.assertEqual(status["last_output"], "assistant completed result")
+        self.assertNotIn("private prompt", status["summary"])
+        companion.close()
+
     def test_resume_reconciles_schema_terminal_turns_without_using_user_items_as_output(self) -> None:
         db_file = os.path.join(self.temp_dir.name, "resume-terminal.db")
         original = CodexCompanion(
