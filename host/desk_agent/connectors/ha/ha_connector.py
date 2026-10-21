@@ -264,14 +264,28 @@ class HAConnector:
         """
         current_list = self.get_all_states()
         changes: list[dict[str, Any]] = []
+        current_ids: set[str] = set()
         for item in current_list:
             eid = item["entity_id"]
+            current_ids.add(eid)
             new_st = item.get("state")
             old_item = self._cached_states.get(eid)
             old_st = old_item.get("state") if old_item else None
             if old_st != new_st:
                 changes.append({"entity_id": eid, "old_state": old_st, "new_state": new_st})
             self._cached_states[eid] = item
+
+        # HA can remove an entity without returning a replacement state in
+        # /api/states. Drop it from the authoritative cache and report the
+        # transition as old -> None so polling subscribers converge too.
+        for eid in tuple(self._cached_states):
+            if eid not in current_ids:
+                old_item = self._cached_states.pop(eid)
+                changes.append({
+                    "entity_id": eid,
+                    "old_state": old_item.get("state"),
+                    "new_state": None,
+                })
 
         return {"total_entities": len(current_list), "reconciled_changes": changes}
 
@@ -447,6 +461,8 @@ class HAConnector:
 
                                 if isinstance(new_obj, dict):
                                     self._cached_states[entity_id] = new_obj
+                                else:
+                                    self._cached_states.pop(entity_id, None)
 
                                 with self._state_condition:
                                     self._state_condition.notify_all()

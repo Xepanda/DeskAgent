@@ -296,6 +296,19 @@ class TestHAConnector(unittest.TestCase):
         self.assertEqual(rep3["reconciled_changes"][0]["old_state"], "off")
         self.assertEqual(rep3["reconciled_changes"][0]["new_state"], "on")
 
+        # Entity removal must clear the cached snapshot and notify subscribers
+        # with a transition to None instead of retaining stale state forever.
+        state_data.clear()
+        rep4 = ha.reconcile_states()
+        self.assertEqual(rep4["total_entities"], 0)
+        self.assertEqual(rep4["reconciled_changes"], [{
+            "entity_id": "light.desk",
+            "old_state": "on",
+            "new_state": None,
+        }])
+        rep5 = ha.reconcile_states()
+        self.assertEqual(rep5["reconciled_changes"], [])
+
     def test_polling_subscriber_exception_does_not_drop_other_snapshot_changes(self) -> None:
         """One consumer exception must not permanently lose later changes in the same snapshot."""
         ha = HAConnector(mock_mode=True)
