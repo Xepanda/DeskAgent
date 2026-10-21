@@ -1,6 +1,6 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.16.0
+> 文档版本：V3.17.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
 > 状态：**2026-10-22 最新 CLI 镜像和当前全仓测试结果见 §0。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 move/stop 均超时且没有 ACK/物理反馈，动作状态未知。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
@@ -8,6 +8,7 @@
 > V3.14.0 变更：Companion 增至 53 项 L2 测试，覆盖 app-server `thread/resume` 重启时恢复非终态任务、确认 `cancelling` 终态及 active-writer 下 pending 重试；新代码/测试无真实默认模型及 throwaway workspace restart smoke 证据，设备回传 L4 仍未验证。
 > V3.15.0 变更：补录真实 Codex app-server 默认模型（未传 `model`）与 throwaway workspace 任务在 8.76 秒内完成、Companion 重建后本地 completed 状态/assistant 摘要恢复且未含原 prompt。由于重启时 DB 已为终态，只发生 initialize、未触发 `thread/resume`；此为任务执行和本地持久化 L3 smoke，不是自动 resume 的 L3 证据。自动 resume 仍只有 53 项 L2 测试覆盖，设备反馈 L4 未验。
 > V3.16.0 变更：记录本轮生活服务提醒 outbox 取消/认领/重试的事务修复及 54 项定向测试、Host 相机注入源的 L2 测试边界、SDK C 测试桩链接真实 WebSocket 源与官方 SDK camera lease 序列修正；全仓 Linux/WSL Python 3.12 测试为 539 passed、2 skipped、44 subtests passed。两项跳过分别为未设置 `WATCHEROBOT_SDK_SRC` 的官方适配器集成和 Windows SQLite unlink 特例。上述均属 L2；未取到真机 JPEG，STM32 仍无 ACK，官方 Runtime 真机配对、HA 实控、设备结果反馈及恢复验收仍未完成。
+> V3.17.0 变更：补录 A1 相机 SPI 最大传输长度与 PTL body 上限一致的修复（相机错误契约 5 项通过；真实全零 PTL 头根因和 JPEG 仍未解决）；A2 以 C bridge 生成 PairAccept/HardwareHello 驱动 pinned 官方 Runtime loopback server 并确认 sys.ack（A2 套件 89 passed、21 subtests；依赖 13.1 与 pinned SDK 声明的 14–15 不一致）；A4 增加 HA WebSocket 暂时不可用后的重连测试（36 passed、4 subtests）；A5 真实 app-server 发现 turn/interrupt no-active-turn 竞态并补权威 resume 恢复尝试（Companion 54 passed，真实默认模型/重启恢复 L3）。设置本地官方 SDK 源后完整 Linux/WSL Python 3.12 回归为 544 passed、1 skipped、44 subtests passed；唯一 skip 是 Windows SQLite unlink 特例。以上不代表设备 WebSocket、相机 JPEG、STM32 ACK/动作、HA 实控或设备端反馈通过。
 > V3.12.0 变更：记录 CR-006 最终交叉测试为 52 passed、9 subtests passed，inline JS 与 diff 检查通过；复审无新增 Critical/Important。该项为 L2，真实相机 `rc=-25/out_len=0`，L3 失败、L4 未验证，不能称全契约实机通过。补充本轮 COM21 只读 ESP32-S3 日志采集的两条事件及证据范围。
 > V3.9.0 变更：记录 `6255657` Host managed SDK session 的 Codex terminal summary→`ctrl.expression.set` 软件链路、outbox 幂等/退避与 UTF-8 截断行为及定向回归结果；明确该证据为 L2，未启动真实 `WATCHER_APP_*` Runtime，也没有当前设备/声音 L3 证据。
 > V3.8.0 变更：说明 camera `READY` 不代表 HX 传感器就绪；记录同步命中后 SPI header read 返回 `ESP_OK` 但七字节全零并映射为 `rc=-25`；列出同一次 capture 的下一步同步示波测量点，并标记现场尚无波形证据。
