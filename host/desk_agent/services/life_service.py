@@ -65,6 +65,13 @@ def _resolve_timezone(tz_name: Optional[str]) -> timezone | zoneinfo.ZoneInfo:
         return timezone.utc
 
 
+def _normalize_utc_iso(value: str) -> str:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def compute_next_occurrence(
     current_iso: str,
     repeat_rule: str,
@@ -121,6 +128,55 @@ def compute_next_occurrence(
         return None
 
     return next_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _next_occurrence_after(
+    current_iso: str, repeat_rule: str, threshold_iso: str, tz_name: Optional[str]
+) -> Optional[str]:
+    """Advance a recurring schedule past downtime without replaying every missed slot."""
+    try:
+        current = datetime.fromisoformat(current_iso.replace("Z", "+00:00"))
+        threshold = datetime.fromisoformat(threshold_iso.replace("Z", "+00:00"))
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        if threshold.tzinfo is None:
+            threshold = threshold.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+    rule = repeat_rule.strip().lower()
+    step_minutes: Optional[int] = None
+    if rule == "hourly" or rule == "freq=hourly":
+        step_minutes = 60
+    elif rule.startswith("interval:"):
+        try:
+            step_minutes = int(rule.split(":", 1)[1])
+        except ValueError:
+            return None
+    elif "interval=" in rule and "minutely" in rule:
+        try:
+            step_minutes = int(next(p for p in rule.split(";") if p.startswith("interval=")).split("=", 1)[1])
+        except (StopIteration, ValueError):
+            return None
+
+    if step_minutes is not None:
+        if step_minutes <= 0:
+            return None
+        start_utc = current.astimezone(timezone.utc)
+        threshold_utc = threshold.astimezone(timezone.utc)
+        elapsed_steps = max(1, int((threshold_utc - start_utc).total_seconds() // (step_minutes * 60)) + 1)
+        next_utc = start_utc + timedelta(minutes=step_minutes * elapsed_steps)
+        return next_utc.isoformat().replace("+00:00", "Z")
+
+    next_iso = current_iso
+    for _ in range(100_000):
+        next_iso = compute_next_occurrence(next_iso, repeat_rule, tz_name=tz_name)
+        if not next_iso:
+            return None
+        next_dt = datetime.fromisoformat(next_iso.replace("Z", "+00:00"))
+        if next_dt > threshold.astimezone(timezone.utc):
+            return next_iso
+    return None
 
 
 class LifeService:
@@ -221,6 +277,7 @@ class LifeService:
         repeat_rule: Optional[str] = None,
         priority: str = "normal",
     ) -> dict[str, Any]:
+        due_at = _normalize_utc_iso(due_at)
         now_str = self._now_utc_str()
         occ_id = f"occ-{reminder_id}-0"
         with self._lock, self._get_connection() as conn:
@@ -277,7 +334,7 @@ class LifeService:
                 raise KeyError(f"Reminder '{reminder_id}' not found")
 
             new_title = title if title is not None else current["title"]
-            new_due = due_at if due_at is not None else current["due_at"]
+            new_due = _normalize_utc_iso(due_at) if due_at is not None else current["due_at"]
             new_rule = repeat_rule if repeat_rule is not None else current["repeat_rule"]
 
             conn.execute(
@@ -320,12 +377,18 @@ class LifeService:
     # Occurrence Scheduling & Ringing Control (Decoupled)
     # =========================================================================
 
-    def get_due_occurrences(self, now_iso: Optional[str] = None, max_catchup_hours: Optional[int] = None) -> list[dict[str, Any]]:
-        threshold = now_iso or self._now_utc_str()
+    def get_due_occurrences(self, now_iso: Optional[str] = None, max_catchup_hours: Optional[int] = 24) -> list[dict[str, Any]]:
+        """Return due reminders, expiring downtime misses older than 24 hours by default.
+
+        Pass ``None`` as ``max_catchup_hours`` to disable expiry for callers that
+        explicitly want every missed occurrence returned.
+        """
         try:
+            threshold = _normalize_utc_iso(now_iso) if now_iso else self._now_utc_str()
             now_dt = datetime.fromisoformat(threshold.replace("Z", "+00:00"))
         except Exception:
-            now_dt = datetime.now(timezone.utc)
+            threshold = self._now_utc_str()
+            now_dt = datetime.fromisoformat(threshold.replace("Z", "+00:00"))
 
         with self._lock, self._get_connection() as conn:
             rows = conn.execute(
@@ -355,6 +418,29 @@ class LifeService:
                         "UPDATE occurrences SET state = 'expired' WHERE occurrence_id = ?",
                         (item["occurrence_id"],),
                     )
+                    if item["repeat_rule"]:
+                        next_due = _next_occurrence_after(
+                            item["scheduled_at"], item["repeat_rule"], threshold, item["timezone"]
+                        )
+                        if next_due:
+                            try:
+                                next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
+                            except ValueError:
+                                next_ts = int(time.time())
+                            next_occ_id = f"occ-{item['reminder_id']}-{next_ts}"
+                            conn.execute(
+                                "INSERT OR IGNORE INTO occurrences (occurrence_id, reminder_id, scheduled_at, state) VALUES (?, ?, ?, 'pending')",
+                                (next_occ_id, item["reminder_id"], next_due),
+                            )
+                            conn.execute(
+                                "UPDATE reminders SET due_at = ?, status = 'scheduled', updated_at = ? WHERE reminder_id = ?",
+                                (next_due, self._now_utc_str(), item["reminder_id"]),
+                            )
+                    else:
+                        conn.execute(
+                            "UPDATE reminders SET status = 'missed', updated_at = ? WHERE reminder_id = ?",
+                            (self._now_utc_str(), item["reminder_id"]),
+                        )
                     continue
 
                 item["is_catchup"] = delay_sec > 120.0  # More than 2 minutes delayed = catchup
@@ -499,7 +585,11 @@ class LifeService:
                 ).fetchone()[0]
 
                 if pending_count == 0:
-                    next_due = compute_next_occurrence(scheduled_at, repeat_rule, tz_name=rem_tz)
+                    next_due = (
+                        _next_occurrence_after(scheduled_at, repeat_rule, now_str, rem_tz)
+                        if is_catchup
+                        else compute_next_occurrence(scheduled_at, repeat_rule, tz_name=rem_tz)
+                    )
                     if next_due:
                         try:
                             next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
@@ -645,6 +735,7 @@ class LifeService:
     def get_pending_outbox(self, now_iso: Optional[str] = None, include_delayed: bool = False) -> list[dict[str, Any]]:
         now_str = now_iso or self._now_utc_str()
         with self._lock, self._get_connection() as conn:
+            self._expire_stale_reminder_outbox(conn, now_str)
             if include_delayed:
                 rows = conn.execute(
                     "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC"
@@ -684,11 +775,11 @@ class LifeService:
         """Records an outbox delivery failure, increments retry count, applies optional backoff, and marks failed if max retries exceeded."""
         now = datetime.now(timezone.utc)
         with self._lock, self._get_connection() as conn:
-            row = conn.execute("SELECT retry_count FROM outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
+            row = conn.execute("SELECT retry_count, event_type FROM outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
             if not row:
                 return
             new_retries = row["retry_count"] + 1
-            if new_retries >= max_retries:
+            if row["event_type"] != "reminder.alert" and new_retries >= max_retries:
                 new_state = "failed"
                 next_retry = None
             else:
@@ -712,6 +803,7 @@ class LifeService:
         """Returns pending outbox entries with 'topic' field populated."""
         now_str = now_iso or self._now_utc_str()
         with self._lock, self._get_connection() as conn:
+            self._expire_stale_reminder_outbox(conn, now_str)
             if include_delayed:
                 rows = conn.execute(
                     "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC LIMIT ?",
@@ -733,6 +825,45 @@ class LifeService:
                 item["payload"] = json.loads(item.pop("payload_json", "{}"))
                 result.append(item)
             return result
+
+    @staticmethod
+    def _expire_stale_reminder_outbox(conn: sqlite3.Connection, now_iso: str) -> None:
+        """Expire reminder alerts older than 24h so offline devices do not replay stale prompts."""
+        try:
+            now_dt = datetime.fromisoformat(_normalize_utc_iso(now_iso).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return
+        rows = conn.execute(
+            "SELECT outbox_id, payload_json, created_at FROM outbox WHERE state = 'pending' AND event_type = 'reminder.alert'"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+                timestamp = payload.get("scheduled_at") or row["created_at"]
+                scheduled_dt = datetime.fromisoformat(_normalize_utc_iso(timestamp).replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if now_dt - scheduled_dt > timedelta(hours=24):
+                conn.execute("UPDATE outbox SET state = 'expired' WHERE outbox_id = ?", (row["outbox_id"],))
+                occurrence_id = payload.get("occurrence_id")
+                reminder_id = payload.get("reminder_id")
+                if occurrence_id:
+                    conn.execute(
+                        "UPDATE occurrences SET state = 'expired' WHERE occurrence_id = ? AND state = 'ringing'",
+                        (occurrence_id,),
+                    )
+                if reminder_id:
+                    conn.execute(
+                        """
+                        UPDATE reminders SET status = CASE
+                            WHEN EXISTS (SELECT 1 FROM occurrences WHERE reminder_id = ? AND state = 'pending') THEN 'scheduled'
+                            ELSE 'missed'
+                        END
+                        WHERE reminder_id = ? AND status = 'ringing'
+                        """,
+                        (reminder_id, reminder_id),
+                    )
+        conn.commit()
 
     # =========================================================================
     # Online Backup & Restore

@@ -14,6 +14,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from host.desk_agent.services.life_service import LifeService
 
@@ -68,6 +69,19 @@ class TestLifeService(unittest.TestCase):
         deleted = self.service.delete_reminder("rem-001")
         self.assertTrue(deleted)
         self.assertIsNone(self.service.get_reminder("rem-001"))
+
+    def test_reminder_due_time_with_offset_is_normalized_to_utc(self) -> None:
+        created = self.service.create_reminder(
+            reminder_id="rem-offset-time",
+            title="Local time reminder",
+            due_at="2026-10-15T09:00:00+08:00",
+            timezone_str="Asia/Shanghai",
+        )
+
+        self.assertEqual(created["due_at"], "2026-10-15T01:00:00Z")
+        self.assertEqual(self.service.get_reminder("rem-offset-time")["due_at"], "2026-10-15T01:00:00Z")
+        self.assertEqual(self.service.get_due_occurrences("2026-10-15T00:59:00Z"), [])
+        self.assertEqual(len(self.service.get_due_occurrences("2026-10-15T01:01:00Z")), 1)
 
     # -------------------------------------------------------------------------
     # 2. Occurrence Scheduling & Due Triggering
@@ -301,6 +315,39 @@ class TestLifeService(unittest.TestCase):
         self.assertFalse(due_map["rem-fresh-01"]["is_catchup"])
         self.assertLess(due_map["rem-fresh-01"]["delay_seconds"], 60)
 
+    def test_very_old_one_shot_reminder_expires_after_restart(self) -> None:
+        """A one-shot missed by more than the 24-hour recovery window is not replayed."""
+        self.service.create_reminder(
+            reminder_id="rem-expired-one-shot",
+            title="Old one-shot",
+            due_at="2026-10-14T08:00:00Z",
+        )
+
+        due = self.service.get_due_occurrences("2026-10-15T09:00:00Z")
+
+        self.assertEqual(due, [])
+        self.assertEqual(self.service.get_all_occurrences("rem-expired-one-shot")[0]["state"], "expired")
+        self.assertEqual(self.service.get_reminder("rem-expired-one-shot")["status"], "missed")
+
+    def test_expired_recurring_reminder_resumes_at_next_future_occurrence(self) -> None:
+        """After long downtime, recurring reminders skip stale alerts and resume their cadence."""
+        self.service.create_reminder(
+            reminder_id="rem-expired-daily",
+            title="Daily medicine",
+            due_at="2026-10-14T08:00:00Z",
+            repeat_rule="daily",
+            timezone_str="UTC",
+        )
+
+        due = self.service.get_due_occurrences("2026-10-15T09:00:00Z")
+
+        self.assertEqual(due, [])
+        occurrences = self.service.get_all_occurrences("rem-expired-daily")
+        self.assertEqual(occurrences[0]["state"], "expired")
+        pending = [item for item in occurrences if item["state"] == "pending"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["scheduled_at"], "2026-10-16T08:00:00Z")
+
     # -------------------------------------------------------------------------
     # 9. Online SQLite Backup & Restore
     # -------------------------------------------------------------------------
@@ -347,6 +394,32 @@ class TestLifeService(unittest.TestCase):
         pending_after = self.service.get_pending_outbox(include_delayed=True)
         self.assertEqual(len(pending_after), 0, "Failed message must transition out of pending state into failed")
 
+    def test_reminder_delivery_retries_until_expiry_then_is_not_replayed(self) -> None:
+        """Robot-offline alerts retry, but are discarded after the 24-hour reminder window."""
+        self.service.create_reminder(
+            "offline-reminder", "Offline reminder", "2026-10-14T08:00:00Z"
+        )
+        occurrence_id = self.service.get_due_occurrences("2026-10-14T08:05:00Z")[0]["occurrence_id"]
+        message_id = self.service.trigger_occurrence_to_outbox(occurrence_id)["outbox_id"]
+        for _ in range(8):
+            self.service.record_outbox_failure(message_id, "Robot disconnected", backoff_seconds=1)
+
+        pending = self.service.get_pending_outbox_messages(
+            now_iso="2026-10-14T09:00:00Z", include_delayed=True
+        )
+        self.assertEqual(len(pending), 1, "Reminder delivery should remain queued through transient disconnection")
+
+        expired = self.service.get_pending_outbox_messages(
+            now_iso="2026-10-15T09:00:00Z", include_delayed=True
+        )
+        self.assertEqual(expired, [])
+        row = self.service._get_connection().execute(
+            "SELECT state FROM outbox WHERE outbox_id = ?", (message_id,)
+        ).fetchone()
+        self.assertEqual(row["state"], "expired")
+        self.assertEqual(self.service.get_all_occurrences("offline-reminder")[0]["state"], "expired")
+        self.assertEqual(self.service.get_reminder("offline-reminder")["status"], "missed")
+
 
     # -------------------------------------------------------------------------
     # 11. Atomic trigger_occurrence_to_outbox
@@ -376,7 +449,7 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(rem["status"], "ringing")
 
         # Outbox message is created
-        pending = self.service.get_pending_outbox_messages()
+        pending = self.service.get_pending_outbox_messages(now_iso="2026-10-15T09:00:00Z")
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["topic"], "reminder.alert")
         self.assertEqual(pending[0]["payload"]["reminder_id"], "rem-atomic-01")
@@ -399,7 +472,7 @@ class TestLifeService(unittest.TestCase):
 
         self.assertIsNotNone(first)
         self.assertIsNone(second)
-        pending = self.service.get_pending_outbox_messages()
+        pending = self.service.get_pending_outbox_messages(now_iso="2026-10-15T09:00:00Z")
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["payload"]["occurrence_id"], occurrence_id)
 
@@ -423,9 +496,30 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(occs[1]["state"], "pending")
         self.assertEqual(occs[1]["scheduled_at"], "2026-10-16T07:00:00Z")
 
-        pending = self.service.get_pending_outbox_messages()
+        pending = self.service.get_pending_outbox_messages(now_iso="2026-10-15T09:00:00Z")
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["payload"]["reminder_id"], "rem-atomic-rec")
+
+    def test_catchup_recurring_alert_skips_missed_intervals(self) -> None:
+        due_at = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+        self.service.create_reminder(
+            reminder_id="rem-interval-catchup",
+            title="Hydration interval",
+            due_at=due_at,
+            repeat_rule="interval:30",
+            timezone_str="UTC",
+        )
+        occurrence_id = self.service.get_all_occurrences("rem-interval-catchup")[0]["occurrence_id"]
+
+        self.service.trigger_occurrence_to_outbox(occurrence_id, is_catchup=True)
+
+        pending = [item for item in self.service.get_all_occurrences("rem-interval-catchup") if item["state"] == "pending"]
+        self.assertEqual(len(pending), 1)
+        self.assertGreater(
+            datetime.fromisoformat(pending[0]["scheduled_at"].replace("Z", "+00:00")),
+            datetime.now(timezone.utc),
+            "A catch-up must not cause a rapid burst of each missed interval",
+        )
 
     def test_trigger_occurrence_to_outbox_atomic_rollback_on_failure(self) -> None:
         """Verifies that an error during triggering rolls back ringing state and does NOT leave orphaned records."""

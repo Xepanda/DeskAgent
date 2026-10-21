@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.request import urlopen, Request
 import json
@@ -262,7 +263,7 @@ class TestHostDaemon(unittest.TestCase):
     def test_reminder_automatic_scheduler_delivery(self) -> None:
         """Verifies background ReminderScheduler automatically triggers ringing and outbox alert for due items."""
         # Create a reminder due 1 minute ago
-        past_time = "2020-01-01T12:00:00Z"
+        past_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
         create_payload = {
             "schema_version": "1.0.0",
             "request_id": "req-sched-rem-01",
@@ -312,7 +313,7 @@ class TestHostDaemon(unittest.TestCase):
             self.app.life_service.create_reminder(
                 reminder_id="rem-atomic-sched-01",
                 title="Atomic Sched Alert",
-                due_at="2020-01-01T00:00:00Z",
+                due_at=(datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
             )
             # Wait for scheduler loop to pick it up
             time.sleep(1.2)
