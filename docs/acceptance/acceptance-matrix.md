@@ -1,9 +1,11 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.29.0
+> 文档版本：V3.31.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
-> 状态：**2026-10-22 可复现的匹配分区构建后，OTA0 app-only 镜像已写入并通过 esptool hash verify；只读 CLI smoke 有响应，证据仅覆盖 L3 写入/readback 与 CLI 响应。STM32 peer/ACK UNKNOWN；相机仍无 JPEG；新镜像的唤醒/语音日志未见 WakeNet/ASR/TTS，现场复测待用户确认。STM32 动作、相机、语音闭环均未通过/未验证，Level 4 整机闭环仍未完成。**
+> 状态：**2026-10-22 最新只读 COM21 日志采集约 32 秒，只见 transport connected 与每 10 秒 heap/PSRAM 事件（heap 22335 bytes、PSRAM 7074160 bytes）；采集使用 `--no-raw`，未落盘原始字节，也未见 WakeNet/KWS/ASR/TTS。设备仍运行上次 app-only 镜像（SHA-256 `2308F...`）；本轮相机源码未刷机，构建在 C object 后因 Ninja `failed recompaction: Permission denied` 终止。STM32 peer/ACK、当前镜像语音闭环和相机 JPEG 仍 UNKNOWN/未通过，Level 4 整机闭环未完成。A1 STM32 CLI 修复与本轮代码已提交并推送至 PR #14（head `8a81fef`，仍 open、未合并），本轮 image 未刷入设备；COM20 未触碰。**
+> V3.31.0 变更：补录 A5 真实 app-server `thread/resume` 对隔离非终态任务的恢复对账 smoke（Companion 本地服务恢复 L3，不代表设备回传），并记录超时 `thread/start` 可能留下无 SQLite 任务行的 orphan thread 风险；补录官方 SDK Runtime WSL 测试 12 passed、1 deselected，其中 C client/media/reconnect 端到端测试因导入 Windows Pillow `.pyd` 失败而阻塞；另行记录 STM32 CLI 软件修复 26 passed。新增/补充的 26 项与 SDK 12 项均不计入 V3.30 的 166 passed、13 subtests 原组合回归。代码已推送至仍 open、未合并的 PR #14（head `8a81fef`）；本轮 image 未刷入设备。保持设备语音、相机 JPEG、STM32 实物动作与整机 L4 未通过/未验证。
+> V3.30.0 变更：记录本轮 WSL 组合定向 L2 回归 **166 passed、13 subtests passed**（Host reminders、Companion 27、camera/web Host、HA 38、SDK source 8、firmware camera 17、wheel/UI/pairing 12、UART logger 10）；更新 COM21 UART-only 日志捕获证据和相机源码构建失败边界；关联 CR-009，明确当前 ESP32-S3 日志读取仍为 UART-only，网络日志未定义/不支持。本版本更新后代码已进入 PR #14；设备未刷入本轮 image。
 > V3.29.0 变更：记录基于可复现匹配分区构建的 OTA0 app-only COM21 flash：OTA0 `0x20000`，app SHA-256 `2308F478E770A658D1F55B3C5D1137FE9546163B6F8FE1726831F182161375C6`，esptool hash verify passed；仅写 app，未写 partition table、bootloader 或 model，COM20 未触碰。只读 smoke 中 `body status` 为 UART READY、STM32 peer/ACK UNKNOWN；camera capture 为全零 PTL、`rc=-25/out_len=0`，无 JPEG；30 秒日志仅见 AI ping/pong 与 heap，未见 WakeNet/ASR/TTS。该 L3 仅证明 app flash/hash readback 和 CLI 响应；新镜像现场唤醒复测待用户确认，旧镜像语音确认不得外推。证据见 `firmware/.target_logging/verified-flash-20261022/flash-and-smoke-summary.txt` 与 `firmware/.target_logging/reproducible-partition-build-20261022/summary.txt`。
 > V3.24.0 变更：记录 2026-10-22 COM21 只读 `body status` 尝试实际观察到 ESP32 ROM `DOWNLOAD(USB/UART0)`，因此未获得应用或 STM32 状态；随后以非写入 `esptool chip_id` 和 `--after hard_reset` 恢复应用启动，再采集 33.7 秒脱敏串口日志（820 raw bytes、8 行、transport connected 与 4 条 heap/PSRAM 事件），未持久化原始字节。证据仅为 ESP32-S3 应用 UART/内存单项 L3 观测；STM32 状态仍未知，未发送运动命令，COM20 未触碰。
 > V3.25.0 变更：补录恢复应用后在 COM21 以 DTR/RTS 保持低电平进行只读 `body status` 查询：UART Driver State `READY`、缓存 Pan=90/Tilt=120（非物理反馈）、last formatted TX length 0 bytes（非 RX/ACK）；STM32 peer/ACK 仍 UNKNOWN。该证据只证明应用 CLI 响应。另记录外部 ESP32 submodule 分区脚本补丁 commit `3680041...`：6 项测试、`py_compile` 与 diff-check 通过；标准 Tuya CLI build 使用项目 CSV，解码的 12 个分区与已知设备布局一致。未刷机；补丁未推送，也未包含在 DeskAgent PR。分区构建验证为 L2，物理功能缺口保持不变。
@@ -33,7 +35,7 @@
 
 ## 0. 当前现场验收状态（2026-10-22）
 
-本节优先于文档中早期的“设备未接入/所有硬件待测”快照。只记录本轮已提供的实机日志和用户现场确认，不将软件测试扩写成硬件通过。
+本节优先于文档中早期的“设备未接入/所有硬件待测”快照。V3.30 以本轮最新证据为准：COM21 只读日志捕获约 32 秒，使用 `--no-raw` 未落盘原始字节；只见 transport connected 与约每 10 秒一次的 heap/PSRAM 事件（heap 22335 bytes、PSRAM 7074160 bytes），未见 WakeNet/KWS/ASR/TTS。当前镜像仍为 V3.29 记录的 app-only SHA `2308F...`。本轮相机源码没有刷入设备；相机固件构建在 C source object 编译后因 Ninja `failed recompaction: Permission denied` 终止。不得把源码测试或构建尝试表述为当前硬件结果。
 
 | 功能 | 当前证据层级与状态 | 已有证据 | 缺少的验收证据 / 下一步 |
 | :--- | :--- | :--- | :--- |
@@ -41,18 +43,18 @@
 | Wi-Fi / provisioning | **L3 单项状态观测；云端授权未通过** | 新 CLI 镜像启动后 `wifi status` 为 `LINK_UP`；provisioning 阶段报 `mqtt_online`，但 `authorize_read rc=-1` | 需定位授权读取失败并核对真实 MQTT/AI 会话；`LINK_UP` 或 `mqtt_online` 单独不代表 Tuya 会话/语音云服务闭环 |
 | 屏幕、基础提示音 | **L3 单项通过** | 用户现场确认屏幕显示文字、扬声器提示音可听 | 归档对应固件 SHA、完整启动日志和现场记录；尚未验证长稳、并发资源仲裁 |
 | 麦克风采集 | **L3 单项通过（当前镜像观测）** | 新 CLI 镜像日志显示麦克风 READY、`running`，累计 895 frames，errors=0，peak=95 | 这是 PCM 采集状态，不等于唤醒/ASR/语音对话已在本镜像复测；需再次现场唤醒及多轮问答并归档识别、会话、播报证据 |
-| 麦克风、唤醒与对话 | **新镜像唤醒/语音未验证** | 当前 app SHA 为 `2308F478...1375C6`；对应 30 秒串口日志只观察到 AI ping/pong 与 heap，没有 WakeNet/ASR/TTS 事件。此前用户对旧设备状态的唤醒/对话确认不能外推到新镜像；新镜像现场唤醒复测仍待确认 | 在当前 SHA 上现场重复唤醒并完成多轮问答，归档 WakeNet/KWS、ASR、Tuya AI session/MQTT、NLG/TTS 和播放证据；在验证完成前不宣称语音闭环通过 |
+| 麦克风、唤醒与对话 | **当前镜像语音闭环未验证** | COM21 最新约 32 秒日志只有 transport connected 与 heap/PSRAM 事件；采集未落盘原始字节，未见 WakeNet/KWS/ASR/TTS。此前用户确认可以唤醒的现场体验不能代替本次当前镜像的识别/会话/播报日志 | 在当前 SHA 上现场重复唤醒并完成多轮问答，归档 WakeNet/KWS、ASR、Tuya AI session/MQTT、NLG/TTS 和播放证据；在验证完成前不宣称语音闭环通过 |
 | 滚轮、按键与状态页 | **L2 源码契约检查；L3 仅有用户对滚轮/按键可用的确认** | UI 契约测试检查滚轮选择 HOME/AUDIO/CONNECTION/DEVICE 四个只读页、触摸打开/返回、短按/长按调用既有 TuyaOpen talk alert API；覆盖配对 overlay 时保留当前状态页显示。用户确认滚轮和按键可用，但无本轮逐项事件日志 | 归档真机滚轮、触摸、短按、长按输入事件和屏幕变化；源码契约测试不代表页面在当前镜像上的显示/交互已实机验收 |
 | 提醒与备忘 | **L3 隔离服务生命周期 smoke；Host/设备闭环未验** | `LifeService` 30 tests passed。三个独立 Python 子进程 + 临时 SQLite：创建 24h 内 overdue reminder 与 note，claim 为 dispatching 后进程退出；重启恢复唯一 pending、读取 note、状态 ringing；stop 后再次重启验证 pending=0、状态 `ringing_stopped`、occurrence `dismissed` | 仍需 Host 实际部署/服务重启，设备真实播报与用户确认、重复播报抑制和离线到期策略；隔离 smoke 不代表整机 L4 |
-| Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新直接 COM21 CLI capture（DTR/RTS 保持低）返回 `PTL empty response: raw=00000000000000`、`rc=-25`、`valid_frame=NO`、`out_len=0`；脱敏日志 `.target_logging/com21-camera-capture-DTR-low-20261022.log`。这是同一未解决的全零 PTL header，没有 JPEG；不属于 CRC 失败，也未执行刷写。driver `READY` 仅证明初始化路径、I2C expander 配置及 SPI bus/device 创建成功，没有 HX ID/应答探测。详见 `desk_watcher_camera.c:135-193,264-346` | 下一步先同步测量同一事务中的 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 与 HX 电源轨；保存探点、时基和电压。确认总线数据前不盲目重复取帧；修复后导出并打开现场 JPEG，验证连续帧与资源释放 |
+| Himax 相机 | **真实 JPEG 未取得；当前源码未刷机** | 设备此前 PTL capture 为全零 header、`rc=-25/out_len=0`，无 JPEG。此次相机 source build 在 C object 编译后以 Ninja `failed recompaction: Permission denied` 终止；本轮改动没有烧录，因此设备状态仍沿用此前失败观测，未验证源码修复效果 | 先恢复可复现的构建完成，再用当前匹配分区 app-only 镜像获取并打开现场 JPEG；检查连续采集和资源释放。构建/软件测试均不能代替相机 L3 |
 | 相机 SDK parser / Host adapter | **L2 集成通过；L3/L4 未验证** | PR #13 合入后相机/Host 定向测试共 43 passed、9 subtests。修正 3 项陈旧测试预期，让测试注入真实帧源；没有帧源时仍返回 unavailable/不产生帧。测试中的帧源是软件测试输入，不是设备采集；未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
 | CR-006 Host MJPEG stream | **L2 测试通过；L3 失败、L4 未验证** | `tests/camera`、Host route、SDK camera adapter 与 managed SDK startup 定向测试：43 passed、9 subtests。3 项陈旧测试预期已修正为注入真实帧源，同时保留无帧源时 unavailable 的行为；实现只消费真实硬件 JPEG，最高 2 FPS | 最新设备 capture 为全零 PTL header、`rc=-25`、`out_len=0`，无真实 JPEG。以上仅为 L2 软件证据；需取得可打开的现场 JPEG，经 Host 到浏览器验证帧新鲜度与断线恢复，才能验收实机链路。不能称全契约实机通过 |
 | STM32 / 机身动作 | **L3 命令发送尝试失败；STM32 peer/ACK/物理状态仍 UNKNOWN** | 此前 `move` 与 `stop` 均返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，没有 RX、ACK 或物理反馈。ROM `DOWNLOAD(USB/UART0)` 期间的 `body status` 没有应用或 STM32 响应。恢复后在 COM21、DTR/RTS 保持低电平执行只读 `body status`，应用 CLI 返回 UART Driver State `READY`、cached setpoint Pan=90/Tilt=120、last formatted TX length 0 bytes；缓存角度不是物理反馈，TX 长度为 0 也不是 RX/ACK。此查询证明应用 CLI 能响应，但 STM32 peer/ACK 仍 UNKNOWN。证据：`.target_logging/stm32-status-readonly/body-status-DTR-low-20261022.txt`。本轮无 move/stop，COM20 未触碰 | 核对板卡原理图、STM32 固件协议及内部 UART 接线；使用接收侧观测和物理反馈验证 ACK 关联、动作及通信故障安全停止 |
-| 官方 Python SDK | **L1 契约；L2 parser 测试通过；真实 Runtime L3 未验证** | 官方 SDK parser 对有效 fixture 的互操作测试通过；设备侧 pairing window 命令曾现场打开/取消。官方 Runtime 的真实 WebSocket 发现、配对、HardwareHello、能力注册、命令与媒体传输均未验 | 用未修改官方 SDK 连真实设备；错误配对码必须拒绝，正确配对后记录完整连接/命令/媒体/断线重连日志 |
-| Home Assistant | **L2 软件测试；L3/L4 未验证** | HA connector 定向套件 **37 passed、4 subtests passed**，包含 polling subscriber callback isolation 回归；仅证明 connector 软件行为，没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
-| 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | 最新提醒/Core 定向套件报告 **61 passed、4 subtests passed**。两条 E2E due fixture 改为运行时近时值：crash recovery 用 90 分钟前（符合 24h catch-up 且超过 1h 延迟断言），delivery 用 5 分钟前（符合 catch-up 标记阈值及 24h 上限）；real-chain 提醒 fixture 也用运行时 5 分钟前。`test_p1_gaps_verification.py` 在清理临时目录前显式 `LifeService.close()`，Windows WinError 32 已消除。均为软件测试，不代表真机播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
-| Windows Companion / Codex | **真实 app-server 任务与本地持久化 L3 smoke 通过；自动 resume 仍为 L2；设备回传 L4 未完成** | Companion 定向套件 **53 passed（L2）**，覆盖 app-server `thread/resume` 重启时恢复非终态任务、对 `cancelling` 任务确认终态、active-writer 情况下 pending 重试。另以真实 Codex app-server 默认模型（未传 `model`）在 throwaway workspace 执行任务，8.76 秒内得到 `codex.turn_completed`；重建 Companion 后 completed 状态与 assistant 摘要一致，恢复内容不含原 prompt。重启时 DB 已是终态，只发送 initialize、没有 `thread/resume`，因此该 smoke 不证明自动 resume。`6255657` 的 terminal summary→`ctrl.expression.set` 软件路径和 outbox 逻辑仍未由真实设备 Runtime 验证，未验证设备显示/播报或用户听感 | 真实非终态任务进程重启后的 `thread/resume` 仍需单独 L3 验证；启动真实 managed Runtime 并连接设备，观察任务结果到设备反馈的完整链路并由用户确认听感 |
-| ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 新镜像只读 smoke** | 新镜像 30 秒日志摘要只见 AI ping/pong 与 heap，未见 WakeNet/ASR/TTS；这只能说明日志链路可观察且应用有活动，不能证明唤醒或对话。此前 33.7 秒只读日志仍是旧观测。详见 [现场 Runbook](field-runbook-2026-10-21.md) | 保留新镜像的脱敏摘要与复现命令；完成新镜像现场语音复测并记录相应事件，长稳另行验收 |
+| 官方 Python SDK | **L1 契约；L2 official Runtime compatibility tests 部分通过；真机 Runtime L3 未验证** | WSL `test_official_sdk_runtime_compat.py` **12 passed、1 deselected**，包括 pairing 与 HardwareHello 的官方 server 测试。唯一 C client/media/reconnect 端到端子测因导入 Windows Pillow `.pyd` 失败（`PIL._imaging`），属于环境阻塞，不计为通过。以上 SDK 追加回归不包含在 166 passed、13 subtests 组合回归中 | 修复/隔离 WSL 中 Windows Pillow 二进制导入问题后重跑 C client/media/reconnect；再用未修改官方 SDK 连真机，验证错误配对拒绝、正确配对、命令/媒体与断线重连 |
+| Home Assistant | **L2 软件测试；L3/L4 未验证** | 前次 HA connector 定向套件 **37 passed、4 subtests passed**，包含 polling subscriber callback isolation 回归；本轮组合回归另覆盖 HA 38 项。两者均只证明 connector 软件行为，没有真实 HA/物理设备证据 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
+| 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | 前次提醒/Core 定向套件报告 **61 passed、4 subtests passed**；本轮组合回归另覆盖 Host reminders。此前测试中两条 E2E due fixture 使用运行时近时值，DB teardown 先关闭 `LifeService`。均为软件测试，不代表真机播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
+| Windows Companion / Codex | **Companion 本地服务恢复 L3 smoke 通过；设备回传 L4 未完成** | 本轮隔离 throwaway SQLite task 在退出前为 `inProgress`；重启后的真实 app-server `thread/resume` authoritative interrupted reconciliation 后，`recovery_status=reconciled`、`pending=0`。证据：`.target_logging/a5-cancel-live-20261022/resume-audit.json`。该证据仅为 Companion 本地任务恢复，不代表设备反馈。另一次长 `thread/start` 超过 10 秒后请求超时，SQLite 无任务行；存在未管理 orphan thread 风险，未继续创建任务。`6255657` 的 terminal summary→`ctrl.expression.set` 软件路径仍未由真实设备 Runtime 验证 | 调查并处理 `thread/start` 超时后的 orphan thread 对账/清理；启动真实 managed Runtime 并连接设备，观察任务结果到设备显示/播报的完整链路并由用户确认听感 |
+| ESP32-S3 串口日志读取 | **L2 工具测试通过；本轮 L3 只读 UART 观测有限** | COM21 被动捕获约 32 秒，只有 transport connected 与每 10 秒 heap/PSRAM 事件（heap 22335 bytes、PSRAM 7074160 bytes）；使用 `--no-raw` 未落盘原始字节，未见 WakeNet/KWS/ASR/TTS。CR-009 将现行能力限定为 UART-only，网络日志契约未定义/不支持。详见 [CR-009](../implementation/CR-009-esp32s3-network-log-source.md) 与 [现场 Runbook](field-runbook-2026-10-21.md) | 网络日志需先经 A0 定义契约并由 A1/A7 分别实现/验收；当前仅可使用脱敏 UART 采集。完成当前镜像语音复测并记录相应事件，长稳另行验收 |
 | 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散；语音、屏幕、Codex 本机任务等是各自单项证据 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
 
 ### 2026-10-21 回归数字与构建状态（历史快照）
@@ -107,12 +109,17 @@
 
 ### 2026-10-22 定向回归补充（L2）
 
+本次最新组合定向回归（WSL）为 **166 passed、13 subtests passed**，各覆盖套件计数如下；这是本轮选定范围内的 L2 软件回归，不是全仓测试或硬件通过。下方早期单套件数字是历史/前次快照，不应与本次总数相加。
+
 | 范围 | 最新定向结果 | 证据边界 |
 | :--- | :--- | :--- |
+| 本轮组合定向回归 | **166 passed、13 subtests passed**：Host reminders、Companion 27、camera/web Host、HA 38、SDK source 8、firmware camera 17、wheel/UI/pairing 12、UART logger 10 | WSL 软件回归，全部为 L2；不证明当前设备语音唤醒、camera JPEG、STM32 ACK/动作、真实 SDK Runtime 或整机闭环 |
+| STM32 CLI 与 body protocol 追加软件回归（独立于上述组合） | **26 passed** | A1 CLI owner 修复与 `desk_cli`、`stm32_uart`、body protocol 定向回归；属于 L2 软件证据，不证明 STM32 实机 RX/ACK、动作或故障安全停止；不计入 166/13 |
+| 官方 SDK Runtime 追加回归（独立于上述组合） | `test_official_sdk_runtime_compat.py`: **12 passed、1 deselected** | WSL 官方 server pairing/HardwareHello 测试通过，属于 L2；C client/media/reconnect 端到端子测因 Windows Pillow `.pyd` (`PIL._imaging`) 导入失败而被环境阻塞，未通过；不计入 166/13 |
 | HA Connector | **37 passed、4 subtests passed** | 包含 polling subscriber callback isolation 回归；软件 connector 测试仍为 L2，没有真实 HA 会话或物理设备动作 |
 | Reminder / Core | **61 passed，4 subtests passed** | 动态提醒 fixture 覆盖 24h catch-up 策略；DB teardown 先关闭 LifeService。仍是软件验证，不代表设备播报 |
-| A5 Companion | **53 passed + 真实任务 smoke** | 53 项为 L2，覆盖 `thread/resume` restart recovery、`cancelling` terminal confirmation、active-writer pending retry。另有真实默认模型/throwaway workspace 任务和已完成任务本地持久化重建 smoke（L3）；该任务重启时已终态，未触发 `thread/resume`，不作为自动恢复 L3 证据，也不代表设备结果回传 |
-| A2 SDK | **6 passed** | SDK 定向契约/互操作软件检查；不代表官方 SDK Runtime 已连接真机 |
+| A5 Companion | **本轮组合覆盖 27 项 L2；非终态 resume 恢复为本地 L3 smoke** | 隔离 SQLite 中 `inProgress` task 经真实 app-server `thread/resume` reconciled，`pending=0`；证据 `.target_logging/a5-cancel-live-20261022/resume-audit.json`。本地服务恢复不代表设备回传。长 `thread/start` >10s 超时且 DB 无任务行，存在 orphan thread 风险，未继续创建任务 |
+| A2 SDK | **SDK source 8 项纳入组合 L2；官方 Runtime 追加回归独立记录** | 官方 SDK Runtime compatibility tests 12 passed、1 deselected；C client/media/reconnect 子测在 `from PIL import Image` 处因 WSL 导入 Windows Pillow `.pyd` (`PIL._imaging`) 失败而阻塞。真实 Runtime 真机连接仍未验证 |
 | 更新后的跨模块定向回归 | **19 passed** | L2 软件集成；不升级为 Level 3/4 设备闭环 |
 | 全仓 pytest（WSL Python 3.12） | **550 passed、2 skipped、44 subtests passed；140.36 秒** | PR #13 合入后的全量软件回归，属 L2。两个 skip 仍按各自说明适用；这不是硬件或服务端 E2E 证据 |
 | 相机 / Host 定向回归 | **43 passed、9 subtests passed** | L2 软件回归。PR #13 后修正 3 项陈旧相机测试预期：为成功路径注入真实帧源，同时保留无帧源时 unavailable/不产生帧的行为。软件帧源不证明设备取帧成功 |
@@ -130,7 +137,7 @@
 | 证据层级 | 验收范围与含义 | 当前结论 | 关键依据与测试输出 | 绝对不能代表什么 |
 | :--- | :--- | :---: | :--- | :--- |
 | **Level 1：公开源码 / 契约标准** | JSON Schema (Draft 2020-12)、25 个 fixtures、13 个稳定错误码、动态 ISO 8601 时钟契约 | **契约检查通过** | `contracts/validator/validate.py` 深度校验通过 | 不能代表物理板卡具备该 capability 或在线部署成功 |
-| **Level 2：模拟 PoC / 协议对齐** | C 固件驱动报文、SDK 协议、RobotAdapter、真实 Host 进程与伪设备组成的 TCP 链路、跨模块回归、C 驱动故障跨层、Python 核心、HA/Codex 软件接口、故障注入与压力测试 | **此前快照 295 项通过；不是当前分支的全量结果** | 下方 §2 记录的是当时命令及输出；本次后续改动需重跑对应套件，必要时重跑全量 | 无法证明真机、真实 HA/SDK/Codex 业务和物理动作 |
+| **Level 2：模拟 PoC / 协议对齐** | C 固件驱动报文、SDK 协议、RobotAdapter、真实 Host 进程与伪设备组成的 TCP 链路、跨模块回归、Python 核心、HA/Codex 软件接口与故障注入 | **本轮组合定向回归 166 passed、13 subtests passed；不是全仓回归** | §0 的 2026-10-22 最新定向回归列出本次套件范围；历史全量数字仅作历史快照 | 无法证明真机、真实 HA/SDK/Codex 业务和物理动作 |
 | **Level 3：单项硬件 / 节点实测** | ESP32-S3 语音/屏幕/输入、Himax 相机、STM32 动作、Windows Companion、真实 HA 与 Host | **部分单项通过；相机失败；STM32/真实 HA 等未验证** | 见 §0 和 [现场 Runbook](field-runbook-2026-10-21.md)；未实测项仍存在 | 单项实测不能代表系统端到端或长稳 |
 | **Level 4：端到端闭环与恢复验收** | 真实语音唤醒→外部工具/服务执行→真实结果→设备反馈，断网/服务退出/重启后恢复 | **未完成** | 当前缺少贯通真实服务动作、设备反馈及故障恢复的一条完整关联证据 | 不能代表所有未知硬件版本或生产环境 |
 
