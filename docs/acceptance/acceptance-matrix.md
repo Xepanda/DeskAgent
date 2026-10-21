@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.28.0
+> 文档版本：V3.29.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
-> 状态：**2026-10-22 最新 CLI 镜像和当前全仓测试结果见 §0。用户最新现场确认当前设备已可通过唤醒词唤醒并进行对话；该证据未附设备日志，不能据此确认 ASR/TTS 细节、多轮会话、云端会话状态或恢复能力。相机仍未取到 JPEG，STM32 move/stop 均超时且没有 ACK/物理反馈，动作状态未知。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> 状态：**2026-10-22 可复现的匹配分区构建后，OTA0 app-only 镜像已写入并通过 esptool hash verify；只读 CLI smoke 有响应，证据仅覆盖 L3 写入/readback 与 CLI 响应。STM32 peer/ACK UNKNOWN；相机仍无 JPEG；新镜像的唤醒/语音日志未见 WakeNet/ASR/TTS，现场复测待用户确认。STM32 动作、相机、语音闭环均未通过/未验证，Level 4 整机闭环仍未完成。**
+> V3.29.0 变更：记录基于可复现匹配分区构建的 OTA0 app-only COM21 flash：OTA0 `0x20000`，app SHA-256 `2308F478E770A658D1F55B3C5D1137FE9546163B6F8FE1726831F182161375C6`，esptool hash verify passed；仅写 app，未写 partition table、bootloader 或 model，COM20 未触碰。只读 smoke 中 `body status` 为 UART READY、STM32 peer/ACK UNKNOWN；camera capture 为全零 PTL、`rc=-25/out_len=0`，无 JPEG；30 秒日志仅见 AI ping/pong 与 heap，未见 WakeNet/ASR/TTS。该 L3 仅证明 app flash/hash readback 和 CLI 响应；新镜像现场唤醒复测待用户确认，旧镜像语音确认不得外推。证据见 `firmware/.target_logging/verified-flash-20261022/flash-and-smoke-summary.txt` 与 `firmware/.target_logging/reproducible-partition-build-20261022/summary.txt`。
 > V3.24.0 变更：记录 2026-10-22 COM21 只读 `body status` 尝试实际观察到 ESP32 ROM `DOWNLOAD(USB/UART0)`，因此未获得应用或 STM32 状态；随后以非写入 `esptool chip_id` 和 `--after hard_reset` 恢复应用启动，再采集 33.7 秒脱敏串口日志（820 raw bytes、8 行、transport connected 与 4 条 heap/PSRAM 事件），未持久化原始字节。证据仅为 ESP32-S3 应用 UART/内存单项 L3 观测；STM32 状态仍未知，未发送运动命令，COM20 未触碰。
 > V3.25.0 变更：补录恢复应用后在 COM21 以 DTR/RTS 保持低电平进行只读 `body status` 查询：UART Driver State `READY`、缓存 Pan=90/Tilt=120（非物理反馈）、last formatted TX length 0 bytes（非 RX/ACK）；STM32 peer/ACK 仍 UNKNOWN。该证据只证明应用 CLI 响应。另记录外部 ESP32 submodule 分区脚本补丁 commit `3680041...`：6 项测试、`py_compile` 与 diff-check 通过；标准 Tuya CLI build 使用项目 CSV，解码的 12 个分区与已知设备布局一致。未刷机；补丁未推送，也未包含在 DeskAgent PR。分区构建验证为 L2，物理功能缺口保持不变。
 > V3.26.0 变更：补录 DTR/RTS 保持低电平时直接通过 COM21 执行的最新只读 `camera capture`：PTL `raw=00000000000000`、`rc=-25`、`valid_frame=NO`、`out_len=0`。这是既有全零 PTL header 问题的再次观测，仍无 JPEG；不是 CRC 失败，未执行刷写。相机 L3 仍失败，L4 未验证。
@@ -36,11 +37,11 @@
 
 | 功能 | 当前证据层级与状态 | 已有证据 | 缺少的验收证据 / 下一步 |
 | :--- | :--- | :--- | :--- |
-| 固件 build / flash | **当前标准 CLI build 未通过分区兼容烧录门禁；匹配表 app flash 未验收** | patch `3680041...` 的 6 项测试、`py_compile`、diff-check 通过；但标准 Tuya CLI build 会先按 manifest 将 ESP32 submodule 从补丁同步回 `8cd2a15`，故生成 9 分区 stock map hash `DE7EA934...898F8D`，与设备已知 12 分区 map hash `C6F7A192...A003ADFD` 不匹配。归档匹配表二进制缺少可复现标准构建日志/来源证明。历史 app-only flash/hash verify 不代表该次构建通过；当前产物不得刷机，未写 partition table、bootloader 或 model；COM20 未触碰 | 修复 CLI sync/补丁纳入可复现构建链，留存完整构建日志并核对 app 地址/大小与设备布局；再单独验收匹配表 app-only flash |
+| 固件 build / flash | **L3 app-only flash/readback 与只读 CLI smoke 通过** | 可复现 Tuya CLI build 的分区表为 12 项，SHA256 `C6F7A192...A003ADFD` 与设备只读读回一致；app SHA256 `2308F478E770A658D1F55B3C5D1137FE9546163B6F8FE1726831F182161375C6` 写入 OTA0 `0x20000`，esptool hash verify passed。只写 app，未写 partition table、bootloader、model；COM20 未触碰。设备 smoke 仅证明 `body status` CLI 响应，不能证明 STM32 peer/ACK、动作或其他功能 | 记录对应构建和 flash 证据；分别完成 STM32 收发/实物动作、相机真实 JPEG、新镜像语音唤醒与对话验证后再推进整机 L4 |
 | Wi-Fi / provisioning | **L3 单项状态观测；云端授权未通过** | 新 CLI 镜像启动后 `wifi status` 为 `LINK_UP`；provisioning 阶段报 `mqtt_online`，但 `authorize_read rc=-1` | 需定位授权读取失败并核对真实 MQTT/AI 会话；`LINK_UP` 或 `mqtt_online` 单独不代表 Tuya 会话/语音云服务闭环 |
 | 屏幕、基础提示音 | **L3 单项通过** | 用户现场确认屏幕显示文字、扬声器提示音可听 | 归档对应固件 SHA、完整启动日志和现场记录；尚未验证长稳、并发资源仲裁 |
 | 麦克风采集 | **L3 单项通过（当前镜像观测）** | 新 CLI 镜像日志显示麦克风 READY、`running`，累计 895 frames，errors=0，peak=95 | 这是 PCM 采集状态，不等于唤醒/ASR/语音对话已在本镜像复测；需再次现场唤醒及多轮问答并归档识别、会话、播报证据 |
-| 麦克风、唤醒与对话 | **L3 单项用户现场确认；详细链路未由日志验证** | 用户于 2026-10-22 最新确认“现在可以唤醒对话了”，即当前设备能响应唤醒词并进行对话。该确认没有附带本轮设备日志或固件 SHA；此前已有 PCM 采集观测，但不能把它当作本次对话的日志佐证 | 归档匹配当前固件 SHA 的启动、WakeNet/KWS、ASR、Tuya AI session/MQTT、NLG/TTS 与扬声器播放日志；量化重复唤醒并验证多轮上下文、断网恢复和长稳。当前用户确认不代表这些细项已通过 |
+| 麦克风、唤醒与对话 | **新镜像唤醒/语音未验证** | 当前 app SHA 为 `2308F478...1375C6`；对应 30 秒串口日志只观察到 AI ping/pong 与 heap，没有 WakeNet/ASR/TTS 事件。此前用户对旧设备状态的唤醒/对话确认不能外推到新镜像；新镜像现场唤醒复测仍待确认 | 在当前 SHA 上现场重复唤醒并完成多轮问答，归档 WakeNet/KWS、ASR、Tuya AI session/MQTT、NLG/TTS 和播放证据；在验证完成前不宣称语音闭环通过 |
 | 滚轮、按键与状态页 | **L2 源码契约检查；L3 仅有用户对滚轮/按键可用的确认** | UI 契约测试检查滚轮选择 HOME/AUDIO/CONNECTION/DEVICE 四个只读页、触摸打开/返回、短按/长按调用既有 TuyaOpen talk alert API；覆盖配对 overlay 时保留当前状态页显示。用户确认滚轮和按键可用，但无本轮逐项事件日志 | 归档真机滚轮、触摸、短按、长按输入事件和屏幕变化；源码契约测试不代表页面在当前镜像上的显示/交互已实机验收 |
 | 提醒与备忘 | **L3 隔离服务生命周期 smoke；Host/设备闭环未验** | `LifeService` 30 tests passed。三个独立 Python 子进程 + 临时 SQLite：创建 24h 内 overdue reminder 与 note，claim 为 dispatching 后进程退出；重启恢复唯一 pending、读取 note、状态 ringing；stop 后再次重启验证 pending=0、状态 `ringing_stopped`、occurrence `dismissed` | 仍需 Host 实际部署/服务重启，设备真实播报与用户确认、重复播报抑制和离线到期策略；隔离 smoke 不代表整机 L4 |
 | Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新直接 COM21 CLI capture（DTR/RTS 保持低）返回 `PTL empty response: raw=00000000000000`、`rc=-25`、`valid_frame=NO`、`out_len=0`；脱敏日志 `.target_logging/com21-camera-capture-DTR-low-20261022.log`。这是同一未解决的全零 PTL header，没有 JPEG；不属于 CRC 失败，也未执行刷写。driver `READY` 仅证明初始化路径、I2C expander 配置及 SPI bus/device 创建成功，没有 HX ID/应答探测。详见 `desk_watcher_camera.c:135-193,264-346` | 下一步先同步测量同一事务中的 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 与 HX 电源轨；保存探点、时基和电压。确认总线数据前不盲目重复取帧；修复后导出并打开现场 JPEG，验证连续帧与资源释放 |
@@ -51,7 +52,7 @@
 | Home Assistant | **L2 软件测试；L3/L4 未验证** | HA connector 定向套件 **37 passed、4 subtests passed**，包含 polling subscriber callback isolation 回归；仅证明 connector 软件行为，没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
 | 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | 最新提醒/Core 定向套件报告 **61 passed、4 subtests passed**。两条 E2E due fixture 改为运行时近时值：crash recovery 用 90 分钟前（符合 24h catch-up 且超过 1h 延迟断言），delivery 用 5 分钟前（符合 catch-up 标记阈值及 24h 上限）；real-chain 提醒 fixture 也用运行时 5 分钟前。`test_p1_gaps_verification.py` 在清理临时目录前显式 `LifeService.close()`，Windows WinError 32 已消除。均为软件测试，不代表真机播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
 | Windows Companion / Codex | **真实 app-server 任务与本地持久化 L3 smoke 通过；自动 resume 仍为 L2；设备回传 L4 未完成** | Companion 定向套件 **53 passed（L2）**，覆盖 app-server `thread/resume` 重启时恢复非终态任务、对 `cancelling` 任务确认终态、active-writer 情况下 pending 重试。另以真实 Codex app-server 默认模型（未传 `model`）在 throwaway workspace 执行任务，8.76 秒内得到 `codex.turn_completed`；重建 Companion 后 completed 状态与 assistant 摘要一致，恢复内容不含原 prompt。重启时 DB 已是终态，只发送 initialize、没有 `thread/resume`，因此该 smoke 不证明自动 resume。`6255657` 的 terminal summary→`ctrl.expression.set` 软件路径和 outbox 逻辑仍未由真实设备 Runtime 验证，未验证设备显示/播报或用户听感 | 真实非终态任务进程重启后的 `thread/resume` 仍需单独 L3 验证；启动真实 managed Runtime 并连接设备，观察任务结果到设备反馈的完整链路并由用户确认听感 |
-| ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 只读日志观测** | 本轮在 `chip_id` / `--after hard_reset` 后以 `--no-raw` 只读 COM21 采集 33.7 秒：820 raw bytes、8 行，记录 transport connected 与 4 条 heap/PSRAM 事件；未持久化原始串口字节。证据仅说明应用 UART 日志和内存事件可观察，不提供 STM32 状态或语音/相机功能证据，也不代表长稳。详见 [现场 Runbook](field-runbook-2026-10-21.md) | 需要保留脱敏日志、摘要及复现命令；后续长稳需单独定义时长/断线标准，不能将串口连通或内存事件等同于整机通过 |
+| ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 新镜像只读 smoke** | 新镜像 30 秒日志摘要只见 AI ping/pong 与 heap，未见 WakeNet/ASR/TTS；这只能说明日志链路可观察且应用有活动，不能证明唤醒或对话。此前 33.7 秒只读日志仍是旧观测。详见 [现场 Runbook](field-runbook-2026-10-21.md) | 保留新镜像的脱敏摘要与复现命令；完成新镜像现场语音复测并记录相应事件，长稳另行验收 |
 | 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散；语音、屏幕、Codex 本机任务等是各自单项证据 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
 
 ### 2026-10-21 回归数字与构建状态（历史快照）
@@ -95,7 +96,7 @@
 
 | 检查项 | 结果 | 证据层级 / 边界 |
 | :--- | :--- | :--- |
-| CLI 固件构建与烧录 | 历史 app-only 镜像曾写入 OTA0 `0x20000` 并 verify hash；但本轮标准 CLI build 被 SDK manifest sync 覆盖本地补丁，生成 9 分区 stock map（`DE7EA934...898F8D`），与设备已知 12 分区表（`C6F7A192...A003ADFD`）不匹配。当前构建产物不得刷机；归档匹配表二进制无可复现标准构建日志。匹配表 app flash 未验收；未写 partition table/bootloader/model，COM20 未触碰 | patch 为 L2 静态测试通过；CLI build 产物与设备布局不兼容，未通过烧录门禁；不得将历史 app flash/hash verify 作为当前构建验收 |
+| CLI 固件构建与烧录 | 匹配分区构建已复现；OTA0 app-only flash 至 `0x20000`，app SHA256 `2308F478...1375C6`，esptool hash verify passed。只写 app，未写 partition table/bootloader/model，COM20 未触碰 | L3 仅证明 app 写入/hash readback；只读 smoke 有 CLI 响应。STM32 动作、相机 JPEG、新镜像唤醒/语音均未通过或未验证 |
 | 网络 / provisioning | `wifi status LINK_UP`；provisioning `mqtt_online`，但 `authorize_read rc=-1` | L3 单项状态观测；云端授权与 Tuya AI 会话未验 |
 | 音频输入 | 麦克风 READY/running，895 frames、errors=0、peak=95；用户最新确认当前设备可唤醒并对话 | PCM 帧数据是 L3 单项采集观测；唤醒/对话是 2026-10-22 用户现场确认，未附本轮设备日志或固件 SHA。未验证带日志的 WakeNet/KWS、ASR、Tuya 会话、TTS/扬声器细节、多轮上下文或恢复 |
 | 相机 | Driver READY；PTL empty response `raw=00000000000000`，`rc=-25`，`out_len=0`，无 JPEG。READY 只表明初始化路径、expander 配置及 SPI bus/device 创建成功；未探测 HX ID/应答。同步命中后 7-byte SPI header read 返回 ESP_OK 但全零，才映射为 `rc=-25` | L3 失败；无真实图片。现场没有 scope/logic-analyzer 波形证据；下次必须在同一次 capture 同步观测 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 和 HX 电源轨 |
