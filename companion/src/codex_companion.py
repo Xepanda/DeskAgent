@@ -33,6 +33,7 @@ import threading
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Mapping, Optional, Union
 
@@ -622,15 +623,46 @@ class CodexCompanion:
                     self._persist_task(self._tasks[task_id])
             elif method in ("turn/completed", "task/completed", "turn/finished"):
                 if task_id and task_id in self._tasks:
-                    self._tasks[task_id]["status"] = "completed"
-                    self._tasks[task_id]["state"] = "completed"
-                    self._persist_task(self._tasks[task_id])
-                    summary = params.get("summary") or self._tasks[task_id].get("prompt", "")[:60]
-                    self._dispatch_event("codex.turn_completed", {
-                        "task_id": task_id,
-                        "status": "completed",
-                        "summary": summary,
-                    })
+                    turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                    raw_status = str(turn.get("status") or params.get("status") or "completed").lower()
+                    error_info = params.get("error") or turn.get("error")
+                    if raw_status in ("failed", "error") or error_info is not None:
+                        self._tasks[task_id]["status"] = "failed"
+                        self._tasks[task_id]["state"] = "failed"
+                        self._persist_task(self._tasks[task_id])
+                        summary = params.get("summary") or turn.get("summary")
+                        if not summary:
+                            if isinstance(error_info, dict):
+                                summary = error_info.get("message")
+                            elif error_info:
+                                summary = str(error_info)
+                            else:
+                                summary = f"Task {task_id} failed"
+                        self._dispatch_event("codex.failed", {
+                            "task_id": task_id,
+                            "status": "failed",
+                            "summary": summary,
+                        })
+                    elif raw_status in ("interrupted", "cancelled"):
+                        self._tasks[task_id]["status"] = "interrupted"
+                        self._tasks[task_id]["state"] = "interrupted"
+                        self._persist_task(self._tasks[task_id])
+                        summary = params.get("summary") or turn.get("summary") or f"Task {task_id} interrupted"
+                        self._dispatch_event("codex.interrupted", {
+                            "task_id": task_id,
+                            "status": "interrupted",
+                            "summary": summary,
+                        })
+                    else:
+                        self._tasks[task_id]["status"] = "completed"
+                        self._tasks[task_id]["state"] = "completed"
+                        self._persist_task(self._tasks[task_id])
+                        summary = params.get("summary") or turn.get("summary") or self._tasks[task_id].get("prompt", "")[:60]
+                        self._dispatch_event("codex.turn_completed", {
+                            "task_id": task_id,
+                            "status": "completed",
+                            "summary": summary,
+                        })
 
     def _get_transport(self) -> JsonRpcTransport:
         if self._transport is not None:
@@ -915,6 +947,7 @@ class RemoteCodexCompanionClient:
         auth_token: Optional[str] = None,
         timeout_sec: float = 10.0,
         poll_interval: float = 1.0,
+        state_file_path: Optional[str] = None,
     ) -> None:
         self.endpoint_url = endpoint_url.rstrip("/")
         if self.endpoint_url.endswith("/rpc"):
@@ -922,12 +955,47 @@ class RemoteCodexCompanionClient:
         self.auth_token = auth_token
         self.timeout_sec = timeout_sec
         self.poll_interval = poll_interval
+        self.state_file_path = state_file_path
         self.workspaces: dict[str, str] = {}
         self._lock = threading.Lock()
         self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
         self._pending_tasks: dict[str, dict[str, Any]] = {}
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
+
+        if self.state_file_path:
+            self._load_persisted_tasks()
+
+    def _load_persisted_tasks(self) -> None:
+        if not self.state_file_path:
+            return
+        p = Path(self.state_file_path)
+        if not p.is_file():
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                with self._lock:
+                    self._pending_tasks.update(data)
+                if self._pending_tasks:
+                    logger.info("Restored %d in-flight Codex tasks from %s", len(self._pending_tasks), p)
+                    self._ensure_polling_thread()
+        except Exception as exc:
+            logger.warning("Failed to load persisted remote Codex tasks from %s: %s", p, exc)
+
+    def _save_persisted_tasks(self) -> None:
+        if not self.state_file_path:
+            return
+        p = Path(self.state_file_path)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = p.with_suffix(".tmp")
+            with open(tmp_p, "w", encoding="utf-8") as f:
+                json.dump(self._pending_tasks, f, indent=2)
+            tmp_p.replace(p)
+        except Exception as exc:
+            logger.warning("Failed to save remote Codex tasks to %s: %s", p, exc)
 
     def add_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
         with self._lock:
@@ -983,6 +1051,7 @@ class RemoteCodexCompanionClient:
                 if status in ("completed", "succeeded"):
                     with self._lock:
                         self._pending_tasks.pop(task_id, None)
+                        self._save_persisted_tasks()
                     summary = res.get("summary") or (
                         res.get("result", {}).get("summary")
                         if isinstance(res.get("result"), dict)
@@ -997,9 +1066,21 @@ class RemoteCodexCompanionClient:
                         "summary": summary,
                         "result": res,
                     })
-                elif status in ("failed", "error", "cancelled"):
+                elif status in ("interrupted", "cancelled"):
                     with self._lock:
                         self._pending_tasks.pop(task_id, None)
+                        self._save_persisted_tasks()
+                    summary = res.get("summary") or f"Task {task_id} interrupted"
+                    self._dispatch_event("codex.interrupted", {
+                        "task_id": task_id,
+                        "status": "interrupted",
+                        "summary": summary,
+                        "result": res,
+                    })
+                elif status in ("failed", "error"):
+                    with self._lock:
+                        self._pending_tasks.pop(task_id, None)
+                        self._save_persisted_tasks()
                     err_msg = res.get("error") or f"Task {task_id} failed"
                     self._dispatch_event("codex.failed", {
                         "task_id": task_id,
@@ -1062,6 +1143,7 @@ class RemoteCodexCompanionClient:
                 "workspace_alias": workspace_alias,
                 "model": model,
             }
+            self._save_persisted_tasks()
         self._ensure_polling_thread()
         return res
 

@@ -254,11 +254,177 @@ class TestCameraAcquireReleasePipeline(unittest.TestCase):
         self.assertIn("ctrl.camera.release", commands_sent)
 
     def test_production_default_disallows_synthetic_frames(self) -> None:
-        """Confirms that in production Host configuration, allow_synthetic defaults to False and never invents frames."""
-        self.assertFalse(self.app.camera_service.allow_synthetic)
-        self.app.camera_service.acquire_lease("viewer-no-fake", lease_ms=5000)
-        frame = self.app.camera_service.get_latest_frame("viewer-no-fake")
-        self.assertIsNone(frame, "Must NOT produce synthetic frames when hardware is missing")
+        """Confirms that with no camera config block, allow_synthetic defaults to False and never invents frames."""
+        cfg_default_path = os.path.join(self.tmpdir.name, "default_config.json")
+        with open(cfg_default_path, "w", encoding="utf-8") as f:
+            json.dump({"storage": {"db_path": self.db_path}}, f)
+        app_default = DeskAgentHostApp(cfg_default_path)
+        try:
+            self.assertFalse(app_default.camera_service.allow_synthetic)
+            self.assertFalse(app_default.camera_service.auto_start_pipeline)
+            app_default.camera_service.acquire_lease("viewer-no-fake", lease_ms=5000)
+            frame = app_default.camera_service.get_latest_frame("viewer-no-fake")
+            self.assertIsNone(frame, "Must NOT produce synthetic frames when hardware is missing")
+        finally:
+            app_default.close()
+
+    def test_synthetic_frame_never_overwrites_hardware_frame(self) -> None:
+        """Verifies push_frame ignores synthetic frames if a non-stale hardware frame exists."""
+        cam = self.app.camera_service
+        cam.acquire_lease("test-hw-protection", lease_ms=5000)
+        hw_jpeg = b"\xff\xd8\xff\xe0HW_FRAME\xff\xd9"
+        cam.push_frame(hw_jpeg, is_hardware=True)
+        self.assertEqual(cam.get_latest_frame("test-hw-protection")["jpeg_data"], hw_jpeg)
+
+        fake_jpeg = b"\xff\xd8\xff\xe0SYNTHETIC\xff\xd9"
+        cam.push_frame(fake_jpeg, is_hardware=False)
+        self.assertEqual(cam.get_latest_frame("test-hw-protection")["jpeg_data"], hw_jpeg)
+
+    def test_camera_acquire_rejection_from_robot_rolls_back_host_lease(self) -> None:
+        """Confirms that when robot nacks camera acquire, host rolls back lease and does NOT capture."""
+        self.mock_robot.send_command.return_value = {
+            "type": "sys.nack",
+            "code": 409,
+            "error": {"code": "RESOURCE_BUSY", "message": "Device camera locked"},
+        }
+        req = make_req("resource.camera.acquire", {"client_id": "busy-client", "lease_duration_ms": 5000}, client_id="busy-client")
+        resp = self.app._handle_camera_acquire(req)
+        self.assertEqual(resp.status, ResponseStatus.FAILED)
+        self.assertFalse(self.app.camera_service.is_lease_valid())
+        commands_sent = [call.args[0]["type"] for call in self.mock_robot.send_command.call_args_list]
+        self.assertIn("ctrl.camera.acquire", commands_sent)
+        self.assertNotIn("ctrl.camera.capture", commands_sent)
+
+    def test_snapshot_acquires_lease_before_capture_and_returns_real_frame(self) -> None:
+        """Verifies snapshot acquires ephemeral lease on host and device before issuing capture."""
+        from urllib.request import urlopen
+        from host.desk_agent.main import make_request_handler, ThreadedHTTPServer
+
+        real_frame = b"\xff\xd8\xff\xe0REAL_ROBOT_SNAPSHOT\xff\xd9"
+        def mock_send(cmd, timeout=1.0):
+            if cmd["type"] == "ctrl.camera.acquire":
+                return {"type": "sys.ack", "code": 0}
+            elif cmd["type"] == "ctrl.camera.capture":
+                self.app.camera_service.ingest_robot_frame(real_frame)
+                return {"type": "sys.ack", "code": 0}
+            return {"type": "sys.ack", "code": 0}
+        self.mock_robot.send_command.side_effect = mock_send
+
+        server = ThreadedHTTPServer(("127.0.0.1", 0), make_request_handler(self.app))
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        port = server.server_address[1]
+        try:
+            with urlopen(f"http://127.0.0.1:{port}/snapshot") as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get("X-Frame-Hardware"), "1")
+                data = resp.read()
+                self.assertEqual(data, real_frame)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestCodexTurnStatusAndPersistence(unittest.TestCase):
+    def test_codex_failed_and_interrupted_turn_notifications(self) -> None:
+        from companion.src.codex_companion import CodexCompanion
+        comp = CodexCompanion()
+        events = []
+        comp.add_event_listener(lambda ev, data: events.append((ev, data)))
+        comp.workspaces["ws-1"] = "/tmp"
+        comp._tasks["task-fail-01"] = {"task_id": "task-fail-01", "prompt": "Fail prompt"}
+        comp._tasks["task-int-01"] = {"task_id": "task-int-01", "prompt": "Interrupt prompt"}
+        comp._tasks["task-ok-01"] = {"task_id": "task-ok-01", "prompt": "Ok prompt"}
+
+        # 1. Failed turn
+        comp._handle_server_notification("turn/completed", {
+            "task_id": "task-fail-01",
+            "turn": {"id": "turn-1", "status": "failed", "error": {"message": "Compilation error"}},
+        })
+        self.assertEqual(events[0][0], "codex.failed")
+        self.assertEqual(events[0][1]["status"], "failed")
+        self.assertIn("Compilation error", events[0][1]["summary"])
+
+        # 2. Interrupted turn
+        comp._handle_server_notification("turn/completed", {
+            "task_id": "task-int-01",
+            "turn": {"id": "turn-2", "status": "interrupted"},
+        })
+        self.assertEqual(events[1][0], "codex.interrupted")
+        self.assertEqual(events[1][1]["status"], "interrupted")
+
+        # 3. Successful turn
+        comp._handle_server_notification("turn/completed", {
+            "task_id": "task-ok-01",
+            "turn": {"id": "turn-3", "status": "completed", "summary": "Build succeeded"},
+        })
+        self.assertEqual(events[2][0], "codex.turn_completed")
+        self.assertEqual(events[2][1]["status"], "completed")
+        self.assertEqual(events[2][1]["summary"], "Build succeeded")
+
+    def test_remote_codex_persistence_and_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, "remote_codex_tasks.json")
+            client1 = RemoteCodexCompanionClient(
+                endpoint_url="http://127.0.0.1:9999",
+                state_file_path=state_file,
+            )
+            client1._pending_tasks["task-persist-01"] = {
+                "task_id": "task-persist-01",
+                "prompt": "Persistent task prompt",
+                "workspace_alias": "ws-test",
+            }
+            client1._save_persisted_tasks()
+            client1.close()
+
+            # Client 2 restores on startup
+            client2 = RemoteCodexCompanionClient(
+                endpoint_url="http://127.0.0.1:9999",
+                state_file_path=state_file,
+            )
+            self.assertIn("task-persist-01", client2._pending_tasks)
+            self.assertEqual(client2._pending_tasks["task-persist-01"]["prompt"], "Persistent task prompt")
+            client2.close()
+
+    def test_main_codex_event_announcements(self) -> None:
+        """Verifies DeskAgentHostApp maps codex completion, failure, and interrupt to appropriate announcements."""
+        with tempfile.TemporaryDirectory() as td:
+            db_p = os.path.join(td, "test.db")
+            cfg_p = os.path.join(td, "cfg.json")
+            with open(cfg_p, "w", encoding="utf-8") as f:
+                json.dump({"storage": {"db_path": db_p}, "robot": {"auto_connect": False}}, f)
+            app = DeskAgentHostApp(cfg_p)
+            mock_robot = MagicMock()
+            app.robot_adapter = mock_robot
+            try:
+                # Simulate completed
+                app.companion._dispatch_event("codex.turn_completed", {"task_id": "t1", "summary": "Done job"})
+                mock_robot.send_announcement.assert_called_with("codex.completed", {
+                    "title": "Codex 任务完成",
+                    "text": "Codex任务已完成：Done job",
+                    "sound": "notify",
+                    "task_id": "t1",
+                })
+
+                # Simulate failed
+                app.companion._dispatch_event("codex.failed", {"task_id": "t2", "summary": "Syntax error"})
+                mock_robot.send_announcement.assert_called_with("codex.failed", {
+                    "title": "Codex 任务失败",
+                    "text": "Codex任务执行失败：Syntax error",
+                    "sound": "alert",
+                    "task_id": "t2",
+                })
+
+                # Simulate interrupted
+                app.companion._dispatch_event("codex.interrupted", {"task_id": "t3", "summary": "Cancelled by user"})
+                mock_robot.send_announcement.assert_called_with("codex.interrupted", {
+                    "title": "Codex 任务中断",
+                    "text": "Codex任务已中断：Cancelled by user",
+                    "sound": "alert",
+                    "task_id": "t3",
+                })
+            finally:
+                app.close()
 
 
 if __name__ == "__main__":

@@ -137,7 +137,7 @@ class CameraViewerService:
         stale_threshold_ms: int = 2000,
         on_lease_released: Optional[LeaseReleaseCallback] = None,
         auto_start_pipeline: bool = False,
-        allow_synthetic: bool = True,
+        allow_synthetic: bool = False,
     ) -> None:
         self.default_lease_ms = default_lease_ms
         self.stale_threshold_ms = stale_threshold_ms
@@ -270,6 +270,11 @@ class CameraViewerService:
         """
         with self._lock:
             if self.is_lease_valid():
+                # Never let a synthetic frame overwrite a non-stale live hardware frame
+                if not is_hardware and getattr(self, "_is_hardware_frame", False) and self._latest_jpeg is not None:
+                    now = time.time()
+                    if (now - self._latest_frame_time) * 1000 < self.stale_threshold_ms:
+                        return
                 self._latest_jpeg = jpeg_data
                 self._latest_frame_time = time.time()
                 self._is_hardware_frame = is_hardware

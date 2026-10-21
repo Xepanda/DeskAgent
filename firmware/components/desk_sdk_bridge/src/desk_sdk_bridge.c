@@ -1402,6 +1402,14 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
              strcmp(msg_type, "ctrl.camera.capture_with_feedback") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        if (!desk_arbiter_camera_is_lease_active()) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                     "\"code\":\"NO_ACTIVE_LEASE\","
+                     "\"message\":\"No active camera lease held on device\"}}",
+                     rid);
+            return 0;
+        }
         size_t max_jpeg = 65536;
         uint8_t *jpeg_buf = (uint8_t *)desk_psram_malloc(max_jpeg);
         if (!jpeg_buf) {

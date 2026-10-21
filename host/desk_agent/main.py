@@ -66,17 +66,19 @@ class DeskAgentHostApp:
         cam_cfg = self.config.get("camera", {})
         self.camera_service = CameraViewerService(
             default_lease_ms=cam_cfg.get("default_lease_ms", 10000),
-            auto_start_pipeline=cam_cfg.get("auto_start_pipeline", True),
-            allow_synthetic=cam_cfg.get("allow_synthetic", True),
+            auto_start_pipeline=cam_cfg.get("auto_start_pipeline", False),
+            allow_synthetic=cam_cfg.get("allow_synthetic", False),
         )
 
         codex_cfg = self.config.get("codex", {})
         companion_url = codex_cfg.get("companion_url") or self.config.get("codex_companion", {}).get("endpoint")
         if companion_url:
             logger.info("Configured remote Windows Codex Companion at %s", companion_url)
+            state_file = str(db_path.parent / "remote_codex_tasks.json")
             self.companion = RemoteCodexCompanionClient(
                 endpoint_url=companion_url,
                 auth_token=codex_cfg.get("auth_token") or self.config.get("auth_token"),
+                state_file_path=state_file,
             )
         else:
             self.companion = CodexCompanion(
@@ -121,6 +123,26 @@ class DeskAgentHostApp:
                     }
                     if self.robot_adapter:
                         self.robot_adapter.send_announcement("codex.completed", announcement)
+                elif event_type in ("codex.failed", "codex.error"):
+                    summary = data.get("summary") or f"Task {data.get('task_id', '')} failed"
+                    announcement = {
+                        "title": "Codex 任务失败",
+                        "text": f"Codex任务执行失败：{summary}",
+                        "sound": "alert",
+                        "task_id": data.get("task_id"),
+                    }
+                    if self.robot_adapter:
+                        self.robot_adapter.send_announcement("codex.failed", announcement)
+                elif event_type in ("codex.interrupted", "codex.cancelled"):
+                    summary = data.get("summary") or f"Task {data.get('task_id', '')} interrupted"
+                    announcement = {
+                        "title": "Codex 任务中断",
+                        "text": f"Codex任务已中断：{summary}",
+                        "sound": "alert",
+                        "task_id": data.get("task_id"),
+                    }
+                    if self.robot_adapter:
+                        self.robot_adapter.send_announcement("codex.interrupted", announcement)
 
             if hasattr(self.companion, "add_event_listener"):
                 self.companion.add_event_listener(_on_codex_event)
@@ -547,16 +569,32 @@ class DeskAgentHostApp:
             )
         if self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
             try:
-                self._robot_client.send_command({
+                ack = self._robot_client.send_command({
                     "type": "ctrl.camera.acquire",
                     "client_id": client_id,
                     "lease_duration_ms": res.get("lease_duration_ms", 10000),
                 }, timeout=1.0)
+                if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
+                    logger.warning("Robot rejected camera acquire: %s. Rolling back host lease.", ack)
+                    self.camera_service.release_lease(client_id)
+                    err_info = ack.get("error", {}) if isinstance(ack, dict) else {}
+                    return ResponseEnvelope.create_error(
+                        req.request_id,
+                        code=err_info.get("code", "RESOURCE_BUSY"),
+                        message=err_info.get("message", "Robot rejected camera acquire"),
+                        details=ack if isinstance(ack, dict) else {},
+                    )
                 self._robot_client.send_command({
                     "type": "ctrl.camera.capture",
                 }, timeout=1.0)
             except Exception as e:
-                logger.debug("Failed to dispatch camera acquire/capture to robot: %s", e)
+                logger.warning("Failed to dispatch camera acquire/capture to robot: %s. Rolling back lease.", e)
+                self.camera_service.release_lease(client_id)
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code="DEVICE_ERROR",
+                    message=f"Failed to communicate with robot camera: {e}",
+                )
         return ResponseEnvelope.create_success(req.request_id, res)
 
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
@@ -837,12 +875,68 @@ def make_request_handler(app: DeskAgentHostApp):
                 )
 
                 if is_snapshot_path:
+                    effective_client = client_id or "snapshot-viewer"
+                    if app.camera_service.is_lease_valid():
+                        if client_id and app.camera_service._active_lease_owner != client_id:
+                            self.send_response(403)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                            return
+                        effective_client = app.camera_service._active_lease_owner
+                    else:
+                        acq = app.camera_service.acquire_lease(effective_client, lease_ms=5000)
+                        if not acq.get("granted"):
+                            self.send_response(403)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                            return
+                        if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                            try:
+                                ack = app._robot_client.send_command({
+                                    "type": "ctrl.camera.acquire",
+                                    "client_id": effective_client,
+                                    "lease_duration_ms": 5000,
+                                }, timeout=1.0)
+                                if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
+                                    logger.warning("Robot rejected snapshot camera acquire: %s", ack)
+                                    app.camera_service.release_lease(effective_client)
+                                    self.send_response(403)
+                                    self.send_header("Content-Type", "application/json")
+                                    self.end_headers()
+                                    self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                                    return
+                            except Exception as exc:
+                                logger.warning("Snapshot acquire dispatch error: %s", exc)
+                                app.camera_service.release_lease(effective_client)
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "DEVICE_UNAVAILABLE"}).encode())
+                                return
+
+                    initial_seq = getattr(app.camera_service, "_frame_seq", 0)
                     if app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
                         try:
                             app._robot_client.send_command({"type": "ctrl.camera.capture"}, timeout=1.0)
                         except Exception as e:
                             logger.debug("Snapshot trigger to robot error: %s", e)
-                    frame_info = app.camera_service.get_snapshot(client_id=client_id)
+
+                    frame_info = None
+                    deadline = time.time() + 1.2
+                    while time.time() < deadline:
+                        candidate = app.camera_service.get_latest_frame(effective_client)
+                        if candidate is not None:
+                            if candidate.get("frame_seq", 0) > initial_seq or candidate.get("is_hardware"):
+                                frame_info = candidate
+                                break
+                            elif frame_info is None:
+                                frame_info = candidate
+                        time.sleep(0.02)
+
+                    if frame_info is None:
+                        frame_info = app.camera_service.get_latest_frame(effective_client)
                 else:
                     # /api/camera/frame strictly enforces existing lease ownership
                     effective_id = client_id or "web-client"

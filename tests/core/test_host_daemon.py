@@ -22,7 +22,7 @@ class TestHostDaemon(unittest.TestCase):
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.db_path = Path(cls.temp_dir.name) / "test_host_daemon.db"
         cfg_file = Path(cls.temp_dir.name) / "config.json"
-        cfg_file.write_text(json.dumps({"storage": {"db_path": str(cls.db_path)}}))
+        cfg_file.write_text(json.dumps({"storage": {"db_path": str(cls.db_path)}, "camera": {"allow_synthetic": True, "auto_start_pipeline": True}}))
 
         # Initialize App
         cls.app = DeskAgentHostApp(config_path=str(cfg_file))
