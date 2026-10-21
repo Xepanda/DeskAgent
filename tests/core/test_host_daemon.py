@@ -769,6 +769,7 @@ class TestCameraStreamRoute(unittest.TestCase):
 
         self.service = StreamService()
         app = SimpleNamespace(config={"auth_token": "stream-test-token"}, camera_service=self.service)
+        self.app = app
         self.access_logs = []
         handler = make_request_handler(app)
 
@@ -791,6 +792,7 @@ class TestCameraStreamRoute(unittest.TestCase):
         with self.assertRaises(HTTPError) as unauthorized:
             urlopen(self.url, timeout=2)
         self.assertEqual(unauthorized.exception.code, 401)
+        unauthorized.exception.close()
         self.assertEqual(self.service.calls, [])
 
         query_token_url = f"{self.base_url}?client_id=viewer-1&token=stream-test-token"
@@ -819,6 +821,14 @@ class TestCameraStreamRoute(unittest.TestCase):
         self.assertTrue(self.service.iterator_closed)
         self.assertFalse(any(call[0] == "release" for call in self.service.calls))
         self.assertEqual(self.service.active_lease_owner, "viewer-1")
+
+    def test_stream_fails_closed_when_no_bearer_token_is_configured(self) -> None:
+        self.app.config["auth_token"] = None
+        with self.assertRaises(HTTPError) as unauthorized:
+            urlopen(self.url, timeout=2)
+        self.assertEqual(unauthorized.exception.code, 401)
+        unauthorized.exception.close()
+        self.assertEqual(self.service.calls, [])
 
     def test_rejects_missing_empty_and_duplicate_client_ids_before_service_call(self) -> None:
         urls = (

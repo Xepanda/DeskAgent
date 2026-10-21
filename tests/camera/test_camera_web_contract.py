@@ -99,6 +99,55 @@ assert.equal(completed.parts.length, 1);
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute the browser multipart consumer")
+    def test_mjpeg_consumer_does_not_refresh_view_for_duplicate_frame_sequence(self) -> None:
+        source = WEB.read_text(encoding="utf-8")
+        script = source.split("<script>", 1)[1].split("</script>", 1)[0]
+        helpers = script[script.index("function concatBytes"):script.index("function waitForRetry")]
+        checks = r'''
+const assert = require("node:assert/strict");
+const enc = new TextEncoder();
+const boundary = "demo-boundary";
+const jpeg = Uint8Array.from([255, 216, 1, 2, 255, 217]);
+function part(seq) {
+  const header = `--${boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\nX-Frame-Seq: ${seq}\r\nX-Frame-Age-Ms: 3\r\n\r\n`;
+  const head = enc.encode(header);
+  const tail = enc.encode(`\r\n--${boundary}\r\n`);
+  const out = new Uint8Array(head.length + jpeg.length + tail.length);
+  out.set(head); out.set(jpeg, head.length); out.set(tail, head.length + jpeg.length);
+  return out;
+}
+const all = concatBytes(part("7"), part("7"));
+let read = false;
+let createdUrls = 0;
+const controller = { signal: { aborted: false } };
+global.leaseActive = true;
+global.frameExpiryTimer = null;
+global.lastFrameSeq = null;
+global.currentObjectUrl = null;
+global.document = { getElementById: () => ({ style: {}, innerText: "" }) };
+global.Blob = class { constructor(parts) { this.parts = parts; } };
+global.createImageBitmap = async () => ({ close() {} });
+global.URL = { createObjectURL: () => `blob:${++createdUrls}`, revokeObjectURL() {} };
+global.clearTimeout = () => {};
+global.setTimeout = () => 1;
+const response = { body: { getReader: () => ({
+  async read() { if (read) return { done: true }; read = true; return { done: false, value: all }; },
+  async cancel() {}
+}) } };
+(async () => {
+  await consumeMjpeg(response, controller, boundary);
+  assert.equal(createdUrls, 1, "a duplicate frame sequence must not repaint or refresh freshness");
+})().catch(err => { console.error(err); process.exitCode = 1; });
+''';
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", helpers + "\n" + checks],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_disconnect_expiry_and_page_exit_clear_or_stop_the_viewer(self) -> None:
         source = WEB.read_text(encoding="utf-8")
         self.assertIn("frameExpiryTimer", source)

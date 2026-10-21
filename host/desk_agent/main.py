@@ -1003,8 +1003,8 @@ def make_request_handler(app: DeskAgentHostApp):
         def _check_stream_auth(self) -> bool:
             """Camera streams accept configured credentials only as a Bearer header."""
             auth_token = app.config.get("auth_token")
-            if not auth_token:
-                return True
+            if not isinstance(auth_token, str) or not auth_token:
+                return False
             auth_hdr = self.headers.get("Authorization", "")
             return auth_hdr.startswith("Bearer ") and auth_hdr[7:].strip() == auth_token
 

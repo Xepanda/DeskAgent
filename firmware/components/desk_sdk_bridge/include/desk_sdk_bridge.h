@@ -88,7 +88,7 @@ typedef enum {
 #pragma pack(push, 1)
 typedef struct {
     char magic[4];          /* "WSPK" */
-    uint8_t frame_type;     /* 1: Audio, 2: Camera JPEG, 3: Data */
+    uint8_t frame_type;     /* 1: Audio, 2: Video, 3: Image/JPEG, 4: Data */
     uint8_t flags;          /* Flags, e.g. 0x01: EOS, 0x02: Keyframe */
     uint16_t stream_id;     /* Stream ID (Little-Endian per official SDK) */
     uint32_t sequence;      /* Packet sequence (Little-Endian) */

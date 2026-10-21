@@ -295,13 +295,20 @@
       if (!response.body) throw new Error("浏览器不支持流式响应");
       const reader = response.body.getReader();
       let buffer = new Uint8Array(0);
+      let lastStreamSeq = null;
       while (leaseActive && !controller.signal.aborted) {
         const { value, done } = await reader.read();
         if (done) break;
         buffer = concatBytes(buffer, value);
         const parsed = parseMjpegBuffer(buffer, boundary);
         buffer = parsed.remainder;
-        for (const part of parsed.parts) await renderStreamFrame(part.jpeg, part.seq, part.ageMs);
+        for (const part of parsed.parts) {
+          const seq = Number(part.seq);
+          if (!Number.isSafeInteger(seq) || seq < 1) throw new Error("MJPEG 帧序号无效");
+          if (lastStreamSeq !== null && seq <= lastStreamSeq) continue;
+          lastStreamSeq = seq;
+          await renderStreamFrame(part.jpeg, seq, part.ageMs);
+        }
         if (buffer.length > 262144) throw new Error("MJPEG 缓冲区超限");
       }
       await reader.cancel().catch(() => {});
