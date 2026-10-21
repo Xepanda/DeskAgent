@@ -164,6 +164,34 @@ class TestLifeService(unittest.TestCase):
         pending_after = self.service.get_pending_outbox()
         self.assertEqual(len(pending_after), 0)
 
+    def test_outbox_idempotency_preserves_existing_pending_item(self) -> None:
+        payload = {"task_id": "task-1", "turn_id": "turn-1", "summary": "safe"}
+        first = self.service.enqueue_outbox_once(
+            "codex.completed", payload, idempotency_key="task-1:turn-1"
+        )
+        second = self.service.enqueue_outbox_once(
+            "codex.completed", {**payload, "summary": "replayed"}, idempotency_key="task-1:turn-1"
+        )
+        self.assertEqual(first, second)
+        pending = self.service.get_pending_outbox_messages()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["payload"]["summary"], "safe")
+
+    def test_outbox_managed_failure_can_remain_pending_after_retry_limit(self) -> None:
+        outbox_id = self.service.enqueue_outbox_once(
+            "codex.failed", {"task_id": "task-2"}, idempotency_key="task-2:turn-2"
+        )
+        for _ in range(6):
+            self.service.record_outbox_failure(
+                outbox_id, "device unavailable", max_retries=1,
+                backoff_seconds=1, keep_pending=True,
+            )
+        row = self.service._get_connection().execute(
+            "SELECT state, retry_count FROM outbox WHERE outbox_id = ?", (outbox_id,)
+        ).fetchone()
+        self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["retry_count"], 6)
+
     # -------------------------------------------------------------------------
     # 5. Notes CRUD & Search
     # -------------------------------------------------------------------------

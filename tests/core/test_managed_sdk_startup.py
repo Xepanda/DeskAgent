@@ -16,9 +16,11 @@ class ManagedSdkStartupTests(unittest.TestCase):
         class FakeTransport:
             def __init__(self) -> None:
                 self._disconnect_callback = lambda: None
+                self.commands = []
 
-            def send_command(self, *_args, **_kwargs):
-                return {"type": "sys.ack", "code": 0}
+            def send_command(self, *args, **_kwargs):
+                self.commands.append(args)
+                return {"type": "sys.ack", "code": 0, "data": {"status": "accepted", "accepted": True}}
 
         class FakeCamera:
             def capture(self, **_kwargs):
@@ -98,6 +100,10 @@ class ManagedSdkStartupTests(unittest.TestCase):
             self.assertIsNone(app.robot_adapter, "managed mode must not start the legacy TCP adapter")
             self.assertIsNotNone(app.official_camera_adapter)
             self.assertTrue(app.official_camera_adapter.is_connected)
+            self.assertIsNotNone(app.managed_codex_feedback_adapter)
+            app.managed_codex_feedback_adapter.send_terminal("codex.completed", {
+                "task_id": "startup-task", "resolution": "completed", "summary": "done",
+            })
             app.close()
             state["host_closed"] = True
 
@@ -120,6 +126,8 @@ class ManagedSdkStartupTests(unittest.TestCase):
         self.assertTrue(state["life_closed"])
         self.assertTrue(state["companion_closed"])
         transport = state["transport"]
+        self.assertEqual(transport.commands[0][0], "ctrl.expression.set")
+        self.assertEqual(transport.commands[0][1]["event_type"], "codex.completed")
         self.assertIs(transport._disconnect_callback, state["disconnect_callback"])
         old_tcp_adapter.assert_not_called()
 

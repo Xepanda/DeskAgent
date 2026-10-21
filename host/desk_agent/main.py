@@ -31,6 +31,7 @@ from host.desk_agent.connectors.ha.ha_connector import HAConnector
 from host.desk_agent.camera.camera_service import CameraViewerService
 from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
 from host.desk_agent.connectors.robot.official_camera_adapter import OfficialRobotCameraAdapter
+from host.desk_agent.connectors.robot.managed_codex_feedback_adapter import ManagedCodexFeedbackAdapter
 from companion.src.codex_companion import CodexCompanion
 
 logging.basicConfig(
@@ -49,6 +50,8 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 class DeskAgentHostApp:
     def __init__(self, config_path: Optional[str] = None, *, managed_sdk_session: bool = False) -> None:
+        self.managed_sdk_session = bool(managed_sdk_session)
+        self.managed_codex_feedback_adapter: Optional[ManagedCodexFeedbackAdapter] = None
         self.config = self._load_config(config_path)
         self.start_time = time.time()
 
@@ -156,45 +159,50 @@ class DeskAgentHostApp:
         self._delivery_thread.start()
 
     def _on_codex_event(self, event_type: str, data: dict[str, Any]) -> bool:
-        task_id = data.get("task_id", "")
-        if event_type in ("codex.turn_completed", "codex.completed"):
-            summary = data.get("summary") or f"Task {task_id} finished"
-            announcement_topic = "codex.completed"
-            announcement = {
-                "title": "Codex 任务完成",
-                "text": f"Codex任务已完成：{summary}",
-                "sound": "notify",
-                "task_id": task_id,
-            }
-        elif event_type in ("codex.failed", "codex.error"):
-            summary = data.get("summary") or f"Task {task_id} failed"
-            announcement_topic = "codex.failed"
-            announcement = {
-                "title": "Codex 任务失败",
-                "text": f"Codex任务执行失败：{summary}",
-                "sound": "alert",
-                "task_id": task_id,
-            }
-        elif event_type in ("codex.interrupted", "codex.cancelled"):
-            summary = data.get("summary") or f"Task {task_id} interrupted"
-            announcement_topic = "codex.interrupted"
-            announcement = {
-                "title": "Codex 任务中断",
-                "text": f"Codex任务已中断：{summary}",
-                "sound": "alert",
-                "task_id": task_id,
-            }
+        state_by_event = {
+            "codex.completed": "completed",
+            "codex.failed": "failed",
+            "codex.error": "failed",
+            "codex.interrupted": "interrupted",
+            "codex.cancelled": "interrupted",
+        }
+        if event_type == "codex.turn_completed":
+            resolution = data.get("resolution") or data.get("status") or "completed"
         else:
+            resolution = state_by_event.get(event_type)
+        if resolution not in ("completed", "failed", "interrupted"):
             return True
 
-        # Persist to SQLite outbox first so announcement survives host crash/restarts
-        outbox_id = self.life_service.enqueue_outbox(announcement_topic, announcement)
+        task_id = data.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            logger.warning("Ignoring Codex terminal event without task_id")
+            return False
+        turn_id = data.get("turn_id")
+        if not isinstance(turn_id, str):
+            turn_id = ""
+        topic = f"codex.{resolution}"
+        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        payload = {"task_id": task_id, "resolution": resolution, "summary": summary}
+        if turn_id:
+            payload["turn_id"] = turn_id
+
+        # Stable outbox identity prevents repeated Companion notifications from
+        # creating duplicate device prompts while preserving any pending retry.
+        identity = f"{task_id}\0{turn_id or resolution}"
+        outbox_id = self.life_service.enqueue_outbox_once(
+            topic, payload, idempotency_key=identity
+        )
+
+        if self.managed_sdk_session:
+            logger.info("Codex terminal event queued for managed SDK delivery (outbox=%s)", outbox_id)
+            return False
 
         # Try immediate delivery if robot is currently online
         delivered = False
         if self.robot_adapter and getattr(self.robot_adapter, "is_connected", False):
             try:
-                delivered = bool(self.robot_adapter.send_announcement(announcement_topic, announcement))
+                legacy_announcement = self._legacy_codex_announcement(topic, payload)
+                delivered = bool(self.robot_adapter.send_announcement(topic, legacy_announcement))
                 if delivered:
                     if hasattr(self.companion, "acknowledge_task"):
                         self.companion.acknowledge_task(task_id)
@@ -208,6 +216,21 @@ class DeskAgentHostApp:
         else:
             logger.info("Robot not connected or announcement not confirmed for task %s; outbox %s queued for delivery retry", task_id, outbox_id)
             return False
+
+    @staticmethod
+    def _legacy_codex_announcement(topic: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        resolution = payload.get("resolution")
+        title, prefix, sound = {
+            "completed": ("Codex 任务完成", "Codex任务已完成：", "notify"),
+            "failed": ("Codex 任务失败", "Codex任务执行失败：", "alert"),
+            "interrupted": ("Codex 任务中断", "Codex任务已中断：", "alert"),
+        }.get(str(resolution), ("Codex 任务状态", "Codex任务状态：", "notify"))
+        return {
+            "title": title,
+            "text": f"{prefix}{payload.get('summary', '')}",
+            "sound": sound,
+            "task_id": payload.get("task_id", ""),
+        }
 
     def register_announcement_channel(self, channel: Callable[[str, dict[str, Any]], bool]) -> None:
         """Registers external robot audio / TTS speaker delivery channel."""
@@ -308,9 +331,35 @@ class DeskAgentHostApp:
                                 outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
                             )
                     elif topic in ("codex.completed", "codex.failed", "codex.interrupted"):
-                        if self.robot_adapter and getattr(self.robot_adapter, "is_connected", False):
+                        if self.managed_codex_feedback_adapter is not None:
                             try:
-                                delivered = bool(self.robot_adapter.send_announcement(topic, payload))
+                                result = self.managed_codex_feedback_adapter.send_terminal(topic, payload)
+                                if result.get("accepted") is True:
+                                    task_id = payload.get("task_id")
+                                    if task_id and hasattr(self.companion, "acknowledge_task"):
+                                        self.companion.acknowledge_task(task_id)
+                                    self.life_service.mark_outbox_dispatched(outbox_id)
+                                    logger.info(
+                                        "Codex terminal command accepted by device (outbox=%s); audio completion is unconfirmed",
+                                        outbox_id,
+                                    )
+                                else:
+                                    raise RuntimeError("managed SDK feedback did not return accepted status")
+                            except Exception as exc:
+                                backoff = min(60, 2 ** (item.get("retry_count", 0) + 1))
+                                self.life_service.record_outbox_failure(
+                                    outbox_id,
+                                    f"Managed SDK terminal delivery failed: {exc}",
+                                    backoff_seconds=backoff,
+                                    keep_pending=True,
+                                )
+                        elif self.robot_adapter and getattr(self.robot_adapter, "is_connected", False):
+                            try:
+                                delivered = bool(
+                                    self.robot_adapter.send_announcement(
+                                        topic, self._legacy_codex_announcement(topic, payload)
+                                    )
+                                )
                                 if delivered:
                                     task_id = payload.get("task_id")
                                     if task_id and hasattr(self.companion, "acknowledge_task"):
@@ -330,7 +379,10 @@ class DeskAgentHostApp:
                         else:
                             backoff = min(30, 2 ** (item.get("retry_count", 0) + 1))
                             self.life_service.record_outbox_failure(
-                                outbox_id, "Robot is disconnected", backoff_seconds=backoff
+                                outbox_id,
+                                "Managed SDK session is not ready" if self.managed_sdk_session else "Robot is disconnected",
+                                backoff_seconds=backoff,
+                                keep_pending=self.managed_sdk_session,
                             )
                     else:
                         self.life_service.mark_outbox_dispatched(outbox_id)
@@ -704,6 +756,16 @@ class DeskAgentHostApp:
         self.camera_service.on_lease_released = release_device_lease
         if on_disconnect is not None:
             on_disconnect(adapter.disconnect)
+        return adapter
+
+    def register_managed_sdk_codex_feedback_session(
+        self,
+        *,
+        command_sender: Callable[[str, dict[str, Any], Optional[float]], dict[str, Any]],
+    ) -> ManagedCodexFeedbackAdapter:
+        """Attach Codex feedback to the existing managed SDK transport without opening a connection."""
+        adapter = ManagedCodexFeedbackAdapter(command_sender)
+        self.managed_codex_feedback_adapter = adapter
         return adapter
 
     def has_robot_hardware_connected(self) -> bool:
@@ -1230,6 +1292,7 @@ async def _run_managed_application(config_path: Optional[str], host: str, port: 
             context.robot,
             command_sender=transport.send_command,
         )
+        app.register_managed_sdk_codex_feedback_session(command_sender=transport.send_command)
         # A disconnect makes the next bounded SDK capture fail; the camera adapter
         # then clears the Host lease/frame without replacing the SDK's private callback.
         await asyncio.to_thread(

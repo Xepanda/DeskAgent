@@ -12,6 +12,7 @@ Features:
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 import uuid
@@ -740,6 +741,27 @@ class LifeService:
 
         return outbox_id
 
+    def enqueue_outbox_once(
+        self, event_type: str, payload: Mapping[str, Any], *, idempotency_key: str
+    ) -> str:
+        """Insert one durable outbox item for an event identity, retaining its state on replay."""
+        if not idempotency_key:
+            raise ValueError("idempotency_key is required")
+        digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:32]
+        outbox_id = f"outbox-once-{digest}"
+        now_str = self._now_utc_str()
+        payload_str = json.dumps(payload, ensure_ascii=False)
+        with self._lock, self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO outbox (outbox_id, event_type, payload_json, state, retry_count, created_at)
+                VALUES (?, ?, ?, 'pending', 0, ?)
+                """,
+                (outbox_id, event_type, payload_str, now_str),
+            )
+            conn.commit()
+        return outbox_id
+
     def get_pending_outbox(self, now_iso: Optional[str] = None, include_delayed: bool = False) -> list[dict[str, Any]]:
         now_str = now_iso or self._now_utc_str()
         with self._lock, self._get_connection() as conn:
@@ -779,6 +801,7 @@ class LifeService:
         error_message: str,
         max_retries: int = 5,
         backoff_seconds: Optional[int] = None,
+        keep_pending: bool = False,
     ) -> None:
         """Records an outbox delivery failure, increments retry count, applies optional backoff, and marks failed if max retries exceeded."""
         now = datetime.now(timezone.utc)
@@ -787,7 +810,7 @@ class LifeService:
             if not row:
                 return
             new_retries = row["retry_count"] + 1
-            if row["event_type"] != "reminder.alert" and new_retries >= max_retries:
+            if not keep_pending and row["event_type"] != "reminder.alert" and new_retries >= max_retries:
                 new_state = "failed"
                 next_retry = None
             else:
