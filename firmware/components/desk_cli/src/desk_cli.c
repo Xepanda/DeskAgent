@@ -12,12 +12,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <math.h>
 
 #include "desk_hardware.h"
 #include "desk_tclaw_bridge.h"
 #include "desk_sdk_bridge.h"
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_audio.h"
+#include "desk_watcher_camera.h"
+#include "desk_watcher_motion.h"
 #endif
 
 #ifdef ESP_PLATFORM
@@ -59,6 +63,28 @@ static void cmd_network(int argc, char *argv[]);
 static void cmd_wifi(int argc, char *argv[]);
 static void cmd_provisioning(int argc, char *argv[]);
 static void cmd_pairing(int argc, char *argv[]);
+
+static bool cli_parse_finite_float(const char *text, float *out_value)
+{
+    if (!text || !out_value || text[0] == '\0') return false;
+    errno = 0;
+    char *end = NULL;
+    float value = strtof(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' || !isfinite(value)) return false;
+    *out_value = value;
+    return true;
+}
+
+static bool cli_parse_duration_ms(const char *text, uint32_t *out_value)
+{
+    if (!text || !out_value || text[0] == '\0' || text[0] == '-') return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || value > UINT32_MAX) return false;
+    *out_value = (uint32_t)value;
+    return true;
+}
 
 #ifdef ESP_PLATFORM
 #define PAIRING_WINDOW_TTL_US (120ULL * 1000ULL * 1000ULL)
@@ -148,7 +174,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"display", "Display status or set expression: display [preset] [status]", cmd_display},
     {"audio", "Audio diagnostic: audio [status|sample|test|stop]", cmd_audio},
     {"camera", "Camera subsystem diagnostic: camera [status|capture]", cmd_camera},
-    {"body", "STM32 body coprocessor diagnostic: body [status|stop]", cmd_body},
+    {"body", "STM32 control: body [status|move <pan> <tilt> [duration_ms]|stop]", cmd_body},
     {"peripherals", "Board peripherals status (RTC, LED, battery)", cmd_peripherals},
     {"network", "SDK TCP/UDP server status: network [status]", cmd_network},
     {"wifi", "Read-only Wi-Fi status: wifi [status]", cmd_wifi},
@@ -261,7 +287,7 @@ static void cmd_system(int argc, char *argv[])
         case TUYA_CLOUD_ERROR: tuya_str = "ERROR"; break;
         default: tuya_str = "UNKNOWN"; break;
     }
-    printf("Tuya Cloud Session  : %s\r\n", tuya_str);
+    printf("Tuya Local Session  : %s (shim state; not cloud connectivity proof)\r\n", tuya_str);
 #ifdef ESP_PLATFORM
     /* Local bridge state above is not proof of native SDK/AI readiness. */
     const char *native_states[] = {"ready", "subscribed", "disabled", "failed", "blocked"};
@@ -275,10 +301,13 @@ static void cmd_system(int argc, char *argv[])
 #endif
 
     /* SDK Bridge Server State */
-    printf("SDK TCP Stream Port : %d (%s)\r\n",
-           desk_sdk_socket_server_get_port(),
-           desk_sdk_bridge_is_connected() ? "CLIENT CONNECTED" : "LISTENING");
-    printf("SDK UDP Pairing Port: %d (LISTENING)\r\n", desk_sdk_pairing_server_get_port());
+    int tcp_port = desk_sdk_socket_server_get_port();
+    int udp_port = desk_sdk_pairing_server_get_port();
+    printf("SDK TCP Stream Port : %d (%s)\r\n", tcp_port,
+           tcp_port <= 0 ? "NOT_LISTENING" :
+           (desk_sdk_bridge_is_connected() ? "CLIENT CONNECTED" : "LISTENING"));
+    printf("SDK UDP Pairing Port: %d (%s)\r\n", udp_port,
+           udp_port <= 0 ? "NOT_LISTENING" : "LISTENING");
 
     /* Arbiter State */
     printf("Hardware Arbiter    : ACTIVE (Unified Resource Arbiter)\r\n");
@@ -296,25 +325,32 @@ static void cmd_display(int argc, char *argv[])
     } else {
         char preset[32] = "";
         char status[64] = "";
-        desk_hardware_display_get_expression(preset, sizeof(preset), status, sizeof(status));
-        printf("Display Current: preset='%s', status='%s', initialized=%s\r\n",
-               preset, status, desk_hardware_is_display_initialized() ? "YES" : "NO");
+        if (!desk_hardware_is_display_initialized()) {
+            printf("Display status: NOT_INITIALIZED\r\n");
+            return;
+        }
+        int rc = desk_hardware_display_get_expression(preset, sizeof(preset), status, sizeof(status));
+        if (rc != DESK_HW_OK) {
+            printf("Display status: UNKNOWN (readback rc=%d)\r\n", rc);
+            return;
+        }
+        printf("Display status: READY; current preset='%s', status='%s'\r\n", preset, status);
     }
 }
 
 static void cmd_audio(int argc, char *argv[])
 {
+    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+        int rc = desk_hardware_audio_play_stop();
+        printf("Audio playback stop rc=%d\r\n", rc);
+        return;
+    }
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
     if (argc >= 2 && strcmp(argv[1], "test") == 0) {
         printf("Audio 1000ms 1kHz output test rc=%d (audibility requires physical confirmation)\r\n",
                desk_watcher_audio_test_tone());
         return;
     }
-    bool ready=false, running=false;
-    uint32_t frames=0, errors=0, peak=0;
-    desk_watcher_audio_status(&ready, &running, &frames, &errors, &peak);
-    printf("Watcher codec ready=%d mic_running=%d frames=%lu errors=%lu last_peak=%lu\r\n",
-           ready, running, (unsigned long)frames, (unsigned long)errors, (unsigned long)peak);
     if (argc >= 2 && strcmp(argv[1], "sample") == 0) {
         int16_t samples[320];
         size_t count=0;
@@ -329,15 +365,19 @@ static void cmd_audio(int argc, char *argv[])
         return;
     }
 #endif
-    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
-        desk_hardware_audio_play_stop();
-        printf("Audio playback stopped.\r\n");
+    desk_hardware_audio_status_t audio_status = {0};
+    int status_rc = desk_hardware_audio_get_status(&audio_status);
+    if (status_rc == DESK_HW_OK) {
+        printf("Audio status: %s; mic_running=%s frames=%lu errors=%lu peak=%lu\r\n",
+               audio_status.ready ? "READY" : "NOT_READY",
+               audio_status.running ? "YES" : "NO",
+               (unsigned long)audio_status.frames, (unsigned long)audio_status.errors,
+               (unsigned long)audio_status.peak);
     } else {
-        printf("Audio Subsystem:\r\n");
-        printf("  Arbiter Playback Owner: %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK));
-        printf("  Arbiter Record Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_AUDIO_RECORD));
-        printf("  Driver Active         : %s\r\n", desk_hardware_get_driver_ops()->driver_name);
+        printf("Audio status: UNKNOWN (driver status rc=%d)\r\n", status_rc);
     }
+    printf("  Arbiter Playback Owner: %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK));
+    printf("  Arbiter Record Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_AUDIO_RECORD));
 }
 
 static void cmd_camera(int argc, char *argv[])
@@ -346,28 +386,87 @@ static void cmd_camera(int argc, char *argv[])
         static DESK_DIAG_BSS uint8_t jpeg_buf[8192];
         size_t out_len = 0;
         int rc = desk_hardware_camera_capture_jpeg(jpeg_buf, sizeof(jpeg_buf), &out_len, 500);
-        printf("Camera Capture: rc=%d, out_len=%lu bytes\r\n", rc, (unsigned long)out_len);
+        printf("Camera Capture: rc=%d, valid_frame=%s, out_len=%lu bytes\r\n",
+               rc, rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
     } else {
         printf("Camera Subsystem:\r\n");
         printf("  Arbiter Camera Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR));
-        printf("  Driver                : %s\r\n", desk_hardware_get_driver_ops()->driver_name);
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        printf("  Capture Driver State  : %s\r\n",
+               desk_watcher_camera_is_ready() ? "READY" : "NOT_INITIALIZED");
+#else
+        printf("  Capture Driver State  : UNKNOWN (no board capture status API)\r\n");
+#endif
+        printf("  HAL Cached Frame      : %s\r\n",
+               desk_hardware_camera_has_frame() ? "PRESENT" : "NONE");
     }
 }
 
 static void cmd_body(int argc, char *argv[])
 {
+    if (argc >= 2 && strcmp(argv[1], "move") == 0) {
+        float pan = 0.0f, tilt = 0.0f;
+        uint32_t duration_ms = 500;
+        if ((argc != 4 && argc != 5) ||
+            !cli_parse_finite_float(argc > 2 ? argv[2] : NULL, &pan) ||
+            !cli_parse_finite_float(argc > 3 ? argv[3] : NULL, &tilt) ||
+            (argc == 5 && !cli_parse_duration_ms(argv[4], &duration_ms))) {
+            printf("Usage: body move <pan_deg> <tilt_deg> [duration_ms]\r\n");
+            return;
+        }
+        int rc;
+#ifdef ESP_PLATFORM
+        rc = desk_hardware_motion_move_to(pan, tilt, duration_ms);
+#else
+        /* Host HAL is a simulation and must not report an accepted physical move. */
+        rc = DESK_HW_ERR_UNAVAILABLE;
+#endif
+        if (rc == DESK_HW_OK) {
+            printf("Body move accepted=true, state_confirmed=false (requested %.1f, %.1f deg; duration=%lu ms)\r\n",
+                   (double)pan, (double)tilt, (unsigned long)duration_ms);
+        } else {
+            printf("Body move failed: rc=%d (accepted=false)\r\n", rc);
+        }
+        return;
+    }
     if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
-        desk_hardware_motion_stop(true);
-        printf("Body Emergency Stop executed.\r\n");
+        int rc;
+#ifdef ESP_PLATFORM
+        rc = desk_hardware_motion_stop(true);
+#else
+        rc = DESK_HW_ERR_UNAVAILABLE;
+#endif
+        if (rc == DESK_HW_OK) {
+            printf("Body emergency stop accepted=true; physical stop is unconfirmed.\r\n");
+        } else {
+            printf("Body emergency stop failed: rc=%d\r\n", rc);
+        }
     } else {
         float pan = 0.0f, tilt = 0.0f;
-        desk_hardware_motion_get_position(&pan, &tilt);
+        int position_rc = desk_hardware_motion_get_position(&pan, &tilt);
         uint8_t last_frame[64];
         size_t last_len = 0;
-        desk_hardware_get_last_mcu_frame(last_frame, sizeof(last_frame), &last_len);
+        int frame_rc = desk_hardware_get_last_mcu_frame(last_frame, sizeof(last_frame), &last_len);
         printf("STM32 Body Coprocessor:\r\n");
-        printf("  Position: Pan=%.1f deg, Tilt=%.1f deg\r\n", pan, tilt);
-        printf("  Last Packet Length: %lu bytes\r\n", (unsigned long)last_len);
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        printf("  UART Driver State: %s\r\n",
+               desk_watcher_motion_is_ready() ? "READY" : "NOT_INITIALIZED");
+#else
+        printf("  UART Driver State: UNKNOWN (no board status API)\r\n");
+#endif
+        if (position_rc == DESK_HW_OK) {
+            printf("  HAL cached setpoint: Pan=%.1f deg, Tilt=%.1f deg (not physical feedback)\r\n",
+                   (double)pan, (double)tilt);
+        } else {
+            printf("  Setpoint: UNKNOWN (read rc=%d)\r\n", position_rc);
+        }
+        if (frame_rc == DESK_HW_OK) {
+            printf("  Last formatted TX request length: %lu bytes (not an RX/ACK counter)\r\n",
+                   (unsigned long)last_len);
+        } else {
+            printf("  Last formatted TX request length: UNKNOWN (read rc=%d)\r\n", frame_rc);
+        }
+        printf("  STM32 peer/ACK state: UNKNOWN (no independent peer status in CLI)\r\n");
         printf("  UART Protocol: A5 5A Class=0x02 Motion Frame\r\n");
     }
 }
@@ -376,10 +475,10 @@ static void cmd_peripherals(int argc, char *argv[])
 {
     (void)argc; (void)argv;
     printf("Peripherals Status:\r\n");
-    printf("  RTC (PCF8563 on I2C0) : NOT_INITIALIZED (Pending bus scan)\r\n");
-    printf("  RGB LED (GPIO 40)     : CONFIGURED\r\n");
-    printf("  Battery ADC (GPIO 3)  : READY\r\n");
-    printf("  IO Expander (PCA95xx) : READY\r\n");
+    printf("  RTC state             : UNKNOWN (no read-only status API)\r\n");
+    printf("  RGB LED state         : UNKNOWN (no readback API)\r\n");
+    printf("  Battery state         : UNKNOWN (no ADC status API)\r\n");
+    printf("  IO Expander state     : UNKNOWN (probe may initialize board power)\r\n");
 }
 
 static void cmd_network(int argc, char *argv[])
@@ -388,14 +487,23 @@ static void cmd_network(int argc, char *argv[])
 #ifdef ESP_PLATFORM
     netmgr_status_e status = NETMGR_LINK_DOWN;
     int rc = netmgr_conn_get(NETCONN_AUTO, NETCONN_CMD_STATUS, &status);
-    printf("Network status: rc=%d link=%d\r\n", rc, (int)status);
+    const char *link_name = "UNKNOWN";
+    if (rc == 0) {
+        if (status == NETMGR_LINK_UP) link_name = "LINK_UP";
+        else if (status == NETMGR_LINK_DOWN) link_name = "LINK_DOWN";
+    }
+    printf("Network status: rc=%d link=%s (%d)\r\n", rc, link_name, (int)status);
 #else
     printf("Network status: host simulation\r\n");
 #endif
     printf("Network & SDK Server Status:\r\n");
     printf("  TCP Server Port : %d\r\n", desk_sdk_socket_server_get_port());
-    printf("  TCP Client State: %s\r\n", desk_sdk_bridge_is_connected() ? "CONNECTED" : "WAITING");
-    printf("  UDP Pairing Port: %d\r\n", desk_sdk_pairing_server_get_port());
+    int tcp_port = desk_sdk_socket_server_get_port();
+    int udp_port = desk_sdk_pairing_server_get_port();
+    printf("  TCP Client State: %s\r\n", tcp_port <= 0 ? "UNKNOWN (server not listening)" :
+           (desk_sdk_bridge_is_connected() ? "CONNECTED" : "WAITING"));
+    printf("  UDP Pairing Port: %d (%s)\r\n", udp_port,
+           udp_port <= 0 ? "NOT_LISTENING" : "LISTENING");
 }
 
 static void cmd_provisioning(int argc, char *argv[])
@@ -442,9 +550,11 @@ static void cmd_wifi(int argc, char *argv[])
 #ifdef ESP_PLATFORM
     netmgr_status_e status = NETMGR_LINK_DOWN;
     int rc = netmgr_conn_get(NETCONN_AUTO, NETCONN_CMD_STATUS, &status);
-    printf("Wi-Fi status: rc=%d link=%d\r\n", rc, (int)status);
+    const char *link_name = "UNKNOWN";
+    if (rc == 0) link_name = status == NETMGR_LINK_UP ? "LINK_UP" : "LINK_DOWN";
+    printf("Wi-Fi status: rc=%d link=%s (%d)\r\n", rc, link_name, (int)status);
 #else
-    printf("Wi-Fi Station Status: Host Mock (IP: 127.0.0.1)\r\n");
+    printf("Wi-Fi status: UNKNOWN (host simulation; no radio state)\r\n");
 #endif
 }
 
