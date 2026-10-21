@@ -42,7 +42,6 @@
 #define PCA_PIN_SYNC_PORT0_MASK   (1u << 6) /* Port 0, bit 6 (Pin 6) */
 #define PCA_PIN_HX_PWR_PORT1_MASK (1u << 3) /* Port 1, bit 3 (Pin 11) */
 
-#define CAM_MAX_PACKET_SZ         65536
 #define CAM_SYNC_TIMEOUT_MS       300
 #define CAM_HX_POWER_SETTLE_MS    20
 #define CAM_SYNC_GUARD_MS         2
@@ -60,6 +59,10 @@
 
 #define WATCHER_HX_PTL_MAX_JPEG_SIZE (128U * 1024U)
 #define WATCHER_HX_PTL_BODY_CAPACITY (HX_MEDIA_HEADER_SIZE + WATCHER_HX_PTL_MAX_JPEG_SIZE)
+/* spi_bus_config_t.max_transfer_sz limits each SPI transaction, including the
+ * PTL body read. The old 64 KiB limit was smaller than the accepted 128 KiB
+ * JPEG body, so otherwise valid larger frames failed at the SPI driver. */
+#define CAM_MAX_PACKET_SZ         WATCHER_HX_PTL_BODY_CAPACITY
 
 #ifdef ESP_PLATFORM
 #include "esp_attr.h"

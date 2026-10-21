@@ -59,6 +59,12 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
         self.assertIn("vTaskDelay(pdMS_TO_TICKS(CAM_SYNC_GUARD_MS))", source)
         self.assertIn("vTaskDelay(pdMS_TO_TICKS(1))", source)
 
+    def test_spi_transfer_limit_covers_maximum_ptl_body(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        self.assertIn("#define WATCHER_HX_PTL_BODY_CAPACITY (HX_MEDIA_HEADER_SIZE + WATCHER_HX_PTL_MAX_JPEG_SIZE)", source)
+        self.assertIn("#define CAM_MAX_PACKET_SZ         WATCHER_HX_PTL_BODY_CAPACITY", source)
+        self.assertIn(".max_transfer_sz = CAM_MAX_PACKET_SZ", source)
+
 
 if __name__ == "__main__":
     unittest.main()
