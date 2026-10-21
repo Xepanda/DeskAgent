@@ -338,7 +338,13 @@ class HAConnector:
                     try:
                         res = self.reconcile_states()
                         for chg in res["reconciled_changes"]:
-                            callback(chg["entity_id"], chg["old_state"], chg["new_state"])
+                            try:
+                                callback(chg["entity_id"], chg["old_state"], chg["new_state"])
+                            except Exception as callback_err:
+                                # A consumer failure must not suppress other changes from
+                                # this snapshot. Reconciliation updates the cache first,
+                                # so skipped callbacks would otherwise be lost forever.
+                                logger.exception("HA state subscriber callback failed: %s", callback_err)
                     except Exception as err:
                         logger.debug("State subscriber polling note: %s", err)
                 stop_evt.wait(interval_sec)

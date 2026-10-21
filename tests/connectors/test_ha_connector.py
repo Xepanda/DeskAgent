@@ -296,6 +296,31 @@ class TestHAConnector(unittest.TestCase):
         self.assertEqual(rep3["reconciled_changes"][0]["old_state"], "off")
         self.assertEqual(rep3["reconciled_changes"][0]["new_state"], "on")
 
+    def test_polling_subscriber_exception_does_not_drop_other_snapshot_changes(self) -> None:
+        """One consumer exception must not permanently lose later changes in the same snapshot."""
+        ha = HAConnector(mock_mode=True)
+        ha._mock_states = {
+            "light.desk": {"entity_id": "light.desk", "state": "on", "attributes": {}},
+            "switch.heater": {"entity_id": "switch.heater", "state": "on", "attributes": {}},
+        }
+        delivered: list[str] = []
+        heater_event = threading.Event()
+
+        def subscriber(entity_id: str, old_state: Optional[str], new_state: Optional[str]) -> None:
+            delivered.append(entity_id)
+            if entity_id == "light.desk":
+                raise RuntimeError("simulated consumer bug")
+            if entity_id == "switch.heater":
+                heater_event.set()
+
+        stop = ha.subscribe_state_changes(subscriber, interval_sec=0.02)
+        try:
+            self.assertTrue(heater_event.wait(timeout=1.0))
+            self.assertEqual(delivered, ["light.desk", "switch.heater"])
+        finally:
+            stop()
+            ha.close()
+
     # -------------------------------------------------------------------------
     # 4. Service Execution & Two-Stage Verification Tests
     # -------------------------------------------------------------------------

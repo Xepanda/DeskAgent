@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.20.0
+> 文档版本：V3.21.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
-> 状态：**2026-10-22 最新 CLI 镜像和当前全仓测试结果见 §0。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 move/stop 均超时且没有 ACK/物理反馈，动作状态未知。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> 状态：**2026-10-22 最新 CLI 镜像和当前全仓测试结果见 §0。用户最新现场确认当前设备已可通过唤醒词唤醒并进行对话；该证据未附设备日志，不能据此确认 ASR/TTS 细节、多轮会话、云端会话状态或恢复能力。相机仍未取到 JPEG，STM32 move/stop 均超时且没有 ACK/物理反馈，动作状态未知。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> V3.21.0 变更：记录用户 2026-10-22 最新现场确认“现在可以唤醒对话了”，证据级别为未附设备日志的用户现场确认；不扩展为日志佐证的 ASR/TTS、多轮会话或恢复通过。
 > V3.13.0 变更：更新 HA、Reminder/Core、Companion、SDK 与定向回归测试数字；记录提醒 fixture 使用动态近时值且符合 24h catch-up 窗口、SQLite 测试 teardown 显式关闭连接；校准只读状态页/旋钮按钮 UI 契约、无真实帧源时不产生合成相机帧，以及 OS RNG 字符串形状 smoke test 的证据边界。全仓 pytest 为 336 passed、193 errors、1 failed、15 subtests；errors 与 failed 均由 Windows 缺少 `gcc`、native C harness 无法启动导致。相机和 STM32 的 L3 阻塞仍未解除。
 > V3.14.0 变更：Companion 增至 53 项 L2 测试，覆盖 app-server `thread/resume` 重启时恢复非终态任务、确认 `cancelling` 终态及 active-writer 下 pending 重试；新代码/测试无真实默认模型及 throwaway workspace restart smoke 证据，设备回传 L4 仍未验证。
 > V3.15.0 变更：补录真实 Codex app-server 默认模型（未传 `model`）与 throwaway workspace 任务在 8.76 秒内完成、Companion 重建后本地 completed 状态/assistant 摘要恢复且未含原 prompt。由于重启时 DB 已为终态，只发生 initialize、未触发 `thread/resume`；此为任务执行和本地持久化 L3 smoke，不是自动 resume 的 L3 证据。自动 resume 仍只有 53 项 L2 测试覆盖，设备反馈 L4 未验。
@@ -34,7 +35,7 @@
 | Wi-Fi / provisioning | **L3 单项状态观测；云端授权未通过** | 新 CLI 镜像启动后 `wifi status` 为 `LINK_UP`；provisioning 阶段报 `mqtt_online`，但 `authorize_read rc=-1` | 需定位授权读取失败并核对真实 MQTT/AI 会话；`LINK_UP` 或 `mqtt_online` 单独不代表 Tuya 会话/语音云服务闭环 |
 | 屏幕、基础提示音 | **L3 单项通过** | 用户现场确认屏幕显示文字、扬声器提示音可听 | 归档对应固件 SHA、完整启动日志和现场记录；尚未验证长稳、并发资源仲裁 |
 | 麦克风采集 | **L3 单项通过（当前镜像观测）** | 新 CLI 镜像日志显示麦克风 READY、`running`，累计 895 frames，errors=0，peak=95 | 这是 PCM 采集状态，不等于唤醒/ASR/语音对话已在本镜像复测；需再次现场唤醒及多轮问答并归档识别、会话、播报证据 |
-| 麦克风、唤醒与对话 | **L3 单项历史通过；当前 CLI 镜像唤醒/对话未验证** | 用户此前确认可唤醒并对话；该确认早于当前 CLI 镜像。当前镜像只有麦克风采集正常的观测 | 在当前已刷镜像上复测重复唤醒、多轮问答及回复播报；断网恢复、长稳和跨模块任务闭环未验证 |
+| 麦克风、唤醒与对话 | **L3 单项用户现场确认；详细链路未由日志验证** | 用户于 2026-10-22 最新确认“现在可以唤醒对话了”，即当前设备能响应唤醒词并进行对话。该确认没有附带本轮设备日志或固件 SHA；此前已有 PCM 采集观测，但不能把它当作本次对话的日志佐证 | 归档匹配当前固件 SHA 的启动、WakeNet/KWS、ASR、Tuya AI session/MQTT、NLG/TTS 与扬声器播放日志；量化重复唤醒并验证多轮上下文、断网恢复和长稳。当前用户确认不代表这些细项已通过 |
 | 滚轮、按键与状态页 | **L2 源码契约检查；L3 仅有用户对滚轮/按键可用的确认** | UI 契约测试检查滚轮选择 HOME/AUDIO/CONNECTION/DEVICE 四个只读页、触摸打开/返回、短按/长按调用既有 TuyaOpen talk alert API；覆盖配对 overlay 时保留当前状态页显示。用户确认滚轮和按键可用，但无本轮逐项事件日志 | 归档真机滚轮、触摸、短按、长按输入事件和屏幕变化；源码契约测试不代表页面在当前镜像上的显示/交互已实机验收 |
 | Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新 COM21 capture 日志显示 driver `READY`，但该状态仅证明初始化路径、I2C expander 配置及 SPI bus/device 创建成功；没有 HX ID/应答探测，不证明传感器就绪。capture 命中同步后，7-byte SPI header transfer 返回 `ESP_OK`，采样数据仍全零 (`raw=00000000000000`)，随后返回 `rc=-25`、`out_len=0`；未取得 JPEG。详见 `desk_watcher_camera.c:135-193,264-346`。现场尚无示波器/逻辑分析仪波形证据 | 下一次 capture 必须同步测量同一事务中的 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 与 HX 电源轨；保存探点、时基和电压。确认总线数据前不盲目重复取帧；修复后导出并打开现场 JPEG，验证连续帧与资源释放 |
 | 相机 SDK parser / Host adapter | **L2 fake 集成通过；L3/L4 未验证** | 测试调用固定版本官方 SDK 的 WSPK parser 和图片回调，以有效 JPEG fixture 验证适配路径；A3 Host adapter 代码/测试使用 fake managed context。`FrameCapturePipeline` 无 capture source 时必须不发出帧，即使传入 `allow_synthetic=True` 也忽略该兼容参数；该断言防止伪造 JPEG，不证明相机取帧成功。未连接官方 Runtime，也未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
@@ -90,7 +91,7 @@
 | :--- | :--- | :--- |
 | CLI 固件构建与烧录 | 构建成功；app-only bin 1,899,680 bytes，SHA-256 `C09E84798654C8071875D04901213B8979BF2032F1B14F921CF911A6F857BE65`；COM21 写入 OTA0 `0x20000` 并 verify hash。因构建 partition table 与实机读取布局不一致，未写 table/bootloader/model；COM20 未触碰 | L2 build + L3 app flash/hash verification；不是整机功能通过 |
 | 网络 / provisioning | `wifi status LINK_UP`；provisioning `mqtt_online`，但 `authorize_read rc=-1` | L3 单项状态观测；云端授权与 Tuya AI 会话未验 |
-| 音频输入 | 麦克风 READY/running，895 frames、errors=0、peak=95 | L3 PCM 采集观测；当前镜像 WakeNet/ASR/多轮对话/回复播报未复验。此前用户确认对应旧镜像 |
+| 音频输入 | 麦克风 READY/running，895 frames、errors=0、peak=95；用户最新确认当前设备可唤醒并对话 | PCM 帧数据是 L3 单项采集观测；唤醒/对话是 2026-10-22 用户现场确认，未附本轮设备日志或固件 SHA。未验证带日志的 WakeNet/KWS、ASR、Tuya 会话、TTS/扬声器细节、多轮上下文或恢复 |
 | 相机 | Driver READY；PTL empty response `raw=00000000000000`，`rc=-25`，`out_len=0`，无 JPEG。READY 只表明初始化路径、expander 配置及 SPI bus/device 创建成功；未探测 HX ID/应答。同步命中后 7-byte SPI header read 返回 ESP_OK 但全零，才映射为 `rc=-25` | L3 失败；无真实图片。现场没有 scope/logic-analyzer 波形证据；下次必须在同一次 capture 同步观测 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 和 HX 电源轨 |
 | STM32 / body UART | 本轮 move 与 stop 均 `rc=-3`；UART READY 是初始化状态，23-byte last frame 是格式化缓存；stop 是否执行无法确认 | L3 命令尝试超时；没有 RX/ACK/物理反馈，当前动作状态未知、安全闭环未验。驱动等待 ACK 最多 3×500ms，但未提供 RX 内容/CRC/序列/NACK 分类。COM21 已释放。后续先核对原理图、固件协议和内部 UART 接线，再决定是否加入 RX 诊断 |
 | Codex terminal summary 设备反馈 | `6255657` 在 Host managed SDK session 将 Codex terminal summary 编为 `ctrl.expression.set`；outbox 去重/幂等、退避和 UTF-8 63-byte 截断行为纳入实现 | combined 定向回归报告 166 passed、6 subtests passed，证据为 L2；测试中的 ACK 只代表 `accepted`。`WATCHER_APP_*` real managed Runtime 未配置/启动，无当前设备显示/声音或用户听感 L3 证据 |

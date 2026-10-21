@@ -8,7 +8,7 @@
 - **分区保护提示**：构建产出的 partition table 与实机分区表不一致；实机 OTA0 为 `0x20000`、6 MiB，model 为 `0xC20000`。本轮未写 partition table、bootloader 或 model；COM20 未触碰。除 app-only 且地址经核对的操作外，先解决差异再操作。
 - 已恢复模型：`firmware/.build/bin/srmodels.bin`，SHA-256 `7C87DD7ADB5A7623907B6354D49BEA7F9289371262E6A57F15458FB8908C5814`。
 - Wi-Fi / provisioning：当前 CLI 镜像 `wifi status` 为 `LINK_UP`；provisioning stage 为 `mqtt_online`，但 `authorize_read rc=-1`。这是 L3 单项状态观测，不代表云端授权或 Tuya AI 会话已可用。
-- 麦克风：当前 CLI 镜像显示 READY、running、895 frames、errors=0、peak=95，属于 L3 PCM 采集观测。用户此前确认的唤醒/对话发生在旧镜像上；当前 CLI 镜像尚未重新验证 WakeNet、ASR、多轮会话或回复播报。
+- 麦克风与语音：当前 CLI 镜像显示 READY、running、895 frames、errors=0、peak=95，属于 L3 PCM 采集观测。用户于 2026-10-22 最新现场确认当前设备已可通过唤醒词唤醒并进行对话；这是未附本轮设备日志或固件 SHA 的用户现场确认。WakeNet/KWS、ASR、Tuya AI session/MQTT、TTS/扬声器播放细节、多轮上下文、断网恢复和长稳尚无本轮日志证据。
 - 相机：L3 失败。当前 CLI 镜像日志显示 camera driver READY，但该状态只表示初始化路径、I2C expander 配置以及 SPI bus/device 创建成功；代码没有 HX ID/应答探测，因此 READY 不证明传感器已就绪。capture 命中同步后，7-byte SPI header 传输返回 `ESP_OK`，读数仍全零 (`raw=00000000000000`)，随后映射为 `rc=-25`、`out_len=0`，未取得 JPEG。来源：`firmware/components/desk_hardware/src/desk_watcher_camera.c:135-193,264-346`。现场无示波器/逻辑分析仪证据。
 - CR-006 Host MJPEG：相机 service、浏览器 UI 与 `/api/camera/stream` 路由交叉测试为 L2（`python -m pytest tests/camera tests/core/test_host_daemon.py tests/connectors/test_official_robot_camera_adapter.py tests/core/test_managed_sdk_startup.py -q`：52 passed、9 subtests passed；inline JS `node --check -` 与 `git diff --check` 通过）。A3/A6 已修复此前 review 提出的问题，最终复审无新增 Critical/Important。实现只转发真实硬件 JPEG，最高 2 FPS，不合成或复用旧帧。当前设备最新真实 capture 为 `rc=-25`、`out_len=0`，无 JPEG，因此相机 L3 仍失败，L4 未验证；这是 L2 软件验证，不能称全契约实机通过。
 - STM32 / body UART：本轮真实发送小幅命令 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 显示 UART READY、cached setpoint 仍为 90/120、last formatted TX length=23 bytes。该 TX 长度只是发送帧记录，不是 STM32 RX/ACK；没有实物动作确认，动作未通过。日志：`.target_logging/com21-small-motion-test-20261022.log`。
@@ -39,6 +39,8 @@ python -m unittest tests.e2e.test_p1_regression_gates
 这些命令提供 L2 证据。最近一次 `tools/verification/verify_all.sh` 在 Step 2 失败，Step 3–8 未运行。该脚本会运行本机 C 构建、全量 Python 套件和部署预检；执行前确认没有其他 Agent 占用共享 `firmware/build`，并且当前环境具备脚本依赖。脚本通过仍不能自动升级任何 L3/L4 状态。
 
 ## 3. 语音与输入复测（COM21 单人占用）
+
+当前进展：用户已确认设备可唤醒并对话；此项记为用户现场确认，不能替代下述日志门槛，也不代表重复唤醒、多轮上下文、ASR/TTS 细节或恢复能力已验收。
 
 ### 操作
 
