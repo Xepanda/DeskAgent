@@ -18,17 +18,17 @@
 ### 1.1 历史冲突分析
 在早期架构设计草案与历史记录中，存在针对 ESP32-S3 与 STM32 机身协处理器通信帧的两种互不兼容描述：
 1. **旧依赖草案（历史记录）**：记有 `COBS framing + CRC16`（基于 Consistent Overhead Byte Stuffing 换行分帧）；
-2. **生产固件实现（`firmware/components/desk_hardware/src/desk_hardware.c`）**：实现了基于固定双字节魔数 `0xA5 0x5A`、12 字节固定帧头、小端字段与 CRC16-CCITT 的定长二进制帧。
+2. **DeskAgent 仓库实现**：包含基于固定双字节魔数 `0xA5 0x5A`、12 字节固定帧头、小端字段与 CRC16-CCITT-FALSE 的实现。Watcher board ops 进入 `desk_watcher_motion.c`；仓库另有 `desk_hardware.c` 接收实现。当前构建实际选用路径与 STM32 固件兼容性仍按 CR-007 待证。
 
 ### 1.2 A0 架构与协议裁决结论 (Adjudication Ruling)
-依据 Seeed SenseCAP Watcher 硬件设计、实机固件代码以及自动化测试套件的验证证据，A0 做出如下权威裁决：
+依据 DeskAgent 仓库内协议实现与契约测试，A0 冻结 DeskAgent 主机侧合同。仓库源码和测试不等于当前 STM32 固件或当前板兼容证据；其证据边界由 CR-007 记录。
 
 > [!IMPORTANT]
-> **裁决一：正式彻底废除 COBS 描述**  
-> 历史文档中的 `COBS framing` 仅为早期概念设计遗留草案，未在任何真实硬件或驱动中落地。自本裁决生效时起，**正式全面废止 COBS 相关描述**。
+> **裁决一：COBS 不属于本主机侧串口发送合同**
+> 历史文档中的 `COBS framing` 不属于当前 DeskAgent Watcher board motion 发送路径。本裁决不据此推断任意 STM32 固件均未采用 COBS。
 >
-> **裁决二：冻结 `0xA5 0x5A` 二进制封包为唯一权威标准**  
-> 正式确认 `0xA5 0x5A` 二进制定长帧结构（12 字节头部 + 小端序列化 + CRC16-CCITT）为 DeskAgent R1 项目中 ESP32-S3 ↔ STM32 物理串口的**唯一规范**。下游 A1-R3b 驱动编写与 A7 测试验收必须 100% 对齐本标准。
+> **裁决二：冻结 `0xA5 0x5A` 为 DeskAgent 主机侧协议合同**
+> DeskAgent 主机端按 `0xA5 0x5A` 定长帧、12 字节头部、小端字段和 CRC16-CCITT-FALSE 编码/解析。该裁决规范 DeskAgent 发送和接收行为；在取得当前 STM32 固件来源、原始 RX/ACK 及 HIL 证据前，不将其表述为已验证的 ESP32-S3 ↔ 当前 STM32 设备协议。
 
 ---
 
@@ -102,7 +102,9 @@
 
 ### 4.3 STM32 确认回包 (`ACK`, MsgID: `0x00` 或 `0x01`/`0x02` + Flags: `0x02`)
 - **回传标志**：`flags = 0x02` (`ACK_RESP`)
-- **回传序号**：必须严格回传原请求的 `sequence`
+- **回传消息 ID**：允许通用 ACK `msg_id = 0x00`，或回显当前未完成请求的 MOVE (`0x01`) / STOP (`0x02`) ID；回显 ID 必须与该请求相符。
+- **flags 必须精确等于** `0x02` (`ACK_RESP`)；不得把组合位、NACK 位或其他标志当作 ACK。
+- **回传序号**：必须严格等于当前待确认请求的 `sequence`；仅 CRC16 校验通过且序号关联成功的 ACK 才能满足该事务。
 - **载荷长度**：4 字节（兼容 `desk_hardware_mcu_receive_bytes`）
 - **总帧长**：12 + 4 + 2 = **18 字节**
 
@@ -111,8 +113,7 @@
 | **+0 ~ +1** | 12 ~ 13 | `pan_deg_x10` | int16 | **Little-Endian** | `0` ~ `1800` | 当前受理解析的水平舵机设定点 × 10 |
 | **+2 ~ +3** | 14 ~ 15 | `tilt_deg_x10`| int16 | **Little-Endian** | `1000` ~ `1400`| 当前受理解析的俯仰舵机设定点 × 10 |
 
-> [!NOTE]
-> 若回包采用通用 ACK 形式，`status_code` (`0x00`) 与 `ack_reason` (`0x00`) 可填充在前 2 字节，但必须保证 `desk_hardware_mcu_receive_bytes` 能安全解析且不会发生跨界越界。
+> ACK 的四字节载荷按本契约表示两个 LE int16 角度设定值/回显值；它不是物理位置传感器反馈。未经权威 STM32 协议来源确认，不另行解释为 `status_code` / `ack_reason`。
 
 ### 4.4 否定应答回包 (`NACK`, MsgID: `0xFF` 或 Flags: `0x04`, Length: 2 字节)
 - **回传标志**：`flags = 0x04` (`NACK_RESP`)
@@ -202,7 +203,7 @@ sequenceDiagram
 依据 `docs/implementation/interfaces.md` §1.4 与 §6.6 (R6)，正式冻结 CR-002 在本协议中的语义：
 
 1. **ACK-Only 语义模式**：
-   - STM32 针对 `SERVO_MOVE` 或 `SERVO_STOP` 的 ACK 回包，**仅代表 STM32 已经成功接收并校验了该轨迹参数，且舵机控制器已启动脉冲输出**。
+   - STM32 针对 `SERVO_MOVE` 或 `SERVO_STOP` 的有效 ACK，**仅代表请求被对端接受/应答**；在当前 STM32 固件来源、ACK 语义和实际接收尚未取得证据时，不进一步断言其已启动脉冲输出。
    - 固件响应信封中，必须严格设置：
      ```json
      {
@@ -217,10 +218,12 @@ sequenceDiagram
    - 严禁驱动层或上层将“ACK 收到”或“`duration_ms` 延时结束”冒充为“物理到位”；
    - 严禁在响应中上报 `status: "succeeded"`、`status: "completed"` 或 `state_confirmed: true`；
    - 严禁在上层透传自造字段（如 `executed: true`）。
-3. **机械物理软限幅强制约束**：
-   - 驱动下发前必须对入参执行机械硬限幅截断：
+3. **公开硬件入口的角度输入规则**：
+   - `desk_hardware_motion_move_to` 对有限的 pan/tilt 输入先执行机械范围钳位，再序列化：
      * **水平轴 (Pan)**：`0.0°` $\le$ `pan_deg` $\le$ `180.0°`（超出时钳位）
      * **俯仰轴 (Tilt)**：`100.0°` $\le$ `tilt_deg` $\le$ `140.0°`（超出时钳位）
+   - `NaN`、正无穷和负无穷必须在钳位及序列化前拒绝；不得把非有限数值转换为帧载荷。
+   - 以上是公开 API 合同要求，不证明电机的物理行程或硬件限位安全。
 
 ---
 
@@ -274,4 +277,4 @@ sequenceDiagram
 
 ## 9. 结论
 
-本报告正式终结了 STM32 机身通信协议中 COBS 与 `0xA5 0x5A` 的历史分歧，全面确认并冻结了以 `0xA5 0x5A` 为帧头、12 字节头部、小端序列化、CRC16-CCITT（Poly 0x1021，Init 0xFFFF）、500ms 超时 2 次重试、以及 CR-002 ACK-only 模式为核心的权威协议契约。
+本报告冻结的是 DeskAgent **主机侧协议合同**：`0xA5 0x5A` 帧头、12 字节头部、小端序列化、CRC16-CCITT-FALSE、500ms 超时与最多 2 次重试（重试保留原 sequence）、以及 CR-002 ACK-only 语义。ACK 可使用通用 ID `0x00` 或回显当前 MOVE/STOP ID，但必须精确 `ACK_RESP=0x02`、恰为 4 字节 payload、CRC 有效且 sequence 与 outstanding 请求相同。有限角度由公开硬件 API 按机械范围 clamp，NaN/正负无穷须在序列化前拒绝。以上为 DeskAgent 合同，不证明当前 STM32 固件遵循该合同；当前板兼容性和动作验收以保持 OPEN 的 CR-007 为准。

@@ -240,7 +240,7 @@
       "protocol_schema": "contracts/schemas/stm32_body_protocol.json",
       "adjudication_doc": "docs/implementation/r3a-stm32-protocol-adjudication.md",
       "adjudication_status": "RATIFIED_ACTIVE_BASELINE",
-      "legacy_conflict_resolution": "The legacy note 'COBS framing + CRC16' is formally abolished and deprecated as an unverified early draft. The active implementation in desk_hardware.c using 0xA5 0x5A binary framing with Class 0x02 Motion (0x01 SERVO_MOVE, 0x02 SERVO_STOP) and Little-Endian CRC16-CCITT is ratified as the sole authoritative wire protocol.",
+      "legacy_conflict_resolution": "The legacy note 'COBS framing + CRC16' is formally abolished and deprecated as an unverified early draft. The active Watcher board motion path uses 0xA5 0x5A binary framing with Class 0x02 Motion and Little-Endian CRC16-CCITT. This is the DeskAgent host-side contract only; compatibility with the current STM32 firmware remains OPEN and unverified.",
       "frame_spec": {
         "magic": [
           165,
@@ -256,8 +256,8 @@
           "0x02": "MCU_MOTION_MSG_SERVO_STOP (payload 2 bytes)"
         },
         "responses": {
-          "0x00": "MCU_MSG_ACK (Flags 0x02 / status_code 0x00)",
-          "0xFF": "MCU_MSG_NACK (Flags 0x04 / error_code != 0)"
+          "ack": "msg_id 0x00 or echo of the outstanding MOVE (0x01) / STOP (0x02); flags must equal ACK_RESP (0x02); payload_len exactly 4; valid CRC16 and sequence equal to the outstanding request",
+          "0xFF": "MCU_MSG_NACK (flags exactly 0x04 / payload_len exactly 2 / error_code != 0)"
         }
       },
       "timing_and_retry_rules": {
@@ -282,7 +282,19 @@
             100.0,
             140.0
           ]
-        }
+        },
+        "public_angle_input": {
+          "finite_out_of_range": "Clamp at the public desk_hardware_motion_move_to API to pan 0..180 degrees and tilt 100..140 degrees before serialization",
+          "non_finite": "Reject NaN and positive/negative infinity before clamping or serialization"
+        },
+        "ack_validation": {
+          "flags_exact": 2,
+          "payload_length_bytes": 4,
+          "message_id": "0x00 or echo of the expected outstanding MOVE/STOP message id",
+          "correlation": "CRC must validate and response sequence must equal the outstanding request sequence",
+          "meaning": "accepted only; does not confirm motion execution, stop completion, or physical position"
+        },
+        "current_board_compatibility_status": "OPEN_UNVERIFIED_NO_STM32_ACK_OR_FIRMWARE_ID_EVIDENCE"
       }
     },
     "audio_codec": {

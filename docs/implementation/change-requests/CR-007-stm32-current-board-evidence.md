@@ -20,22 +20,22 @@
 
 ---
 
-## 2. 已知契约差异（不在本 CR 中裁决）
+## 2. A0 合同同步裁决（2026-10-22；不构成实机兼容结论）
 
-### 2.1 ACK 消息 ID
+### 2.1 ACK 消息 ID、flags、长度与关联
 
-- `docs/implementation/r3a-stm32-protocol-adjudication.md` §4.3 允许通用 ACK ID `0x00`，或回显被确认的 MOVE/STOP ID。
-- `firmware/components/desk_hardware/src/desk_watcher_motion.c` 的 `desk_watcher_motion_parse_ack()` 接受 ACK ID `0x00` 或 `expected_msg_id`。
-- `contracts/dependency_lock.json` 的 `body_coprocessor.frame_spec.responses` 只列出 ACK ID `0x00` 与 NACK ID `0xFF`，没有表达回显 ACK。
+- DeskAgent 主机侧合同允许通用 ACK `msg_id=0x00`，或回显当前 outstanding MOVE (`0x01`) / STOP (`0x02`) ID；echo 必须与预期请求 ID 一致。
+- ACK 的 `flags` 必须精确等于 `ACK_RESP=0x02`，payload 长度必须精确为 4 字节；CRC 必须有效，sequence 必须与 outstanding 请求相同。重试保留原 sequence。
+- 此项统一了 DeskAgent schema、依赖锁和裁决文档的**主机侧解析合同**，不表示当前 STM32 实际发出上述任一 ACK 格式。
 
-A0 需从有权威性的 STM32 协议/固件来源确认回包集合，并在协议裁决文档、schema、依赖锁和驱动契约之间对齐。此 CR 未关闭前，不把两种形式都写成已被 STM32 实机验证。
+驱动源码接受通用 ID 或预期 ID echo，但当前板没有有效 RX/ACK 证据，STM32 固件来源也未归档。两种形式仍均属未验证的设备兼容性；CR-007 保持 OPEN。
 
-### 2.2 超范围角度：拒绝或钳位
+### 2.2 公开入口角度处理
 
-- `docs/implementation/r3a-stm32-protocol-adjudication.md` §7.2 要求机械硬限幅截断（clamp）。
-- `desk_watcher_motion_move()` 在调用打包 helper 前，对超范围 pan/tilt 返回 `DESK_HW_ERR_INVALID_ARG`；打包 helper 自身虽有 clamp，但该公开入口不会把超范围值送入打包流程。
+- DeskAgent 公共硬件入口合同为：有限 pan/tilt 值在 `desk_hardware_motion_move_to` 入口按 pan `0..180°`、tilt `100..140°` 钳位；NaN 与正负无穷必须在钳位/序列化前拒绝。
+- 当前源码 `desk_hardware_motion_move_to()` 实现有限值范围钳位，但该函数本体未见 `isfinite` 检查；CLI 有单独的有限数解析检查，不能据此证明所有公开调用路径拒绝非有限值。Watcher board driver 对直接传入的越界值返回 invalid argument；其内部 pack helper 有 clamp。
 
-A0/A1 需确认产品与 STM32 契约预期是拒绝输入还是钳位输入，并说明哪些层负责该行为。在裁决前保留现有观察，不将 helper 的 clamp 描述成公开动作接口已实现 clamp。
+契约已裁决为“公开硬件入口 clamp 有限值、拒绝非有限值”。当前缺少的是 API 对非有限值的实现证据；这是 DeskAgent 源码实现缺口，不是 STM32 实机兼容证据。不得把这一合同要求描述成已经在所有公开调用路径实现。
 
 ---
 
@@ -62,7 +62,7 @@ A0/A1 需确认产品与 STM32 契约预期是拒绝输入还是钳位输入，�
 1. **目标识别**：记录当前设备 SKU、PCB 丝印/修订与装配来源，并确认测试对象与资料匹配。
 2. **电气与线束**：提供当前板原理图版本；通过连续性/独立测量确认 UART TX/RX/GND、逻辑电平、供电和连接方向。存在矛盾时保持停止，不猜测引脚或改线。
 3. **固件归属**：取得 STM32 固件版本及 SHA-256、协议来源和 ACK 语义；记录 ESP32 测试 app SHA-256、构建来源与实际刷入校验结果。
-4. **静态协议对账**：先关闭第 2 节的 ACK-ID 和角度边界差异，或由 A0 明确记录裁决依据并同步全部契约载体；用原始帧 fixture 覆盖合法 ACK、回显 ACK（若权威契约允许）、NACK、错序、坏 CRC、超时重试与同序号规则。
+4. **静态协议对账**：以第 2 节与已同步的 schema/依赖锁/裁决文档为 DeskAgent 主机侧合同；用原始帧 fixture 覆盖通用 ACK 和 expected-ID echo ACK、精确 ACK flags/长度、NACK、错序、坏 CRC、超时重试与同序号规则。以上 fixture 仍只证明主机实现，不证明 STM32 固件互通。
 5. **安全预检**：确认动作 owner、机械运动范围与限位/急停办法；在现场可直接观察并停止设备。此前 `stop` 未获 ACK、当前动作状态未知，必须先在不产生新动作的方式下确认设备处于可安全测试状态。不得把无 ACK 的 stop 当作已经停止。
 6. **逐步 HIL**：从不会导致危险运动的链路观察开始；通过逻辑分析仪或独立接收计数同时保留 TX/RX 原始数据。只有命令实际接收、ACK 的 ID/序号/CRC 与请求吻合后，才在安全范围内做最小可观察动作及 stop 验证。任何超时、错帧、意外动作或无法确认停止均立即中止。
 7. **结果与恢复**：分别记录命令发送、STM32 接收/ACK、可观察物理动作和 stop 结果；ACK 仅按已裁决语义报告 accepted，不能声称物理到位。记录异常恢复方法和测试后设备状态，并归档原始数据及 hash。
@@ -71,7 +71,7 @@ A0/A1 需确认产品与 STM32 契约预期是拒绝输入还是钳位输入，�
 
 ## 5. 关闭条件与责任分工
 
-- **A0**：取得权威协议来源后，裁决 ACK-ID 与超范围角度语义；对齐 adjudication、schema、dependency lock 和接口契约。
+- **A0**：已统一 DeskAgent 主机侧 ACK/角度合同；若取得权威 STM32 协议来源，复核此合同是否适用于当前 STM32，并继续维护各合同载体一致。实机证据缺失时维持 OPEN。
 - **A1**：在资料匹配当前板后，核对 UART 接线/电气配置与实际 STM32 固件协议；仅在安全预检通过后参与硬件验证。
 - **A7**：依据冻结后的契约执行并归档可重复的 HIL 测试，确保记录可关联当前 ESP32/STM32 镜像与设备身份。
 
@@ -110,8 +110,8 @@ A0/A1 需确认产品与 STM32 契约预期是拒绝输入还是钳位输入，�
 
 1. 先补当前 PCB/SKU/线束与适配原理图版本、STM32 固件来源/版本/hash；按 §4 核对 TX/RX/GND、电平和波特率，不通过软件命令推断接线正确。
 2. 在不向执行器发送 move/stop 的前提下，用独立逻辑分析仪或已验证的只读接收路径观察 STM32 TX/RX 空闲及启动字节，归档带时间戳的原始波形/字节和设备、固件身份。仅 UART READY 或 ESP32 的 TX 计数不足以通过。
-3. 对照权威 STM32 协议来源，先统一 ACK ID/flags/payload 长度、角度边界、序号回绕和 retry 语义，并为两套实现增加相同负例/正例覆盖；确认同一协议实现被当前构建实际选用。
+3. 当前 DeskAgent 主机合同已统一 ACK ID/flags/payload 长度、公开角度输入规则、CRC 与 sequence 关联、retry sequence 语义；仍需对照权威 STM32 固件来源确认设备端兼容性，并为两套实现维持相同正/负例覆盖，确认实际构建选用的实现路径。
 4. 当前 stop 无 ACK 且动作状态未知。在任何新的动作之前，须由现场人员通过独立目视/机械安全确认设备静止、执行器工作区域清空、可用物理断电/急停手段就位，并明确现场验证窗口。此前置条件未满足时不发动作命令。
 5. 仅在安全预检完成并有现场监督后，先采集可区分的原始 TX/RX（不发送动作的链路观察优先）；若后续最小动作验证获得明确授权且确认安全，每条命令都要求同序号、正确 CRC 的 STM32 响应和独立可见的动作/停止观察。任一超时、坏帧、错序、意外动作或无法确认静止即中止；不得把软件 stop 重试当作安全急停。
 
-**A0 结论：**源码实现大体符合 `A5 5A` / CRC16-CCITT-FALSE / 32-bit 序号关联 / 同序号重试的冻结契约，但 ACK 回包集合和角度边界在不同接口/契约载体中有差异，且存在两套可能行为不同的固件实现。仓库测试只证明 L2。因当前设备两条动作命令均超时且没有 STM32 RX/ACK、固件身份或物理状态证据，CR-007 继续 OPEN；当前板协议兼容、动作执行与安全停止均未验证。
+**A0 结论：**DeskAgent 主机侧合同已统一为 `A5 5A` / CRC16-CCITT-FALSE / 32-bit sequence 关联与同序号重试；ACK 允许通用 ID 或 expected MOVE/STOP ID echo，且必须精确 ACK flags、4-byte payload、有效 CRC 和匹配 sequence。公开硬件入口合同要求有限角度 clamp、拒绝非有限输入；当前源码尚未证明所有公开调用路径都拒绝非有限值。仓库测试仅为 L2。当前设备两条动作命令均超时，没有 STM32 RX/ACK、固件身份或物理状态证据；CR-007 继续 OPEN，当前板协议兼容、动作执行与安全停止均未验证。
