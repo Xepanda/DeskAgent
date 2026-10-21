@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -445,11 +446,12 @@ class RealChainTestCase(unittest.TestCase):
         row is marked `dispatched` because delivery succeeded -- not because the
         worker backed off after a rejected send.
         """
-        # Already-due timestamp so the scheduler fires on its next poll.
+        # Keep this recent past time inside the scheduler's 24-hour catch-up window.
+        due_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
         resp = self.tool_request_roundtrip(
             "req-chain-rem-due", "reminder.create",
             {"reminder_id": "rem-chain-due", "title": "Stand up and stretch",
-             "due_at": "2026-10-16T08:00:00Z"},
+             "due_at": due_at},
         )
         self.assertEqual(resp.get("status"), "succeeded")
 

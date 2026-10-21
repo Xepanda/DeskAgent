@@ -69,8 +69,13 @@ class TestWatcherUiInput(unittest.TestCase):
         render = function_body(self.bridge, "watcher_ui_render")
         self.assertIn('desk_hardware_display_set_expression(s_ui_home_preset, status)', render)
         update = function_body(self.bridge, "desk_tclaw_update_screen")
-        self.assertLess(update.index("if (s_ui_overlay_active)"),
+        # Keep the latest home expression/status in memory while pairing or
+        # the read-only overlay owns the display; render that UI before the
+        # default home expression can be drawn directly.
+        self.assertLess(update.index("if (s_ui_overlay_active || s_pairing_ui_active)"),
                         update.index("desk_hardware_display_set_expression(safe_preset, safe_status)"))
+        self.assertLess(update.index("snprintf(s_ui_home_preset"),
+                        update.index("return watcher_ui_render()"))
 
     def test_connection_page_labels_its_local_value_as_tclaw_shim_state(self) -> None:
         render = function_body(self.bridge, "watcher_ui_render")

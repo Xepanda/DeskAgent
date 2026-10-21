@@ -1,9 +1,10 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.12.0
+> 文档版本：V3.13.0
 > 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
 > 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
-> 状态：**2026-10-22 最新 CLI 镜像的增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 小幅动作命令已尝试但超时且无 ACK/动作证据。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> 状态：**2026-10-22 最新 CLI 镜像和当前全仓测试结果见 §0。当前镜像下 Wi-Fi 为 LINK_UP、麦克风采集正常；相机仍未取到 JPEG，STM32 move/stop 均超时且没有 ACK/物理反馈，动作状态未知。Level 3 仅按单项记录，Level 4 整机闭环仍未完成。**
+> V3.13.0 变更：更新 HA、Reminder/Core、Companion、SDK 与定向回归测试数字；记录提醒 fixture 使用动态近时值且符合 24h catch-up 窗口、SQLite 测试 teardown 显式关闭连接；校准只读状态页/旋钮按钮 UI 契约、无真实帧源时不产生合成相机帧，以及 OS RNG 字符串形状 smoke test 的证据边界。全仓 pytest 为 336 passed、193 errors、1 failed、15 subtests；errors 与 failed 均由 Windows 缺少 `gcc`、native C harness 无法启动导致。相机和 STM32 的 L3 阻塞仍未解除。
 > V3.12.0 变更：记录 CR-006 最终交叉测试为 52 passed、9 subtests passed，inline JS 与 diff 检查通过；复审无新增 Critical/Important。该项为 L2，真实相机 `rc=-25/out_len=0`，L3 失败、L4 未验证，不能称全契约实机通过。补充本轮 COM21 只读 ESP32-S3 日志采集的两条事件及证据范围。
 > V3.9.0 变更：记录 `6255657` Host managed SDK session 的 Codex terminal summary→`ctrl.expression.set` 软件链路、outbox 幂等/退避与 UTF-8 截断行为及定向回归结果；明确该证据为 L2，未启动真实 `WATCHER_APP_*` Runtime，也没有当前设备/声音 L3 证据。
 > V3.8.0 变更：说明 camera `READY` 不代表 HX 传感器就绪；记录同步命中后 SPI header read 返回 `ESP_OK` 但七字节全零并映射为 `rc=-25`；列出同一次 capture 的下一步同步示波测量点，并标记现场尚无波形证据。
@@ -27,15 +28,15 @@
 | 屏幕、基础提示音 | **L3 单项通过** | 用户现场确认屏幕显示文字、扬声器提示音可听 | 归档对应固件 SHA、完整启动日志和现场记录；尚未验证长稳、并发资源仲裁 |
 | 麦克风采集 | **L3 单项通过（当前镜像观测）** | 新 CLI 镜像日志显示麦克风 READY、`running`，累计 895 frames，errors=0，peak=95 | 这是 PCM 采集状态，不等于唤醒/ASR/语音对话已在本镜像复测；需再次现场唤醒及多轮问答并归档识别、会话、播报证据 |
 | 麦克风、唤醒与对话 | **L3 单项历史通过；当前 CLI 镜像唤醒/对话未验证** | 用户此前确认可唤醒并对话；该确认早于当前 CLI 镜像。当前镜像只有麦克风采集正常的观测 | 在当前已刷镜像上复测重复唤醒、多轮问答及回复播报；断网恢复、长稳和跨模块任务闭环未验证 |
-| 滚轮、按键与状态页 | **L3 用户确认，日志证据待归档** | 用户确认滚轮和按键可用；交互约定为滚轮滚动/选择只读状态页，短按/长按沿用 TuyaOpen 语音事件 | 归档每项输入事件日志及对应 UI 页面变化；覆盖快速旋转、反向、短按、长按 |
+| 滚轮、按键与状态页 | **L2 源码契约检查；L3 仅有用户对滚轮/按键可用的确认** | UI 契约测试检查滚轮选择 HOME/AUDIO/CONNECTION/DEVICE 四个只读页、触摸打开/返回、短按/长按调用既有 TuyaOpen talk alert API；覆盖配对 overlay 时保留当前状态页显示。用户确认滚轮和按键可用，但无本轮逐项事件日志 | 归档真机滚轮、触摸、短按、长按输入事件和屏幕变化；源码契约测试不代表页面在当前镜像上的显示/交互已实机验收 |
 | Himax 相机 | **L3 失败（当前 CLI 镜像观测）** | 最新 COM21 capture 日志显示 driver `READY`，但该状态仅证明初始化路径、I2C expander 配置及 SPI bus/device 创建成功；没有 HX ID/应答探测，不证明传感器就绪。capture 命中同步后，7-byte SPI header transfer 返回 `ESP_OK`，采样数据仍全零 (`raw=00000000000000`)，随后返回 `rc=-25`、`out_len=0`；未取得 JPEG。详见 `desk_watcher_camera.c:135-193,264-346`。现场尚无示波器/逻辑分析仪波形证据 | 下一次 capture 必须同步测量同一事务中的 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 与 HX 电源轨；保存探点、时基和电压。确认总线数据前不盲目重复取帧；修复后导出并打开现场 JPEG，验证连续帧与资源释放 |
-| 相机 SDK parser / Host adapter | **L2 fake 集成通过；L3/L4 未验证** | 测试调用固定版本官方 SDK 的 WSPK parser 和图片回调，以有效 JPEG fixture 验证适配路径；A3 Host adapter 代码/测试使用 fake managed context。未连接官方 Runtime，也未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
+| 相机 SDK parser / Host adapter | **L2 fake 集成通过；L3/L4 未验证** | 测试调用固定版本官方 SDK 的 WSPK parser 和图片回调，以有效 JPEG fixture 验证适配路径；A3 Host adapter 代码/测试使用 fake managed context。`FrameCapturePipeline` 无 capture source 时必须不发出帧，即使传入 `allow_synthetic=True` 也忽略该兼容参数；该断言防止伪造 JPEG，不证明相机取帧成功。未连接官方 Runtime，也未从设备得到真实 JPEG | 真实 Runtime 完成发现/配对/会话后，由设备媒体帧经官方 parser、managed Application、Host camera service 到浏览器验证新鲜图；当前无此闭环 |
 | CR-006 Host MJPEG stream | **L2 测试通过；最终复审无新增 Critical/Important；L3 失败、L4 未验证** | `tests/camera`、Host route、SDK camera adapter 与 managed SDK startup 交叉测试：52 passed、9 subtests passed；inline JS `node --check -`、`git diff --check` 通过。实现只消费真实硬件 JPEG，最高 2 FPS | 最新设备 capture 为 `rc=-25`、`out_len=0`，无真实 JPEG。以上仅为 L2 软件证据；需取得可打开的现场 JPEG，经 Host 到浏览器验证帧新鲜度与断线恢复，才能验收实机链路。不能称全契约实机通过 |
-| STM32 / 机身动作 | **L3 命令发送尝试超时；动作未执行验收** | 新 CLI 镜像发出 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 为 UART READY、cached setpoint 仍 90/120、last formatted TX length=23 bytes；没有 STM32 RX/ACK 或物理动作证据。TX 长度只代表发送帧记录 | 核对线束、串口参数与 STM32 协议；定位此命令超时，再验证真实 RX/ACK 关联、小幅动作与实物位置反馈，并验证通信故障安全停止 |
+| STM32 / 机身动作 | **L3 命令发送尝试失败；当前动作状态未知，安全闭环未验** | 本轮 `move` 与 `stop` 均返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)；没有 RX、ACK 或物理反馈，故 stop 是否执行无法确认，当前动作状态未知。只读源码诊断显示 UART `READY` 只代表 UART 初始化，不探测 STM32；23-byte last frame 是格式化帧缓存，不是 TX/RX 计数。驱动 UART write 完整后等待 ACK，最多 3×500ms，但未记录 RX 字节、坏 CRC、错序或 NACK 分类。COM21 已释放，本轮没有后续动作 | 先核对板卡原理图、STM32 固件协议及内部 UART 接线，再评估增加 RX 诊断；随后用可观察反馈验证 ACK 关联、物理动作和通信故障安全停止 |
 | 官方 Python SDK | **L1 契约；L2 parser 测试通过；真实 Runtime L3 未验证** | 官方 SDK parser 对有效 fixture 的互操作测试通过；设备侧 pairing window 命令曾现场打开/取消。官方 Runtime 的真实 WebSocket 发现、配对、HardwareHello、能力注册、命令与媒体传输均未验 | 用未修改官方 SDK 连真实设备；错误配对码必须拒绝，正确配对后记录完整连接/命令/媒体/断线重连日志 |
-| Home Assistant | **L2 软件测试；L3/L4 未验证** | HA Connector 测试仅证明软件接口行为；没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
-| 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | LifeService 23 项及提醒相关 crash-recovery 测试 1 项通过；SQLite teardown `WinError 32` 已通过显式 close 修复并在 Windows 验证立即删除 DB 文件。该结果是受控测试中的 orderly teardown/recovery，不是强杀进程后的真实崩溃验证，也不代表设备播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
-| Windows Companion / Codex | **L3 本机真实 Codex 任务单项通过；新 managed-session 结果回传仅 L2；设备闭环 L4 未完成** | 既有 app-server 默认模型调用及隔离工作区修改任务有本机真实服务证据。`6255657` 新增的 terminal summary→`ctrl.expression.set`、outbox 幂等/退避与 UTF-8 63-byte 截断由定向回归覆盖，测试只将响应 ACK 判为 `accepted`；`WATCHER_APP_*` real managed Runtime 未配置/启动。未验证当前设备实际显示/发声或用户听到 | 启动真实 managed Runtime 并连接设备，确认 terminal summary 经真实 Host/SDK 送达；观察设备播报并由用户确认听感，同时覆盖失败、重复 outbox、断线重试及超长 UTF-8 文本 |
+| Home Assistant | **L2 软件测试；L3/L4 未验证** | HA 定向软件套件 **35 passed**；仅证明 connector/路由软件行为，没有证据表明已连接泰山派上的用户 HA 或执行物理设备 | 用真实 HA 和低风险设备验证发现、白名单服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
+| 提醒 / Host 服务 | **L2 软件测试通过；L3/L4 未验证** | 最新提醒/Core 定向套件报告 **61 passed、4 subtests passed**。两条 E2E due fixture 改为运行时近时值：crash recovery 用 90 分钟前（符合 24h catch-up 且超过 1h 延迟断言），delivery 用 5 分钟前（符合 catch-up 标记阈值及 24h 上限）；real-chain 提醒 fixture 也用运行时 5 分钟前。`test_p1_gaps_verification.py` 在清理临时目录前显式 `LifeService.close()`，Windows WinError 32 已消除。均为软件测试，不代表真机播报 | 在真实 Host/设备创建提醒，跨服务重启观察到期、播报、确认去重；另测强制进程终止后的 WAL 恢复、时区与离线错过策略 |
+| Windows Companion / Codex | **L3 本机真实 Codex 任务单项通过；新 managed-session 结果回传仅 L2；设备闭环 L4 未完成** | Companion 定向套件 **48 passed**。既有 app-server 默认模型调用及隔离工作区修改任务有本机真实服务证据。`6255657` 新增的 terminal summary→`ctrl.expression.set`、outbox 幂等/退避与 UTF-8 63-byte 截断由软件回归覆盖，测试只将响应 ACK 判为 `accepted`；`WATCHER_APP_*` real managed Runtime 未配置/启动。未验证当前设备实际显示/发声或用户听到 | 启动真实 managed Runtime 并连接设备，确认 terminal summary 经真实 Host/SDK 送达；观察设备播报并由用户确认听感，同时覆盖失败、重复 outbox、断线重试及超长 UTF-8 文本 |
 | ESP32-S3 串口日志读取 | **L2 工具测试通过；L3 只读日志观测** | A7 logger 7 项测试通过。本轮命令 `python tools/verification/capture_esp32s3_logs.py --capture --port COM21 --baud 115200 --output-dir .target_logging/esp32s3-live-20261022` 只读占用 COM21 约 4.85 秒，捕获 205 raw bytes、解析 2 行：transport connected、free heap 22,703 / PSRAM 7,074,164 bytes；offline replay exit 0 并复现事件。证据目录 `.target_logging/esp32s3-live-20261022/` | 仅覆盖这两条日志；不代表其他模块状态、语音/相机/STM32功能或长稳通过 |
 | 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散；语音、屏幕、Codex 本机任务等是各自单项证据 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
 
@@ -44,7 +45,7 @@
 | 范围 | 本轮数字/结果 | 证据边界 |
 | :--- | :--- | :--- |
 | HA Connector | **30 项** | L2 软件测试；不证明真实 HA/实体动作 |
-| 提醒与 Host daemon | **37 项合计** | L2 软件测试；Reminder E2E teardown 留有 `WinError 32`，该套件不得标记全绿 |
+| 提醒与 Host daemon | **37 项合计** | L2 软件测试历史快照；早期 Reminder E2E teardown 有 `WinError 32`，现已在对应测试中显式 close `LifeService` 后再清理目录。最新定向数字见 §0 |
 | SDK bridge | **5 项 source-contract 检查通过；本机 GCC 依赖的 10 项用例 skipped** | 仅 source-contract L2；跳过用例没有运行结果，不证明编译或官方 SDK 互通 |
 | 输入/UI | **9 项** | L2 输入/UI contract；用户确认滚轮和按键可用，现场事件日志待归档 |
 | STM32 raw UART | **2 项静态检查** | 有一次交叉构建成功并生成镜像，但该镜像未烧录；没有 STM32 接收 ACK 或实物动作证据 |
@@ -84,10 +85,25 @@
 | 网络 / provisioning | `wifi status LINK_UP`；provisioning `mqtt_online`，但 `authorize_read rc=-1` | L3 单项状态观测；云端授权与 Tuya AI 会话未验 |
 | 音频输入 | 麦克风 READY/running，895 frames、errors=0、peak=95 | L3 PCM 采集观测；当前镜像 WakeNet/ASR/多轮对话/回复播报未复验。此前用户确认对应旧镜像 |
 | 相机 | Driver READY；PTL empty response `raw=00000000000000`，`rc=-25`，`out_len=0`，无 JPEG。READY 只表明初始化路径、expander 配置及 SPI bus/device 创建成功；未探测 HX ID/应答。同步命中后 7-byte SPI header read 返回 ESP_OK 但全零，才映射为 `rc=-25` | L3 失败；无真实图片。现场没有 scope/logic-analyzer 波形证据；下次必须在同一次 capture 同步观测 CS GPIO21、SCLK GPIO4、MISO GPIO6、MOSI GPIO5、PCA SYNC bit 6 和 HX 电源轨 |
-| STM32 / body UART | `body move 91 120 500` 返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)、`accepted=false`；之后 `body status` 显示 UART READY、cached setpoint 90/120、last formatted TX length 23 bytes | L3 真实命令尝试失败；没有 RX/ACK/物理动作证据。TX 长度不等于 STM32 收到命令，设定值仍为 90/120 表明未确认目标状态。日志：`.target_logging/com21-small-motion-test-20261022.log` |
+| STM32 / body UART | 本轮 move 与 stop 均 `rc=-3`；UART READY 是初始化状态，23-byte last frame 是格式化缓存；stop 是否执行无法确认 | L3 命令尝试超时；没有 RX/ACK/物理反馈，当前动作状态未知、安全闭环未验。驱动等待 ACK 最多 3×500ms，但未提供 RX 内容/CRC/序列/NACK 分类。COM21 已释放。后续先核对原理图、固件协议和内部 UART 接线，再决定是否加入 RX 诊断 |
 | Codex terminal summary 设备反馈 | `6255657` 在 Host managed SDK session 将 Codex terminal summary 编为 `ctrl.expression.set`；outbox 去重/幂等、退避和 UTF-8 63-byte 截断行为纳入实现 | combined 定向回归报告 166 passed、6 subtests passed，证据为 L2；测试中的 ACK 只代表 `accepted`。`WATCHER_APP_*` real managed Runtime 未配置/启动，无当前设备显示/声音或用户听感 L3 证据 |
 
 本次为指定真机状态增量，不代表全量回归或端到端通过；整机 L4 仍未完成。
+
+### 2026-10-22 定向回归补充（L2）
+
+| 范围 | 最新定向结果 | 证据边界 |
+| :--- | :--- | :--- |
+| HA Connector | **35 passed** | 软件 connector/路由测试；没有真实 HA 会话或物理设备动作 |
+| Reminder / Core | **61 passed，4 subtests passed** | 动态提醒 fixture 覆盖 24h catch-up 策略；DB teardown 先关闭 LifeService。仍是软件验证，不代表设备播报 |
+| A5 Companion | **48 passed** | Companion 软件回归；不代表设备已收到 Codex 结果 |
+| A2 SDK | **6 passed** | SDK 定向契约/互操作软件检查；不代表官方 SDK Runtime 已连接真机 |
+| 更新后的跨模块定向回归 | **19 passed** | L2 软件集成；不升级为 Level 3/4 设备闭环 |
+| 全仓 pytest | **336 passed、193 errors、1 failed、15 subtests** | 193 errors 与 1 failed 均因当前 Windows 运行环境缺少 `gcc`，native C harness 无法启动；这些结果不是功能断言失败，但全仓回归不能标为通过 |
+
+本轮相机测试只断言未接入真实 capture source 时不输出帧；产品实现明确禁止将合成/占位 JPEG 当作硬件画面。屏幕输入/UI contract 是源码级检查：滚轮选择四个只读页，短按和长按沿用 TuyaOpen talk alert 事件；真机页面变化日志仍待归档。
+
+`tests/test_p1_final_closure.py::test_os_rng_token_shape_smoke_check` 仅使用 Python `os.urandom(32)` 检查 OS RNG 字节可编码成 64 字符小写十六进制字符串。这是跨平台的字符串形状/熵 smoke check，**不调用固件 C token 生成实现，不构成固件 CSPRNG 验证**。
 
 ---
 
@@ -174,8 +190,8 @@
 | **`tests/connectors/`** | 26 | 1. 生产模式未配置凭据真实抛错（不伪造返回）<br/>2. 实体域与服务黑白名单多级校验（放行合规设备，拦截锁/安防/更新等敏感域）<br/>3. 两阶段状态确认机制（`accepted` 与 `state_confirmed` 解耦）<br/>4. 目标属性比对确认（亮度/色温等未达目标时 `state_confirmed=False`）<br/>5. 真实 HTTP 通信轮询与状态扭转<br/>6. WebSocket `/api/websocket` 客户端鉴权握手与状态流式订阅<br/>7. 指数退避断网重连与状态对账消除状态漂移<br/>8. 双通道容灾（WebSocket 中断时平滑降级 REST 轮询）与 HTTP 429 限流退避 |
 | **`tests/core/`** | 61 | 1. SQLite WAL 事务持久化保证零丢失<br/>2. 提醒创建、推迟(Snooze)与完成状态彻底解耦<br/>3. 开机追赶与到期轮次精准筛选<br/>4. 持久化发件箱（Outbox）出入队与去重<br/>5. 便签创建、全文检索与分页<br/>6. 后台 `ReminderScheduler` 自动轮询到期 occurrence，触发 ringing 状态扭转并投递 `reminder.alert` outbox 消息<br/>7. 宿主守护进程 HTTP RPC 端到端分发（集成 Codex 路由、相机帧流抓取、默认回环绑定与 401 鉴权拦截）<br/>8. 单事务原子触发（occurrence ringing / reminder ringing / 周期排程 / outbox 入队绝不脱节）<br/>9. 时区感知 (`zoneinfo`) 跨天与跨夏令时重复计算<br/>10. **R1/R2 运动 ACK 语义与请求关联**：固件 ACK 只判 `accepted`、驱动失败→`HARDWARE_FAULT`、静默→`unknown`+`OPERATION_TIMEOUT`、乱序/迟到/无 `request_id` 的 ACK 一律丢弃、`request_id` 并发唯一<br/>11. **A3 Python 伪设备故障信封测试 (`test_hardware_fault_envelope.py`)**：给定伪设备上报硬件故障时，Host 最外层信封正确失败（纯 Python 伪设备，**不能**证明真实固件会传播驱动错误） |
 | **`tests/e2e/`** | 47 | 1. 跨模块信封路由、幂等性去重与过期毫秒级拦截<br/>2. HA 领域指令执行与观察状态一致性闭环<br/>3. 生活服务持久化与服务重启恢复<br/>4. Codex 任务提交流程与敏感操作审批闭环<br/>5. 相机租约互斥与帧时效性检测<br/>6. 固件发起到 Host 路由与提醒后台到期投递全链路闭环<br/>7. **G1 软件协议仿真 (Level 2 PoC)**：`test_g1_official_sdk_and_tuya_interop.py`<br/>8. **A7 E2E 故障注入与网络自愈 (`test_e2e_fault_injection.py`)**：HA WebSocket 突发断连重连与状态对账自愈、进程异常退出与 SQLite WAL 崩溃恢复（到期提醒自动打上 `is_catchup=True` 追赶标记）、10 个高并发客户端争夺相机租约的绝对互斥仲裁、Router 高并发重复请求幂等缓存去重<br/>9. **A7 全系统长期稳定性压测 (`test_system_stability_stress.py`)**：200 轮跨域高频密集连续操作（50 提醒 + 50 HA 两阶段 + 50 Codex 任务/审批 + 50 相机拉流/续租），执行后校验 SQLite `PRAGMA integrity_check` 与 `foreign_key_check` 零损坏零外键违背<br/>10. **A7 真实链路端到端 (`test_real_chain_tclaw_to_host.py`)**：起真实 `DeskAgentHostApp`（真实 RobotAdapter / Router / LifeService / 后台调度器与发件箱 Worker），对端以忠实伪固件复现 `desk_sdk_bridge` TCP 服务与 TClaw 对话引擎，严格按 C 固件线格式收发。覆盖：工具请求经 TCP 贯通 Host 路由并在 SQLite 真实落库、固件 ACK 仅判 `accepted`（`state_confirmed=False`）、**固件扣发 ACK 时超时判定为 `unknown`+`OPERATION_TIMEOUT` 且绝不伪报成功**、到期提醒经调度器/发件箱回推 `ctrl.expression.play` 播报且 outbox 行为 `dispatched`（非退避）、未知操作与过期信封错误原路回传、脏数据不破坏链路、链路断开后自动重连并恢复链路<br/>11. **A7 跨模块 P1 回归门禁 (`test_p1_regression_gates.py`)**：见 §2.6<br/>12. **A7 真实固件跨层故障链路 (`test_real_firmware_motion_fault_chain.py`)**：见 §2.7 |
-| **`tests/test_p1_gaps_verification.py`** | 4 | 1. 泰山派远程调用 Windows Codex Companion 客户端分发与审批确认<br/>2. 提醒发件箱后台消费 Worker 投递到机器人音频通道与重试机制<br/>3. HA 实体与服务白名单拦截、状态对账与状态变更订阅回调<br/>4. 相机动态 FrameCapturePipeline 抓取与动态云台坐标叠加验证 |
-| **`tests/test_p1_final_closure.py`** | 5 | 1. CSPRNG 动态 Token 熵值与格式校验<br/>2. RobotAdapter TCP/UDP 握手、舵机运动控制与到期提醒音频播报通道投递<br/>3. Host 路由器 Codex 待审批查询（`codex.get_pending_approvals` / `codex.list_approvals`）<br/>4. Host 路由器 HA 状态迁移事件查询（`ha.list_changes`）<br/>5. 相机硬件传感器帧源接入与 `hardware_sensor` 标签识别 |
+| **`tests/test_p1_gaps_verification.py`** | 4 | 1. 泰山派远程调用 Windows Codex Companion 客户端分发与审批确认<br/>2. 提醒发件箱后台消费 Worker 投递与重试机制<br/>3. HA 实体与服务白名单拦截、状态对账与状态变更订阅回调<br/>4. 无真实 capture source 时 FrameCapturePipeline 不输出合成/占位帧；不验证真实相机取帧 |
+| **`tests/test_p1_final_closure.py`** | 5 | 1. Python OS RNG 字节的十六进制字符串形状 smoke check（不验证固件 C token 生成）<br/>2. RobotAdapter TCP/UDP 握手、舵机运动控制与到期提醒通道投递<br/>3. Host 路由器 Codex 待审批查询（`codex.get_pending_approvals` / `codex.list_approvals`）<br/>4. Host 路由器 HA 状态迁移事件查询（`ha.list_changes`）<br/>5. 相机硬件传感器帧源接入与 `hardware_sensor` 标签识别 |
 
 ### 2.4 验收脚本范围及本轮状态 (`tools/verification/verify_all.sh`)
 为落实 `AGENTS.md` 规范第 4 节，提供自动化脚本对 Level 1 ~ Level 4 进行统一检查：

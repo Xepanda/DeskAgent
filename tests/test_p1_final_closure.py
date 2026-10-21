@@ -1,7 +1,7 @@
 """
 Desk Agent R1 Comprehensive P1/P2 Closed-Loop Integration Test Suite.
 Validates:
-1. CSPRNG pairing token generation in firmware.
+1. OS RNG token string shape and entropy smoke check (not firmware token generation).
 2. RobotAdapter UDP pairing, TCP handshake, announcement delivery, and motion dispatch.
 3. Host router Codex pending approvals RPC query (codex.get_pending_approvals / codex.list_approvals).
 4. Host router Home Assistant state transition subscription & event query (ha.list_changes).
@@ -38,19 +38,11 @@ class TestP1FinalClosure(unittest.TestCase):
         self.temp_dir.cleanup()
 
     # -------------------------------------------------------------------------
-    # 1. CSPRNG Token Verification in C SDK Bridge
+    # 1. OS RNG token shape and entropy smoke check
     # -------------------------------------------------------------------------
-    def test_csprng_dynamic_token_entropy(self) -> None:
-        """Verifies dynamic token in C library produces 64-char hexadecimal string with high entropy."""
-        lib_path = Path("firmware/build/libdesk_sdk_bridge.a")
-        if not lib_path.exists():
-            lib_path = Path("firmware/build/esp-idf/desk_sdk_bridge/libdesk_sdk_bridge.a")
-        self.assertTrue(lib_path.exists(), "Firmware static library must be built")
-
-        # Test via Python urandom equivalent and C shared library if compiled
-        # Read from /dev/urandom as POSIX baseline
-        with open("/dev/urandom", "rb") as f:
-            rnd = f.read(32)
+    def test_os_rng_token_shape_smoke_check(self) -> None:
+        """Smoke-check OS RNG bytes encode as a 64-character lowercase hex string."""
+        rnd = os.urandom(32)
         token = rnd.hex()
         self.assertEqual(len(token), 64)
         self.assertTrue(all(c in "0123456789abcdef" for c in token))

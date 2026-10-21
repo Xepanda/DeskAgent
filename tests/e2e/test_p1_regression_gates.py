@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -533,9 +534,11 @@ class OutboundEnvelopeGates(RealChainGateCase):
 
     def test_reminder_delivery_still_works_end_to_end(self) -> None:
         """A due reminder is delivered to the robot channel and the outbox row dispatched."""
+        # Keep the due time within the scheduler's 24-hour catch-up window.
+        due_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
         resp = self.tool_roundtrip(
             "req-gate-reg-due", "reminder.create",
-            {"reminder_id": "rem-gate-due", "title": "Stretch", "due_at": "2026-10-16T08:00:00Z"},
+            {"reminder_id": "rem-gate-due", "title": "Stretch", "due_at": due_at},
         )
         self.assertEqual(resp.get("status"), "succeeded")
 
