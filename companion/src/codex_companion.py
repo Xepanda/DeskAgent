@@ -1340,7 +1340,7 @@ class RemoteCodexCompanionClient:
         self.state_file_path = state_file_path
         self.workspaces: dict[str, str] = {}
         self._lock = threading.RLock()
-        self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
+        self._event_listeners: list[Callable[[str, dict[str, Any]], bool]] = []
         self._pending_tasks: dict[str, dict[str, Any]] = {}
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
@@ -1384,7 +1384,7 @@ class RemoteCodexCompanionClient:
             if self._pending_tasks and self._event_listeners:
                 self._ensure_polling_thread()
 
-    def add_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
+    def add_event_listener(self, cb: Callable[[str, dict[str, Any]], bool]) -> None:
         with self._lock:
             if cb not in self._event_listeners:
                 self._event_listeners.append(cb)
@@ -1409,16 +1409,16 @@ class RemoteCodexCompanionClient:
             listeners = list(self._event_listeners)
         if not listeners:
             return False
-        any_false = False
+        all_acked = True
         for cb in listeners:
             try:
                 res = cb(event_type, data)
-                if res is False:
-                    any_false = True
+                if res is not True:
+                    all_acked = False
             except Exception as err:
                 logger.warning("Remote Codex event listener error: %s", err)
-                any_false = True
-        return not any_false
+                all_acked = False
+        return all_acked
 
     def _ensure_polling_thread(self) -> None:
         with self._lock:

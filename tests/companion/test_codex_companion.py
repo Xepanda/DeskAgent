@@ -700,6 +700,59 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertNotIn("result", events[0][1])
         self.assertNotIn(prompt, json.dumps(events[0][1]))
 
+    def test_remote_task_is_not_acknowledged_by_listener_without_explicit_true(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9995", poll_interval=0.01)
+        task_id = "tsk-no-device-ack"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": "private prompt"}
+        client.get_task_status = lambda _task_id: {
+            "result": {"task_id": task_id, "status": "completed", "summary": "assistant result"}
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+        stop_after_delivery = threading.Event()
+
+        def observer(event: str, data: dict[str, Any]) -> None:
+            events.append((event, data))
+            stop_after_delivery.set()
+
+        try:
+            client.add_event_listener(observer)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not stop_after_delivery.is_set():
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertIn(task_id, client._pending_tasks)
+
+    def test_remote_task_is_acknowledged_only_when_listener_returns_true(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9994", poll_interval=0.01)
+        task_id = "tsk-device-ack"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": "private prompt"}
+        client.get_task_status = lambda _task_id: {
+            "result": {"task_id": task_id, "status": "completed", "summary": "assistant result"}
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def accepted(event: str, data: dict[str, Any]) -> bool:
+            events.append((event, data))
+            return True
+
+        try:
+            client.add_event_listener(accepted)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and task_id in client._pending_tasks:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertNotIn(task_id, client._pending_tasks)
+
     def test_remote_failure_event_uses_persisted_failure_summary(self) -> None:
         from companion.src.codex_companion import RemoteCodexCompanionClient
 
