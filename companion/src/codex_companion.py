@@ -1111,7 +1111,28 @@ class CodexCompanion:
         params: dict[str, Any] = {"threadId": thread_id, "turnId": turn_id}
         if reason:
             params["reason"] = reason
-        transport.send_request("turn/interrupt", params)
+        try:
+            transport.send_request("turn/interrupt", params)
+        except RuntimeError as exc:
+            # Cancellation can race with a turn that has already reached a
+            # terminal state. Reconcile the authoritative thread state so the
+            # caller receives completed/interrupted instead of a stale RPC
+            # error and a task left marked as running.
+            if "no active turn to interrupt" not in str(exc).lower():
+                raise
+            self.recover_pending_tasks()
+            with self._lock:
+                task = self._tasks.get(task_id)
+                terminal_statuses = {"completed", "failed", "interrupted", "cancelled", "succeeded", "error"}
+                if task is not None and str(task.get("status") or "").lower() in terminal_statuses:
+                    return {
+                        "task_id": task_id,
+                        "turn_id": turn_id,
+                        "status": task["status"],
+                        "summary": task.get("summary") or task.get("last_output") or "",
+                        "reason": reason,
+                    }
+            raise
 
         with self._lock:
             task["state"] = "cancelling"

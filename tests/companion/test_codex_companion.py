@@ -953,6 +953,43 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertNotIn("turn_id", params)
         companion.close()
 
+    def test_cancel_reconciles_server_terminal_state_when_turn_is_no_longer_active(self) -> None:
+        """A completion/cancel race should return the app-server's terminal state."""
+        class NoActiveTurnTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"capabilities": {}}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": "thr-no-active-01"}
+                if method == "turn/start":
+                    return {"turn_id": "trn-no-active-01", "state": "running"}
+                if method == "turn/interrupt":
+                    raise RuntimeError("Codex JSON-RPC error: no active turn to interrupt")
+                if method == "thread/resume":
+                    return {"thread": {"id": params["threadId"], "turns": [{
+                        "id": "trn-no-active-01",
+                        "status": "interrupted",
+                        "items": [],
+                    }]}}
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=NoActiveTurnTransport(),
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        companion.add_event_listener(lambda event, data: events.append((event, data)))
+        companion.submit_task("tsk-no-active-01", "test-project", "private prompt")
+
+        result = companion.cancel_task("tsk-no-active-01", reason="User requested stop")
+
+        status = companion.get_task_status("tsk-no-active-01")
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(status["status"], "interrupted")
+        self.assertNotIn("private prompt", status["summary"])
+        self.assertEqual([event for event, _ in events], ["codex.interrupted"])
+        companion.close()
+
     def test_initialize_resumes_persisted_running_thread_and_restores_turn_correlation(self) -> None:
         db_file = os.path.join(self.temp_dir.name, "resume-running.db")
         original = CodexCompanion(
