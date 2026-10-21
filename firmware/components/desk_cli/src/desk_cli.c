@@ -18,6 +18,7 @@
 #include "desk_hardware.h"
 #include "desk_tclaw_bridge.h"
 #include "desk_sdk_bridge.h"
+#include "desk_watcher_input.h"
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_audio.h"
 #include "desk_watcher_camera.h"
@@ -59,6 +60,7 @@ static void cmd_audio(int argc, char *argv[]);
 static void cmd_camera(int argc, char *argv[]);
 static void cmd_body(int argc, char *argv[]);
 static void cmd_peripherals(int argc, char *argv[]);
+static void cmd_input(int argc, char *argv[]);
 static void cmd_network(int argc, char *argv[]);
 static void cmd_wifi(int argc, char *argv[]);
 static void cmd_provisioning(int argc, char *argv[]);
@@ -176,6 +178,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"camera", "Camera subsystem diagnostic: camera [status|capture]", cmd_camera},
     {"body", "STM32 control: body [status|move <pan> <tilt> [duration_ms]|stop]", cmd_body},
     {"peripherals", "Board peripherals status (RTC, LED, battery)", cmd_peripherals},
+    {"input", "Read-only input driver status and event counters", cmd_input},
     {"network", "SDK TCP/UDP server status: network [status]", cmd_network},
     {"wifi", "Read-only Wi-Fi status: wifi [status]", cmd_wifi},
     {"provisioning", "Read-only Tuya provisioning state", cmd_provisioning},
@@ -485,6 +488,69 @@ static void cmd_peripherals(int argc, char *argv[])
     printf("  RGB LED state         : UNKNOWN (no readback API)\r\n");
     printf("  Battery state         : UNKNOWN (no ADC status API)\r\n");
     printf("  IO Expander state     : UNKNOWN (probe may initialize board power)\r\n");
+}
+
+static const char *input_state_name(desk_watcher_input_state_t state)
+{
+    switch (state) {
+    case DESK_WATCHER_INPUT_INIT: return "INIT";
+    case DESK_WATCHER_INPUT_READY: return "READY";
+    case DESK_WATCHER_INPUT_ERROR: return "ERROR";
+    case DESK_WATCHER_INPUT_UNKNOWN:
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *input_target_name(desk_touch_target_t target)
+{
+    switch (target) {
+    case DESK_TOUCH_TARGET_BACKTOUCH: return "BACKTOUCH";
+    case DESK_TOUCH_TARGET_SCREENTOUCH: return "SCREENTOUCH";
+    case DESK_TOUCH_TARGET_ROLLER: return "ROLLER";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *input_action_name(desk_touch_action_t action)
+{
+    switch (action) {
+    case DESK_TOUCH_ACTION_SHORT_PRESS: return "SHORT_PRESS";
+    case DESK_TOUCH_ACTION_LONG_PRESS: return "LONG_PRESS";
+    case DESK_TOUCH_ACTION_SCROLL_UP: return "SCROLL_UP";
+    case DESK_TOUCH_ACTION_SCROLL_DOWN: return "SCROLL_DOWN";
+    default: return "UNKNOWN";
+    }
+}
+
+static void cmd_input(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    printf("Input Status (read-only):\r\n");
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    desk_watcher_input_status_t status = {0};
+    int rc = desk_watcher_input_get_status(&status);
+    if (rc != DESK_HW_OK) {
+        printf("  Status read: UNKNOWN (rc=%d)\r\n", rc);
+        return;
+    }
+    printf("  Knob  : %s events=%lu error_code=%d\r\n", input_state_name(status.knob.state),
+           (unsigned long)status.knob.event_count, status.knob.error_code);
+    printf("  Button: %s events=%lu error_code=%d\r\n", input_state_name(status.button.state),
+           (unsigned long)status.button.event_count, status.button.error_code);
+    printf("  Touch : %s events=%lu error_code=%d\r\n", input_state_name(status.touch.state),
+           (unsigned long)status.touch.event_count, status.touch.error_code);
+    if (status.last_event_valid) {
+        printf("  Last event: target=%s action=%s\r\n", input_target_name(status.last_target),
+               input_action_name(status.last_action));
+    } else {
+        printf("  Last event: UNKNOWN (none observed)\r\n");
+    }
+#else
+    printf("  Knob  : UNKNOWN events=0 error_code=0\r\n");
+    printf("  Button: UNKNOWN events=0 error_code=0\r\n");
+    printf("  Touch : UNKNOWN events=0 error_code=0\r\n");
+    printf("  Last event: UNKNOWN (input hardware status unavailable)\r\n");
+#endif
 }
 
 static void cmd_network(int argc, char *argv[])

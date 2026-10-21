@@ -19,6 +19,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/portmacro.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #endif
@@ -44,9 +45,16 @@
 
 static bool s_input_initialized = false;
 static volatile bool s_input_task_running = false;
+static bool s_touch_i2c_owned = false;
+static desk_watcher_input_status_t s_status = {
+    .knob = { .state = DESK_WATCHER_INPUT_UNKNOWN },
+    .button = { .state = DESK_WATCHER_INPUT_UNKNOWN },
+    .touch = { .state = DESK_WATCHER_INPUT_UNKNOWN },
+};
 
 #ifdef ESP_PLATFORM
 static TaskHandle_t s_input_task_handle = NULL;
+static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
 #endif
 
 extern int desk_watcher_board_pca_read(uint8_t reg, uint8_t *value);
@@ -69,7 +77,7 @@ static esp_err_t watcher_touch_i2c_init(void)
     return i2c_driver_install(WATCHER_TOUCH_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
 }
 
-static void watcher_knob_gpio_init(void)
+static int watcher_knob_gpio_init(void)
 {
     const gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << WATCHER_KNOB_PIN_A) | (1ULL << WATCHER_KNOB_PIN_B),
@@ -78,18 +86,36 @@ static void watcher_knob_gpio_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io_conf);
+    return (int)gpio_config(&io_conf);
 }
 
-static void watcher_btn_expander_init(void)
+static int watcher_btn_expander_init(void)
 {
     uint8_t cfg0 = 0;
-    if (desk_watcher_board_pca_read(PCA_REG_CONFIG0, &cfg0) == DESK_HW_OK) {
-        uint8_t next_cfg0 = (uint8_t)(cfg0 | PCA_PIN_BTN_PORT0_MASK); /* Input */
-        if (next_cfg0 != cfg0) {
-            desk_watcher_board_pca_write(PCA_REG_CONFIG0, next_cfg0);
-        }
+    int rc = desk_watcher_board_pca_read(PCA_REG_CONFIG0, &cfg0);
+    if (rc != DESK_HW_OK) return rc;
+    uint8_t next_cfg0 = (uint8_t)(cfg0 | PCA_PIN_BTN_PORT0_MASK); /* Input */
+    if (next_cfg0 != cfg0) {
+        rc = desk_watcher_board_pca_write(PCA_REG_CONFIG0, next_cfg0);
     }
+    return rc;
+}
+
+static void watcher_input_record_event(desk_watcher_input_channel_status_t *channel,
+                                       desk_touch_target_t target,
+                                       desk_touch_action_t action)
+{
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&s_status_mux);
+#endif
+    channel->event_count++;
+    s_status.last_event_valid = true;
+    s_status.last_target = target;
+    s_status.last_action = action;
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&s_status_mux);
+#endif
+    (void)desk_hardware_feed_touch_event(target, action);
 }
 
 static bool watcher_knob_decode_step(int previous_state, int current_state,
@@ -142,29 +168,34 @@ static void watcher_input_worker_task(void *arg)
     int64_t touch_start_us = 0;
     int touch_start_y = 0;
 
-    int cur_a = gpio_get_level(WATCHER_KNOB_PIN_A);
-    int cur_b = gpio_get_level(WATCHER_KNOB_PIN_B);
-    last_state = (cur_a << 1) | cur_b;
+    if (s_status.knob.state == DESK_WATCHER_INPUT_READY) {
+        int cur_a = gpio_get_level(WATCHER_KNOB_PIN_A);
+        int cur_b = gpio_get_level(WATCHER_KNOB_PIN_B);
+        last_state = (cur_a << 1) | cur_b;
+    }
 
     while (s_input_task_running) {
         vTaskDelay(pdMS_TO_TICKS(25));
 
         /* --- 1. Knob Quadrature Decoding --- */
-        cur_a = gpio_get_level(WATCHER_KNOB_PIN_A);
-        cur_b = gpio_get_level(WATCHER_KNOB_PIN_B);
-        int state = (cur_a << 1) | cur_b;
+        if (s_status.knob.state == DESK_WATCHER_INPUT_READY) {
+            cur_a = gpio_get_level(WATCHER_KNOB_PIN_A);
+            cur_b = gpio_get_level(WATCHER_KNOB_PIN_B);
+            int state = (cur_a << 1) | cur_b;
 
-        if (state != last_state) {
-            desk_touch_action_t action;
-            if (watcher_knob_decode_step(last_state, state, &knob_quarter_steps, &action)) {
-                desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, action);
+            if (state != last_state) {
+                desk_touch_action_t action;
+                if (watcher_knob_decode_step(last_state, state, &knob_quarter_steps, &action)) {
+                    watcher_input_record_event(&s_status.knob, DESK_TOUCH_TARGET_ROLLER, action);
+                }
+                last_state = state;
             }
-            last_state = state;
         }
 
         /* --- 2. Knob Button via PCA9535 Expander --- */
         uint8_t in0 = 0xFF;
-        if (desk_watcher_board_pca_read(PCA_REG_INPUT0, &in0) == DESK_HW_OK) {
+        if (s_status.button.state == DESK_WATCHER_INPUT_READY &&
+            desk_watcher_board_pca_read(PCA_REG_INPUT0, &in0) == DESK_HW_OK) {
             bool btn_pressed = ((in0 & PCA_PIN_BTN_PORT0_MASK) == 0); /* Active low */
 
             if (btn_pressed && !btn_was_pressed) {
@@ -174,9 +205,11 @@ static void watcher_input_worker_task(void *arg)
                 btn_was_pressed = false;
                 int64_t duration_ms = (esp_timer_get_time() - btn_press_start_us) / 1000;
                 if (duration_ms >= 500) {
-                    desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_LONG_PRESS);
+                    watcher_input_record_event(&s_status.button, DESK_TOUCH_TARGET_ROLLER,
+                                               DESK_TOUCH_ACTION_LONG_PRESS);
                 } else if (duration_ms >= 30) {
-                    desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SHORT_PRESS);
+                    watcher_input_record_event(&s_status.button, DESK_TOUCH_TARGET_ROLLER,
+                                               DESK_TOUCH_ACTION_SHORT_PRESS);
                 }
             }
         }
@@ -184,10 +217,13 @@ static void watcher_input_worker_task(void *arg)
         /* --- 3. SPD2010 Touch on I2C1 --- */
         uint8_t touch_reg = 0x00;
         uint8_t touch_data[6] = {0};
-        esp_err_t err = i2c_master_write_read_device(WATCHER_TOUCH_I2C_PORT, WATCHER_TOUCH_ADDR,
-                                                    &touch_reg, 1, touch_data, sizeof(touch_data),
-                                                    pdMS_TO_TICKS(10));
-        if (err == ESP_OK) {
+        esp_err_t err = ESP_FAIL;
+        if (s_status.touch.state == DESK_WATCHER_INPUT_READY) {
+            err = i2c_master_write_read_device(WATCHER_TOUCH_I2C_PORT, WATCHER_TOUCH_ADDR,
+                                               &touch_reg, 1, touch_data, sizeof(touch_data),
+                                               pdMS_TO_TICKS(10));
+        }
+        if (s_status.touch.state == DESK_WATCHER_INPUT_READY && err == ESP_OK) {
             bool pressed = (touch_data[0] > 0);
             int cur_y = (int)(((touch_data[3] & 0x0F) << 8) | touch_data[4]);
 
@@ -201,13 +237,17 @@ static void watcher_input_worker_task(void *arg)
                 int dy = cur_y - touch_start_y;
 
                 if (dy < -40) {
-                    desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_SCREENTOUCH, DESK_TOUCH_ACTION_SCROLL_UP);
+                    watcher_input_record_event(&s_status.touch, DESK_TOUCH_TARGET_SCREENTOUCH,
+                                               DESK_TOUCH_ACTION_SCROLL_UP);
                 } else if (dy > 40) {
-                    desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_SCREENTOUCH, DESK_TOUCH_ACTION_SCROLL_DOWN);
+                    watcher_input_record_event(&s_status.touch, DESK_TOUCH_TARGET_SCREENTOUCH,
+                                               DESK_TOUCH_ACTION_SCROLL_DOWN);
                 } else if (duration_ms >= 400) {
-                    desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_SCREENTOUCH, DESK_TOUCH_ACTION_LONG_PRESS);
+                    watcher_input_record_event(&s_status.touch, DESK_TOUCH_TARGET_SCREENTOUCH,
+                                               DESK_TOUCH_ACTION_LONG_PRESS);
                 } else if (duration_ms >= 20) {
-                    desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_SCREENTOUCH, DESK_TOUCH_ACTION_SHORT_PRESS);
+                    watcher_input_record_event(&s_status.touch, DESK_TOUCH_TARGET_SCREENTOUCH,
+                                               DESK_TOUCH_ACTION_SHORT_PRESS);
                 }
             }
         }
@@ -222,23 +262,60 @@ int desk_watcher_input_init(void)
 #ifdef ESP_PLATFORM
     if (s_input_initialized) return DESK_HW_OK;
 
-    watcher_knob_gpio_init();
-    watcher_btn_expander_init();
-    (void)watcher_touch_i2c_init();
+    memset(&s_status, 0, sizeof(s_status));
+    s_status.knob = (desk_watcher_input_channel_status_t){ .state = DESK_WATCHER_INPUT_INIT };
+    s_status.button = (desk_watcher_input_channel_status_t){ .state = DESK_WATCHER_INPUT_INIT };
+    s_status.touch = (desk_watcher_input_channel_status_t){ .state = DESK_WATCHER_INPUT_INIT };
+
+    int knob_rc = watcher_knob_gpio_init();
+    s_status.knob.state = knob_rc == 0 ? DESK_WATCHER_INPUT_READY : DESK_WATCHER_INPUT_ERROR;
+    s_status.knob.error_code = knob_rc;
+
+    int button_rc = watcher_btn_expander_init();
+    s_status.button.state = button_rc == DESK_HW_OK ? DESK_WATCHER_INPUT_READY : DESK_WATCHER_INPUT_ERROR;
+    s_status.button.error_code = button_rc;
+
+    int touch_rc = (int)watcher_touch_i2c_init();
+    s_status.touch.state = touch_rc == 0 ? DESK_WATCHER_INPUT_READY : DESK_WATCHER_INPUT_ERROR;
+    s_status.touch.error_code = touch_rc;
+    s_touch_i2c_owned = touch_rc == 0;
+
+    if (s_status.knob.state != DESK_WATCHER_INPUT_READY &&
+        s_status.button.state != DESK_WATCHER_INPUT_READY &&
+        s_status.touch.state != DESK_WATCHER_INPUT_READY) {
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
 
     s_input_task_running = true;
     BaseType_t ret = xTaskCreate(watcher_input_worker_task, "watcher_input", 2048, NULL, 3, &s_input_task_handle);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create input polling task");
         s_input_task_running = false;
+        const int task_error = DESK_HW_ERR_UNAVAILABLE;
+        if (s_status.knob.state == DESK_WATCHER_INPUT_READY) {
+            s_status.knob.state = DESK_WATCHER_INPUT_ERROR;
+            s_status.knob.error_code = task_error;
+        }
+        if (s_status.button.state == DESK_WATCHER_INPUT_READY) {
+            s_status.button.state = DESK_WATCHER_INPUT_ERROR;
+            s_status.button.error_code = task_error;
+        }
+        if (s_status.touch.state == DESK_WATCHER_INPUT_READY) {
+            s_status.touch.state = DESK_WATCHER_INPUT_ERROR;
+            s_status.touch.error_code = task_error;
+        }
         return DESK_HW_ERR_UNAVAILABLE;
     }
 
     s_input_initialized = true;
-    ESP_LOGI(TAG, "Watcher input driver initialized (Knob: GPIO 41/42, Touch: I2C1 GPIO 39/38, Btn: PCA9535 bit 3)");
-    return DESK_HW_OK;
+    ESP_LOGI(TAG, "Watcher input polling active (knob=%d button=%d touch=%d)",
+             (int)s_status.knob.state, (int)s_status.button.state, (int)s_status.touch.state);
+    return (knob_rc == 0 && button_rc == DESK_HW_OK && touch_rc == 0) ? DESK_HW_OK : DESK_HW_ERR_IO;
 #else
-    s_input_initialized = true;
+    s_status.knob.state = DESK_WATCHER_INPUT_UNKNOWN;
+    s_status.button.state = DESK_WATCHER_INPUT_UNKNOWN;
+    s_status.touch.state = DESK_WATCHER_INPUT_UNKNOWN;
+    s_input_initialized = false;
     return DESK_HW_OK;
 #endif
 }
@@ -249,16 +326,36 @@ int desk_watcher_input_deinit(void)
     if (s_input_initialized) {
         s_input_task_running = false;
         vTaskDelay(pdMS_TO_TICKS(50));
-        i2c_driver_delete(WATCHER_TOUCH_I2C_PORT);
         s_input_initialized = false;
+    }
+    if (s_touch_i2c_owned) {
+        i2c_driver_delete(WATCHER_TOUCH_I2C_PORT);
+        s_touch_i2c_owned = false;
     }
 #else
     s_input_initialized = false;
 #endif
+    memset(&s_status, 0, sizeof(s_status));
+    s_status.knob.state = DESK_WATCHER_INPUT_UNKNOWN;
+    s_status.button.state = DESK_WATCHER_INPUT_UNKNOWN;
+    s_status.touch.state = DESK_WATCHER_INPUT_UNKNOWN;
     return DESK_HW_OK;
 }
 
 bool desk_watcher_input_is_ready(void)
 {
     return s_input_initialized;
+}
+
+int desk_watcher_input_get_status(desk_watcher_input_status_t *status)
+{
+    if (!status) return DESK_HW_ERR_INVALID_ARG;
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&s_status_mux);
+#endif
+    *status = s_status;
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&s_status_mux);
+#endif
+    return DESK_HW_OK;
 }
