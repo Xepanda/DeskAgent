@@ -529,6 +529,43 @@ class TestHAConnector(unittest.TestCase):
             stop_sub()
             ha.close()
 
+    def test_websocket_reconnects_after_transient_unavailability(self) -> None:
+        """A transient HA outage must recover the authenticated event channel without restarting the host."""
+        connected_ws = MockWebSocketClient([
+            json.dumps({"type": "auth_required", "ha_version": "2026.10"}),
+            json.dumps({"type": "auth_ok", "ha_version": "2026.10"}),
+            json.dumps({"id": 1, "type": "result", "success": True, "result": None}),
+        ])
+        attempts = 0
+
+        def ws_factory(url: str) -> MockWebSocketClient:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ConnectionError("simulated temporary HA outage")
+            return connected_ws
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            transport=lambda *args: (200, []),
+            ws_factory=ws_factory,
+        )
+        stop_sub = ha.subscribe_state_changes(lambda *args: None, interval_sec=0.1)
+        try:
+            deadline = time.monotonic() + 3.5
+            while not ha.is_ws_connected and time.monotonic() < deadline:
+                time.sleep(0.02)
+
+            self.assertGreaterEqual(attempts, 2)
+            self.assertTrue(ha.is_ws_connected)
+            sent = [json.loads(message) for message in connected_ws.sent]
+            self.assertEqual(sent[0]["type"], "auth")
+            self.assertEqual(sent[-1]["type"], "subscribe_events")
+        finally:
+            stop_sub()
+            ha.close()
+
     def test_websocket_rejected_subscription_is_not_reported_connected(self) -> None:
         """HA must acknowledge the exact subscription before the connector claims event coverage."""
         script = [
