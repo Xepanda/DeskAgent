@@ -742,6 +742,22 @@ class TestLifeService(unittest.TestCase):
         )
         self.assertEqual(next_hourly_fold, "2026-11-01T06:30:00Z")
 
+    def test_new_york_fallback_preserves_second_fold_wall_time(self) -> None:
+        """The bundled Windows fallback must distinguish the repeated 01:30 after DST ends."""
+        from host.desk_agent.services.life_service import compute_next_occurrence
+
+        with patch(
+            "host.desk_agent.services.life_service.zoneinfo.ZoneInfo",
+            side_effect=KeyError("tzdata unavailable"),
+        ):
+            next_daily = compute_next_occurrence(
+                "2026-11-01T06:30:00Z", "daily", tz_name="America/New_York"
+            )
+
+        # 06:30Z is the second 01:30 (EST). The next daily occurrence is
+        # 01:30 EST on Nov 2, which is still 06:30Z.
+        self.assertEqual(next_daily, "2026-11-02T06:30:00Z")
+
     # -------------------------------------------------------------------------
     # 13. LifeService Close & Context Manager
     # -------------------------------------------------------------------------

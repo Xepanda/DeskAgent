@@ -36,7 +36,15 @@ class _FallbackEasternTz(tzinfo):
         n1_w = datetime(y, 11, 1).weekday()
         dst_end = datetime(y, 11, 1 + (6 - n1_w) % 7, 2, 0)
         naive = dt.replace(tzinfo=None)
-        if dst_start <= naive < dst_end:
+        # 02:00-03:00 on the spring transition date is a nonexistent local
+        # interval. Match ZoneInfo's default (fold=0) interpretation as EST.
+        if naive.date() == dst_start.date() and naive.hour == 2:
+            return timedelta(hours=-5)
+        # On the fall transition date, 01:00-02:00 occurs twice. fold=0 is
+        # the daylight occurrence and fold=1 is standard time.
+        if naive.date() == dst_end.date() and naive.hour == 1:
+            return timedelta(hours=-5 if dt.fold else -4)
+        if dst_start + timedelta(hours=1) <= naive < dst_end:
             return timedelta(hours=-4)
         return timedelta(hours=-5)
 
@@ -47,6 +55,23 @@ class _FallbackEasternTz(tzinfo):
 
     def tzname(self, dt: Optional[datetime]) -> str:
         return "EDT" if self.dst(dt) else "EST"
+
+    def fromutc(self, dt: datetime) -> datetime:
+        """Convert UTC to Eastern time while preserving the autumn fold bit."""
+        if dt.tzinfo is not self:
+            raise ValueError("fromutc: dt.tzinfo is not self")
+        year = dt.year
+        march_first_weekday = datetime(year, 3, 1).weekday()
+        dst_start_day = 1 + (6 - march_first_weekday) % 7 + 7
+        november_first_weekday = datetime(year, 11, 1).weekday()
+        dst_end_day = 1 + (6 - november_first_weekday) % 7
+        start_utc = datetime(year, 3, dst_start_day, 7)
+        end_utc = datetime(year, 11, dst_end_day, 6)
+        utc_naive = dt.replace(tzinfo=None)
+        is_dst = start_utc <= utc_naive < end_utc
+        local_naive = utc_naive + timedelta(hours=-4 if is_dst else -5)
+        fold = int(end_utc <= utc_naive < end_utc + timedelta(hours=1))
+        return local_naive.replace(tzinfo=self, fold=fold)
 
 
 def _resolve_timezone(tz_name: Optional[str]) -> timezone | zoneinfo.ZoneInfo:
