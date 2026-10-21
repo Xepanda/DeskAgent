@@ -338,7 +338,7 @@ class TestHostDaemon(unittest.TestCase):
             with urlopen(release_request) as response:
                 self.assertTrue(json.loads(response.read().decode())["result"]["released"])
 
-    def test_snapshot_endpoint_retrieval(self) -> None:
+    def test_snapshot_endpoint_unavailable_without_physical_image_source(self) -> None:
         """GET /snapshot reports unavailable when the Host has no physical image source."""
         snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
         with self.assertRaises(HTTPError) as error:
@@ -347,6 +347,21 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(error.exception.code, 404)
         finally:
             error.exception.close()
+
+    def test_snapshot_endpoint_retrieval(self) -> None:
+        """Verifies GET /snapshot returns fresh JPEG with anti-caching and frame headers."""
+        jpeg = b"\xff\xd8host-test-image\xff\xd9"
+        self.app.camera_service.set_hardware_frame_source(lambda: jpeg)
+        snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
+        try:
+            with urlopen(snap_req) as snap_resp:
+                self.assertEqual(snap_resp.status, 200)
+                self.assertEqual(snap_resp.headers.get("Content-Type"), "image/jpeg")
+                self.assertIn("no-cache", snap_resp.headers.get("Cache-Control", ""))
+                self.assertIsNotNone(snap_resp.headers.get("X-Frame-Seq"))
+                self.assertEqual(snap_resp.read(), jpeg)
+        finally:
+            self.app.camera_service.set_hardware_frame_source(None)
 
     def test_reminder_automatic_scheduler_delivery(self) -> None:
         """Verifies background ReminderScheduler automatically triggers ringing and outbox alert for due items."""

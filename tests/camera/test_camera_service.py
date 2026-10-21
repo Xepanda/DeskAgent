@@ -206,5 +206,62 @@ class TestCameraService(unittest.TestCase):
         cam.release_lease("viewer")
 
 
+    def test_get_snapshot_auto_acquire(self) -> None:
+        """Confirms get_snapshot auto-acquires a lease and waits for a real frame source."""
+        cam = CameraViewerService(default_lease_ms=500, auto_start_pipeline=True, allow_synthetic=True)
+        cam.set_hardware_frame_source(lambda: TEST_JPEG)
+        try:
+            self.assertFalse(cam.is_lease_valid())
+            frame = cam.get_snapshot()
+            self.assertIsNotNone(frame)
+            self.assertFalse(cam.is_lease_valid(), "The short-lived snapshot lease must be released after returning bytes")
+            self.assertEqual(frame["jpeg_data"], TEST_JPEG)
+            self.assertTrue(frame["is_hardware"])
+        finally:
+            cam.stop_capture()
+
+    def test_get_snapshot_with_active_lease(self) -> None:
+        """Confirms get_snapshot returns a real frame for the active lease owner."""
+        cam = CameraViewerService(default_lease_ms=1000, auto_start_pipeline=True, allow_synthetic=True)
+        cam.set_hardware_frame_source(lambda: TEST_JPEG)
+        try:
+            cam.acquire_lease("active-user", lease_ms=2000)
+            time.sleep(0.12)
+            frame = cam.get_snapshot("active-user")
+            self.assertIsNotNone(frame)
+            self.assertEqual(cam._active_lease_owner, "active-user")
+            self.assertEqual(frame["jpeg_data"], TEST_JPEG)
+            self.assertTrue(frame["is_hardware"])
+        finally:
+            cam.release_lease("active-user")
+            cam.stop_capture()
+
+
+    def test_get_snapshot_rejects_omitted_or_non_owner_when_active_lease_held(self) -> None:
+        """Confirms get_snapshot denies access when an active lease is held and client_id is omitted or non-owner."""
+        cam = CameraViewerService(default_lease_ms=1000, auto_start_pipeline=False, allow_synthetic=False)
+        try:
+            cam.acquire_lease("owner-A", lease_ms=2000)
+            cam.push_frame(b"\xff\xd8fake-owner-frame\xff\xd9", is_hardware=True)
+            self.assertTrue(cam.is_lease_valid())
+            self.assertEqual(cam._active_lease_owner, "owner-A")
+
+            # 1. Non-owner explicit client must be rejected
+            self.assertIsNone(cam.get_snapshot("viewer-B"))
+
+            # 2. Omitted client_id must NOT hijack or bypass owner-A's lease
+            self.assertIsNone(cam.get_snapshot())
+            self.assertIsNone(cam.get_snapshot(None))
+            self.assertIsNone(cam.get_snapshot(""))
+
+            # 3. Legitimate owner-A must be granted frame
+            frame = cam.get_snapshot("owner-A")
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame["jpeg_data"], b"\xff\xd8fake-owner-frame\xff\xd9")
+        finally:
+            cam.release_lease("owner-A")
+            cam.stop_capture()
+
+
 if __name__ == "__main__":
     unittest.main()

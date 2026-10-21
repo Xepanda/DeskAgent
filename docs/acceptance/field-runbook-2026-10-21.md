@@ -10,7 +10,7 @@
 - Wi-Fi / provisioning：当前 CLI 镜像 `wifi status` 为 `LINK_UP`；provisioning stage 为 `mqtt_online`，但 `authorize_read rc=-1`。这是 L3 单项状态观测，不代表云端授权或 Tuya AI 会话已可用。
 - 麦克风与语音：当前 CLI 镜像显示 READY、running、895 frames、errors=0、peak=95，属于 L3 PCM 采集观测。用户于 2026-10-22 最新现场确认当前设备已可通过唤醒词唤醒并进行对话；这是未附本轮设备日志或固件 SHA 的用户现场确认。WakeNet/KWS、ASR、Tuya AI session/MQTT、TTS/扬声器播放细节、多轮上下文、断网恢复和长稳尚无本轮日志证据。
 - 相机：L3 失败。当前 CLI 镜像日志显示 camera driver READY，但该状态只表示初始化路径、I2C expander 配置以及 SPI bus/device 创建成功；代码没有 HX ID/应答探测，因此 READY 不证明传感器已就绪。capture 命中同步后，7-byte SPI header 传输返回 `ESP_OK`，读数仍全零 (`raw=00000000000000`)，随后映射为 `rc=-25`、`out_len=0`，未取得 JPEG。来源：`firmware/components/desk_hardware/src/desk_watcher_camera.c:135-193,264-346`。现场无示波器/逻辑分析仪证据。
-- CR-006 Host MJPEG：相机 service、浏览器 UI 与 `/api/camera/stream` 路由交叉测试为 L2（`python -m pytest tests/camera tests/core/test_host_daemon.py tests/connectors/test_official_robot_camera_adapter.py tests/core/test_managed_sdk_startup.py -q`：52 passed、9 subtests passed；inline JS `node --check -` 与 `git diff --check` 通过）。A3/A6 已修复此前 review 提出的问题，最终复审无新增 Critical/Important。实现只转发真实硬件 JPEG，最高 2 FPS，不合成或复用旧帧。当前设备最新真实 capture 为 `rc=-25`、`out_len=0`，无 JPEG，因此相机 L3 仍失败，L4 未验证；这是 L2 软件验证，不能称全契约实机通过。
+- CR-006 Host MJPEG：相机 service、浏览器 UI 与 `/api/camera/stream` 路由交叉测试为 L2（相机/Host 定向测试 43 passed、9 subtests passed）。PR #13 合入后修正了 3 项陈旧测试预期：成功路径注入真实帧源，同时保留无帧源时返回 unavailable、不输出帧的行为。实现只转发真实硬件 JPEG，最高 2 FPS，不合成或复用旧帧。当前设备最新真实 capture 仍为全零 PTL header、`rc=-25`、`out_len=0`，无 JPEG，因此相机 L3 仍失败，L4 未验证；这些定向测试仅是 L2 软件证据，不能称全契约实机通过。
 - STM32 / body UART：本轮真实发送小幅命令 `body move 91 120 500`，返回 `rc=-3` (`DESK_HW_ERR_TIMEOUT`)，CLI `accepted=false`。随后 `body status` 显示 UART READY、cached setpoint 仍为 90/120、last formatted TX length=23 bytes。该 TX 长度只是发送帧记录，不是 STM32 RX/ACK；没有实物动作确认，动作未通过。日志：`.target_logging/com21-small-motion-test-20261022.log`。
 - HA：当前仅 L2 connector 测试；没有用户现有 HA 会话或物理设备动作证据。
 - 提醒：`LifeService` 23 项和定向 reminder catch-up 1 项通过；SQLite teardown 的 `WinError 32` 修复属 L2。强制 kill 崩溃恢复、真实 Host 重启、设备到期播报/确认未验。
@@ -37,6 +37,8 @@ python -m unittest tests.e2e.test_p1_regression_gates
 ```
 
 这些命令提供 L2 证据。最近一次 `tools/verification/verify_all.sh` 在 Step 2 失败，Step 3–8 未运行。该脚本会运行本机 C 构建、全量 Python 套件和部署预检；执行前确认没有其他 Agent 占用共享 `firmware/build`，并且当前环境具备脚本依赖。脚本通过仍不能自动升级任何 L3/L4 状态。
+
+当前集成回归记录：PR #13 变更合入后，WSL Python 3.12 全量套件 **550 passed、2 skipped、44 subtests passed，140.36 秒**；相机/Host 定向套件 **43 passed、9 subtests passed**。这两项均为 L2 软件证据。相机定向测试的成功路径使用注入帧源；无帧源仍须保持 unavailable，且不生成合成帧。设备侧仍未取到 JPEG。
 
 ## 3. 语音与输入复测（COM21 单人占用）
 
