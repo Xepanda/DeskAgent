@@ -1,11 +1,52 @@
 # Desk Agent R1 全系统验收矩阵与证据清单 (Acceptance Matrix)
 
-> 文档版本：V3.3.0  
-> 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证  
-> 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见  
-> 状态：**G0 契约与基线冻结完成；Level 1 (契约/Schema) 与 Level 2 (软件协议与模拟互通 PoC、真实链路 E2E、跨模块 P1 回归门禁、真实 C 驱动跨层故障链路、故障注入与稳定性压测) 自动化测试全部 PASS (295 项用例 100% OK)；提供一键全量核验工具 `tools/verification/verify_all.sh` (8 阶段)；G1 真实关口与硬件接入待真机台架实测 (Level 3/4 Pending)**  
+> 文档版本：V3.4.0
+> 责任 Agent：A0 架构与协议（基线与证据校准） / A7 系统集成与交付验证
+> 参照标准：`AGENTS.md` 架构治理规范、实施计划关口目标与 PR #2 审查意见
+> 状态：**2026-10-21 现场增量验收见 §0 和 [现场验收 Runbook](field-runbook-2026-10-21.md)。旧测试总数与下文历史报告不代表当前分支的最新全量结果。语音/屏幕/基础音频有真机证据；相机取帧失败；STM32 尚无实物证据；HA、提醒与 Codex 的真实业务闭环未完成。Level 3 按单项记录，Level 4 整机闭环仍未完成。**
+> V3.5.0 变更：更新本轮复核的软件测试数量与构建/实机证据；注明 `verify_all.sh` 本轮在 Step 2 失败，后续阶段未运行；保留 Reminder E2E teardown `WinError 32` 未解决状态。
+> V3.4.0 变更：加入 2026-10-21 真实硬件状态与按功能的证据级别；新增现场 Runbook，列出相机失败定位证据、逐项后续操作、通过证据及停止条件。旧版用例数为历史快照，不作为当前全量回归声明。
 > V3.3.0 变更：新增 A7 **真实固件跨层链路**证据 `tests/e2e/test_real_firmware_motion_fault_chain.py`（在真实编译 C 驱动中注入故障，经真实 C 协议桥接 → 真实 `RobotAdapter` → 真实 `DeskAgentHostApp`，断言**最外层响应信封**；并显式区分 direct C / real C protocol / Python fake-device / 全链路四类证据）；修复 `tests/e2e/test_g1_official_sdk_and_tuya_interop.py` 的 TCP 分帧假设缺陷（新增 `_recv_line()` 跨 `recv()` 累积读取助手，替换三处单次 `recv()` 读整行）；`verify_all.sh` 阶段 5 纳入跨层链路；按实测校准全量用例数为 295 项、并按套件逐一校准（firmware_contract 30 / sdk_contract 73 / camera 9 / companion 40 / connectors 26 / core 61 / e2e 47 / 顶层 9）。  
 > V3.2.0 变更：新增 A7 跨模块 P1 回归门禁 `tests/e2e/test_p1_regression_gates.py`（PR #11 整改：驱动故障绝不伪成功、无 ACK 超时绝不报完成、乱序并发 ACK 不串线、超时后迟到 ACK 不污染新请求、真实 socket 流分帧、配对 fail-closed、Companion 局域网启动门禁、既有链路无回归）；`verify_all.sh` 由 7 阶段扩展为 8 阶段并将回归门禁纳入总控执行；校准全量用例数为实测 268 项（并发安全整改后复测）
+
+---
+
+## 0. 当前现场验收状态（2026-10-21）
+
+本节优先于文档中早期的“设备未接入/所有硬件待测”快照。只记录本轮已提供的实机日志和用户现场确认，不将软件测试扩写成硬件通过。
+
+| 功能 | 当前证据层级与状态 | 已有证据 | 缺少的验收证据 / 下一步 |
+| :--- | :--- | :--- | :--- |
+| 屏幕、基础提示音 | **L3 单项通过** | 用户现场确认屏幕显示文字、扬声器提示音可听 | 归档对应固件 SHA、完整启动日志和现场记录；尚未验证长稳、并发资源仲裁 |
+| 麦克风、唤醒与对话 | **L3 单项通过（本次观测）** | COM21 记录 `wn9_nihaoxiaozhi_tts` 加载、AFE 初始化、WakeNet 检出、ASR/NLG 输出；用户确认已能唤醒并对话。模型分区恢复后音频状态记录 `mic_running=1`、PCM 帧持续增长、错误数为 0 | 在稳定的当前固件上做重复唤醒和多轮问答，归档完整日志、固件/模型 SHA 和现场听感；未验证断网恢复、长时运行或跨模块任务闭环 |
+| 滚轮、按键与状态页 | **L3 用户确认，日志证据待归档** | 用户确认滚轮和按键可用；交互约定为滚轮滚动/选择只读状态页，短按/长按沿用 TuyaOpen 语音事件 | 归档每项输入事件日志及对应 UI 页面变化；覆盖快速旋转、反向、短按、长按，不应改变语音事件语义 |
+| Himax 相机 | **L3 未通过** | 烧录后连续两次真实采集均为 `PTL header rejected: parser rc=-2 magic=0000 type=00 size=0`、`rc=-20, out_len=0`；没有得到 JPEG。时序调整后故障仍在 | 先用示波器/逻辑分析仪检查供电、SYNC、CS、SCLK、MISO；确认头字节后再导出并打开 JPEG。不得用初始化成功或模拟帧代替真实图像 |
+| STM32 / 机身动作 | **L3 未验证** | 当前没有实物 ACK/接收计数或动作观测证据；发送帧长度不能算 STM32 接收 | 先核对接线、串口参数和协议，再进行小幅动作、ACK 关联、超时安全停止和实物位置观测 |
+| 官方 Python SDK | **L1 契约有定义；L2/L3 互通未通过验收** | 已识别官方 Runtime 等待设备主动 WebSocket 连接，固件现状/适配仍需以 A2 最终实现核验 | 用未修改官方 SDK 真机发现、错误配对码拒绝、正确配对、HardwareHello、能力注册、命令/结果/媒体收发、断线重连全程留日志 |
+| Home Assistant | **L2 软件测试；L3/L4 未验证** | HA Connector 本轮复核 30 项；不代表连接了用户现有 HA 或物理设备执行 | 用真实 HA 和低风险灯/插座验证发现、受限服务调用、事件/状态订阅；分别记录 accepted、state changed、physical action |
+| 提醒 / Host 服务 | **L2 软件测试；L3/L4 未验证，E2E 清理问题未解决** | 本轮 LifeService/Host daemon 相关测试 37 项合计；Reminder E2E teardown 仍出现 `WinError 32`，故不可将其报告为全绿。此结果不代表真实设备播报或现场重启恢复 | 修复/定位 Windows 测试清理时序并复跑；另在真实 Host/设备创建提醒、重启服务并观察到期、播报、确认去重；记录时区、离线错过处理和持久化状态 |
+| Windows Companion / Codex | **L3 单次服务调用通过；L4 未完成** | 省略模型参数调用 app-server 成功；Companion 16 项测试通过 | 隔离测试工程中实跑任务修改/验证、审批、失败和取消、重启恢复；将 assistant 结果送到设备显示/播报并现场确认 |
+| 整机闭环 / 恢复 | **L4 未完成** | 各能力证据分散，语音单项已真实运行 | 完成语音→任务路由→真实服务/设备动作→真实结果→设备反馈，并验断网、服务退出、设备重启与重连；见 Runbook |
+
+### 本轮回归数字与构建状态（2026-10-21）
+
+| 范围 | 本轮数字/结果 | 证据边界 |
+| :--- | :--- | :--- |
+| HA Connector | **30 项** | L2 软件测试；不证明真实 HA/实体动作 |
+| 提醒与 Host daemon | **37 项合计** | L2 软件测试；Reminder E2E teardown 留有 `WinError 32`，该套件不得标记全绿 |
+| SDK bridge | **5 项 source-contract 检查通过；本机 GCC 依赖的 10 项用例 skipped** | 仅 source-contract L2；跳过用例没有运行结果，不证明编译或官方 SDK 互通 |
+| 输入/UI | **9 项** | L2 输入/UI contract；用户确认滚轮和按键可用，现场事件日志待归档 |
+| STM32 raw UART | **2 项静态检查** | 有一次交叉构建成功并生成镜像，但该镜像未烧录；没有 STM32 接收 ACK 或实物动作证据 |
+| A6 Host 相机页 | **13 项通过** | L2 Host/Web 测试；设备仍未产生可打开的真实 JPEG，相机能力 L3 仍失败 |
+| `tools/verification/verify_all.sh` | **本轮在 Step 2 失败** | 后续 Step 3–8 未运行；不得写成八阶段全通过，也不得沿用旧 295/412 总数作为本轮结果 |
+
+### 本轮可复核记录
+
+- 固件应用镜像（OTA app）SHA-256：`A0ABD911C7DFD643B419674767E539DF0057CB15F5E09C1280F343BABCB375E3`，文件位于 `firmware/.target_logging/p0-2-camera-guards-20261021/desk_agent_firmware.bin`。
+- 恢复后的 SR 模型文件 SHA-256：`7C87DD7ADB5A7623907B6354D49BEA7F9289371262E6A57F15458FB8908C5814`。
+- 唤醒/对话证据：`.target_logging/com21-wake-after-fix-20261021.log`、`.target_logging/com21-wake-after-model-restore-20261021.log`。
+- 最新相机复测：`.target_logging/com21-camera-after-guard-flash-20261021.log`。日志显示麦克风仍运行、PCM 错误数为 0，但相机未返回图像。
+- 上述路径属于本地忽略日志归档；合入前需确认文件仍在工作站，不应假定它们会随 Git 提交或 PR 自动分发。
 
 ---
 
@@ -16,9 +57,9 @@
 | 证据层级 | 验收范围与含义 | 当前结论 | 关键依据与测试输出 | 绝对不能代表什么 |
 | :--- | :--- | :---: | :--- | :--- |
 | **Level 1：公开源码 / 契约标准** | JSON Schema (Draft 2020-12)、25 个 fixtures、13 个稳定错误码、动态 ISO 8601 时钟契约 | **100% PASS** | `contracts/validator/validate.py` 深度校验通过 | 不能代表物理板卡具备该 capability 或在线部署成功 |
-| **Level 2：模拟 PoC / 协议对齐** | C 固件硬件链路与驱动报文、SDK 小端协议与 CSPRNG 配对 Token、RobotAdapter 全双工适配器、真实链路 E2E（设备工具请求经 TCP 贯通 Host 路由并原路回传）、跨模块 P1 回归门禁（驱动故障/超时绝不伪成功、请求关联、TCP 分帧、配对 fail-closed、Companion 启动门禁）、**真实 C 驱动跨层故障链路（真实编译 C 驱动故障 → 真实 C 协议 → 真实 Adapter → 真实 Host → 最外层信封）**、Python 核心路由与调度器、HA 状态订阅与 Codex 审批查询、E2E 故障注入与 200 轮全系统稳定性压测 | **100% PASS** | `Ran 295 tests in 44.118s -> OK`<br/>`tools/verification/verify_all.sh` 8 大阶段 100% 通过<br/>C 固件原生可执行文件与静态库构建通过 | 不能代表物理机嵌入式网络环境、声学杂音或真实云端延迟达标 |
-| **Level 3：单项硬件 / 节点实测** | 泰山派 Linux ARM 守护进程、Windows Companion 进程通信、ESP32-S3 物理单板 | **未实测 (待现场实板)** | `deploy/edge/` 与 `deploy/windows/` 脚本及生产配置完备 | 不能代表系统端到端链路长期无丢包或无故障运行 |
-| **Level 4：端到端闭环与恢复验收** | 真实语音唤醒→Tuya云端→外部MCP工具→HA/Codex/Life执行→语音播报闭环，断网/断电恢复 | **未完成 (Pending 实体台架)** | 真实环境待具备 | 不能代表所有未知硬件改版或不可控生产环境的质量担保 |
+| **Level 2：模拟 PoC / 协议对齐** | C 固件驱动报文、SDK 协议、RobotAdapter、真实 Host 进程与伪设备组成的 TCP 链路、跨模块回归、C 驱动故障跨层、Python 核心、HA/Codex 软件接口、故障注入与压力测试 | **此前快照 295 项通过；不是当前分支的全量结果** | 下方 §2 记录的是当时命令及输出；本次后续改动需重跑对应套件，必要时重跑全量 | 无法证明真机、真实 HA/SDK/Codex 业务和物理动作 |
+| **Level 3：单项硬件 / 节点实测** | ESP32-S3 语音/屏幕/输入、Himax 相机、STM32 动作、Windows Companion、真实 HA 与 Host | **部分单项通过；相机失败；STM32/真实 HA 等未验证** | 见 §0 和 [现场 Runbook](field-runbook-2026-10-21.md)；未实测项仍存在 | 单项实测不能代表系统端到端或长稳 |
+| **Level 4：端到端闭环与恢复验收** | 真实语音唤醒→外部工具/服务执行→真实结果→设备反馈，断网/服务退出/重启后恢复 | **未完成** | 当前缺少贯通真实服务动作、设备反馈及故障恢复的一条完整关联证据 | 不能代表所有未知硬件版本或生产环境 |
 
 > [!IMPORTANT]
 > **关于 G1 关口验收状态的严格校正（遵照 AGENTS.md 第 4 节）**：  
@@ -28,6 +69,8 @@
 ---
 
 ## 2. 详细测试证据明细 (Level 1 & Level 2)
+
+> 本节的固定用例数和历史命令输出来自 V3.3.0 快照；后续 A3/A4/A5/A2 等有代码变化。请按 [现场验收 Runbook](field-runbook-2026-10-21.md) 重新运行当前分支对应测试后再引用，不要把这里记录的历史数字当作当前测试结论。
 
 ### 2.1 Level 1: 契约规范与 Schema 深度校验
 - **验证命令**：`python3 contracts/validator/validate.py`
@@ -93,19 +136,15 @@
 | **`tests/test_p1_gaps_verification.py`** | 4 | 1. 泰山派远程调用 Windows Codex Companion 客户端分发与审批确认<br/>2. 提醒发件箱后台消费 Worker 投递到机器人音频通道与重试机制<br/>3. HA 实体与服务白名单拦截、状态对账与状态变更订阅回调<br/>4. 相机动态 FrameCapturePipeline 抓取与动态云台坐标叠加验证 |
 | **`tests/test_p1_final_closure.py`** | 5 | 1. CSPRNG 动态 Token 熵值与格式校验<br/>2. RobotAdapter TCP/UDP 握手、舵机运动控制与到期提醒音频播报通道投递<br/>3. Host 路由器 Codex 待审批查询（`codex.get_pending_approvals` / `codex.list_approvals`）<br/>4. Host 路由器 HA 状态迁移事件查询（`ha.list_changes`）<br/>5. 相机硬件传感器帧源接入与 `hardware_sensor` 标签识别 |
 
-### 2.4 一键系统级验收套件 (`tools/verification/verify_all.sh`)
+### 2.4 验收脚本范围及本轮状态 (`tools/verification/verify_all.sh`)
 为落实 `AGENTS.md` 规范第 4 节，提供自动化脚本对 Level 1 ~ Level 4 进行统一检查：
 ```bash
 ./tools/verification/verify_all.sh
 ```
-- **阶段 1 (Level 1)**: 契约与 JSON Schema (Draft 2020-12) 深度校验 -> **PASS**
-- **阶段 2 (Level 2)**: C 固件原生 HAL 与 SDK Bridge 静态编译验证 -> **PASS**
-- **阶段 3 (Level 2)**: 295 项全量自动化测试套件执行（含故障注入与稳定性压测） -> **PASS**
-- **阶段 4 (Level 2)**: 真实链路端到端验证（TClaw → SDK Bridge TCP → Host Router → Life 执行 → 结果回传设备） -> **PASS**
-- **阶段 5 (Level 2)**: 跨模块 P1 回归门禁（驱动故障/超时防伪成功、ACK 关联、TCP 分帧、配对 fail-closed、Companion 局域网启动门禁）**+ 真实 C 驱动跨层故障链路**（`test_real_firmware_motion_fault_chain.py`） -> **PASS**
-- **阶段 6 (Level 2)**: 泰山派 Linux 边缘环境 Pre-flight 检查 -> **PASS**
-- **阶段 7 (Level 3/4)**: 物理单板与在线台架硬性约束审计 -> **PASS**（仅审计缺口清单完备性，不代表硬件已实测）
-- **阶段 8 (Level 1/4)**: 证据分层防夸大审计门禁 -> **PASS**（校验 Level 3/4 仍如实标记为未实测/未完成，且验收矩阵与真实链路套件保持同步）
+- 脚本依序运行契约检查、本机 C 构建、Python 测试、真实 Host+伪设备链路、跨模块回归、部署预检和状态矩阵静态检查。它不连接硬件或真实外部服务。
+- **本轮最近一次执行在 Step 2（C 固件原生 HAL / SDK Bridge 构建）失败并退出。Step 3–8 未运行，因此本轮没有全套结果。**
+- 先前版本记录的 295 项或其他全量数均为历史快照，不作为当前分支的通过结果。当前已复核的分项数字见 §0 的“本轮回归数字与构建状态”。
+- 脚本成功结束也只能表示其配置的自动化门禁通过；L3 按单项证据记录，L4 仍需真实端到端与恢复验收。
 
 ### 2.5 A7 真实链路端到端套件证据明细 (`tests/e2e/test_real_chain_tclaw_to_host.py`)
 

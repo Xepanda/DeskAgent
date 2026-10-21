@@ -4,8 +4,8 @@
 # Enforces AGENTS.md Section 4 (Evidence Layering: Level 1 to Level 4)
 #
 # Runs all 8 verification phases. Phases 1-5, 7, 8 are automated gates; phase 6
-# is the physical-bench gap audit and deliberately reports Level 3/4 as
-# PENDING_HARDWARE rather than claiming a pass.
+# verifies the recorded evidence matrix only. This script does not exercise
+# hardware or connected services and cannot promote any L3/L4 result.
 # ==============================================================================
 set -euo pipefail
 
@@ -93,7 +93,8 @@ step_pass "TaishanPi edge environment pre-flight checks passed (directories, per
 echo ""
 echo "--- Step 7: Hardware & Acceptance Matrix Audit (docs/acceptance/) ---"
 test -f docs/acceptance/acceptance-matrix.md || step_fail "acceptance-matrix.md missing"
-step_pass "Acceptance matrix and physical bench hardware requirements verified"
+test -f docs/acceptance/field-runbook-2026-10-21.md || step_fail "Current field runbook missing"
+step_pass "Acceptance matrix and dated field runbook are present (this step does not exercise hardware)"
 
 # ------------------------------------------------------------------------------
 # 8. Level 1 & Level 4: Evidence Layering Anti-Overclaim Audit (AGENTS.md Sec.4)
@@ -102,41 +103,41 @@ echo ""
 echo "--- Step 8: Evidence Layering Anti-Overclaim Audit ---"
 MATRIX="docs/acceptance/acceptance-matrix.md"
 
-# The matrix must still declare the honest, un-achieved state of the physical
-# tiers. Anchor on the Level 3 / Level 4 table rows themselves: a bare substring
-# search would also match the prose that *describes* this gate, and so could pass
-# even after the rows were rewritten to claim a pass.
-grep -E "^\| \*\*Level 3" "${MATRIX}" | grep -q "未实测" \
-  || step_fail "Level 3 row in the acceptance matrix must still record the bench as 未实测"
+# Anchor on the Level 3 / Level 4 table rows themselves so prose elsewhere
+# cannot mask a stale or overstated capability-level status.
+grep -E "^\| \*\*Level 3" "${MATRIX}" | grep -q "部分单项通过" \
+  || step_fail "Level 3 row must preserve the partial item-level evidence status"
+grep -E "^\| \*\*Level 3" "${MATRIX}" | grep -q "未验证" \
+  || step_fail "Level 3 row must continue to identify unverified hardware/services"
 grep -E "^\| \*\*Level 4" "${MATRIX}" | grep -q "未完成" \
-  || step_fail "Level 4 row in the acceptance matrix must still record the live loop as 未完成"
+  || step_fail "Level 4 row must still record the live loop as 未完成"
 
 # The matrix must stay in sync with the real chain suite it cites.
 test -f tests/e2e/test_real_chain_tclaw_to_host.py \
   || step_fail "Real chain E2E suite tests/e2e/test_real_chain_tclaw_to_host.py is missing"
 grep -q "test_real_chain_tclaw_to_host" "${MATRIX}" \
   || step_fail "Acceptance matrix must cite tests/e2e/test_real_chain_tclaw_to_host.py"
+grep -q "field-runbook-2026-10-21.md" "${MATRIX}" \
+  || step_fail "Acceptance matrix must link the current field runbook"
 
 # This script's own evidence summary must present the physical tiers as pending.
-grep -qE "Level 3 \(Physical Node\): *PENDING_HARDWARE" tools/verification/verify_all.sh \
-  || step_fail "verify_all.sh must report Level 3 as PENDING_HARDWARE (no physical bench present)"
+grep -qE "Level 3 \(Physical Node\): *RECORDED_PARTIAL" tools/verification/verify_all.sh \
+  || step_fail "verify_all.sh must report recorded partial L3 evidence"
 grep -qE "Level 4 \(End-to-End Live\): *PENDING_HARDWARE" tools/verification/verify_all.sh \
-  || step_fail "verify_all.sh must report Level 4 as PENDING_HARDWARE (no live environment present)"
-step_pass "Evidence layering intact: Level 3/4 remain PENDING_HARDWARE, no overclaim detected"
+  || step_fail "verify_all.sh must report Level 4 as pending"
+grep -q "This script does not exercise hardware" tools/verification/verify_all.sh \
+  || step_fail "verify_all.sh must state that it does not exercise hardware"
+step_pass "Evidence layering intact: L3 is item-specific, L4 remains pending, this run cannot promote either"
 
 echo ""
 echo "========================================================================"
-echo -e "\033[0;32m  ALL 8 VERIFICATION PHASES COMPLETED SUCCESSFULLY (AUTOMATED GATES OK) \033[0m"
+echo -e "\033[0;32m  VERIFICATION SCRIPT REACHED ITS SUMMARY BLOCK \033[0m"
 echo "========================================================================"
 echo "Evidence Summary:"
-echo "  Level 1 (Contracts & Schemas):  100% PASS (JSON Schema draft 2020-12, fixtures, error codes)"
-echo "  Level 2 (Software Simulation):  100% PASS (All tests, C HAL, WSPK framing, SQLite WAL, RPC,"
-echo "                                             real chain TClaw -> SDK Bridge TCP -> Host -> device,"
-echo "                                             cross-module P1 regression gates,"
-echo "                                             real-C-driver -> C bridge -> Adapter -> Host cross-layer fault chain)"
-echo "  Level 3 (Physical Node):        PENDING_HARDWARE (ESP32-S3 bench, Himax camera, audio codecs)"
-echo "  Level 4 (End-to-End Live):      PENDING_HARDWARE (Live Tuya Cloud IoT, LAN HA, Windows Codex)"
+echo "  Level 1/2:                      Checks reached above without a failing gate; use each command's output as evidence."
+echo "  Level 3 (Physical Node):        RECORDED_PARTIAL (see docs/acceptance/acceptance-matrix.md; this script does not exercise hardware)"
+echo "  Level 4 (End-to-End Live):      PENDING_HARDWARE (see field runbook for remaining live-service and recovery gates)"
 echo ""
-echo "NOTE: Level 3 and Level 4 are NOT verified by this run. No ESP32-S3 board,"
-echo "      Tuya cloud, LAN Home Assistant, or Windows Codex host is present."
+echo "NOTE: This script does not exercise hardware or connected services. Recorded L3 evidence"
+echo "      is item-specific; this run cannot verify, revoke, or promote those records."
 echo "========================================================================"

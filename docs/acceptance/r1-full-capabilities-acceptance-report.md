@@ -1,5 +1,7 @@
 # Desk Agent R1 全功能综合验收与复审整改报告 (Full Capabilities Acceptance Report)
 
+> **历史快照（已被后续现场证据取代）**：本文反映本轮真机联调之前的状态，COM21 离线、语音未实测、412 项通过数及固件 SHA 均不是当前基线。2026-10-21 的逐功能状态以 [acceptance-matrix.md](acceptance-matrix.md) §0 和 [field-runbook-2026-10-21.md](field-runbook-2026-10-21.md) 为准。本文原 Level 3/4 结论、旧镜像哈希和下方旧烧录命令不得用于当前设备验收或刷机。
+
 > **文档版本**：V1.7.0  
 > **责任角色**：A7 独立复审员（Independent Reviewer）与架构团队  
 > **审查基线**：`feat/r1-full-capabilities-bringup`（PR #14 第四轮返修闭环版本）  
@@ -122,15 +124,6 @@
 > 宿主机串口状态确认当前 **COM 端口全部离线，目标串口 `COM21` 未物理连接**。  
 > 按照《AGENTS.md》防假断言规范，在未取得真实硬件串口实测日志前，**坚决不宣称硬件实测或语音闭环通过**。
 
-#### 待实测 Level 3/4 现场 Runbook
-硬件接入后执行：
-```powershell
-# 1. 确认端口识别
-[System.IO.Ports.SerialPort]::GetPortNames()
+#### 后续现场验收 Runbook
 
-# 2. 受控安全烧录（单分区 0x20000）
-tuyaopen-cli flash --port COM21 --baud 921600 --file firmware/dist/desk_agent_firmware_1.0.0/desk_agent_firmware.bin --address 0x20000
-
-# 3. 串口监控与观测
-tuyaopen-cli monitor --port COM21 --baud 115200
-```
+本文曾包含指向 `firmware/dist/desk_agent_firmware_1.0.0/desk_agent_firmware.bin` 的旧刷写命令，现已撤下，避免误刷旧镜像。当前设备基线、串口限制、每项现场操作与证据门槛见 [field-runbook-2026-10-21.md](field-runbook-2026-10-21.md)。任何刷写都必须先核验当前镜像 SHA 与分区目标，并遵守当次授权。
