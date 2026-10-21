@@ -129,6 +129,31 @@ class TestHAConnector(unittest.TestCase):
         with self.assertRaises(PermissionError):
             ha.execute("light.desk", "turn_off")
 
+    def test_invalid_state_confirmation_timeout_rejected_before_service_call(self) -> None:
+        """Malformed or negative confirmation waits must not trigger a service call."""
+        recorded_methods: list[str] = []
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            recorded_methods.append(method)
+            return 200, []
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        for invalid_timeout in (-1, float("inf"), "1000", True):
+            with self.subTest(timeout_ms=invalid_timeout):
+                with self.assertRaises(ValueError):
+                    ha.execute("light.desk", "turn_on", wait_for_state={
+                        "expected_state": "on", "timeout_ms": invalid_timeout,
+                    })
+
+        self.assertEqual(recorded_methods, [])
+
+    def test_state_confirmation_timeout_is_capped(self) -> None:
+        """Untrusted callers cannot extend synchronous state confirmation beyond 30 seconds."""
+        from host.desk_agent.connectors.ha.ha_connector import _normalize_confirmation_timeout_ms
+
+        self.assertEqual(_normalize_confirmation_timeout_ms(10**12), 30_000)
+        self.assertEqual(_normalize_confirmation_timeout_ms(1250), 1250)
+
     # -------------------------------------------------------------------------
     # 3. Transport Mock Integration Tests
     # -------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -62,6 +63,14 @@ DEFAULT_DENIED_SERVICES = frozenset({
 })
 
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+MAX_STATE_CONFIRMATION_TIMEOUT_MS = 30_000
+
+
+def _normalize_confirmation_timeout_ms(value: Any) -> float:
+    """Validate and cap caller-supplied synchronous state confirmation waits."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError("wait_for_state.timeout_ms must be a finite, non-negative number")
+    return min(float(value), float(MAX_STATE_CONFIRMATION_TIMEOUT_MS))
 
 KNOWN_ATTRIBUTE_KEYS = frozenset({
     "brightness",
@@ -610,6 +619,12 @@ class HAConnector:
         if not self.is_service_allowed(domain, action):
             raise PermissionError(f"Service '{domain}.{action}' is outside allowed service scope")
 
+        # Validate this before issuing the service request, so malformed wait
+        # parameters can never trigger an action and caller waits stay bounded.
+        timeout_ms = None
+        if wait_for_state is not None:
+            timeout_ms = _normalize_confirmation_timeout_ms(wait_for_state.get("timeout_ms", 2000))
+
         service_path = f"/api/services/{domain}/{action}"
 
         body: dict[str, Any] = {"entity_id": entity_id}
@@ -661,8 +676,7 @@ class HAConnector:
         state_confirmed = False
 
         if wait_for_state is not None and (expected_state is not None or expected_attributes):
-            timeout_ms = wait_for_state.get("timeout_ms", 2000)
-            deadline = time.time() + (timeout_ms / 1000.0)
+            deadline = time.monotonic() + (timeout_ms / 1000.0)
 
             # Check initial state immediately
             try:
@@ -681,8 +695,8 @@ class HAConnector:
 
             # Poll with interval or wake up immediately on WebSocket state condition
             poll_interval = 0.05
-            while time.time() < deadline:
-                remaining = deadline - time.time()
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
 
