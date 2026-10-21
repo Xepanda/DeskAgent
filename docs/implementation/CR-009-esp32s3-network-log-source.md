@@ -2,9 +2,9 @@
 
 - **提出方：** A0（基于 A7 网络日志源缺口记录）
 - **提出日期：** 2026-10-22
-- **状态：** **PROPOSED — 契约草案；尚无实现或网络日志能力**
+- **状态：** **APPROVED — 有限 L2 实现；未批准实机验证或产品交付宣称**
 - **关联：** `docs/acceptance/network-log-source-gap-2026-10-22.md`、`docs/implementation/interfaces.md` §5 L-09 / §6.4、`firmware/components/desk_sdk_bridge/`
-- **预期 owner：** A0 契约批准；A1 设备日志源与发送；A2 SDK Runtime / 协议桥互通；A7 采集器和验收
+- **预期 owner：** A0 契约/依赖裁决；A1 设备日志 sink/queue；A2 固件协议桥 handler 与发送；A3 Host consumer、Runtime 部署/托管集成；A7 验收
 
 ## 1. 目标与现状
 
@@ -63,38 +63,50 @@ Runtime → 设备取消订阅也必须用 `build_command()` 封套：`{"type":"
     "uptime_ms": 123456,
     "level": "WARN",
     "component": "camera",
-    "message": "capture returned hardware error",
-    "fields": {}
+    "event_id": "CAPTURE_FAILED",
+    "fields": {"error_code": -2}
   }
 }
 ```
 
-`sequence` 在单次 `boot_id` 内单调递增；序号缺口代表一个或多个事件丢失，序号不因订阅、重连或 filter 改变而复用。`uptime_ms` 必填，避免未校准设备时钟造成假 UTC；设备时钟可信时才附加 RFC3339 `timestamp_utc`，否则省略。设备可发 `sys.log.gap` 控制事件，报告 `first_dropped_sequence`、`last_dropped_sequence`、`dropped_count` 和 `reason`；接收端也必须能从 sequence gap 发现丢失。gap 通知本身不回收或重用丢失序号。
+`sequence` 在单次 `boot_id` 内单调递增；序号缺口代表一个或多个事件丢失，序号不因订阅、重连或 filter 改变而复用。`uptime_ms` 必填，避免未校准设备时钟造成假 UTC；设备时钟可信时才附加 RFC3339 `timestamp_utc`，否则省略。设备可发 `sys.log.gap` 控制事件，报告 `first_dropped_sequence`、`last_dropped_sequence`、`dropped_count` 和封闭枚举 `reason`；接收端也必须能从 sequence gap 发现丢失。gap 通知本身不回收或重用丢失序号。
 
 SDK v0.1.11 没有专用 log event/consumer API。`RawFrameRouter.route_external()` 会把设备合法 JSON frame 原样路由到活动的 Application channel；`LocalWebSocketApplicationBridge` 再调用 `on_frame`，其缺省 callback 是 `_ignore_callback`。若无活动 Application，则原始 frame 路由到 Desktop；不得把此默认 callback 或通用 Desktop 路由称为安全归档。A2 必须增加显式、有界的 log consumer/handler，并在认证/授权 gate 后仅把 `sys.log.event/gap` 交给它；当前 PR 若只接入临时 Application handler，也必须明确仅当前实现范围，不得宣称 SDK 已提供持久或安全日志 API。
 
-日志不是任意业务事件转发：媒体、ASR 转写、用户输入、工具参数/结果、提醒内容、HA 实体值、Codex 文件内容等均不得进入该流。设备只发送经过 A1 审核的严格 allowlist 组件和低敏结构化诊断项；`fields` 只允许已批准的有界标量字段，不允许任意嵌套对象或任意日志文本。禁止把原始 ESP-IDF/printf/UART payload 送入网络流。设备端必须先做字段级脱敏，Host consumer 再二次脱敏；禁止把原始 payload 默认持久化，诊断存储只保留 allowlist 内的脱敏事件和明确的丢失统计。
+日志不是任意业务事件转发：媒体、ASR 转写、用户输入、工具参数/结果、提醒内容、HA 实体值、Codex 文件内容等均不得进入该流。设备只发送经过 A1 审核的严格 allowlist 组件和低敏结构化诊断项；`fields` 只允许已批准的有界标量字段，不允许任意嵌套对象或自由文本；事件必须由审核过的枚举 `event_id` 表示，并仅携带该事件 schema 允许的有界 scalar `fields`（仅数值、布尔值或封闭枚举，不允许自由字符串）。禁止把原始 ESP-IDF/printf/UART payload 送入网络流；不持久化任何日志事件或原始 payload。设备端先做字段级脱敏，Host consumer 再二次脱敏。
 
 ## 4. 级别、隐私与资源边界
 
 - 日志等级限 `ERROR/WARN/INFO/DEBUG`；不支持 `VERBOSE` 网络订阅。缺省 `WARN`，`DEBUG` 需显式本地订阅，固件重启后不恢复。
 - 仅允许低敏、固定/结构化诊断值；必须删除/遮蔽 pairing code、session token、Wi-Fi 密码、云端/API/HA/Codex 凭据、Authorization 字段、密钥、音视频内容及用户可识别内容。对未知字段、未审核组件/消息默认丢弃；禁止把敏感原值仅依赖 Host 脱敏。LAN 明文可观察性下，即使脱敏也不得传送自由文本、用户内容或高敏运行时数据。
-- `boot_id` 使用每次启动生成的非凭据、非长期设备标识随机值；不输出完整 MAC、序列号或固定设备身份。时间、tag、message、fields 长度均设上限，非法 UTF-8/过大事件丢弃并计数。
+- `boot_id` 使用每次启动生成的非凭据、非长期设备标识随机值；不输出完整 MAC、序列号或固定设备身份。时间、tag、event_id、fields 长度均设上限，非法 UTF-8/过大事件丢弃并计数。
 - 日志入口必须是固定时延、非阻塞 sink，由后台 worker 做队列消费、协议编码和 WebSocket 发送；sink 内禁止网络 I/O、阻塞等待、动态大块分配及再次调用 `ESP_LOG`（避免递归）。它不得改变既有 UART 输出/格式/级别。
 - TAL `PrintLogV()` 在持有 global log mutex 时同步执行输出 sink；故 TAL sink 只能把已格式化、经 allowlist/脱敏后的短诊断复制到固定队列后立即返回。ESP-IDF `esp_log_set_vprintf` hook 没有 tag 参数且可能并发/重入：需先以有界 buffer 格式化，再解析审核过的 tag/event；必须可重入/并发安全，不能在 hook 内调用 `ESP_LOG`。
-- 资源限制仍是**待 A0/A1 实测裁决**，不冻结 64 KiB/4096-byte 默认值。当前可供评估的候选是 16 × 192-byte 固定队列（3072 bytes）+ 约 2 KiB internal worker stack，合计约 5 KiB 目标预算，**未经目标板测量，不是已验证预算或强制实现常量**。A1 需测队列高水位、worker stack HWM、heap/PSRAM 和控制/语音干扰，再由 A0/A1冻结可接受值。
+- 资源限制：候选 16 × 192-byte 固定队列（3072 bytes）+ 约 2 KiB internal worker stack，合计约 5 KiB。该预算未在目标板测量；A1 必须在进入 L3 前测量队列高水位、worker stack HWM、heap/PSRAM 和控制/语音干扰，超预算时先回到 A0 裁决。
 - 队列满时采用 **drop-new + counter**，保留已排队较早事件；日志序号继续推进并通过 `sys.log.gap` 报告丢弃范围。断线立即丢弃并清空旧队列；重连不回放断线期间旧日志，重新订阅只从 ACK 返回的当前序号开始。Runtime 接收端也须有界；消费变慢不得阻塞 WebSocket 心跳/业务命令，丢弃需可观测。
-- Runtime 接收端也使用有界队列；消费变慢时暂停/降低日志读取或明确丢弃并记录 gap，不得反压阻塞 WebSocket 心跳和业务命令。
+- Runtime 接收端也使用有界、默认关闭的 consumer 队列；消费变慢时暂停/降低日志读取或明确丢弃并记录 gap，不得反压阻塞 WebSocket 心跳和业务命令。consumer 不持久化日志。
 - 不写 Flash/NVS/SD，也不保留跨断线日志 ring buffer。掉线时清空待发队列，重连后重新通过配对认证与双侧授权，再按新 stream_id 从当前序号开始；不重放离线期间的旧队列。已知队列丢弃通过计数/gap 报告；断连期间的日志不承诺回补。
 - 网络日志是诊断旁路数据，对业务不可用；断线、鉴权失败或订阅拒绝不影响控制功能。A7 的 UART-only logger 保留为独立 fallback。
 
-## 5. 兼容性和 owner 实现点
+## 5. 兼容性和最小文件 ownership
 
 1. `device.logs.read` 仅作为能力兼容提示，不构成权限授权；旧 Runtime 忽略未知 capability，旧设备不声明它。Runtime 未观察到能力时不发订阅；即使观察到，仍必须由本地显式开启的授权诊断 consumer 决定是否订阅。设备端 `sys.log.subscribe/unsubscribe` handler 也必须校验当前 paired session、已连接状态和设备侧 log-read gate。两侧任一 gate 关闭时均不传送日志。
-2. A1 在固件 SDK bridge 的已配对 WebSocket receive/send path 增加 `sys.log.subscribe/unsubscribe` **显式 handler**、订阅状态、低敏 allowlist logger sink、固定有界队列、序列/gap 生成和设备端脱敏。当前 bridge 未知 type 落入 `UNKNOWN_OPERATION`/404 NACK 分支；只在此分支之前新增明确处理，不可误将其视为已实现。不能将 `printf`/任意 ESP-IDF 输出无条件转发；不得增加新端口或更改 Tuya 音频会话。
-3. A2 核验并扩展 pinned official Runtime 的路由和显式有界 consumer：下行 subscribe/unsubscribe 使用 `build_command()` 的 `{type, code, data:{command_id,...}}` 封套；ACK/NACK 在 `data.command_id` 精确关联。上行 `sys.log.event/gap` 是合法 JSON frame，沿现有 raw-frame route 到 Application callback，但 SDK 无专用日志 API，且 callback 默认 `_ignore_callback`；A2 必须新增有界 handler/consumer并应用 Host 显式授权 gate。不得把默认 callback 或 Desktop 路由作为安全归档。若当前 PR 只提供临时、易失的 Application handler，需限定其能力，不得宣称持久归档。
-4. A7 为网络采集消费者实现 L2 协议 fixtures/测试与 L3 设备验收；不修改固件协议或绕过 A1/A2。A0 批准并同步本 CR 后，相关 schema/接口目录及能力版本由 A0/A2 按 ownership 单独更新。
-5. 既有 UART capture 不删除、不转成网络 fallback；UART 和网络证据分别标注来源、固件 hash、boot_id 与证据等级。
+
+2. **A2 — SDK bridge 与传输端（既有 ownership）：** 在 `firmware/components/desk_sdk_bridge/include/desk_sdk_bridge.h`、`src/desk_sdk_bridge.c`、`src/desk_sdk_websocket.c` 处理新增命令类型、配对/连接授权 gate、WebSocket JSON send、ACK/NACK `data.command_id` 关联与 disconnect 清理；未知命令现落入 `UNKNOWN_OPERATION`/404，必须新增显式 handler。对应桥接契约测试归 `tests/sdk_contract/`。A2 不修改 `desk_hardware`、`desk_tclaw`、`firmware/main/src/app_main.c`、产品 Host 核心或 `.target_logging/**/vendor` 中的 pinned SDK 源码。
+
+3. **A1 — 日志源与有界 producer（既有 ownership）：** 在 `firmware/components/desk_hardware/` 新增/维护低敏 allowlist 日志 sink、脱敏和固定有界队列；优先接入现有 `desk_hardware_init()` 或 A1 自有 `desk_tclaw/` 初始化路径，TAL/ESP-IDF producer hook 只做固定时延 enqueue，UART 输出语义保持不变。通过 A2 提供的接口消费队列/发送。A1 不修改 `desk_sdk_bridge/` 或 `app_main.c`。
+
+4. **`firmware/main/src/app_main.c` 接线判定：当前不预设必须修改。** 当前启动路径已调用 `desk_hardware_init()` 与 `desk_tclaw_init()`；若 sink 可从 A1 已有初始化/生命周期注册，避免改主入口。若静态/设备证据证明必须在 `app_main.c` 增加 hook 或启动调用，该文件未列入 A1/A2 当前独占路径；须先由 A0 明确归属（建议 A0 处理公共启动/组件注册，或批准一次性窄路径例外给指定 owner），并单独记录相应 CR。不得把该修改默认为 A1 或 A2 的权限。`deploy/edge/` 则已明确归 A3，不需要 ownership 例外；Runtime 部署使用 §7 已批准的锁定版本。
+
+5. **Host consumer 与 Runtime 部署：区分产品与验证用途。** A7 拥有 `tools/verification/` 网络日志采集工具及 `tests/e2e/` 验证；A3 拥有 `host/desk_agent/core/` 产品 consumer（及对应测试）、`deploy/edge/` 安装/服务配置和 Host 生命周期集成。A3 负责新增默认关闭、有界、显式授权的产品 consumer，并接通由官方 Runtime 提供的 managed Application callback；普通 Desktop raw route 和默认 `_ignore_callback` 不得作为日志归档。A2 只维护固件 bridge/设备事件协议，不改产品 Host 核心或 Runtime 安装源码。
+
+   **前置依赖：当前 edge 部署没有安装或启动 pinned official Runtime。** `deploy/edge/install.sh` 安装普通 Host/Companion 并安装 `desk-agent.service`；该 unit 直接运行 `host.desk_agent.main` 普通配置入口。Host 只有在 Runtime 提供 managed-app 环境时，才会进入 `_run_managed_application()` 并创建 `ApplicationContext.from_environment()`。当前没有日志 consumer、consumer 授权 gate 或有界接收队列。因此，即使固件先发送 `sys.log.event/gap`，当前部署也没有可用的受管 Host 消费链路。A3 在 `host/desk_agent/core/` + `deploy/edge/` 单独部署/托管该锁定版本官方 Runtime 与 managed app，并提供默认关闭、有界 consumer；可通过集中封装的 `private context._transport` listener 接收日志，但必须增加绑定该 Runtime SHA 的契约测试。只有本地显式启用且设备配对授权通过才消费。先做 L2 本机/模拟集成，不宣称 TaiShanPi 可用。
+
+   Runtime 候选已由本地 pinned source 核验：v0.1.11，commit SHA `8bc13967a06ef073459be47e930ff43ef37ee8fb`，许可证 Apache-2.0（见 §7）。A0 已批准此版本作为部署锁定版本；部署清单必须固定该版本并保留来源/许可证记录。`deploy/edge/` 已属于 A3 ownership，不需路径例外；如需改 pinned SDK 安装/第三方源码，当前不在 A3/A2 ownership 内，须先提出 A0 窄范围 ownership/path exception CR，明确 tracked path、owner、来源/许可证、升级回合及测试边界；ignored vendor checkout 保持只读。若 Application callback 可通过现有受支持接口接入，则不需要 SDK 源码例外。
+
+6. **A0 — 公共契约与注册：** 批准本 CR 后，A0 更新公共接口/Schema/capability contract；如新增组件需变更公用构建注册，按 AGENTS 由 A0 合入。任何 ownership 例外先记录后实施。
+
+7. A7 为网络采集消费者实现 L2 协议 fixtures/测试与 L3 设备验收；不修改固件生产代码或绕过 A1/A2。既有 UART capture 不删除、不转成网络 fallback；UART 和网络证据分别标注来源、固件 hash、boot_id 与证据等级。
 
 ## 6. 验收门槛
 
@@ -118,6 +130,7 @@ SDK v0.1.11 没有专用 log event/consumer API。`RawFrameRouter.route_external
 
 ## 7. 当前证据与待裁决项
 
+- **pinned official Runtime 候选（L1）：** 本地 pinned source 核验版本 v0.1.11，commit SHA `8bc13967a06ef073459be47e930ff43ef37ee8fb`，许可证 Apache-2.0。此为部署锁定候选，不表示已部署或已在 TaiShanPi 验证。
 - **A2 静态审计（pinned SDK v0.1.11，L1）：** `watcherobot/protocol.py::build_command()` 生成 `{type, code: 0, data: {..., command_id}}`；`watcherobot/desktop_session.py::_resolve_pending()` 只以 `data.command_id` 匹配 ACK/NACK。订阅控制必须遵循这套封套。
 - **A2 静态审计（pinned SDK v0.1.11，L1）：** `runtime/daemon/connections/websocket_server.py::_handle_hello()` 解析首个 HardwareHello 并调用 authorizer；`runtime/daemon/runtime.py::_authorize_hardware_hello()` 调用 pairing session；`runtime/daemon/pairing/session.py::DevicePairingSession.connect_device()` 校验当前状态、pair request / daemon ID / token / mode / peer IP 后设置 CONNECTED。该 Runtime 未把 capability 用作权限授权。
 - **A2 静态审计（pinned SDK v0.1.11，L1）：** `runtime/daemon/routing/raw.py::RawFrameRouter.route_external()` 对合法 JSON frame 作原样路由；`runtime/daemon/application/bridge.py::LocalWebSocketApplicationBridge` 的缺省 frame callback 为 `_ignore_callback`；没有专用 log consumer/archive API。SDK `watcherobot/robot.py::Robot._on_message()` 对未列入分支的消息不作日志消费。
@@ -125,8 +138,16 @@ SDK v0.1.11 没有专用 log event/consumer API。`RawFrameRouter.route_external
 - **当前设备桥静态证据（L1）：** `firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c::desk_sdk_bridge_process_command()` 对未知 type 返回 404 `UNKNOWN_OPERATION` NACK；新订阅必须有显式 handler。`firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c::desk_sdk_ws_client_poll()` 是设备 WebSocket 收帧入口，dispatch / paired-state gate 尚未实现为日志功能。
 - **A1 日志入口静态审计（本地 TuyaOpen SDK snapshot，L1；目标硬件未测）：** `.target_logging/a1-currenthead-isolated-build-20261022/TuyaOpenSDK/src/tal_system/src/tal_log.c::PrintLogV()` 在 `tal_mutex_lock(pLogManage->mutex)` 与 `tal_mutex_unlock()` 范围内格式化并同步调用 `__output_logManage_buf()`；网络 sink 若阻塞会延长/死锁全局日志锁。A1 提醒 `esp_log_set_vprintf` hook 需支持并发/重入、无 tag 参数，应先 bounded-format 再 allowlist 解析，hook 内不能再次调用 `ESP_LOG`。计划采用非阻塞固定队列 + worker、drop-new + counter，保留 UART 输出；候选 16×192B + ~2KiB internal stack（约 5KiB）尚未真机测量。
 - **日志来源覆盖范围未对账：** TAL/stdout、ESP-IDF logger、UART sink 以及 ROM/bootloader logger 是否分别可捕获、是否重复、是否能保持现有 UART 语义尚未核实。该方案只允许经过 tag/event allowlist 和脱敏的低敏诊断，不等同于转发全部串口/系统日志。
-- **A7 缺口记录证据（工具层 L2、有限 UART L3）：** 当前 logger 只读取 UART；未见网络日志 stream/sink。
-- **未实现/未证明：** pinned Runtime 无专用 log consumer；Host capability 不授权；A1 未接入新 command handler/sink；A2 未加有界 consumer；当前 WebSocket 无 TLS；目标镜像上的 logger hook、内存预算、设备端脱敏、真机网络接收/恢复/性能均未验证。
-- **A0/A1/A2 合入前必须确认：** Runtime/Application consumer 如何有界消费并区分已授权设备；订阅权限开关默认关闭；设备侧 handler 如何绑定实际 authenticated paired state；`boot_id` 熵源和候选 ~5KiB 预算/事件尺寸是否符合实测资源；logger hook 的重入与 UART 输出保真；各日志源覆盖/重复关系；pairing token 生命周期对长连接的影响。任一不满足须先修订 CR，不得发明隐式行为。
+- **A3 Host/deployment 静态审计（L1）：** `deploy/edge/install.sh` 安装普通 Host/Companion 并部署 `desk-agent.service`，没有安装或启动 pinned official Runtime；`deploy/edge/desk-agent.service` 直接执行 `python3 -m host.desk_agent.main --config ...`。`host/desk_agent/main.py::_run_managed_application()` 才调用 `ApplicationContext.from_environment()`；该路径依赖 Runtime 注入 managed-app 环境。当前部署无日志 consumer、授权 gate 或有界接收队列，故 Host/Runtime 部署与托管集成是网络日志端到端接收的前置依赖。
+- **未实现/未证明：** edge 当前未部署/启动 pinned Runtime；Host 当前没有显式有界 log consumer/授权 gate；pinned Runtime 无专用 log consumer；Host capability 不授权；A1 未接入新 command handler/sink；A2 未加 handler/发送；当前 WebSocket 无 TLS；目标镜像上的 logger hook、内存预算、设备端脱敏、真机网络接收/恢复/性能均未验证。
+- **A0/A1/A2/A3 合入前必须确认：** A0 是否批准 §7 的有限 L2 实现范围；A3 如何按锁定版本部署/托管 Runtime、注入 managed-app environment、接入 managed Application callback 并提供默认关闭的显式有界 consumer；Runtime/Application consumer 如何区分已授权设备；订阅权限开关默认关闭；设备侧 handler 如何绑定实际 authenticated paired state；`app_main.c` 是否确实需要接线（若需要，先批准路径 owner）；产品 Host callback/consumer 的受支持接入点及 pinned SDK 外部源码是否必须保持只读；`boot_id` 熵源和候选 ~5KiB 预算/事件尺寸是否符合实测资源；logger hook 的重入与 UART 输出保真；各日志源覆盖/重复关系；pairing token 生命周期对长连接的影响。任一不满足须先修订 CR 或另开窄范围 ownership CR，不得发明隐式行为。
 
-**结论：** 提案选择已认证的 L-09 WebSocket 为唯一允许的候选日志通道，明确拒绝未认证旁路；其网络日志能力仍为未实现/未验证。A0 批准前不得开始协议实现或将能力宣称为可用。
+**A0 Decision Log — 2026-10-22：** 批准 CR-009 进入有限 L2 实现阶段；仅允许本机/模拟构建、契约 fixtures 与集成验证，不批准实机验证、部署完成或产品交付宣称。范围固定为： (1) Runtime pin 为 watcherobot v0.1.11、SHA `8bc13967a06ef073459be47e930ff43ef37ee8fb`、Apache-2.0；(2) 仅传结构化枚举 `event_id` 与严格有界低敏 `fields`，不传原始日志或自由文本，不持久化；(3) A1 仅在 `desk_hardware/` / `desk_tclaw/` 提供 queue/sink API，A2 在 `desk_sdk_bridge/` 实现显式 paired command handler/发送，A3 在 `host/desk_agent/core/` + `deploy/edge/` 托管 Runtime/managed app 并实现默认关闭 bounded consumer，A0维护公开接口/schema，A7维护 L2 fixtures；(4) Runtime 无 TLS，LAN 仅允许低敏数据；候选约 5 KiB 预算必须在 L3 前测量。
+
+**实现前 CR 子项：** (a) 冻结各 `event_id` 的具体字段映射、类型、范围和脱敏规则；(b) 由 A0/A2 明确 bridge 中 authenticated paired-state 授权 seam 的实际接口/生命周期。两项未解决前不得实现相关协议字段或授权逻辑。
+
+**L3/L4 尚未通过：** 真实 Runtime service 在目标 Host 的部署、managed-app env 注入及 paired device 网络收发尚未验证；真实设备资源预算、日志源覆盖、TLS 缺失下的隐私边界和 UART 保真也未测。
+
+**实机前置条件：** 完成上述实现前 CR 子项；A3 在目标部署启动锁定 Runtime 并提供 managed-app environment；A1/A2 完成目标固件 sink/handler/配对 gate；A3 consumer 显式开启且双侧授权；测量资源预算并确认 logger source 覆盖、隐私过滤和 UART 保真后，才可进入 L3/L4 真机验收。
+
+**结论：** 提案选择已认证的 L-09 WebSocket 为唯一允许的候选日志通道，明确拒绝未认证旁路；L2 实现获批，但网络日志能力仍未实现；真实 Runtime service/paired device 的 L3/L4 和产品交付未批准。
