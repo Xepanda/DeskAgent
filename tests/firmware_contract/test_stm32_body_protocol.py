@@ -552,9 +552,25 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         self.assertEqual(pan_x10, 1200)
         self.assertEqual(tilt_x10, 1100)
 
-        # Feed ACK into desk_hardware_mcu_receive_bytes
-        recv_rc = self.lib.desk_hardware_mcu_receive_bytes(buf, 18)
-        self.assertEqual(recv_rc, DESK_HW_OK)
+        # ACK is accepted only for the matching outstanding transaction.
+        self.assertEqual(self.lib.desk_hardware_mcu_receive_bytes(buf, 18), DESK_HW_ERR_BUSY)
+
+        @MCU_TX_CB
+        def ack_on_tx(tx_ptr, tx_len, _user_data):
+            tx = bytes(ctypes.cast(tx_ptr, ctypes.POINTER(ctypes.c_uint8 * tx_len)).contents)
+            (tx_seq,) = struct.unpack("<I", tx[6:10])
+            response = (ctypes.c_uint8 * 64)()
+            response_len = ctypes.c_size_t()
+            self.lib.desk_hardware_format_stm32_ack_packet(
+                tx_seq, 1200, 1100, response, len(response), ctypes.byref(response_len)
+            )
+            self.lib.desk_hardware_mcu_receive_bytes(response, response_len.value)
+
+        _KEEP_ALIVE.append(ack_on_tx)
+        self.lib.desk_hardware_register_mcu_tx_cb(ack_on_tx, None)
+        self.lib.desk_hardware_set_mcu_timeout_ms(30)
+        self.lib.desk_hardware_set_mcu_max_retries(0)
+        self.assertEqual(self.lib.desk_hardware_motion_move_to(120.0, 110.0, 300), DESK_HW_OK)
         self.assertAlmostEqual(self.lib.desk_hardware_get_pan(), 120.0, places=2)
         self.assertAlmostEqual(self.lib.desk_hardware_get_tilt(), 110.0, places=2)
 
@@ -574,10 +590,23 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         self.assertEqual(nack_frame[12], MCU_NACK_ERR_CRC)
         self.assertEqual(nack_frame[13], 0x10)
 
-        # Feed NACK into desk_hardware_mcu_receive_bytes
-        recv_nack_rc = self.lib.desk_hardware_mcu_receive_bytes(buf, 16)
-        self.assertEqual(recv_nack_rc, DESK_HW_ERR_IO)
+        @MCU_TX_CB
+        def nack_on_tx(tx_ptr, tx_len, _user_data):
+            tx = bytes(ctypes.cast(tx_ptr, ctypes.POINTER(ctypes.c_uint8 * tx_len)).contents)
+            (tx_seq,) = struct.unpack("<I", tx[6:10])
+            response = (ctypes.c_uint8 * 64)()
+            response_len = ctypes.c_size_t()
+            self.lib.desk_hardware_format_stm32_nack_packet(
+                tx_seq, MCU_NACK_ERR_CRC, 0x10, response, len(response), ctypes.byref(response_len)
+            )
+            self.lib.desk_hardware_mcu_receive_bytes(response, response_len.value)
+
+        _KEEP_ALIVE.append(nack_on_tx)
+        self.lib.desk_hardware_register_mcu_tx_cb(nack_on_tx, None)
+        self.assertEqual(self.lib.desk_hardware_motion_move_to(120.0, 110.0, 300), DESK_HW_ERR_TIMEOUT)
         self.assertEqual(self.lib.desk_hardware_get_mcu_nack_count(), 1)
+        self.lib.desk_hardware_set_mcu_max_retries(MCU_MAX_RETRIES)
+        self.lib.desk_hardware_set_mcu_timeout_ms(MCU_ACK_TIMEOUT_MS)
 
     # ------------------------------------------------------------------
     # Test 6: CRC and Corruption Detection
@@ -608,6 +637,66 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         # 3. Truncated frame
         rc = self.lib.desk_hardware_mcu_receive_bytes(buf, 10)
         self.assertEqual(rc, -1)
+
+    def test_06b_receive_requires_exact_correlated_ack_or_nack(self) -> None:
+        outcomes = []
+
+        @MCU_TX_CB
+        def on_tx(tx_ptr, tx_len, _user_data):
+            tx = bytes(ctypes.cast(tx_ptr, ctypes.POINTER(ctypes.c_uint8 * tx_len)).contents)
+            (seq,) = struct.unpack("<I", tx[6:10])
+            base = (ctypes.c_uint8 * 64)()
+            base_len = ctypes.c_size_t()
+            self.lib.desk_hardware_format_stm32_ack_packet(
+                seq, 900, 1200, base, len(base), ctypes.byref(base_len)
+            )
+            valid = bytearray(base[:base_len.value])
+
+            def send(mutated: bytearray, declared_len: int | None = None):
+                crc_end = 12 + (mutated[10] | (mutated[11] << 8))
+                crc = python_crc16_ccitt(bytes(mutated[:crc_end]))
+                mutated[crc_end:crc_end + 2] = struct.pack("<H", crc)
+                frame = (ctypes.c_uint8 * len(mutated))(*mutated)
+                outcomes.append(self.lib.desk_hardware_mcu_receive_bytes(
+                    frame, len(mutated) if declared_len is None else declared_len
+                ))
+
+            wrong_seq = bytearray(valid)
+            wrong_seq[6] ^= 1
+            send(wrong_seq)
+            wrong_id = bytearray(valid)
+            wrong_id[4] = MCU_MOTION_MSG_SERVO_STOP
+            send(wrong_id)
+            wrong_flags = bytearray(valid)
+            wrong_flags[5] = MCU_FRAME_FLAG_ACK_RESP | MCU_FRAME_FLAG_ACK_REQ
+            send(wrong_flags)
+            wrong_payload = bytearray(valid)
+            wrong_payload[10:12] = struct.pack("<H", 5)
+            wrong_payload = wrong_payload[:16] + b"\x00" + wrong_payload[16:]
+            send(wrong_payload)
+            trailing = bytearray(valid + b"\x00")
+            outcomes.append(self.lib.desk_hardware_mcu_receive_bytes(
+                (ctypes.c_uint8 * len(trailing))(*trailing), len(trailing)
+            ))
+            send(bytearray(valid))
+
+        _KEEP_ALIVE.append(on_tx)
+        self.lib.desk_hardware_register_mcu_tx_cb(on_tx, None)
+        self.lib.desk_hardware_set_mcu_timeout_ms(30)
+        self.lib.desk_hardware_set_mcu_max_retries(0)
+        self.assertEqual(self.lib.desk_hardware_motion_move_to(90.0, 120.0, 300), DESK_HW_OK)
+        self.assertEqual(outcomes, [DESK_HW_ERR_BUSY, DESK_HW_ERR_IO, DESK_HW_ERR_IO,
+                                    DESK_HW_ERR_IO, -3, DESK_HW_OK])
+        self.lib.desk_hardware_set_mcu_max_retries(MCU_MAX_RETRIES)
+        self.lib.desk_hardware_set_mcu_timeout_ms(MCU_ACK_TIMEOUT_MS)
+
+    def test_06c_motion_rejects_non_finite_angles(self) -> None:
+        for pan, tilt in ((float("nan"), 120.0), (90.0, float("nan")),
+                          (float("inf"), 120.0), (90.0, float("-inf"))):
+            self.assertEqual(
+                self.lib.desk_hardware_motion_move_to(pan, tilt, 300),
+                DESK_HW_ERR_INVALID_ARG,
+            )
 
     # ------------------------------------------------------------------
     # Test 7: Timeout & Retry Sequence Preservation Invariant
