@@ -62,6 +62,20 @@ DEFAULT_DENIED_SERVICES = frozenset({
     "homeassistant.check_config",
 })
 
+# Safe, explicit controls available when a deployment does not provide its
+# own service list. Read-only domains intentionally have no default services.
+DEFAULT_ALLOWED_SERVICES = frozenset({
+    "light.turn_on", "light.turn_off", "light.toggle",
+    "switch.turn_on", "switch.turn_off", "switch.toggle",
+    "cover.open_cover", "cover.close_cover", "cover.stop_cover", "cover.set_cover_position",
+    "climate.set_temperature", "climate.set_hvac_mode",
+    "fan.turn_on", "fan.turn_off", "fan.toggle", "fan.set_percentage",
+    "media_player.turn_on", "media_player.turn_off", "media_player.media_play",
+    "media_player.media_pause", "media_player.media_stop", "media_player.volume_set",
+    "scene.turn_on",
+    "input_boolean.turn_on", "input_boolean.turn_off", "input_boolean.toggle",
+})
+
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 MAX_STATE_CONFIRMATION_TIMEOUT_MS = 30_000
 
@@ -167,7 +181,9 @@ class HAConnector:
 
         self.allowed_entities: Optional[set[str]] = set(allowed_entities) if allowed_entities is not None else None
         self.denied_entities: set[str] = set(denied_entities) if denied_entities is not None else set()
-        self.allowed_services: Optional[set[str]] = set(allowed_services) if allowed_services is not None else None
+        self.allowed_services: set[str] = (
+            set(allowed_services) if allowed_services is not None else set(DEFAULT_ALLOWED_SERVICES)
+        )
         self.denied_services: set[str] = set(denied_services) if denied_services is not None else set()
         self.timeout_sec = max(0.5, timeout_sec)
         self._transport = transport
@@ -237,11 +253,9 @@ class HAConnector:
         full_svc = f"{domain}.{action}"
         if full_svc in self.denied_services or action in self.denied_services:
             return False
-        if full_svc in DEFAULT_DENIED_SERVICES and not (self.allowed_services and full_svc in self.allowed_services):
+        if full_svc in DEFAULT_DENIED_SERVICES:
             return False
-        if self.allowed_services is None:
-            return True
-        return full_svc in self.allowed_services or action in self.allowed_services
+        return full_svc in self.allowed_services
 
     def reconcile_states(self) -> dict[str, Any]:
         """
@@ -373,7 +387,7 @@ class HAConnector:
                         backoff = min(backoff * 2.0, 16.0)
                         continue
                 elif msg.get("type") != "auth_ok":
-                    logger.warning("Unexpected first WebSocket message: %s", msg)
+                    raise ConnectionError("Home Assistant WebSocket did not begin with an authentication message")
 
                 # 2. Subscribe to state_changed events
                 sub_id = self._next_interaction_id()
@@ -385,8 +399,12 @@ class HAConnector:
                 conn.send(json.dumps(sub_msg))
                 sub_ack_raw = conn.recv(timeout=self.timeout_sec)
                 sub_ack = json.loads(sub_ack_raw)
-                if not sub_ack.get("success", False) and sub_ack.get("id") == sub_id:
-                    logger.warning("HA state_changed subscription not accepted: %s", sub_ack)
+                if (
+                    sub_ack.get("type") != "result"
+                    or sub_ack.get("id") != sub_id
+                    or sub_ack.get("success") is not True
+                ):
+                    raise ConnectionError("Home Assistant did not acknowledge the state_changed subscription")
 
                 self._ws_connected.set()
                 backoff = 1.0
@@ -643,6 +661,8 @@ class HAConnector:
 
         body: dict[str, Any] = {"entity_id": entity_id}
         if parameters:
+            if "entity_id" in parameters and parameters["entity_id"] != entity_id:
+                raise ValueError("parameters.entity_id cannot differ from the allowlisted target entity")
             body.update(parameters)
 
         # Resolve target state and attributes confirmation requirements

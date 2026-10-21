@@ -129,6 +129,42 @@ class TestHAConnector(unittest.TestCase):
         with self.assertRaises(PermissionError):
             ha.execute("light.desk", "turn_off")
 
+    def test_default_service_allowlist_is_explicit_and_domain_scoped(self) -> None:
+        """Unconfigured deployments expose only declared low-risk controls, never action-wide grants."""
+        ha = HAConnector(base_url="http://ha.test:8123", token="token")
+        self.assertTrue(ha.is_service_allowed("light", "turn_on"))
+        self.assertTrue(ha.is_service_allowed("climate", "set_temperature"))
+        self.assertFalse(ha.is_service_allowed("light", "reload"))
+        self.assertFalse(ha.is_service_allowed("media_player", "join"))
+        self.assertFalse(ha.is_service_allowed("sensor", "turn_on"))
+        self.assertFalse(ha.is_service_allowed("homeassistant", "restart"))
+
+    def test_allowed_service_requires_domain_qualified_entry(self) -> None:
+        """A configured bare action cannot accidentally authorize the same action across domains."""
+        ha = HAConnector(allowed_services=["turn_on"])
+        self.assertFalse(ha.is_service_allowed("light", "turn_on"))
+        with self.assertRaises(PermissionError):
+            ha.execute("light.desk", "turn_on")
+
+    def test_parameters_cannot_replace_allowlisted_target_entity(self) -> None:
+        """A caller cannot pass entity authorization for one entity and execute against another."""
+        posted: list[Mapping[str, Any]] = []
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "POST":
+                posted.append(payload or {})
+            return 200, {"entity_id": "light.desk", "state": "on"}
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            allowed_entities=["light.desk"],
+            transport=mock_transport,
+        )
+        with self.assertRaises(ValueError):
+            ha.execute("light.desk", "turn_on", parameters={"entity_id": "light.restricted"})
+        self.assertEqual(posted, [])
+
     def test_invalid_state_confirmation_timeout_rejected_before_service_call(self) -> None:
         """Malformed or negative confirmation waits must not trigger a service call."""
         recorded_methods: list[str] = []
@@ -489,6 +525,48 @@ class TestHAConnector(unittest.TestCase):
         try:
             time.sleep(0.1)
             self.assertFalse(ha.is_ws_connected)
+        finally:
+            stop_sub()
+            ha.close()
+
+    def test_websocket_rejected_subscription_is_not_reported_connected(self) -> None:
+        """HA must acknowledge the exact subscription before the connector claims event coverage."""
+        script = [
+            json.dumps({"type": "auth_required", "ha_version": "2026.10"}),
+            json.dumps({"type": "auth_ok", "ha_version": "2026.10"}),
+            json.dumps({"id": 999, "type": "result", "success": True, "result": None}),
+        ]
+        mock_ws = MockWebSocketClient(script)
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            transport=lambda *args: (200, []),
+            ws_factory=lambda url: mock_ws,
+        )
+
+        stop_sub = ha.subscribe_state_changes(lambda *args: None)
+        try:
+            time.sleep(0.1)
+            self.assertFalse(ha.is_ws_connected)
+        finally:
+            stop_sub()
+            ha.close()
+
+    def test_websocket_unexpected_initial_message_is_not_authenticated(self) -> None:
+        """An unexpected greeting cannot proceed to event subscription as an authenticated session."""
+        mock_ws = MockWebSocketClient([json.dumps({"type": "event", "event": {}})])
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            transport=lambda *args: (200, []),
+            ws_factory=lambda url: mock_ws,
+        )
+
+        stop_sub = ha.subscribe_state_changes(lambda *args: None)
+        try:
+            time.sleep(0.1)
+            self.assertFalse(ha.is_ws_connected)
+            self.assertEqual(mock_ws.sent, [])
         finally:
             stop_sub()
             ha.close()
