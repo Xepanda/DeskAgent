@@ -6,6 +6,39 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestTclawRuntimeContract(unittest.TestCase):
+    def test_native_boot_tolerates_transient_display_ui_ownership(self) -> None:
+        app = (ROOT / "firmware/main/src/app_main.c").read_text(encoding="utf-8")
+        checks = app.split("for (int r = 0; r < DESK_RES_MAX; r++)", 1)[1].split(
+            'printf("[READY]', 1
+        )[0]
+        native_checks = checks.split("#ifdef ESP_PLATFORM", 1)[1].split("#endif", 1)[0]
+
+        self.assertIn(
+            "r == DESK_RES_DISPLAY_UI",
+            native_checks,
+            "display drawing can briefly own the arbiter during native runtime startup",
+        )
+        self.assertIn(
+            "desk_arbiter_get_owner((desk_resource_type_t)r) != DESK_OWNER_NONE",
+            checks,
+            "the boot check must continue rejecting other leaked resource owners",
+        )
+
+    def test_only_wakeup_or_vad_starts_listening_expression(self) -> None:
+        adapter = (ROOT / "firmware/main/src/tclaw_runtime_adapter.c").read_text(encoding="utf-8")
+        handler = adapter.split("static void __desk_ai_chat_event_handler", 1)[1].split(
+            "int desk_tclaw_runtime_init", 1
+        )[0]
+        listening_cases = handler.split('new_preset = "listening";', 1)[0]
+
+        self.assertIn("case AI_USER_EVT_KEY_WAKEUP:", listening_cases)
+        self.assertIn("case AI_USER_EVT_SERVER_VAD:", listening_cases)
+        self.assertNotIn(
+            "case AI_USER_EVT_MIC_DATA:",
+            listening_cases,
+            "raw PCM delivery is not a wakeup or voice activity event",
+        )
+
     def test_native_runtime_uses_official_modules_in_dependency_order(self) -> None:
         source = ROOT / "firmware/main/src/tclaw_runtime_adapter.c"
         adapter = source.read_text(encoding="utf-8")

@@ -629,7 +629,7 @@ static void __desk_ai_chat_event_handler(AI_NOTIFY_EVENT_T *event)
 
     switch (event->type) {
     case AI_USER_EVT_KEY_WAKEUP:
-    case AI_USER_EVT_MIC_DATA:
+    case AI_USER_EVT_SERVER_VAD:
         new_preset = "listening";
         status_text = "Listening...";
         break;

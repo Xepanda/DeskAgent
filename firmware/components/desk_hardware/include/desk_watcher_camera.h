@@ -15,6 +15,13 @@
 extern "C" {
 #endif
 
+/* Camera-specific failures preserve the protocol layer that rejected a frame. */
+enum {
+    DESK_WATCHER_CAMERA_ERR_PROTOCOL = -20,
+    DESK_WATCHER_CAMERA_ERR_CRC = -21,
+    DESK_WATCHER_CAMERA_ERR_SYNC_IO = -22,
+};
+
 int desk_watcher_camera_init(void);
 int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len);
 int desk_watcher_camera_deinit(void);

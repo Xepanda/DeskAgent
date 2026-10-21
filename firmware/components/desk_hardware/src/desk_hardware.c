@@ -18,6 +18,7 @@
 
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_board.h"
+#include "desk_watcher_audio.h"
 #endif
 
 /* --- Motion & STM32 Link State --- */
@@ -986,6 +987,20 @@ int desk_hardware_audio_record_stop(void)
     return 0;
 }
 
+int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status)
+{
+    if (!out_status) return DESK_HW_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    desk_watcher_audio_status(&out_status->ready, &out_status->running,
+                              &out_status->frames, &out_status->errors,
+                              &out_status->peak);
+    return out_status->ready ? DESK_HW_OK : DESK_HW_ERR_UNAVAILABLE;
+#else
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
 int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void *user_data)
 {
     s_audio_play_cb = cb;
@@ -1154,6 +1169,10 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
             *out_len = drv_len;
             return DESK_HW_OK;
         }
+        if (drv_ret != DESK_HW_OK) {
+            return drv_ret;
+        }
+        return DESK_HW_ERR_IO;
     }
 
 #ifdef ESP_PLATFORM

@@ -87,6 +87,7 @@ void watcher_test_reset(void);
 void watcher_test_set_bus_installed(int installed);
 void watcher_test_set_expander_present(int present);
 void watcher_test_set_system_enabled(int enabled);
+void watcher_test_set_cold_boot_state(void);
 void watcher_test_set_failure(int stage);
 void watcher_test_complete_pending_draw(void);
 int watcher_test_free_count(void);
@@ -233,6 +234,7 @@ void watcher_test_reset(void) {
 void watcher_test_set_bus_installed(int v) { bus_installed = v; }
 void watcher_test_set_expander_present(int v) { expander_present = v; }
 void watcher_test_set_system_enabled(int v) { system_enabled = v; if (v) regs[3] |= 0x04; else regs[3] &= (uint8_t)~0x04; }
+void watcher_test_set_cold_boot_state(void) { system_enabled = 0; regs[3] = 0xA1; regs[7] = 0xFF; }
 void watcher_test_set_failure(int v) { failure = v; }
 void watcher_test_complete_pending_draw(void) { if (draw_callback) draw_callback((void*)0x11, NULL, draw_callback_ctx); }
 int watcher_test_free_count(void) { return frees; }
@@ -320,9 +322,9 @@ const char *esp_err_to_name(esp_err_t err) { (void)err; return "stub-error"; }
         cls.lib.desk_watcher_board_get_driver_ops.restype = ctypes.POINTER(DeskBoardDriverOps)
         for name in (
             "watcher_test_reset", "watcher_test_set_bus_installed", "watcher_test_set_expander_present",
-            "watcher_test_set_system_enabled", "watcher_test_set_failure",
+            "watcher_test_set_system_enabled", "watcher_test_set_cold_boot_state", "watcher_test_set_failure",
         ):
-            getattr(cls.lib, name).argtypes = [ctypes.c_int] if name != "watcher_test_reset" else []
+            getattr(cls.lib, name).argtypes = [] if name in ("watcher_test_reset", "watcher_test_set_cold_boot_state") else [ctypes.c_int]
         for name in (
             "watcher_test_i2c_config_count", "watcher_test_i2c_install_count", "watcher_test_write_count",
             "watcher_test_spi_init_count", "watcher_test_draw_count", "watcher_test_expander_probe_count",
@@ -357,7 +359,7 @@ const char *esp_err_to_name(esp_err_t err) { (void)err; return "stub-error"; }
         self.assertEqual(self.lib.watcher_test_i2c_install_count(), 0)
         self.assertGreater(self.lib.watcher_test_expander_probe_count(), 0)
         self.assertGreater(self.lib.watcher_test_draw_count(), 0)
-        self.assertEqual(self.lib.watcher_test_delay_total_ms(), 50)
+        self.assertEqual(self.lib.watcher_test_delay_total_ms(), 150)
 
     def test_uninstalled_i2c_is_initialized_on_official_general_bus_pins(self) -> None:
         self.assertEqual(self.init(), 0)
@@ -365,7 +367,7 @@ const char *esp_err_to_name(esp_err_t err) { (void)err; return "stub-error"; }
         self.assertEqual(self.lib.watcher_test_i2c_install_count(), 1)
         self.assertGreater(self.lib.watcher_test_draw_count(), 0)
 
-    def test_missing_expander_or_disabled_system_rail_never_touches_spi_or_lcd_power(self) -> None:
+    def test_missing_expander_fails_closed_and_cold_system_rail_is_powered_safely(self) -> None:
         self.lib.watcher_test_set_bus_installed(1)
         self.lib.watcher_test_set_expander_present(0)
         self.assertEqual(self.init(), -2)
@@ -375,9 +377,16 @@ const char *esp_err_to_name(esp_err_t err) { (void)err; return "stub-error"; }
         self.lib.watcher_test_reset()
         self.lib.watcher_test_set_bus_installed(1)
         self.lib.watcher_test_set_system_enabled(0)
-        self.assertEqual(self.init(), -2)
-        self.assertEqual(self.lib.watcher_test_spi_init_count(), 0)
-        self.assertEqual(self.lib.watcher_test_write_count(), 0)
+        self.assertEqual(self.init(), 0)
+        self.assertEqual(self.lib.watcher_test_spi_init_count(), 1)
+        self.assertEqual(self.lib.watcher_test_write_count(), 3)
+        self.assertEqual(self.lib.watcher_test_write_reg(0), 3)
+        self.assertEqual(self.lib.watcher_test_write_value(0), 0x04)
+        self.assertEqual(self.lib.watcher_test_write_reg(1), 3)
+        self.assertEqual(self.lib.watcher_test_write_value(1), 0x06)
+        self.assertEqual(self.lib.watcher_test_write_reg(2), 7)
+        self.assertEqual(self.lib.watcher_test_write_value(2), 0xF9)
+        self.assertEqual(self.lib.watcher_test_delay_total_ms(), 150)
 
     def test_expander_rmw_changes_only_lcd_power_and_direction_bits(self) -> None:
         self.lib.watcher_test_set_bus_installed(1)
@@ -387,6 +396,20 @@ const char *esp_err_to_name(esp_err_t err) { (void)err; return "stub-error"; }
         self.assertEqual(self.lib.watcher_test_write_value(0), 0x06)
         self.assertEqual(self.lib.watcher_test_write_reg(1), 7)
         self.assertEqual(self.lib.watcher_test_write_value(1), 0xF9)
+        self.assertEqual(self.lib.watcher_test_delay_total_ms(), 150)
+
+    def test_cold_boot_powers_system_then_lcd_while_preserving_other_expander_bits(self) -> None:
+        self.lib.watcher_test_set_bus_installed(1)
+        self.lib.watcher_test_set_cold_boot_state()
+
+        self.assertEqual(self.init(), 0)
+        self.assertEqual(self.lib.watcher_test_write_count(), 4)
+        self.assertEqual(
+            [(self.lib.watcher_test_write_reg(i), self.lib.watcher_test_write_value(i)) for i in range(4)],
+            [(3, 0xA5), (7, 0xFB), (3, 0xA7), (7, 0xF9)],
+        )
+        self.assertEqual(self.lib.watcher_test_delay_total_ms(), 150)
+        self.assertGreater(self.lib.watcher_test_draw_count(), 0)
 
     def test_panel_or_draw_failure_keeps_init_unavailable_and_callback_fails_closed(self) -> None:
         for stage in (2, 3, 4, 5, 6):

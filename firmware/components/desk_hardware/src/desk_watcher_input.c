@@ -35,6 +35,7 @@
 /* Rotary Knob Quadrature on GPIO 41 / 42 */
 #define WATCHER_KNOB_PIN_A           GPIO_NUM_41
 #define WATCHER_KNOB_PIN_B           GPIO_NUM_42
+#define WATCHER_KNOB_TRANSITIONS_PER_DETENT 4
 
 /* Knob Button on PCA9535 Port 0 Bit 3 (Pin 3) */
 #define PCA_REG_INPUT0               0x00
@@ -91,10 +92,49 @@ static void watcher_btn_expander_init(void)
     }
 }
 
+static bool watcher_knob_decode_step(int previous_state, int current_state,
+                                     int *quarter_steps, desk_touch_action_t *action)
+{
+    if (!quarter_steps || !action || previous_state < 0 || previous_state > 3 ||
+        current_state < 0 || current_state > 3) {
+        return false;
+    }
+
+    int delta = 0;
+    if ((previous_state == 0 && current_state == 1) ||
+        (previous_state == 1 && current_state == 3) ||
+        (previous_state == 3 && current_state == 2) ||
+        (previous_state == 2 && current_state == 0)) {
+        delta = 1;
+    } else if ((previous_state == 0 && current_state == 2) ||
+               (previous_state == 2 && current_state == 3) ||
+               (previous_state == 3 && current_state == 1) ||
+               (previous_state == 1 && current_state == 0)) {
+        delta = -1;
+    } else if ((previous_state ^ current_state) == 3) {
+        /* A skipped/bounced diagonal transition is not a scroll step. */
+        *quarter_steps = 0;
+    }
+
+    *quarter_steps += delta;
+    if (*quarter_steps >= WATCHER_KNOB_TRANSITIONS_PER_DETENT) {
+        *quarter_steps = 0;
+        *action = DESK_TOUCH_ACTION_SCROLL_UP;
+        return true;
+    }
+    if (*quarter_steps <= -WATCHER_KNOB_TRANSITIONS_PER_DETENT) {
+        *quarter_steps = 0;
+        *action = DESK_TOUCH_ACTION_SCROLL_DOWN;
+        return true;
+    }
+    return false;
+}
+
 static void watcher_input_worker_task(void *arg)
 {
     (void)arg;
     int last_state = 0;
+    int knob_quarter_steps = 0;
     bool btn_was_pressed = false;
     int64_t btn_press_start_us = 0;
 
@@ -115,13 +155,9 @@ static void watcher_input_worker_task(void *arg)
         int state = (cur_a << 1) | cur_b;
 
         if (state != last_state) {
-            /* Quadrature state transition table */
-            if ((last_state == 0 && state == 1) || (last_state == 1 && state == 3) ||
-                (last_state == 3 && state == 2) || (last_state == 2 && state == 0)) {
-                desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP);
-            } else if ((last_state == 0 && state == 2) || (last_state == 2 && state == 3) ||
-                       (last_state == 3 && state == 1) || (last_state == 1 && state == 0)) {
-                desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_DOWN);
+            desk_touch_action_t action;
+            if (watcher_knob_decode_step(last_state, state, &knob_quarter_steps, &action)) {
+                desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, action);
             }
             last_state = state;
         }

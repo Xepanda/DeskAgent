@@ -44,6 +44,8 @@
 
 #define CAM_MAX_PACKET_SZ         65536
 #define CAM_SYNC_TIMEOUT_MS       300
+#define CAM_HX_POWER_SETTLE_MS    20
+#define CAM_SYNC_GUARD_MS         2
 
 /* PTL and Media Protocol definitions */
 #define HX_PTL_BASE_HEADER_SIZE   7U
@@ -56,7 +58,7 @@
 #define HX_MEDIA_MAGIC_1          0x52U /* 'R' */
 #define HX_MEDIA_VERSION          1U
 
-#define WATCHER_HX_PTL_MAX_JPEG_SIZE (64U * 1024U)
+#define WATCHER_HX_PTL_MAX_JPEG_SIZE (128U * 1024U)
 #define WATCHER_HX_PTL_BODY_CAPACITY (HX_MEDIA_HEADER_SIZE + WATCHER_HX_PTL_MAX_JPEG_SIZE)
 
 #ifdef ESP_PLATFORM
@@ -118,13 +120,16 @@ static int camera_sync_configure(void)
     return DESK_HW_OK;
 }
 
-static bool camera_sync_is_active(void)
+static int camera_sync_is_active(bool *active)
 {
     uint8_t in0 = 0;
-    if (desk_watcher_board_pca_read(PCA_REG_INPUT0, &in0) != DESK_HW_OK) {
-        return false;
+    if (!active) return DESK_HW_ERR_INVALID_ARG;
+    int rc = desk_watcher_board_pca_read(PCA_REG_INPUT0, &in0);
+    if (rc != DESK_HW_OK) {
+        return rc;
     }
-    return (in0 & PCA_PIN_SYNC_PORT0_MASK) != 0;
+    *active = (in0 & PCA_PIN_SYNC_PORT0_MASK) != 0;
+    return DESK_HW_OK;
 }
 
 int desk_watcher_camera_init(void)
@@ -142,11 +147,13 @@ int desk_watcher_camera_init(void)
         if (!s_cam_mutex) return DESK_HW_ERR_UNAVAILABLE;
     }
 
-    /* Configure SYNC pin and enable HX power */
+    /* Configure SYNC pin and enable HX power. The upstream Watcher PTL
+     * receiver gives HX6538 20 ms to boot before opening SPI2. */
     if (camera_sync_configure() != DESK_HW_OK || camera_power_enable(true) != DESK_HW_OK) {
         ESP_LOGW(TAG, "Failed to power up Himax HX6538 via PCA9535");
         return DESK_HW_ERR_UNAVAILABLE;
     }
+    vTaskDelay(pdMS_TO_TICKS(CAM_HX_POWER_SETTLE_MS));
 
     /* Initialize SPI2 */
     const spi_bus_config_t buscfg = {
@@ -268,21 +275,34 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     int64_t start = esp_timer_get_time();
     bool sync_ready = false;
     while ((esp_timer_get_time() - start) < (int64_t)(CAM_SYNC_TIMEOUT_MS * 1000)) {
-        if (camera_sync_is_active()) {
+        bool sync_active = false;
+        int sync_rc = camera_sync_is_active(&sync_active);
+        if (sync_rc != DESK_HW_OK) {
+            ESP_LOGE(TAG, "SYNC read failed: PCA9535 INPUT0 rc=%d", sync_rc);
+            xSemaphoreGive(s_cam_mutex);
+            return DESK_WATCHER_CAMERA_ERR_SYNC_IO;
+        }
+        if (sync_active) {
             sync_ready = true;
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     if (!sync_ready) {
+        ESP_LOGE(TAG, "SYNC timeout after %d ms: ready signal stayed low", CAM_SYNC_TIMEOUT_MS);
         xSemaphoreGive(s_cam_mutex);
         return DESK_HW_ERR_TIMEOUT;
     }
 
+    /* SYNC is a FIFO readiness hint: upstream waits 2 ms after its rising
+     * edge because the complete PTL header may not yet be in the slave FIFO. */
+    vTaskDelay(pdMS_TO_TICKS(CAM_SYNC_GUARD_MS));
+
     /* Acquire bus for multi-step transaction */
     esp_err_t err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI bus acquire failed: %s (%d)", esp_err_to_name(err), (int)err);
         xSemaphoreGive(s_cam_mutex);
         return DESK_HW_ERR_IO;
     }
@@ -297,13 +317,19 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     };
     err = spi_device_transmit(s_spi_dev, &hdr_trans);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI PTL header transfer failed: %s (%d)", esp_err_to_name(err), (int)err);
         spi_device_release_bus(s_spi_dev);
         xSemaphoreGive(s_cam_mutex);
         return DESK_HW_ERR_IO;
     }
 
     uint32_t body_size = 0;
-    if (desk_watcher_camera_parse_ptl_header(base_header, sizeof(base_header), &body_size) != 0) {
+    int ptl_rc = desk_watcher_camera_parse_ptl_header(base_header, sizeof(base_header), &body_size);
+    if (ptl_rc != 0) {
+        ESP_LOGE(TAG, "PTL header rejected: parser rc=%d magic=%02x%02x type=%02x size=%u",
+                 ptl_rc, base_header[0], base_header[1], base_header[2],
+                 (unsigned)base_header[3] | ((unsigned)base_header[4] << 8) |
+                 ((unsigned)base_header[5] << 16) | ((unsigned)base_header[6] << 24));
         /* Discard / close rejected packet by clocking 1 dummy byte without KEEP_ACTIVE */
         uint8_t dummy = 0;
         spi_transaction_t close_trans = {
@@ -315,7 +341,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         (void)spi_device_transmit(s_spi_dev, &close_trans);
         spi_device_release_bus(s_spi_dev);
         xSemaphoreGive(s_cam_mutex);
-        return DESK_HW_ERR_IO;
+        return DESK_WATCHER_CAMERA_ERR_PROTOCOL;
     }
 
     /* Step 2: Read complete body into PSRAM buffer s_ptl_body */
@@ -328,6 +354,8 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     err = spi_device_transmit(s_spi_dev, &body_trans);
     spi_device_release_bus(s_spi_dev);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SPI PTL body transfer failed (body_size=%u): %s (%d)",
+                 (unsigned)body_size, esp_err_to_name(err), (int)err);
         xSemaphoreGive(s_cam_mutex);
         return DESK_HW_ERR_IO;
     }
@@ -335,12 +363,21 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     /* Step 3: Validate Media Header, CRC32, and extract JPEG */
     const uint8_t *jpeg_ptr = NULL;
     size_t jpeg_sz = 0;
-    if (desk_watcher_camera_validate_frame(s_ptl_body, body_size, &jpeg_ptr, &jpeg_sz) != 0) {
+    int frame_rc = desk_watcher_camera_validate_frame(s_ptl_body, body_size, &jpeg_ptr, &jpeg_sz);
+    if (frame_rc != 0) {
+        if (frame_rc == -4) {
+            ESP_LOGE(TAG, "CRC mismatch: media payload size=%u", (unsigned)(body_size - HX_MEDIA_HEADER_SIZE));
+            xSemaphoreGive(s_cam_mutex);
+            return DESK_WATCHER_CAMERA_ERR_CRC;
+        }
+        ESP_LOGE(TAG, "Media frame rejected: validator rc=%d body_size=%u", frame_rc, (unsigned)body_size);
         xSemaphoreGive(s_cam_mutex);
-        return DESK_HW_ERR_IO;
+        return DESK_WATCHER_CAMERA_ERR_PROTOCOL;
     }
 
     if (jpeg_sz > max_len) {
+        ESP_LOGE(TAG, "JPEG output buffer too small: jpeg_size=%u max_len=%u",
+                 (unsigned)jpeg_sz, (unsigned)max_len);
         xSemaphoreGive(s_cam_mutex);
         return DESK_HW_ERR_INVALID_ARG;
     }
