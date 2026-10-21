@@ -103,8 +103,8 @@ class TestWatcherHardwareContract(unittest.TestCase):
         cls.lib.desk_watcher_motion_pack_stop.restype = ctypes.c_size_t
 
         cls.lib.desk_watcher_motion_parse_ack.argtypes = [
-            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_uint8)
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint8,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_bool)
         ]
         cls.lib.desk_watcher_motion_parse_ack.restype = ctypes.c_int
 
@@ -223,23 +223,63 @@ class TestWatcherHardwareContract(unittest.TestCase):
         raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
         frame = (ctypes.c_uint8 * len(raw))(*raw)
         nack = ctypes.c_uint8(0xFF)
+        is_nack = ctypes.c_bool(False)
 
         self.assertEqual(len(raw), 18)
         self.assertEqual(
-            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345678, ctypes.byref(nack)),
+            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345678, 1,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack)),
             0,
         )
+        self.assertFalse(is_nack.value)
         self.assertEqual(
-            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345679, ctypes.byref(nack)),
+            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345679, 1,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack)),
             -5,
         )
 
         bad = (ctypes.c_uint8 * len(raw))(*raw)
         bad[-1] ^= 0x01
         self.assertEqual(
-            self.lib.desk_watcher_motion_parse_ack(bad, len(raw), 0x12345678, ctypes.byref(nack)),
+            self.lib.desk_watcher_motion_parse_ack(bad, len(raw), 0x12345678, 1,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack)),
             -4,
         )
+
+    def test_native_binary_ack_requires_expected_command_and_valid_shape(self) -> None:
+        payload = bytes([0xA5, 0x5A, 1, 2, 1, 2]) + struct.pack("<IH", 7, 4)
+        payload += struct.pack("<hh", 900, 1200)
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0)
+        is_nack = ctypes.c_bool(False)
+        parse = self.lib.desk_watcher_motion_parse_ack
+
+        # Echoed MOVE ACK is valid only for the matching pending command.
+        self.assertEqual(parse(frame, len(raw), 7, 1, ctypes.byref(nack), ctypes.byref(is_nack)), 0)
+        self.assertEqual(parse(frame, len(raw), 7, 2, ctypes.byref(nack), ctypes.byref(is_nack)), -5)
+
+        # An ACK frame with an unexpected flag bit or malformed payload is ignored.
+        malformed_payload = bytes([0xA5, 0x5A, 1, 2, 1, 3]) + struct.pack("<IH", 7, 4)
+        malformed_payload += struct.pack("<hh", 900, 1200)
+        malformed = (ctypes.c_uint8 * (len(malformed_payload) + 2))(
+            *(malformed_payload + struct.pack("<H", python_crc16_ccitt(malformed_payload)))
+        )
+        self.assertEqual(parse(malformed, len(malformed), 7, 1,
+                               ctypes.byref(nack), ctypes.byref(is_nack)), -5)
+
+    def test_zero_code_nack_is_still_reported_as_nack(self) -> None:
+        payload = bytes([0xA5, 0x5A, 1, 2, 0xFF, 4]) + struct.pack("<IH", 9, 2)
+        payload += bytes([0, 0])
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0xFF)
+        is_nack = ctypes.c_bool(False)
+        rc = self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 9, 2,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack))
+        self.assertEqual(rc, -4)
+        self.assertTrue(is_nack.value)
+        self.assertEqual(nack.value, 0)
 
     def test_camera_ptl_header_parsing(self) -> None:
         """Verifies Himax PTL 7-byte Base Header parsing and negative rejection."""

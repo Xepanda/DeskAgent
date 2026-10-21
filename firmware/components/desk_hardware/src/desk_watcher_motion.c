@@ -28,6 +28,11 @@
 
 static bool s_motion_initialized = false;
 static uint32_t s_mcu_sequence = 0;
+/* UART2 may be shared with another initialized component. Only delete a
+ * driver instance that this module installed itself. */
+#ifdef ESP_PLATFORM
+static bool s_uart_installed_by_motion = false;
+#endif
 
 #ifdef ESP_PLATFORM
 static SemaphoreHandle_t s_motion_mutex = NULL;
@@ -154,6 +159,7 @@ int desk_watcher_motion_init(void)
             ESP_LOGE(TAG, "UART2 driver_install failed: %s", esp_err_to_name(err));
             return DESK_HW_ERR_IO;
         }
+        s_uart_installed_by_motion = true;
     }
 
     s_motion_initialized = true;
@@ -243,10 +249,14 @@ int desk_watcher_motion_wire_decode(const uint8_t *wire, size_t wire_len, uint8_
 }
 
 int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
-                                  uint32_t expected_seq, uint8_t *out_nack_code)
+                                  uint32_t expected_seq, uint8_t expected_msg_id,
+                                  uint8_t *out_nack_code, bool *out_is_nack)
 {
-    if (!frame || !out_nack_code || frame_len < 14) return DESK_HW_ERR_INVALID_ARG;
+    if (!frame || !out_nack_code || !out_is_nack || frame_len < 14 ||
+        (expected_msg_id != MCU_MOTION_MSG_SERVO_MOVE &&
+         expected_msg_id != MCU_MOTION_MSG_SERVO_STOP)) return DESK_HW_ERR_INVALID_ARG;
     *out_nack_code = 0;
+    *out_is_nack = false;
     if (frame[0] != MCU_FRAME_MAGIC0 || frame[1] != MCU_FRAME_MAGIC1 ||
         frame[2] != MCU_FRAME_PROTO_VERSION || frame[3] != MCU_FRAME_CLASS_MOTION) {
         return DESK_HW_ERR_IO;
@@ -265,10 +275,15 @@ int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
     uint8_t flags = frame[5];
     uint8_t msg_id = frame[4];
     if ((flags & MCU_FRAME_FLAG_NACK_RESP) || msg_id == MCU_MOTION_MSG_NACK) {
-        *out_nack_code = payload_len >= 1 ? frame[12] : 0;
+        if (payload_len != 2) return DESK_HW_ERR_IO;
+        *out_nack_code = frame[12];
+        *out_is_nack = true;
         return DESK_HW_ERR_IO;
     }
-    if ((flags & MCU_FRAME_FLAG_ACK_RESP) && msg_id == MCU_MOTION_MSG_ACK) {
+    /* The frozen protocol permits a generic ACK ID or an echo of the
+     * acknowledged MOVE/STOP ID. Require command correlation and exact flags. */
+    if (flags == MCU_FRAME_FLAG_ACK_RESP && payload_len == 4 &&
+        (msg_id == MCU_MOTION_MSG_ACK || msg_id == expected_msg_id)) {
         return DESK_HW_OK;
     }
     /* Valid command echoes and unrelated messages do not satisfy the request. */
@@ -348,13 +363,15 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
 
             if (expected_frame_len && frame_rx_len == expected_frame_len) {
                 uint8_t nack_code = 0;
+                bool is_nack = false;
                 int ack_rc = desk_watcher_motion_parse_ack(frame_rx, frame_rx_len,
-                                                           expected_seq, &nack_code);
+                                                           expected_seq, frame_data[4],
+                                                           &nack_code, &is_nack);
                 if (ack_rc == DESK_HW_OK) {
                     xSemaphoreGive(s_motion_mutex);
                     return DESK_HW_OK;
                 }
-                if (ack_rc == DESK_HW_ERR_IO && nack_code != 0) {
+                if (ack_rc == DESK_HW_ERR_IO && is_nack) {
                     xSemaphoreGive(s_motion_mutex);
                     return (nack_code == MCU_NACK_ERR_OUT_OF_BOUNDS ||
                             nack_code == MCU_NACK_ERR_INVALID_PARAM)
@@ -399,8 +416,9 @@ int desk_watcher_motion_deinit(void)
 {
 #ifdef ESP_PLATFORM
     if (s_motion_initialized) {
-        if (uart_is_driver_installed(UART_NUM_2)) {
+        if (s_uart_installed_by_motion && uart_is_driver_installed(UART_NUM_2)) {
             uart_driver_delete(UART_NUM_2);
+            s_uart_installed_by_motion = false;
         }
         if (s_motion_mutex) {
             vSemaphoreDelete(s_motion_mutex);
