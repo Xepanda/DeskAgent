@@ -64,6 +64,7 @@ static const char *cli_camera_capture_error_name(int rc)
     case DESK_WATCHER_CAMERA_ERR_SPI: return "SPI";
     case DESK_WATCHER_CAMERA_ERR_EMPTY: return "empty FIFO";
     case DESK_WATCHER_CAMERA_ERR_CONTROL: return "HX6538 control";
+    case DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL: return "buffer-too-small";
     default: return "unknown camera error";
     }
 }

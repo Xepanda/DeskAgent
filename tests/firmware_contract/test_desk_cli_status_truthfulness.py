@@ -72,8 +72,23 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         names = self.source.split("static const char *cli_camera_capture_error_name(", 1)[1].split(
             "\n}", 1
         )[0]
-        for reason in ("timeout", "busy", "invalid-arg", "protocol", "CRC", "SYNC I/O", "SPI", "empty FIFO", "unavailable"):
-            self.assertIn(f'"{reason}"', names)
+        expected_labels = {
+            "DESK_HW_ERR_UNAVAILABLE": "unavailable",
+            "DESK_HW_ERR_TIMEOUT": "timeout",
+            "DESK_HW_ERR_BUSY": "busy",
+            "DESK_HW_ERR_INVALID_ARG": "invalid-arg",
+            "DESK_WATCHER_CAMERA_ERR_PROTOCOL": "protocol",
+            "DESK_WATCHER_CAMERA_ERR_CRC": "CRC",
+            "DESK_WATCHER_CAMERA_ERR_SYNC_IO": "SYNC I/O",
+            "DESK_WATCHER_CAMERA_ERR_NOT_READY": "not-ready",
+            "DESK_WATCHER_CAMERA_ERR_SPI": "SPI",
+            "DESK_WATCHER_CAMERA_ERR_EMPTY": "empty FIFO",
+            "DESK_WATCHER_CAMERA_ERR_CONTROL": "HX6538 control",
+            "DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL": "buffer-too-small",
+        }
+        for error_code, reason in expected_labels.items():
+            with self.subTest(error_code=error_code):
+                self.assertIn(f'case {error_code}: return "{reason}";', names)
         self.assertIn('"unknown camera error"', names)
         self.assertIn('rc=%d (%s)', camera)
         self.assertIn("cli_camera_capture_error_name(rc)", camera)
