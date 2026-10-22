@@ -2,15 +2,15 @@
 
 - **提出方：** A0 架构与协议
 - **关联：** `docs/implementation/change-requests/CR-001-pairing-code-validation.md`、`docs/implementation/interfaces.md` §6.4
-- **状态：** 契约已修订；A1/A2 代码实施部分存在，物理 UI 操作与官方 SDK 真机闭环仍 OPEN（本 CR 关闭条件见 §4）
-- **影响模块：** A1（本机入口、配对窗口、随机码展示、生命周期）；A2（验证、限速、拒绝路径及 A1 UI 通知 seam 调用）
+- **状态：** 配对验证/限速及 A2 锁外调用 A1 UI seam 已有实现和 L2 contract 覆盖；设备端产品物理 UI、未修改官方 Runtime 真机发现/配对/WebSocket、命令/媒体及恢复仍 OPEN（本 CR 关闭条件见 §4）
+- **影响模块：** A1（本机入口、配对窗口、随机码展示、生命周期与 UI seam）；A2（验证、限速、拒绝路径及锁外 UI seam 通知，软件实现已有 L2 覆盖）
 - **A0 依赖裁决：** 批准 A2 `desk_sdk_bridge` 对 A1 `desk_tclaw` 的单向 ESP-IDF 组件依赖，详见 §3.1；通知仍须在 pairing mutex 解锁后调用。
 
 ## 1. 现状与只读证据
 
 当前代码已提供 A1 配对窗口实现：`firmware/components/desk_cli/src/desk_cli.c` 注册 `pairing <open|close>`，`open` 使用 `esp_random()` 32-bit rejection sampling 生成六位码、注入 `desk_sdk_bridge_set_pairing_code()`、显示并启动 5 分钟单调计时；`close`、超时和开新窗口会清码。该文件路径不在 AGENTS.md A1 ownership 表列出的路径中，因此本 CR 将其明确纳入本工作包的 A1 责任范围；公共 ownership 表若后续治理更新，应由 A0 单独提交。
 
-`desk_sdk_bridge_set_pairing_code()` 已有生产调用点（上述 CLI 窗口路径）。Bridge 在接受合法 pair request 时会于锁内消费码；`desk_tclaw_bridge.{h,c}` 另有 A1-only `desk_tclaw_pairing_ui_on_pairing_consumed()` 与 `desk_tclaw_pairing_ui_on_sdk_session_reset()` 显示清理 seam。A2 尚需接入这些 seam；组件依赖裁决见 §3.1。设备固件启动后仍须由操作者显式打开窗口；没有活动码时 fail-closed。
+`desk_sdk_bridge_set_pairing_code()` 已有生产调用点（上述 CLI 窗口路径）。Bridge 在 pairing mutex 内验证/消费码；`desk_tclaw_bridge.{h,c}` 提供 A1-only `desk_tclaw_pairing_ui_on_pairing_consumed()` 与 `desk_tclaw_pairing_ui_on_sdk_session_reset()` 显示清理 seam。A2 已通过 §3.1 批准的组件依赖接入两个 seam：pair request 消费/锁定和 session reset 均在释放 pairing mutex 后通知 A1。`tests/sdk_contract/test_sdk_bridge_protocol.py` 已有对应 L2 contract 覆盖，包含成功消费、五次失败锁定、TTL、reset 与锁外重入。设备固件启动后仍须由操作者显式打开窗口；没有活动码时 fail-closed。该软件证据不等于物理 UI 或官方 Runtime 真机配对完成。
 
 当前启动流程 `firmware/main/src/app_main.c` 初始化 NVS/TAL KV，再通过 `tuya_authorize_init()` / `tuya_authorize_read()` 读取 Tuya 授权 license，读取失败时回退到本地构建配置中的 UUID/AuthKey。该 license 面向 Tuya 云绑定，不是六位数字的 WatcheRobot `pairing_code`；不得把 UUID、AuthKey、`session_token` 或它们的派生值作为设备配对码。
 
@@ -33,7 +33,7 @@
 
 - 配对窗口建议最长 **5 分钟**，并由单调时钟计时；不得因系统时间尚未同步而延长有效期。
 - **成功消费/协议侧封锁：** A2 的 pairing handler 在合法请求成功或失败次数达到上限、并因此于 pairing mutex 内清除 RAM 码后，`desk_sdk_bridge_process_pairing_udp()` 在释放该锁后调用 `desk_tclaw_pairing_ui_on_pairing_consumed()`。通知表示“一次性码已失效”，不表示主机已收到 UDP 响应或 WebSocket/HardwareHello 已成功；A1 seam 只清显示，不再次修改 A2 凭据。若 A2 的单调期限先于 A1 窗口计时触发，也按该时序清显示。通知不得在 pairing mutex 内调用，避免 UI 渲染与 A2 锁耦合。
-- **会话 reset：** A2 在 `desk_sdk_bridge_reset()` 清理配对态和码、释放 pairing mutex 后调用 `desk_tclaw_pairing_ui_on_sdk_session_reset()`；若初始化时也需要清理旧 UI 状态，应由 A1 自己在显示初始化完成后清 overlay，A2 不得在 UI 初始化前触发可能渲染的回调。A2 不得从锁内调用该 seam。
+- **会话 reset：** A2 在 `desk_sdk_bridge_reset()` 检查到 reset 前存在配对态时，清理配对态和码、释放 pairing mutex 后调用 `desk_tclaw_pairing_ui_on_sdk_session_reset()`；无配对态时不发重复通知。若初始化时也需要清理旧 UI 状态，应由 A1 自己在显示初始化完成后清 overlay，A2 不得在 UI 初始化前触发可能渲染的回调。A2 不得从锁内调用该 seam。
 - **超时/取消/换码：** 由 A1 CLI 窗口 owner 在 timer 到期、`pairing close`、开新窗口前或注入/显示失败时，停止/重置 timer 并调用 `desk_sdk_bridge_set_pairing_code(NULL)` 与本地 UI clear；A2 无需回调。新窗口必须生成新码。
 - **重启：** pairing code 仅在 RAM；任何掉电、看门狗或软件重启后 A2 初始化保持 fail-closed，A1 在显示初始化后清理 pairing overlay。不得持久化或恢复旧码；不要求在重启路径跨模块调用 UI seam。
 - A2 应在活动配对窗口内限制失败尝试（建议最多 5 次，触发后立即清零并要求用户重新物理确认/生成新码），避免六位空间被在线穷举。尝试计数与过期状态必须由单调时间/窗口状态驱动。
@@ -53,18 +53,18 @@
 
 ## 3. 职责边界
 
-- **A1：** 持有当前批准的本机 CLI `pairing open|close` 入口（包括 `firmware/components/desk_cli/`，虽该路径未列入 AGENTS.md 矩阵）；维护 CSPRNG、显示、5 分钟计时及取消/超时/换码清理；实现 A1-only UI notification seams；不改 A2 生产代码。产品物理 UI 导航仍未定，不得擅自绑定现有按钮/触摸事件。
-- **A2：** 持有 setter 与 pairing handler；校验活动码、失败尝试限速、并发安全、fail-closed 和日志脱敏；在消费成功和显式会话 reset 后按 §2 锁外调用相应 A1 UI seam；不读取 Tuya provisioning license，不在桥接锁内执行 UI。
+- **A1：** 持有当前批准的本机 CLI `pairing open|close` 入口（包括 `firmware/components/desk_cli/`，虽该路径未列入 AGENTS.md 矩阵）；维护 CSPRNG、显示、5 分钟计时及取消/超时/换码清理；维护 A1-only UI notification seams；不改 A2 生产代码。产品物理 UI 导航仍未定，不得擅自绑定现有按钮/触摸事件。
+- **A2：** 持有 setter 与 pairing handler；校验活动码、失败尝试限速、并发安全、fail-closed 和日志脱敏；消费成功/锁定及显式会话 reset 后按 §2 锁外调用相应 A1 UI seam（现有实现和 L2 覆盖见 §3.1）；不读取 Tuya provisioning license，不在桥接锁内执行 UI。
 - **A0：** 在 A1/A2 明确是否能跨所有固件重置与故障路径正确清码后更新公共 interfaces 裁决；不替代代码所有者实现。
 
 ### 3.1 A0 裁决：A2 直接依赖 A1 UI seam
 
 **裁决：批准 `desk_sdk_bridge` 在其 ESP-IDF `CMakeLists.txt` 的 `REQUIRES` 中增加 `desk_tclaw`，并由 A2 直接包含 A1 公共头 `desk_tclaw_bridge.h` 后调用两个已声明 seam。** 当前依赖方向为 `desk_sdk_bridge -> desk_tclaw -> desk_hardware`，没有 `desk_tclaw -> desk_sdk_bridge` 的反向依赖，因此不会形成组件环；不另造 A0 注册回调契约。
 
-- A2 后续实现范围：`firmware/components/desk_sdk_bridge/CMakeLists.txt` 与 `firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c`。只使用 A1 公共头声明；禁止 weak symbol、私有 `extern`、复制函数原型或绕过组件依赖。
-- 在 `desk_sdk_bridge_process_pairing_udp()` 中，先完成锁内校验/一次性消费，再释放 `s_pairing_code_mutex`，之后才可调用 `desk_tclaw_pairing_ui_on_pairing_consumed()`。在 `desk_sdk_bridge_reset()` 中同样先完成配对态清理并释放 mutex，再调用 `desk_tclaw_pairing_ui_on_sdk_session_reset()`。不得在持锁期间进入 A1/UI；A1 seam 不得同步回调 A2 pairing API。
+- 已实现范围：`firmware/components/desk_sdk_bridge/CMakeLists.txt` 声明 `REQUIRES desk_tclaw`；`firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c` 只经 A1 公共头调用两个 seam。禁止 weak symbol、私有 `extern`、复制函数原型或绕过组件依赖。
+- 当前实现中，`desk_sdk_bridge_process_pairing_udp()` 先完成锁内校验/一次性消费，再释放 `s_pairing_code_mutex`，之后才调用 `desk_tclaw_pairing_ui_on_pairing_consumed()`；`desk_sdk_bridge_reset()` 先记录并清理配对态、释放 mutex，仅当 reset 前存在配对态时才调用 `desk_tclaw_pairing_ui_on_sdk_session_reset()`。不得在持锁期间进入 A1/UI；A1 seam 不得同步回调 A2 pairing API。
 - 两个 seam 是同步、无返回值的本地显示清理调用，不创建异步注册生命周期、不持有 A2 资源，也不改变配对结果。通知仅表示本地配对码显示应清除；它**不证明 UDP 响应已送达、不证明 WebSocket 已连接，也不证明 HardwareHello 成功**。
-- 后续 A2 验收须覆盖成功消费、达到失败上限后清码、显式 reset 三条路径，并断言 seam 仅在 mutex 解锁后执行；构建验证组件依赖图无环，并运行 pairing SDK contract 与 A1 UI seam contract tests。仍需分别标注软件 Level 2 与未完成的设备 Level 3/4。
+- A2 seam 的 L2 contract 覆盖已存在于 `tests/sdk_contract/test_sdk_bridge_protocol.py`：`test_pairing_ui_notified_once_after_successful_consume_and_after_unlock`、`test_pairing_ui_notified_once_after_five_failure_lockout_and_after_unlock`、`test_pairing_ui_notified_once_when_ttl_expires_via_query_or_poll`、`test_sdk_session_reset_notified_once_only_when_pairing_state_exists`。测试通过 reentry checks 验证通知发生在锁外；CMake `REQUIRES desk_tclaw` 为已实现依赖。该覆盖不证明真机 UI 更新或官方 Runtime 真机配对，相关 L3/L4 仍开放。
 
 ## 4. 跨模块实施与验收门槛
 
@@ -73,7 +73,7 @@
 3. 日志捕获断言：生成码与 `session_token` 不出现在日志，缺省/拒绝路径均不发 `pair.accept`。
 4. 真机 Level 3：现场通过本机 CLI 打开配对窗口，屏幕码输入未修改的官方 Runtime 后真实配对成功；超时或取消后旧码失败、重新开窗后新码成功。只通过模拟/单测不能宣称官方 SDK 真实配对闭环。
 5. **当前设备验收阻塞：** 现有 `pairing open|close` 是本机 CLI 操作者动作，不证明终端用户能通过产品物理 UI 发起配对。产品所需的屏幕导航动作仍未确认，且缺少设备连接官方 Runtime 的真机配对证据；不得将本 CR 标为 closed。A1/A2 可先按已定 CLI 与生命周期契约完成软件实现和 Level 2 覆盖；要解除物理 UI 阻塞，须由产品明确入口动作后再派发 A1 原子实现包。
-6. 关闭本 CR 前，A1 交付 CLI 入口安全性、生成/显示/取消/超时清理测试及物理 UI 入口决策；A2 交付消费/reset seam 调用时序、限速/一次性消费和日志脱敏测试；A0 更新 `interfaces.md` 与官方 SDK 设备接入契约。A1/A2 分别按 §3 ownership 实施；若必须调整 setter 公共接口或协议字段，先发新 CR 由 A0 裁决。
+6. A2 消费/reset seam 调用时序、成功/锁定/TTL/reset、锁外重入和相关拒绝行为已有 L2 contract 覆盖；无需再把 seam 接入列为待实现项。关闭本 CR 前仍须由 A1 提供 CLI 入口安全性、生成/显示/取消/超时清理的适用证据，并按产品决策处理物理 UI 入口；还须通过官方 Runtime 真机发现、配对、WebSocket/HardwareHello、实际命令/媒体及恢复验收。A0 维护 `interfaces.md` 与官方 SDK 设备接入契约的状态一致；若需调整 setter 公共接口或协议字段，先发新 CR 由 A0 裁决。
 
 **仍需产品确认的单点：** 若要求实体设备用户不经本机 CLI 发起配对，需确认屏幕导航动作与用户文案。不得默认占用长按、短按或其它硬件输入：现有滚轮/触摸导航与旋钮 TuyaOpen 语音事件均有既定语义。5 分钟窗口已由代码采用，仍需通过软件计时测试及设备验收验证。
 
