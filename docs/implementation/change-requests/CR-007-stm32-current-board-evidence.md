@@ -2,7 +2,7 @@
 
 - **提出方**：A0 架构与协议
 - **提出日期**：2026-10-22
-- **关联**：`docs/implementation/r3a-stm32-protocol-adjudication.md`、`contracts/dependency_lock.json`、`firmware/components/desk_hardware/src/desk_watcher_motion.c`、2026-10-22 当前板 move/stop 现场记录
+- **关联**：`docs/implementation/r3a-stm32-protocol-adjudication.md`、`docs/implementation/change-requests/CR-020-stm32-ambiguous-move-failure-stop.md`、`contracts/dependency_lock.json`、`firmware/components/desk_hardware/src/desk_watcher_motion.c`、2026-10-22 当前板 move/stop 现场记录
 - **状态**：**OPEN — 证据不足，待当前板资料与协议来源核对；本 CR 不裁决协议语义**
 - **影响模块**：A0（协议/证据裁决）、A1（硬件接线与 STM32 驱动）、A7（HIL 验收）
 
@@ -115,3 +115,9 @@
 5. 仅在安全预检完成并有现场监督后，先采集可区分的原始 TX/RX（不发送动作的链路观察优先）；若后续最小动作验证获得明确授权且确认安全，每条命令都要求同序号、正确 CRC 的 STM32 响应和独立可见的动作/停止观察。任一超时、坏帧、错序、意外动作或无法确认静止即中止；不得把软件 stop 重试当作安全急停。
 
 **A0 结论：**DeskAgent 主机侧合同已统一为 `A5 5A` / CRC16-CCITT-FALSE / 32-bit sequence 关联与同序号重试；ACK 允许通用 ID 或 expected MOVE/STOP ID echo，且必须精确 ACK flags、4-byte payload、有效 CRC 和匹配 sequence。公开硬件入口合同要求有限角度 clamp、拒绝非有限输入；当前源码尚未证明所有公开调用路径都拒绝非有限值。仓库测试仅为 L2。当前设备两条动作命令均超时，没有 STM32 RX/ACK、固件身份或物理状态证据；CR-007 继续 OPEN，当前板协议兼容、动作执行与安全停止均未验证。
+
+### 6.6 MOVE 歧义失败与自动 STOP 策略审查（2026-10-22）
+
+A1 源码审计发现，MOVE 同序号重试耗尽后返回错误并释放 motion arbiter，没有 best-effort STOP。A0 审阅后提出候选策略见 [CR-020](CR-020-stm32-ambiguous-move-failure-stop.md)：未发送 MOVE 的参数/仲裁失败不发 STOP；MOVE 已部分/完整发送但无有效关联终态时视为 ambiguous，并建议在释放同一 owner 前只尝试一个有界、使用新 sequence 的 STOP 事务，保留原 MOVE 错误且不递归重试 STOP。
+
+**此策略尚未获准落地。**当前无法从 STM32 peer 来源确认合法 NACK 是否保证执行前拒绝、同序号 MOVE 重发是否幂等、STOP 是否按队列顺序取消正在执行与排队动作，也无法确认 STOP ACK 的含义。因此不能基于 NACK 标志推断动作未发生，不能把 best-effort STOP 宣称为安全停止，也不能修改生产实现或放宽 CR-007 HIL 门槛。CR-007 继续 OPEN；相关 L1 peer 语义缺失，CR-020 主机 L2 测试未运行，L3/L4 无设备与物理停止证据。
