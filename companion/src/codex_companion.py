@@ -673,7 +673,6 @@ class CodexCompanion:
                     is_assistant_message = (
                         item_type in ("agentMessage", "assistantMessage")
                         or item_role in ("assistant", "agent")
-                        or (item_type == "message" and not item_role)
                     )
                     output_text = None
                     if not is_user_message and is_assistant_message:
@@ -689,8 +688,6 @@ class CodexCompanion:
                                     if isinstance(part, dict) and isinstance(part.get("text"), str)
                                 ]
                                 output_text = "".join(text_parts).strip() or None
-                    elif not item and not is_user_message:
-                        output_text = params.get("output")
                     if output_text:
                         self._tasks[task_id]["last_output"] = str(output_text).strip()
                     self._persist_task(self._tasks[task_id])
@@ -739,20 +736,11 @@ class CodexCompanion:
                             "summary": summary,
                         })
                     else:
-                        turn_res = turn.get("result") if isinstance(turn.get("result"), dict) else {}
-                        summary = (
-                            params.get("summary")
-                            or turn.get("summary")
-                            or turn.get("output")
-                            or turn.get("response")
-                            or turn_res.get("summary")
-                            or turn_res.get("output")
-                            or self._assistant_text_from_items(turn.get("items"))
-                            or params.get("output")
-                            or params.get("response")
+                        assistant_output = (
+                            self._assistant_text_from_items(turn.get("items"))
                             or self._tasks[task_id].get("last_output")
-                            or "任务已成功完成"
                         )
+                        summary = assistant_output or "任务已成功完成"
                         if isinstance(summary, dict):
                             summary = summary.get("summary") or summary.get("text") or summary.get("message") or "任务已成功完成"
                         summary = self._safe_terminal_summary(
@@ -763,7 +751,7 @@ class CodexCompanion:
                         self._tasks[task_id]["status"] = "completed"
                         self._tasks[task_id]["state"] = "completed"
                         self._tasks[task_id]["summary"] = summary
-                        self._tasks[task_id]["last_output"] = self._tasks[task_id].get("last_output") or summary
+                        self._tasks[task_id]["last_output"] = assistant_output or ""
                         self._persist_task(self._tasks[task_id])
                         self._dispatch_event("codex.turn_completed", {
                             "task_id": task_id,

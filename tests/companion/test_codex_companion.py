@@ -211,7 +211,7 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(agent_status["last_output"], "real assistant result")
         self.assertEqual(agent_status["summary"], "real assistant result")
 
-    def test_legacy_message_item_is_output_only_without_user_role(self) -> None:
+    def test_ambiguous_legacy_message_item_is_not_adopted_as_output(self) -> None:
         companion = CodexCompanion(
             allowed_workspaces=self.workspaces,
             transport=DefaultMockTransport(),
@@ -226,7 +226,9 @@ class TestCodexCompanion(unittest.TestCase):
             "turn/completed",
             {"threadId": task["thread_id"], "turnId": task["turn_id"], "status": "completed"},
         )
-        self.assertEqual(companion.get_task_status("tsk-legacy-message")["summary"], "assistant result")
+        legacy_status = companion.get_task_status("tsk-legacy-message")
+        self.assertEqual(legacy_status["summary"], "任务已成功完成")
+        self.assertEqual(legacy_status["last_output"], "")
 
         user_task = companion.submit_task("tsk-legacy-user", "test-project", "private prompt")
         companion._handle_server_notification(
@@ -242,6 +244,28 @@ class TestCodexCompanion(unittest.TestCase):
             {"threadId": user_task["thread_id"], "turnId": user_task["turn_id"], "status": "completed"},
         )
         self.assertNotIn("private prompt", companion.get_task_status("tsk-legacy-user")["summary"])
+
+    def test_untyped_terminal_summary_and_output_are_not_adopted_as_result(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        task = companion.submit_task("tsk-untyped-terminal", "test-project", "private prompt")
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": task["thread_id"],
+                "turnId": task["turn_id"],
+                "status": "completed",
+                "summary": "unattributed summary",
+                "output": "unattributed output",
+                "turn": {"status": "completed", "response": "unattributed response"},
+            },
+        )
+        status = companion.get_task_status("tsk-untyped-terminal")
+        self.assertEqual(status["summary"], "任务已成功完成")
+        self.assertEqual(status["last_output"], "")
 
     def test_failed_turn_is_reported_as_failure_with_server_error(self) -> None:
         db_path = os.path.join(self.workspace_dir, "failed-task.sqlite3")
@@ -1172,8 +1196,10 @@ class TestCodexCompanion(unittest.TestCase):
                     companion._handle_server_notification("turn/completed", {
                         "threadId": params["threadId"],
                         "turnId": "trn-notification-race",
-                        "status": "completed",
-                        "summary": "assistant completed result",
+                        "turn": {
+                            "status": "completed",
+                            "items": [{"type": "agentMessage", "text": "assistant completed result"}],
+                        },
                     })
                     return {"turn_id": "trn-notification-race", "state": "inProgress"}
                 return {}
