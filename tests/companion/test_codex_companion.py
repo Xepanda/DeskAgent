@@ -837,8 +837,13 @@ class TestCodexCompanion(unittest.TestCase):
             }
         }
         events: list[tuple[str, dict[str, Any]]] = []
+
+        def accepted(event: str, data: dict[str, Any]) -> bool:
+            events.append((event, data))
+            return True
+
         try:
-            client.add_event_listener(lambda event, data: events.append((event, data)))
+            client.add_event_listener(accepted)
             deadline = time.time() + 2.0
             while time.time() < deadline and not events:
                 time.sleep(0.01)
