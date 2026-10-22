@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #ifdef ESP_PLATFORM
 #include <sys/poll.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #else
 #include <poll.h>
 #endif
@@ -49,6 +51,16 @@
 #define WS_CONTROL_FRAME_MAX DESK_SDK_MAX_FRAME_LEN
 #define WS_WRITE_DEADLINE_MS 250U
 #define WS_LOG_POLL_INTERVAL_MS 20U
+
+static void ws_writer_pause_1ms(void)
+{
+#ifdef ESP_PLATFORM
+    vTaskDelay(pdMS_TO_TICKS(1));
+#else
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
+    nanosleep(&pause, NULL);
+#endif
+}
 
 static int s_ws_fd = -1;
 static int s_ws_deferred_close_fd = -1;
@@ -140,8 +152,7 @@ static void *ws_writer_main(void *unused)
                 lock_rc = pthread_mutex_trylock(&s_ws_socket_write_mutex);
                 if (lock_rc == 0) break;
                 if (ws_monotonic_ms() >= until) break;
-                struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
-                nanosleep(&pause, NULL);
+                ws_writer_pause_1ms();
             } while (true);
             int send_rc = -1;
             bool stale = frame->generation != ws_lifecycle_generation();
@@ -177,8 +188,7 @@ static void *ws_writer_main(void *unused)
                 lock_rc = pthread_mutex_trylock(&s_ws_socket_write_mutex);
                 if (lock_rc == 0) break;
                 if (ws_monotonic_ms() >= until) break;
-                struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000L};
-                nanosleep(&pause, NULL);
+                ws_writer_pause_1ms();
             } while (true);
             int send_rc = -1;
             if (lock_rc == 0) {
