@@ -22,7 +22,7 @@ class TestCameraWebContract(unittest.TestCase):
 
     def test_viewer_never_shows_non_hardware_stale_or_undecodable_images(self) -> None:
         source = WEB.read_text(encoding="utf-8")
-        self.assertIn("ageMs > 2000", source)
+        self.assertIn("effectiveAgeMs > 2000", source)
         self.assertIn("createImageBitmap(blob)", source)
         self.assertIn("URL.revokeObjectURL(currentObjectUrl)", source)
         self.assertIn("画面已过期", source)
@@ -187,6 +187,49 @@ global.setTimeout = callback => { expiry = callback; return 1; };
   controller.abort();
   await pendingRetry;
   assert.equal(controller.signal.aborted, true, "closing the viewer must cancel a pending reconnect delay");
+})().catch(err => { console.error(err); process.exitCode = 1; });
+''';
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", helpers + "\n" + checks],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute browser frame freshness handling")
+    def test_browser_includes_network_and_decode_delay_in_frame_freshness(self) -> None:
+        source = WEB.read_text(encoding="utf-8")
+        script = source.split("<script>", 1)[1].split("</script>", 1)[0]
+        helpers = script[script.index("async function renderStreamFrame"):script.index("async function consumeMjpeg")]
+        checks = r'''
+const assert = require("node:assert/strict");
+const nodes = new Map();
+for (const id of ["cameraFrame", "videoPlaceholder", "frameStats", "cameraConnectionStatus"]) {
+  nodes.set(id, { style: {}, innerText: "", removeAttribute() {} });
+}
+global.document = { getElementById: id => nodes.get(id) };
+global.leaseActive = true;
+global.frameExpiryTimer = null;
+global.currentObjectUrl = null;
+global.lastFrameSeq = null;
+let now = 0;
+let created = 0;
+global.performance = { now: () => now };
+global.Blob = class { constructor(parts) { this.parts = parts; } };
+global.createImageBitmap = async () => { now += 120; return { close() {} }; };
+global.URL = { createObjectURL: () => `blob:${++created}`, revokeObjectURL() {} };
+global.clearTimeout = () => {};
+global.setTimeout = () => 1;
+(async () => {
+  await renderStreamFrame(Uint8Array.from([255, 216, 1, 2, 255, 217]), 1, 1900, 0);
+  assert.equal(created, 0, "a frame that expires during image decoding must never appear");
+
+  now = 0;
+  global.createImageBitmap = async () => { now += 80; return { close() {} }; };
+  await renderStreamFrame(Uint8Array.from([255, 216, 1, 2, 255, 217]), 2, 500, 0);
+  assert.equal(created, 1);
+  assert.match(nodes.get("frameStats").innerText, /新鲜度: 580 ms/);
 })().catch(err => { console.error(err); process.exitCode = 1; });
 ''';
         completed = subprocess.run(

@@ -264,14 +264,16 @@
       return { parts, remainder: rest };
     }
 
-    async function renderStreamFrame(jpeg, seq, ageMs) {
-      if (!leaseActive || ageMs > 2000) return;
+    async function renderStreamFrame(jpeg, seq, ageMs, receivedAt = performance.now()) {
+      let effectiveAgeMs = ageMs + Math.max(0, performance.now() - receivedAt);
+      if (!leaseActive || effectiveAgeMs > 2000) return;
       const blob = new Blob([jpeg], { type: "image/jpeg" });
       try {
         const decoded = await createImageBitmap(blob);
         decoded.close();
       } catch (_) { return; }
-      if (!leaseActive) return;
+      effectiveAgeMs = ageMs + Math.max(0, performance.now() - receivedAt);
+      if (!leaseActive || effectiveAgeMs > 2000) return;
       clearTimeout(frameExpiryTimer);
       if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
       currentObjectUrl = URL.createObjectURL(blob);
@@ -280,7 +282,7 @@
       img.style.display = "block";
       document.getElementById("videoPlaceholder").style.display = "none";
       lastFrameSeq = seq;
-      document.getElementById("frameStats").innerText = `租约: 激活 | 帧序号: #${seq} | 新鲜度: ${ageMs} ms`;
+      document.getElementById("frameStats").innerText = `租约: 激活 | 帧序号: #${seq} | 新鲜度: ${Math.floor(effectiveAgeMs)} ms`;
       document.getElementById("cameraConnectionStatus").innerText = "已连接";
       frameExpiryTimer = setTimeout(() => {
         if (leaseActive && lastFrameSeq === seq) {
@@ -288,7 +290,7 @@
           document.getElementById("frameStats").innerText = "租约: 激活 | 相机: 等待新鲜帧";
           document.getElementById("cameraConnectionStatus").innerText = "不可用";
         }
-      }, Math.max(0, 2000 - ageMs));
+      }, Math.max(0, 2000 - effectiveAgeMs));
     }
 
     async function consumeMjpeg(response, controller, boundary) {
@@ -299,6 +301,7 @@
       while (leaseActive && !controller.signal.aborted) {
         const { value, done } = await reader.read();
         if (done) break;
+        const receivedAt = performance.now();
         buffer = concatBytes(buffer, value);
         const parsed = parseMjpegBuffer(buffer, boundary);
         buffer = parsed.remainder;
@@ -307,7 +310,7 @@
           if (!Number.isSafeInteger(seq) || seq < 1) throw new Error("MJPEG 帧序号无效");
           if (lastStreamSeq !== null && seq <= lastStreamSeq) continue;
           lastStreamSeq = seq;
-          await renderStreamFrame(part.jpeg, seq, part.ageMs);
+          await renderStreamFrame(part.jpeg, seq, part.ageMs, receivedAt);
         }
         if (buffer.length > 262144) throw new Error("MJPEG 缓冲区超限");
       }
