@@ -121,6 +121,16 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'int desk_sdk_test_preflight(void) { char host[64], hello[512]; uint16_t port = 0; '
                 'return desk_sdk_bridge_get_pairing_target(host, sizeof(host), &port) == 0 && '
                 'desk_sdk_bridge_build_hardware_hello(hello, sizeof(hello)) > 0 ? 1 : 0; }\n'
+                'void desk_sdk_test_attach_writer_fd(int fd) { '
+                'pthread_mutex_lock(&s_ws_lifecycle_mutex); s_ws_fd = fd; '
+                's_ws_ready = true; s_ws_authenticated = true; s_ws_state = DESK_SDK_WS_CONNECTED; '
+                'pthread_mutex_unlock(&s_ws_lifecycle_mutex); }\n'
+                'uint32_t desk_sdk_test_advance_ws_generation(void) { '
+                'pthread_mutex_lock(&s_ws_lifecycle_mutex); ++s_ws_generation; '
+                'uint32_t generation = s_ws_generation; pthread_mutex_unlock(&s_ws_lifecycle_mutex); '
+                'return generation; }\n'
+                'void desk_sdk_test_disconnect_ws_generation(uint32_t generation) { '
+                'ws_disconnect_generation_and_schedule(generation); }\n'
                 'int desk_sdk_test_deadline_write(int fd, const uint8_t *payload, size_t len, unsigned deadline_ms) { '
                 'int old_fd = s_ws_fd; s_ws_fd = fd; int rc = ws_send_frame_deadline(0x1, payload, len, deadline_ms); '
                 's_ws_fd = old_fd; return rc; }\n'
@@ -236,6 +246,12 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.lib.desk_sdk_test_pause_writer_without_thread.argtypes = []
         cls.lib.desk_sdk_test_resume_writer.restype = None
         cls.lib.desk_sdk_test_resume_writer.argtypes = []
+        cls.lib.desk_sdk_test_attach_writer_fd.restype = None
+        cls.lib.desk_sdk_test_attach_writer_fd.argtypes = [ctypes.c_int]
+        cls.lib.desk_sdk_test_advance_ws_generation.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_test_advance_ws_generation.argtypes = []
+        cls.lib.desk_sdk_test_disconnect_ws_generation.restype = None
+        cls.lib.desk_sdk_test_disconnect_ws_generation.argtypes = [ctypes.c_uint32]
         cls.lib.desk_sdk_test_prepare_log_pair.restype = None
         cls.lib.desk_sdk_test_prepare_log_pair.argtypes = []
 
@@ -506,6 +522,47 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             sender.close()
             receiver.close()
 
+    def test_cr009_deadline_caps_total_time_with_slow_progressing_peer(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        sender.setblocking(False)
+        payload = bytes(range(256)) * 32
+        result: dict[str, int] = {}
+        stop_reader = threading.Event()
+
+        def write() -> None:
+            result["rc"] = self.lib.desk_sdk_test_deadline_write(
+                sender.fileno(), ctypes.create_string_buffer(payload), len(payload), 120)
+
+        def read_slowly() -> None:
+            receiver.settimeout(0.02)
+            while not stop_reader.is_set():
+                try:
+                    receiver.recv(64)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                time.sleep(0.003)
+
+        reader = threading.Thread(target=read_slowly)
+        reader.start()
+        start = time.monotonic()
+        writer = threading.Thread(target=write)
+        writer.start()
+        try:
+            writer.join(timeout=0.5)
+            elapsed = time.monotonic() - start
+            self.assertFalse(writer.is_alive(), "bounded send exceeded test watchdog")
+            self.assertNotEqual(result.get("rc"), 0)
+            self.assertGreaterEqual(elapsed, 0.09)
+            self.assertLess(elapsed, 0.35)
+        finally:
+            stop_reader.set()
+            sender.close()
+            receiver.close()
+            reader.join(timeout=0.2)
+
     def test_cr009_binary_frame_over_8k_survives_short_writes(self) -> None:
         sender, receiver = socket.socketpair()
         sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
@@ -553,6 +610,45 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertLess(elapsed, 0.1)
         self.assertEqual(self.lib.desk_sdk_test_outbound_queue_is_zero(), 1)
         self.lib.desk_sdk_test_resume_writer()
+
+    def test_cr009_live_writer_timeout_closes_connection_and_clears_queue(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        sender.setblocking(False)
+        try:
+            while True:
+                try:
+                    sender.send(b"x" * 4096)
+                except BlockingIOError:
+                    break
+            writer_fd = os.dup(sender.fileno())
+            self.lib.desk_sdk_test_attach_writer_fd(writer_fd)
+            start = time.monotonic()
+            self.assertEqual(self.lib.desk_sdk_ws_client_send_text(b'{"type":"sys.ack"}'), 0)
+            deadline = start + 0.8
+            while self.lib.desk_sdk_ws_client_is_connected() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            elapsed = time.monotonic() - start
+            self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+            self.assertGreaterEqual(elapsed, 0.18)
+            self.assertLess(elapsed, 0.8)
+            self.assertEqual(self.lib.desk_sdk_test_outbound_queue_is_zero(), 1)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_stale_writer_failure_cannot_close_new_generation(self) -> None:
+        sender, receiver = socket.socketpair()
+        try:
+            self.lib.desk_sdk_test_attach_writer_fd(os.dup(sender.fileno()))
+            old_generation = self.lib.desk_sdk_test_ws_generation()
+            self.lib.desk_sdk_test_advance_ws_generation()
+            self.lib.desk_sdk_test_disconnect_ws_generation(old_generation)
+            self.assertTrue(self.lib.desk_sdk_ws_client_is_connected())
+        finally:
+            self.lib.desk_sdk_ws_client_close()
+            sender.close()
+            receiver.close()
 
     def test_cr009_command_is_dispatched_from_live_websocket_receive_loop(self) -> None:
         async def exercise() -> dict:

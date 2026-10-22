@@ -111,9 +111,13 @@ static bool s_ws_writer_started;
 
 static int ws_send_frame_deadline(uint8_t opcode, const uint8_t *payload,
                                   size_t len, uint32_t deadline_ms);
+static int ws_send_frame_deadline_fd(int fd, uint8_t opcode, const uint8_t *payload,
+                                     size_t len, uint32_t deadline_ms);
 static void ws_disconnect_and_schedule(void);
+static void ws_disconnect_generation_and_schedule(uint32_t generation);
 static uint64_t ws_monotonic_ms(void);
 static uint32_t ws_lifecycle_generation(void);
+static int ws_socket_fd_for_generation(uint32_t generation);
 
 static void ws_close_deferred_fd(void)
 {
@@ -157,20 +161,21 @@ static void *ws_writer_main(void *unused)
             int send_rc = -1;
             bool stale = frame->generation != ws_lifecycle_generation();
             if (lock_rc == 0) {
-                stale = frame->generation != ws_lifecycle_generation();
-                if (!stale && desk_sdk_ws_client_is_connected()) {
+                int send_fd = ws_socket_fd_for_generation(frame->generation);
+                stale = send_fd < 0;
+                if (!stale) {
                     uint64_t now = ws_monotonic_ms();
                     uint32_t remain = now < until ? (uint32_t)(until - now) : 0;
-                    if (remain) send_rc = ws_send_frame_deadline(frame->opcode,
+                    if (remain) send_rc = ws_send_frame_deadline_fd(send_fd, frame->opcode,
                         frame->payload, frame->len, remain);
                 }
                 pthread_mutex_unlock(&s_ws_socket_write_mutex);
                 ws_close_deferred_fd();
             }
             if (!stale && send_rc != 0) {
-                ws_disconnect_and_schedule();
+                ws_disconnect_generation_and_schedule(frame->generation);
             } else if (!stale && frame->close_after_send) {
-                ws_disconnect_and_schedule();
+                ws_disconnect_generation_and_schedule(frame->generation);
             }
             pthread_mutex_lock(&s_ws_writer_mutex);
             memset(&s_ws_writer_current, 0, sizeof(s_ws_writer_current));
@@ -192,17 +197,18 @@ static void *ws_writer_main(void *unused)
             } while (true);
             int send_rc = -1;
             if (lock_rc == 0) {
-                if (desk_sdk_ws_client_is_connected() && log_generation == ws_lifecycle_generation()) {
+                int send_fd = ws_socket_fd_for_generation(log_generation);
+                if (send_fd >= 0) {
                     uint64_t now = ws_monotonic_ms();
                     uint32_t remain = now < until ? (uint32_t)(until - now) : 0;
-                    if (remain) send_rc = ws_send_frame_deadline(0x1,
+                    if (remain) send_rc = ws_send_frame_deadline_fd(send_fd, 0x1,
                         (const uint8_t *)log_json, (size_t)log_len, remain);
                 }
                 pthread_mutex_unlock(&s_ws_socket_write_mutex);
                 ws_close_deferred_fd();
             }
             if (log_generation == ws_lifecycle_generation() && send_rc != 0) {
-                ws_disconnect_and_schedule();
+                ws_disconnect_generation_and_schedule(log_generation);
             }
             memset(log_json, 0, sizeof(log_json));
             continue;
@@ -277,6 +283,22 @@ static int ws_wait(int fd, short events, int timeout_ms)
     return rc > 0 && (p.revents & events) ? 0 : -1;
 }
 
+static int ws_wait_until(int fd, short events, uint64_t deadline)
+{
+    struct pollfd p = { .fd = fd, .events = events, .revents = 0 };
+    for (;;) {
+        uint64_t now = ws_monotonic_ms();
+        if (now >= deadline) return -1;
+        uint64_t remain = deadline - now;
+        int timeout_ms = remain > INT32_MAX ? INT32_MAX : (int)remain;
+        if (timeout_ms == 0) timeout_ms = 1;
+        p.revents = 0;
+        int rc = poll(&p, 1, timeout_ms);
+        if (rc < 0 && errno == EINTR) continue;
+        return rc > 0 && (p.revents & events) ? 0 : -1;
+    }
+}
+
 static int ws_send_all(int fd, const uint8_t *p, size_t n)
 {
     size_t off = 0;
@@ -310,9 +332,13 @@ static void ws_schedule_reconnect(void)
     s_ws_retry_at = time(NULL) + delay;
 }
 
-static void ws_transport_close(void)
+static bool ws_transport_close_for_generation(uint32_t expected_generation, bool check_generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    if (check_generation && expected_generation != s_ws_generation) {
+        pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+        return false;
+    }
     ++s_ws_generation;
     s_ws_ready = false;
     s_ws_authenticated = false;
@@ -334,6 +360,12 @@ static void ws_transport_close(void)
     }
     ws_clear_outbound_queue();
     desk_sdk_bridge_log_session_closed();
+    return true;
+}
+
+static void ws_transport_close(void)
+{
+    (void)ws_transport_close_for_generation(0, false);
 }
 
 static uint32_t ws_lifecycle_generation(void)
@@ -342,6 +374,14 @@ static uint32_t ws_lifecycle_generation(void)
     uint32_t generation = s_ws_generation;
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
     return generation;
+}
+
+static int ws_socket_fd_for_generation(uint32_t generation)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    int fd = generation == s_ws_generation && s_ws_ready ? s_ws_fd : -1;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return fd;
 }
 
 static bool ws_commit_hardware_hello_ack(uint32_t generation)
@@ -362,6 +402,12 @@ static void ws_disconnect_and_schedule(void)
 {
     ws_transport_close();
     if (s_pairing_target_valid) ws_schedule_reconnect();
+}
+
+static void ws_disconnect_generation_and_schedule(uint32_t generation)
+{
+    if (ws_transport_close_for_generation(generation, true) && s_pairing_target_valid)
+        ws_schedule_reconnect();
 }
 
 static const char s_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -453,15 +499,16 @@ static int ws_send_all_deadline(int fd, const uint8_t *payload, size_t len,
 {
     size_t offset = 0;
     while (offset < len) {
+        if (ws_monotonic_ms() >= deadline) return -1;
         ssize_t sent = send(fd, payload + offset, len - offset, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (sent > 0) { offset += (size_t)sent; continue; }
+        if (sent > 0) {
+            offset += (size_t)sent;
+            if (ws_monotonic_ms() >= deadline) return -1;
+            continue;
+        }
         if (sent < 0 && errno == EINTR) continue;
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            uint64_t now = ws_monotonic_ms();
-            if (now >= deadline) return -1;
-            uint64_t remain = deadline - now;
-            int wait_ms = remain > INT32_MAX ? INT32_MAX : (int)remain;
-            if (ws_wait(fd, POLLOUT, wait_ms) == 0) continue;
+            if (ws_wait_until(fd, POLLOUT, deadline) == 0) continue;
         }
         return -1;
     }
@@ -471,7 +518,12 @@ static int ws_send_all_deadline(int fd, const uint8_t *payload, size_t len,
 static int ws_send_frame_deadline(uint8_t opcode, const uint8_t *payload,
                                   size_t len, uint32_t deadline_ms)
 {
-    int fd = s_ws_fd;
+    return ws_send_frame_deadline_fd(s_ws_fd, opcode, payload, len, deadline_ms);
+}
+
+static int ws_send_frame_deadline_fd(int fd, uint8_t opcode, const uint8_t *payload,
+                                     size_t len, uint32_t deadline_ms)
+{
     size_t max_len = opcode == 0x2 ? DESK_WSPK_MAX_FRAME_SIZE : DESK_SDK_MAX_FRAME_LEN;
     if (fd < 0 || (!payload && len) || len > max_len) return -1;
     uint64_t deadline = ws_monotonic_ms() + deadline_ms;
@@ -559,10 +611,12 @@ int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len)
     if (!s_ws_ready || (!data && len)) return -1;
     if (len > DESK_WSPK_MAX_FRAME_SIZE) return -2;
     if (pthread_mutex_trylock(&s_ws_socket_write_mutex) != 0) return -3; /* BUSY; fail fast to preserve frame boundaries. */
-    int send_rc = ws_send_frame_deadline(0x2, data, len, WS_WRITE_DEADLINE_MS);
+    uint32_t generation = ws_lifecycle_generation();
+    int fd = ws_socket_fd_for_generation(generation);
+    int send_rc = fd >= 0 ? ws_send_frame_deadline_fd(fd, 0x2, data, len, WS_WRITE_DEADLINE_MS) : -1;
     pthread_mutex_unlock(&s_ws_socket_write_mutex);
     ws_close_deferred_fd();
-    if (send_rc != 0) { ws_disconnect_and_schedule(); return -1; }
+    if (send_rc != 0) { ws_disconnect_generation_and_schedule(generation); return -1; }
     return 0;
 }
 

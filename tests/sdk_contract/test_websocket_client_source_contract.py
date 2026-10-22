@@ -44,12 +44,31 @@ class WebSocketClientSourceContract(unittest.TestCase):
         # Control frames use the same serialized writer as command responses,
         # avoiding concurrent writes to a single WebSocket stream.
         self.assertIn("if (op == 0x9) { return ws_enqueue_frame(0xA, payload, len); }", self.ws)
-        self.assertIn("send_rc = ws_send_frame_deadline(frame->opcode", self.ws)
+        self.assertIn("send_rc = ws_send_frame_deadline_fd(send_fd, frame->opcode", self.ws)
         self.assertIn("DESK_SDK_WS_HELLO_SENT", self.ws)
         self.assertIn("desk_sdk_ws_client_get_state", (ROOT / "firmware/components/desk_sdk_bridge/include/desk_sdk_bridge.h").read_text(encoding="utf-8"))
         self.assertIn("desk_sdk_bridge_process_ws_command", self.ws)
         self.assertIn("desk_sdk_ws_client_send_text(s_ws_response)", self.ws)
         self.assertIn("ws_disconnect_and_schedule(); return -1", self.ws)
+
+    def test_cr009_writer_has_shared_deadline_bounded_poll_and_control_priority(self) -> None:
+        self.assertIn("#define WS_WRITE_DEADLINE_MS 250U", self.ws)
+        self.assertIn("#define WS_CONTROL_QUEUE_CAPACITY 3U", self.ws)
+        self.assertIn("MSG_NOSIGNAL | MSG_DONTWAIT", self.ws)
+        self.assertIn("static int ws_wait_until(int fd, short events, uint64_t deadline)", self.ws)
+        self.assertIn("if (now >= deadline) return -1;", self.ws)
+        self.assertIn("if (rc < 0 && errno == EINTR) continue;", self.ws)
+        self.assertIn("if (ws_wait_until(fd, POLLOUT, deadline) == 0) continue;", self.ws)
+        # Control/ACK frames are dequeued before the source log queue each pass.
+        self.assertLess(self.ws.index("if (ws_take_outbound_frame(&s_ws_writer_current))"),
+                        self.ws.index("int log_len = desk_sdk_bridge_log_next_text"))
+        self.assertIn("ws_clear_outbound_queue();\n    desk_sdk_bridge_log_session_closed();", self.ws)
+        self.assertIn("frame->generation != ws_lifecycle_generation()", self.ws)
+        self.assertIn("log_generation == ws_lifecycle_generation()", self.ws)
+        self.assertIn("ws_disconnect_generation_and_schedule(frame->generation)", self.ws)
+        self.assertIn("ws_transport_close_for_generation(generation, true)", self.ws)
+        self.assertIn("ws_socket_fd_for_generation(frame->generation)", self.ws)
+        self.assertIn("ws_send_frame_deadline_fd(send_fd", self.ws)
 
     def test_locked_official_runtime_requires_hello_before_routing(self) -> None:
         runtime = OFFICIAL_WS.read_text(encoding="utf-8")
