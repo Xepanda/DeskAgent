@@ -36,9 +36,10 @@
 - **Linux Runtime 支持与 ARM64 / Python（blocking，尚无上游支持确认，且需实测）：** 2026-10-22 只读核对官方远端 `main` HEAD `24e3823d8f218abd5e830db3cabff1fb4151d6c7`、发布分支 `release/watcherobot-0.1.12` commit `e1976f5111f03cd61febdc5353241cf7a64947d7` 和可见最新稳定 tag `v0.1.11`（`8bc13967a06ef073459be47e930ff43ef37ee8fb`）；main 与 0.1.12 发布分支的 `runtime/daemon/application/manifest.py::_SUPPORTED_HOST_PLATFORMS` 仍为 `windows`、`macos`，`current_host_platform()` 仍只映射 Windows/Darwin，未发现 Linux 支持新增。Linux 不能作为受支持的 Host/Marketplace platform 声明。另一方面，远端 SDK CLI `cli.py::run_application()` 加载 manifest 后直接 `ensure_runtime()`、选择并启动 app，没有调用 `supports_current_host_platform()` 作为本地运行门禁，因此源码证据并不支持“Linux 上 `watcherobot app run` 必然报错”的结论；它可能继续尝试启动，但属于未支持/未验证路径。上游当前源码没有确认 Linux Runtime 支持；A3 必须获得上游明确确认，或由产品明确接受未支持平台试运行，之后仍须在目标 TaishanPi 或等价 Linux ARM64 Python 3.10–3.12 环境验证依赖安装、`watcherobot app run` offline smoke、Runtime 注入、真实设备配对/连接与 systemd stop/restart。SDK metadata 的 Python 版本范围不是 ARM64 平台兼容承诺，且本仓没有对应安装记录。
 - **Runtime 可写目录与生命周期（必须验证）：** `ProtectHome=read-only` 下要使用上述 state/instance root override；需验证权限、日志写入、Daemon 子进程在 systemd cgroup 内的停止顺序及异常重启恢复。
 - **Application wrapper/配置（实施时必须落实）：** 当前仓库没有 SDK `app.json` / `app.py` wrapper；需要固定入口并证明其进入 `main.py` managed branch。该 wrapper 应作为受控 Edge release 文件，不在 systemd 内拼任意 Python 命令或手工伪造 `WATCHER_APP_*` 凭据/URL。
+- **Linux x86/WSL smoke 环境准备（本轮未执行 App，不能判为通过或失败）：** 尝试从锁定 commit 导出源码到 `/tmp` 后，WSL Python 3.12.3 缺少 `pip` 和 `ensurepip`。临时使用 `venv --without-pip` 建立环境，再通过官方 `get-pip` 引导时，连接 `pypi.org` 超时；因此在安装 SDK 前终止，未运行 `watcherobot app run`，未创建 SDK Runtime/Daemon。未做全局安装。此结果只表明当前 WSL 环境的依赖准备受阻，不说明 SDK 是否能在 Linux x86 或 ARM64 运行，也不构成 App smoke pass/fail。
 
 ## 4. 证据等级
 
 - **L1 已确认：** 锁定 SDK commit/tag/version/metadata/CLI/API 形状；2026-10-22 查询的官方远端 main HEAD、release/watcherobot-0.1.12 分支及稳定 tags 的引用与平台源码；当前根 requirements、测试说明、Edge installer/systemd 与 Host managed-entry 源码关系。
 - **推断，未验：** pinned source 的 SDK CLI/Runtime 可能在 Linux 上尝试运行，且 wheel 可能可在 RK3566 Linux ARM64 安装；SDK 未声明 Linux 支持，本轮没有运行证据，不能作为部署承诺。systemd 下 SDK Daemon 与 Application 的启动、停止和故障恢复也未验证。
-- **未完成：** 本轮未构建 wheel、未解析依赖、未访问 Edge 设备、未运行 SDK CLI 或 systemd；以上实施方案是有明确门槛的 A3 建议，不是 Edge 部署通过结论。
+- **未完成：** 本轮未构建 wheel、未解析依赖、未访问 Edge 设备、未运行 SDK CLI 或 systemd。Linux x86/WSL 的本地 App smoke 在安装 SDK 前因缺少 pip/ensurepip 且 PyPI 连接超时而中止，未启动 Runtime/Daemon。以上实施方案是有明确门槛的 A3 建议，不是 Edge 部署通过结论。
