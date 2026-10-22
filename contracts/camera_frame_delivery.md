@@ -1,6 +1,6 @@
 # Camera Frame Delivery Contract (CR-004 proposal)
 
-**Status:** Lead/A0 approved implementation interface boundary (CR-004). The owning agent may implement within the paths below.
+**Status:** Lead/A0 approved interface boundary (CR-004); the A3 `OfficialRobotCameraAdapter` and managed Application composition-root wiring are present with L2 software evidence. This does not establish real Runtime deployment or camera hardware delivery; L3/L4 remain open.
 
 This contract adds **no wire protocol**. Device media remains the pinned WatcheRobot WSPK binary frame `<4sBBHII`; this file defines only the in-process Host consumer boundary using the existing `CameraViewerService.ingest_robot_frame(frame_bytes)` method.
 
