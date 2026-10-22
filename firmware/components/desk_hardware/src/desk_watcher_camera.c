@@ -334,9 +334,13 @@ static int camera_read_resynchronized_header(uint8_t header[HX_PTL_BASE_HEADER_S
             if (desk_watcher_camera_resync_push(&s_ptl_scanner, chunk[i],
                                                 WATCHER_HX_PTL_BODY_CAPACITY, body_size)) {
                 memcpy(header, s_ptl_scanner.bytes, HX_PTL_BASE_HEADER_SIZE);
-                *prefetched = i + 1U >= HX_PTL_BASE_HEADER_SIZE ? i + 1U - HX_PTL_BASE_HEADER_SIZE : 0U;
+                /* spi_device_transmit already clocked the whole chunk. Once
+                 * the scanner finds the 7-byte header at byte i, every byte
+                 * after i is body data already removed from the HX FIFO and
+                 * must be copied into the start of the body buffer. */
+                *prefetched = sizeof(chunk) - i - 1U;
                 if (*prefetched > *body_size) *prefetched = *body_size;
-                if (*prefetched) memcpy(s_ptl_body, chunk + i + 1U - *prefetched, *prefetched);
+                if (*prefetched) memcpy(s_ptl_body, chunk + i + 1U, *prefetched);
                 return 0;
             }
         }

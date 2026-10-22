@@ -187,6 +187,18 @@ int main(void) {
         self.assertIn("return camera_capture_release(scan_rc);", scan_failure)
         self.assertNotIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL);", scan_failure)
 
+    def test_resynchronization_copies_all_bytes_already_clocked_after_header(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        scan = source.split("static int camera_read_resynchronized_header(", 1)[1].split("\n}", 1)[0]
+
+        # The SPI transfer consumes the complete 16-byte chunk before the
+        # rolling scanner can identify a header. The tail after the header is
+        # already body data and must be prefetched exactly as in the locked
+        # WatcheRobot receiver; omitting it shifts every recovered frame.
+        self.assertIn("*prefetched = sizeof(chunk) - i - 1U;", scan)
+        self.assertIn("memcpy(s_ptl_body, chunk + i + 1U, *prefetched)", scan)
+        self.assertNotIn("i + 1U - *prefetched", scan)
+
     def test_zero_ptl_header_has_distinct_empty_error_and_spi_failures_keep_stage(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
