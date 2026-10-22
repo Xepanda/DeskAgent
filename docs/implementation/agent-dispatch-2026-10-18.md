@@ -247,11 +247,11 @@
 
 > **目标：** 仅按已关闭 CR-001 实现设备侧 pairing wire 校验和响应。
 >
-> **范围：** `firmware/components/desk_sdk_bridge/`、`tests/sdk_contract/test_sdk_bridge_protocol.py` 中 pairing 用例。
+> **范围：** `firmware/components/desk_sdk_bridge/CMakeLists.txt`、`firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c`、`tests/sdk_contract/test_sdk_bridge_protocol.py` 中 pairing 用例。A0 已在 [CR-003 §3.1](change-requests/CR-003-pairing-code-production-injection.md) 裁决 A2 `desk_sdk_bridge` 直接依赖 A1 `desk_tclaw`，可通过公开头 `desk_tclaw_bridge.h` 调 seam。
 >
 > **禁止：** CR 未关闭不改协议；不硬编码/记录/读取配对码或 token；不接触真机配对。
 >
-> **验收：** 覆盖缺码、错码、格式错误、fail-closed/裁决的失败响应、敏感日志脱敏；A2 在 pairing code 成功消费与显式 bridge session reset 时，于 pairing mutex 释放后分别调用 A1 `desk_tclaw_pairing_ui_on_pairing_consumed()` / `desk_tclaw_pairing_ui_on_sdk_session_reset()`；通知不得声称 UDP 已送达或 HardwareHello 已完成。跑 `python -m unittest tests.sdk_contract.test_sdk_bridge_protocol` 及相关 UI seam contract tests。
+> **验收：** 覆盖缺码、错码、格式错误、fail-closed/裁决的失败响应、敏感日志脱敏；A2 在 pairing code 成功消费、失败上限清码与显式 bridge session reset 时，先释放 pairing mutex，再分别调用 A1 `desk_tclaw_pairing_ui_on_pairing_consumed()` / `desk_tclaw_pairing_ui_on_sdk_session_reset()`。通知只代表清除本地显示，不得声称 UDP 已送达、WebSocket 已建立或 HardwareHello 已完成。构建确认 `desk_sdk_bridge -> desk_tclaw -> desk_hardware` 组件依赖无环。禁止 weak symbol、私有 `extern` 或复制私有函数声明。跑 `python -m unittest tests.sdk_contract.test_sdk_bridge_protocol` 及相关 UI seam contract tests。
 >
 > **返回证据：** CR 引用、diff、测试命令/结果和 Level 2 边界。
 >

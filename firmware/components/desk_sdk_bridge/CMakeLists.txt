@@ -7,5 +7,6 @@ idf_component_register(
         "include"
     REQUIRES
         desk_hardware
+        desk_tclaw
         lwip
 )

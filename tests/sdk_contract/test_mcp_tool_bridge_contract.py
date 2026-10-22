@@ -50,6 +50,7 @@ class TestMcpToolBridgeContract(unittest.TestCase):
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-o",

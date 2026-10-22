@@ -325,7 +325,7 @@
 2. **校验通过前**，严禁置 `s_paired = true`，严禁生成或发放 `session_token`，严禁回复 `pair.accept`。
 3. 未配置活动配对码时，**必须 fail-closed**（不配对、不发 token）。A1 当前通过本机 CLI `pairing open` 生成六位码，经 `desk_sdk_bridge_set_pairing_code()` 显式注入并只在本机配对显示层呈现；不得硬编码、构建期注入、持久化或复用 Tuya provisioning 凭据。CLI 入口不构成产品物理 UI 验收通过。
 4. 由于官方契约未定义校验失败响应，本阶段**不新增** wire 消息类型；失败时**不回复 `pair.accept`**（即不授予），并记录诊断日志（已脱敏）。
-5. A2 在配对码成功消费、失败次数封锁或 A2 单调期限导致码失效后，释放 pairing mutex 再调用 A1 seam `desk_tclaw_pairing_ui_on_pairing_consumed()`；显式 session reset 在清理配对状态并释放锁后调用 `desk_tclaw_pairing_ui_on_sdk_session_reset()`。两者只清显示且不代表对端收到响应或完成 HardwareHello。A1 自己负责 CLI 取消/窗口计时/换码和显示初始化时清码/清屏。完整生命周期与关闭门槛见 **CR-003**；旧 CR-001 中配对码来源问题由 CR-003 取代。失败 wire response 仍未由官方定义，设备继续静默拒绝，不新增 `pair.reject` 或扩展 `pair.busy`。
+5. **组件依赖裁决：** A2 `desk_sdk_bridge` 直接依赖 A1 `desk_tclaw`（ESP-IDF `REQUIRES desk_tclaw`），并通过公开头 `desk_tclaw_bridge.h` 使用 A1 seam；当前方向 `desk_sdk_bridge -> desk_tclaw -> desk_hardware` 无反向依赖，不引入回调注册契约。A2 在配对码成功消费、失败次数封锁或 A2 单调期限导致码失效后，必须先释放 pairing mutex，再调用 `desk_tclaw_pairing_ui_on_pairing_consumed()`；显式 session reset 必须在清理配对状态并释放锁后调用 `desk_tclaw_pairing_ui_on_sdk_session_reset()`。不得在持锁时调用 UI，也不得用 weak symbol、私有 `extern` 或私自复制原型规避组件依赖。两个同步 seam 只清除本地显示；它们**不证明 UDP 响应已送达、WebSocket 已建立或 HardwareHello 已完成**。A1 自己负责 CLI 取消/窗口计时/换码和显示初始化时清码/清屏。具体后续 owner、锁时序和验收见 **CR-003 §3.1**；旧 CR-001 中配对码来源问题由 CR-003 取代。失败 wire response 仍未由官方定义，设备继续静默拒绝，不新增 `pair.reject` 或扩展 `pair.busy`。
 
 ### 6.5 Windows Companion 启动安全（对应工作包 5）
 

@@ -35,7 +35,7 @@ class PairingCodeWindowContract(unittest.TestCase):
         self.assertIn("DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS 5", self.header)
         self.assertIn("s_pairing_failed_attempts", self.source)
         self.assertIn("desk_sdk_pairing_code_failed_attempt_locked", self.source)
-        helper = self.source[self.source.index("static void desk_sdk_pairing_code_failed_attempt_locked"):]
+        helper = self.source[self.source.index("static bool desk_sdk_pairing_code_failed_attempt_locked"):]
         helper = helper[:helper.index("\n}") + 2]
         self.assertRegex(helper, r"(?:\+\+\s*s_pairing_failed_attempts|s_pairing_failed_attempts\s*\+=\s*1|s_pairing_failed_attempts\+\+)")
         self.assertIn(">= DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS", helper)
@@ -53,6 +53,18 @@ class PairingCodeWindowContract(unittest.TestCase):
         for line in process.splitlines():
             if "printf(" in line or "request_id=%s" in line:
                 self.assertNotRegex(line, r"pairing_code|session_token|token=%s")
+
+    def test_consumption_and_reset_ui_callbacks_follow_mutex_unlock(self) -> None:
+        public = self.source[self.source.index("int desk_sdk_bridge_process_pairing_udp("):]
+        public = public[:public.index("/* Command processing */")]
+        self.assertLess(public.index("pthread_mutex_unlock(&s_pairing_code_mutex)"),
+                        public.index("desk_sdk_pairing_ui_notify_consumed(notify_pairing_consumed)"))
+        reset = self.source[self.source.index("void desk_sdk_bridge_reset(void)"):]
+        reset = reset[:reset.index("bool desk_sdk_bridge_is_connected(void)")]
+        self.assertLess(reset.index("pthread_mutex_unlock(&s_pairing_code_mutex)"),
+                        reset.index("desk_tclaw_pairing_ui_on_sdk_session_reset()"))
+        cmake = (ROOT / "firmware/components/desk_sdk_bridge/CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertRegex(cmake, r"REQUIRES[\s\S]*desk_hardware[\s\S]*desk_tclaw")
 
     def test_pairing_code_storage_is_ephemeral_and_bounded(self) -> None:
         self.assertIn("char s_expected_pairing_code[8]", self.source)

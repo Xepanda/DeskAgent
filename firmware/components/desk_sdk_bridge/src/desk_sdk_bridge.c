@@ -5,6 +5,7 @@
 
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_log_source.h"
+#include "desk_tclaw_bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -254,40 +255,54 @@ static bool desk_sdk_secure_equals(const char *a, const char *b)
     return diff == 0;
 }
 
-static void desk_sdk_pairing_code_clear_locked(void)
+static bool desk_sdk_pairing_code_clear_locked(void)
 {
+    bool was_configured = s_pairing_code_configured;
     memset(s_expected_pairing_code, 0, sizeof(s_expected_pairing_code));
     s_pairing_code_configured = false;
     s_pairing_failed_attempts = 0;
     s_pairing_code_expires_at_ms = 0;
+    return was_configured;
 }
 
-static bool desk_sdk_pairing_code_expire_if_needed_locked(void)
+/* Return true when no valid code remains; `cleared` is true only when this
+ * call consumed an active window and therefore owns the one UI notification. */
+static bool desk_sdk_pairing_code_expire_if_needed_locked(bool *cleared)
 {
+    if (cleared) *cleared = false;
     uint64_t now_ms = 0;
     if (!s_pairing_code_configured) return true;
     if (!desk_sdk_monotonic_now_ms(&now_ms) || now_ms >= s_pairing_code_expires_at_ms) {
-        desk_sdk_pairing_code_clear_locked();
+        bool was_configured = desk_sdk_pairing_code_clear_locked();
+        if (cleared) *cleared = was_configured;
         return true;
     }
     return false;
 }
 
-static void desk_sdk_pairing_code_expire_if_needed(void)
+static void desk_sdk_pairing_ui_notify_consumed(bool notify)
 {
-    pthread_mutex_lock(&s_pairing_code_mutex);
-    (void)desk_sdk_pairing_code_expire_if_needed_locked();
-    pthread_mutex_unlock(&s_pairing_code_mutex);
+    if (notify) desk_tclaw_pairing_ui_on_pairing_consumed();
 }
 
-static void desk_sdk_pairing_code_failed_attempt_locked(void)
+static void desk_sdk_pairing_code_expire_if_needed(void)
+{
+    bool cleared = false;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    (void)desk_sdk_pairing_code_expire_if_needed_locked(&cleared);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_pairing_ui_notify_consumed(cleared);
+}
+
+static bool desk_sdk_pairing_code_failed_attempt_locked(void)
 {
     if (s_pairing_failed_attempts < DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS) {
         ++s_pairing_failed_attempts;
     }
     if (s_pairing_failed_attempts >= DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS) {
-        desk_sdk_pairing_code_clear_locked();
+        return desk_sdk_pairing_code_clear_locked();
     }
+    return false;
 }
 
 int desk_sdk_bridge_set_pairing_code(const char *code)
@@ -327,9 +342,11 @@ void desk_sdk_bridge_clear_pairing_code(void)
 
 bool desk_sdk_bridge_is_pairing_code_configured(void)
 {
+    bool cleared = false;
     pthread_mutex_lock(&s_pairing_code_mutex);
-    bool configured = !desk_sdk_pairing_code_expire_if_needed_locked();
+    bool configured = !desk_sdk_pairing_code_expire_if_needed_locked(&cleared);
     pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_pairing_ui_notify_consumed(cleared);
     return configured;
 }
 
@@ -1120,6 +1137,9 @@ void desk_sdk_bridge_reset(void)
     s_client_connected = false;
     s_event_seq = 0;
     pthread_mutex_lock(&s_pairing_code_mutex);
+    bool had_pairing_state = s_pairing_code_configured || s_paired ||
+        s_pair_request_id[0] != '\0' || s_pair_daemon_instance_id[0] != '\0' ||
+        s_pair_host[0] != '\0' || s_pair_websocket_port != 0;
     s_active_pairing_token[0] = '\0';
     s_paired = false;
     s_pair_request_id[0] = '\0';
@@ -1134,6 +1154,7 @@ void desk_sdk_bridge_reset(void)
     s_last_heartbeat_time = 0;
     desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
+    if (had_pairing_state) desk_tclaw_pairing_ui_on_sdk_session_reset();
 }
 
 bool desk_sdk_bridge_is_connected(void)
@@ -1286,8 +1307,11 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
 }
 
 /* UDP Pairing (watcher_lan_pairing_v1 on port 37021) */
-static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *udp_out, size_t max_out_len)
+static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *udp_out,
+                                                       size_t max_out_len,
+                                                       bool *notify_pairing_consumed)
 {
+    if (notify_pairing_consumed) *notify_pairing_consumed = false;
     if (!udp_in || !udp_out || max_out_len < 128) return DESK_SDK_PAIRING_ERR_ARG;
 
     /* Fail-closed default: nothing is emitted unless validation fully passes. */
@@ -1313,17 +1337,21 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     /* interfaces.md 6.4 / CR-001: never grant a pairing before the pairing code
      * has been validated against the explicitly provisioned device-side code.
  * diagnostics contain only a reason and request_id. */
-    if (desk_sdk_pairing_code_expire_if_needed_locked()) {
+    bool code_expired = false;
+    if (desk_sdk_pairing_code_expire_if_needed_locked(&code_expired)) {
+        if (notify_pairing_consumed) *notify_pairing_consumed = code_expired;
         printf("[SDK-PAIR] pair.request rejected: reason=window_closed request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
     if (!desk_sdk_is_six_digits(pairing_code)) {
-        desk_sdk_pairing_code_failed_attempt_locked();
+        if (notify_pairing_consumed)
+            *notify_pairing_consumed = desk_sdk_pairing_code_failed_attempt_locked();
         printf("[SDK-PAIR] pair.request rejected: reason=malformed_code request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
     if (!desk_sdk_secure_equals(pairing_code, s_expected_pairing_code)) {
-        desk_sdk_pairing_code_failed_attempt_locked();
+        if (notify_pairing_consumed)
+            *notify_pairing_consumed = desk_sdk_pairing_code_failed_attempt_locked();
         printf("[SDK-PAIR] pair.request rejected: reason=code_mismatch request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
@@ -1394,7 +1422,10 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     memcpy(s_pair_daemon_instance_id, daemon_id, sizeof(s_pair_daemon_instance_id));
     snprintf(s_pair_target_mode, sizeof(s_pair_target_mode), "%s", target_mode);
     s_pair_websocket_port = (uint16_t)websocket_port;
-    desk_sdk_pairing_code_clear_locked();
+    if (notify_pairing_consumed)
+        *notify_pairing_consumed = desk_sdk_pairing_code_clear_locked();
+    else
+        (void)desk_sdk_pairing_code_clear_locked();
     desk_sdk_ws_client_close();
     printf("[SDK-PAIR] pair.accept issued: reason=validated request_id=%s\n", req_id);
 
@@ -1403,9 +1434,12 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
 
 int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len)
 {
+    bool notify_pairing_consumed = false;
     pthread_mutex_lock(&s_pairing_code_mutex);
-    int rc = desk_sdk_bridge_process_pairing_udp_locked(udp_in, udp_out, max_out_len);
+    int rc = desk_sdk_bridge_process_pairing_udp_locked(udp_in, udp_out, max_out_len,
+                                                        &notify_pairing_consumed);
     pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_pairing_ui_notify_consumed(notify_pairing_consumed);
     return rc;
 }
 
