@@ -10,6 +10,8 @@
 
 CR-009 的 Host consumer 必须证明日志消息来自**当前已认证的设备 WebSocket 会话**。pinned WatcheRobot Runtime v0.1.11（SHA `8bc13967a06ef073459be47e930ff43ef37ee8fb`）的静态审计显示：`DevicePairingSession.snapshot()` 提供状态、online 和 request ID，但不提供物理连接代次；`ApplicationContext` 没有 typed DeviceSession 属性或连接结束回调。可选 `WATCHER_APP_DEVICE_STATUS_URL` 不能为托管应用提供可靠的重连撤销证据。Desktop 的 `daemon.device.state` 事件也不构成托管应用会话生命周期证明。
 
+源码证据范围：锁定源码副本 `.target_logging/sdk-acceptance/vendor/WatcheRobot_python_sdk` 的 `src/watcherobot/runtime/daemon/pairing/session.py::DevicePairingSession.snapshot()` 仅返回 `state`、`online`、`mode`、`request_id`、`last_error`；`src/watcherobot/application/context.py::ApplicationContext` 未公开 DeviceSession 查询/observer；`src/watcherobot/application/transport.py::DaemonApplicationTransport` 的 `_resource_generation` / `_snapshot_generation` 是 device metadata snapshot 一致性计数，不是物理连接代次或 session end 通知。`ExternalWebSocketServer` 的 device disconnect/session-end listener 是 Runtime 内部接缝，未发现向 Managed Application 公共注入的证据。该结论是针对 pinned SHA 的 Level 1 源码审计；部署变体扩展及其他 SDK 版本未验证。不得把 metadata resource generation 或 `request_id` 当作 session generation。
+
 本 CR 提议一项 Runtime 管理的 DeviceSession Lifecycle API，使 Host 能够：
 
 1. 获取当前通过 HardwareHello 配对认证的设备 WebSocket 会话快照；
