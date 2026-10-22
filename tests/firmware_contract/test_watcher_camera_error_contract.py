@@ -12,6 +12,7 @@ CAMERA_C = ROOT / "firmware/components/desk_hardware/src/desk_watcher_camera.c"
 HARDWARE_C = ROOT / "firmware/components/desk_hardware/src/desk_hardware.c"
 CAMERA_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera.h"
 CAMERA_BUS_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera_bus.h"
+TCLAW_BRIDGE_C = ROOT / "firmware/components/desk_tclaw/src/desk_tclaw_bridge.c"
 
 
 class TestWatcherCameraErrorContract(unittest.TestCase):
@@ -132,6 +133,24 @@ int main(void) {
         self.assertIn("return drv_ret;", capture)
         driver_path = capture.split("if (s_board_driver_ops", 1)[1].split("\n    }", 1)[0]
         self.assertNotIn("return DESK_HW_ERR_UNAVAILABLE;", driver_path)
+
+    def test_tclaw_camera_failure_keeps_driver_code_and_actionable_cause(self):
+        source = TCLAW_BRIDGE_C.read_text(encoding="utf-8")
+        names = source.split("static const char *desk_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        for error_name in (
+            "PTL/media protocol validation failed",
+            "media payload CRC mismatch",
+            "camera SYNC input read failed",
+            "SPI transport failed",
+            "camera FIFO remained empty until deadline",
+        ):
+            self.assertIn(error_name, names)
+        camera_tool = source.split('else if (strcmp(operation, "camera.capture")', 1)[1]
+        camera_tool = camera_tool.split("/* 4. Display Expression Tool */", 1)[0]
+        self.assertIn('"Camera capture rc=%d: %s"', camera_tool)
+        self.assertIn("return_code = cam_rc;", camera_tool)
+        self.assertIn("retryable = desk_camera_capture_error_retryable(cam_rc);", camera_tool)
+        self.assertNotIn("return_code = DESK_HW_ERR_UNAVAILABLE;", camera_tool)
 
     def test_driver_names_sync_spi_protocol_and_crc_failures(self):
         header = CAMERA_H.read_text(encoding="utf-8")

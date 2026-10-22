@@ -19,10 +19,10 @@
 #include "desk_tclaw_bridge.h"
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_input.h"
+#include "desk_watcher_camera.h"
 #include "desk_pairing_window.h"
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_audio.h"
-#include "desk_watcher_camera.h"
 #include "desk_watcher_motion.h"
 #endif
 
@@ -49,6 +49,24 @@ static size_t s_cmd_count = 0;
 static const char *s_provisioning_stage = "idle";
 static const char *s_provisioning_error_stage = "none";
 static int s_provisioning_error_code = 0;
+
+static const char *cli_camera_capture_error_name(int rc)
+{
+    switch (rc) {
+    case DESK_HW_ERR_UNAVAILABLE: return "unavailable";
+    case DESK_HW_ERR_TIMEOUT: return "timeout";
+    case DESK_HW_ERR_BUSY: return "busy";
+    case DESK_HW_ERR_INVALID_ARG: return "invalid-arg";
+    case DESK_WATCHER_CAMERA_ERR_PROTOCOL: return "protocol";
+    case DESK_WATCHER_CAMERA_ERR_CRC: return "CRC";
+    case DESK_WATCHER_CAMERA_ERR_SYNC_IO: return "SYNC I/O";
+    case DESK_WATCHER_CAMERA_ERR_NOT_READY: return "not-ready";
+    case DESK_WATCHER_CAMERA_ERR_SPI: return "SPI";
+    case DESK_WATCHER_CAMERA_ERR_EMPTY: return "empty FIFO";
+    case DESK_WATCHER_CAMERA_ERR_CONTROL: return "HX6538 control";
+    default: return "unknown camera error";
+    }
+}
 
 /* Forward declaration */
 static void cmd_help(int argc, char *argv[]);
@@ -419,8 +437,9 @@ static void cmd_camera(int argc, char *argv[])
         static DESK_DIAG_BSS uint8_t jpeg_buf[8192];
         size_t out_len = 0;
         int rc = desk_hardware_camera_capture_jpeg(jpeg_buf, sizeof(jpeg_buf), &out_len, 500);
-        printf("Camera Capture: rc=%d, valid_frame=%s, out_len=%lu bytes\r\n",
-               rc, rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
+        printf("Camera Capture: rc=%d (%s), valid_frame=%s, out_len=%lu bytes\r\n",
+               rc, rc == DESK_HW_OK ? "ok" : cli_camera_capture_error_name(rc),
+               rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
     } else {
         printf("Camera Subsystem:\r\n");
         printf("  Arbiter Camera Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR));

@@ -66,6 +66,18 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertNotIn("? \"LINK_UP\" : \"LINK_DOWN\"", wifi)
         self.assertIn("UNKNOWN (host simulation; no radio state)", wifi)
 
+    def test_camera_capture_cli_names_specific_driver_failures(self) -> None:
+        camera = function_body(self.source, "static void cmd_camera(int argc, char *argv[])\n{",
+                               "static void cmd_body(int argc, char *argv[])\n{")
+        names = self.source.split("static const char *cli_camera_capture_error_name(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        for reason in ("timeout", "busy", "invalid-arg", "protocol", "CRC", "SYNC I/O", "SPI", "empty FIFO", "unavailable"):
+            self.assertIn(f'"{reason}"', names)
+        self.assertIn('"unknown camera error"', names)
+        self.assertIn('rc=%d (%s)', camera)
+        self.assertIn("cli_camera_capture_error_name(rc)", camera)
+
     def test_body_move_parses_required_args_and_delegates_limits_and_result_to_hal(self) -> None:
         body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",
                              "static void cmd_peripherals(int argc, char *argv[])\n{")

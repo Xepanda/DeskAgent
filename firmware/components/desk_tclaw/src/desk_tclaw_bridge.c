@@ -5,6 +5,7 @@
 
 #include "desk_tclaw_bridge.h"
 #include "desk_hardware.h"
+#include "desk_watcher_camera.h"
 #ifdef ESP_PLATFORM
 #include "ai_agent.h"
 #else
@@ -81,6 +82,32 @@ static int desk_json_parse_int(const char *json, const char *key, int default_va
     const char *pos = desk_json_find_key(json, key);
     if (!pos) return default_val;
     return (int)strtol(pos, NULL, 10);
+}
+
+static const char *desk_camera_capture_error_name(int rc)
+{
+    switch (rc) {
+    case DESK_HW_ERR_UNAVAILABLE: return "capture driver unavailable";
+    case DESK_HW_ERR_TIMEOUT: return "capture deadline expired";
+    case DESK_HW_ERR_BUSY: return "camera resource busy";
+    case DESK_HW_ERR_INVALID_ARG: return "invalid capture buffer or frame size";
+    case DESK_WATCHER_CAMERA_ERR_PROTOCOL: return "PTL/media protocol validation failed";
+    case DESK_WATCHER_CAMERA_ERR_CRC: return "media payload CRC mismatch";
+    case DESK_WATCHER_CAMERA_ERR_SYNC_IO: return "camera SYNC input read failed";
+    case DESK_WATCHER_CAMERA_ERR_NOT_READY: return "camera driver not ready";
+    case DESK_WATCHER_CAMERA_ERR_SPI: return "SPI transport failed";
+    case DESK_WATCHER_CAMERA_ERR_EMPTY: return "camera FIFO remained empty until deadline";
+    case DESK_WATCHER_CAMERA_ERR_CONTROL: return "HX6538 control command failed";
+    default: return "camera capture failed";
+    }
+}
+
+static bool desk_camera_capture_error_retryable(int rc)
+{
+    return rc == DESK_HW_ERR_TIMEOUT || rc == DESK_HW_ERR_BUSY ||
+           rc == DESK_WATCHER_CAMERA_ERR_SYNC_IO ||
+           rc == DESK_WATCHER_CAMERA_ERR_SPI ||
+           rc == DESK_WATCHER_CAMERA_ERR_EMPTY;
 }
 
 static bool desk_json_parse_bool(const char *json, const char *key, bool default_val)
@@ -603,9 +630,10 @@ int desk_tclaw_execute_tool(const char *request_id,
             } else {
                 status = "failed";
                 strncpy(error_code, "HARDWARE_FAULT", sizeof(error_code) - 1);
-                strncpy(error_msg, "Camera sensor frame unavailable - no synthetic frames permitted", sizeof(error_msg) - 1);
-                retryable = false;
-                return_code = DESK_HW_ERR_UNAVAILABLE;
+                snprintf(error_msg, sizeof(error_msg), "Camera capture rc=%d: %s",
+                         cam_rc, desk_camera_capture_error_name(cam_rc));
+                retryable = desk_camera_capture_error_retryable(cam_rc);
+                return_code = cam_rc;
             }
         }
     }
