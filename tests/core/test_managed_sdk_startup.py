@@ -176,6 +176,13 @@ class ManagedSdkStartupTests(unittest.TestCase):
             def get_pending_outbox_messages(self, **_kwargs):
                 return []
 
+            def get_active_notification_contexts(self):
+                return {"occ-startup": "2099-01-01T00:00:00Z"}
+
+            def record_managed_notification_event(self, event):
+                state["notification_event_persisted"] = event
+                return "recorded"
+
             def close(self):
                 state["life_closed"] = True
 
@@ -215,6 +222,7 @@ class ManagedSdkStartupTests(unittest.TestCase):
                 state["companion_closed"] = True
 
         watcherobot_module = types.ModuleType("watcherobot")
+        watcherobot_module.__version__ = "0.1.11"
         application_module = types.ModuleType("watcherobot.application")
         application_module.ApplicationContext = FakeContext
         watcherobot_module.application = application_module
@@ -234,6 +242,7 @@ class ManagedSdkStartupTests(unittest.TestCase):
             transport._binary_callback(types.SimpleNamespace(payload=b"x" * 131073))
             self.assertEqual(len(transport.binary_frames), 1, "oversized WSPK must be dropped before SDK handling")
             self.assertIsNotNone(app.managed_codex_feedback_adapter)
+            self.assertIsNotNone(app.managed_notification_adapter)
             app.managed_codex_feedback_adapter.send_terminal("codex.completed", {
                 "task_id": "startup-task", "resolution": "completed", "summary": "done",
             })
@@ -248,6 +257,10 @@ class ManagedSdkStartupTests(unittest.TestCase):
             })
             self.assertEqual(app.network_log_consumer.snapshot()["unauthorized"], 1)
             self.assertEqual(app.network_log_consumer.snapshot()["queued"], 0)
+            transport.emit_device_message({
+                "type": "notification.status",
+                "data": {"notification_id": "occ-startup", "status": "accepted"},
+            })
             transport._disconnect_callback()
             state["disconnect_observed_in_runtime"] = True
             app.close()
@@ -281,6 +294,13 @@ class ManagedSdkStartupTests(unittest.TestCase):
         self.assertIs(transport._disconnect_callback, state["disconnect_callback"])
         self.assertTrue(state["disconnect_observed_in_runtime"])
         self.assertTrue(state["sdk_disconnect_called"], "SDK disconnect cleanup remains chained")
+        self.assertEqual(state["notification_event_persisted"], {
+            "type": "notification.status",
+            "notification_id": "occ-startup",
+            "status": "unknown",
+            "unverified_device_status": "accepted",
+        })
+        self.assertEqual(transport.message_listeners, [], "notification and log listeners are removed on close")
         self.assertFalse(state["camera_adapter"].is_connected, "disconnect clears camera session state")
         self.assertEqual(state["camera_service"].invalidated, ["viewer-a"])
         self.assertIsNone(state["camera_service"].frame)

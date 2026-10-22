@@ -32,6 +32,7 @@ from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, Respo
 from host.desk_agent.core.router import Router
 from host.desk_agent.core.managed_sdk_listener import ManagedSdkMessageListener
 from host.desk_agent.core.managed_sdk_lifecycle import ManagedSdkLifecycleObservers
+from host.desk_agent.core.managed_notification import ManagedNotificationAdapter
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.services.network_log_consumer import NetworkLogConsumer
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
@@ -139,6 +140,7 @@ class DeskAgentHostApp:
     def __init__(self, config_path: Optional[str] = None, *, managed_sdk_session: bool = False) -> None:
         self.managed_sdk_session = bool(managed_sdk_session)
         self.managed_codex_feedback_adapter: Optional[ManagedCodexFeedbackAdapter] = None
+        self.managed_notification_adapter: Optional[ManagedNotificationAdapter] = None
         self.config = self._load_config(config_path)
         self.start_time = time.time()
 
@@ -402,19 +404,72 @@ class DeskAgentHostApp:
                     if topic == "reminder.alert":
                         if not self.life_service.claim_reminder_alert(outbox_id):
                             continue
-                        title = payload.get("title", "Reminder")
-                        rem_id = payload.get("reminder_id", "")
-                        occ_id = payload.get("occurrence_id", "")
-                        is_catchup = bool(payload.get("is_catchup", False))
-                        success = self._deliver_robot_announcement(title, rem_id, occ_id, is_catchup=is_catchup)
-                        if success:
-                            self.life_service.mark_outbox_dispatched(outbox_id)
-                            logger.info("Outbox alert %s successfully dispatched to robot audio", outbox_id)
+                        if self.managed_sdk_session:
+                            try:
+                                if self.managed_notification_adapter is None:
+                                    raise RuntimeError("managed notification adapter is not registered")
+                                notification = self.life_service.build_reminder_notification(item)
+                                receipt = self.life_service.ensure_notification_receipt(notification)
+                                if receipt not in {"ready", "exists"}:
+                                    raise RuntimeError("notification receipt context is unavailable")
+                                persisted_receipt = self.life_service.get_notification_receipt(
+                                    notification["notification_id"]
+                                )
+                                delivery_status = (
+                                    persisted_receipt.get("delivery_status", "unknown")
+                                    if persisted_receipt else "unknown"
+                                )
+                                if delivery_status != "unknown":
+                                    backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                                    self.life_service.record_outbox_failure(
+                                        outbox_id,
+                                        "Managed notification has a persisted device stage; awaiting expiry",
+                                        backoff_seconds=backoff,
+                                        keep_pending=True,
+                                    )
+                                    logger.info(
+                                        "Managed reminder %s already has device stage %s; no replay sent",
+                                        outbox_id,
+                                        delivery_status,
+                                    )
+                                    continue
+                                result = self.managed_notification_adapter.deliver(notification)
+                                backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                                # CR-018 is blocked: transport ACK and application accepted do not
+                                # prove durable device acceptance. Keep this same occurrence pending.
+                                self.life_service.record_outbox_failure(
+                                    outbox_id,
+                                    "Managed notification delivery remains unknown pending approved device persistence",
+                                    backoff_seconds=backoff,
+                                    keep_pending=True,
+                                )
+                                logger.info(
+                                    "Managed reminder %s remains pending/unknown after transport attempt (state=%s)",
+                                    outbox_id,
+                                    result.get("delivery_state", "unknown"),
+                                )
+                            except Exception as exc:
+                                backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                                self.life_service.record_outbox_failure(
+                                    outbox_id,
+                                    f"Managed notification delivery unavailable: {type(exc).__name__}",
+                                    backoff_seconds=backoff,
+                                    keep_pending=True,
+                                )
                         else:
-                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
-                            self.life_service.record_outbox_failure(
-                                outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
-                            )
+                            title = payload.get("title", "Reminder")
+                            rem_id = payload.get("reminder_id", "")
+                            occ_id = payload.get("occurrence_id", "")
+                            is_catchup = bool(payload.get("is_catchup", False))
+                            success = self._deliver_robot_announcement(title, rem_id, occ_id, is_catchup=is_catchup)
+                            if success:
+                                self.life_service.mark_outbox_dispatched(outbox_id)
+                                logger.info("Outbox alert %s successfully dispatched to robot audio", outbox_id)
+                            else:
+                                backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                                self.life_service.record_outbox_failure(
+                                    outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
+                                )
                     elif topic in ("codex.completed", "codex.failed", "codex.interrupted"):
                         if self.managed_codex_feedback_adapter is not None:
                             try:
@@ -504,7 +559,9 @@ class DeskAgentHostApp:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
             self._scheduler_thread.join(timeout=2.0)
         if hasattr(self, "_delivery_thread") and self._delivery_thread.is_alive():
-            self._delivery_thread.join(timeout=2.0)
+            # Managed send_command is bounded by the pinned SDK adapter timeout;
+            # wait for its callback path before closing listeners or SQLite.
+            self._delivery_thread.join()
         if self.official_camera_adapter:
             self.official_camera_adapter.close()
         if self._managed_network_log_listener is not None:
@@ -513,6 +570,12 @@ class DeskAgentHostApp:
             except Exception as exc:
                 logger.warning("Managed SDK message listener cleanup failed (%s)", type(exc).__name__)
             self._managed_network_log_listener = None
+        if self.managed_notification_adapter is not None:
+            try:
+                self.managed_notification_adapter.close()
+            except Exception as exc:
+                logger.warning("Managed notification adapter cleanup failed (%s)", type(exc).__name__)
+            self.managed_notification_adapter = None
         if getattr(self, "network_log_consumer", None) is not None:
             self.network_log_consumer.close()
         if getattr(self, "robot_adapter", None):
@@ -1544,6 +1607,12 @@ async def _run_managed_application(config_path: Optional[str], host: str, port: 
             app.register_managed_sdk_network_log_session(context)
             lifecycle.add(app.network_log_consumer.on_disconnect)
             app.register_managed_sdk_codex_feedback_session(command_sender=transport.send_command)
+            notification_adapter = ManagedNotificationAdapter(
+                context,
+                app.life_service.record_managed_notification_event,
+                known_notifications=app.life_service.get_active_notification_contexts(),
+            )
+            app.managed_notification_adapter = notification_adapter
             host_loop_started = True
             await asyncio.to_thread(
                 _serve_host,

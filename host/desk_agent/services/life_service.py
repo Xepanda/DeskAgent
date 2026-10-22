@@ -327,11 +327,41 @@ class LifeService:
                 dispatched_at TEXT,
                 next_retry_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS notification_receipts (
+                notification_id TEXT PRIMARY KEY,
+                reminder_id TEXT NOT NULL,
+                occurrence_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                delivery_status TEXT NOT NULL DEFAULT 'unknown',
+                user_acknowledged INTEGER NOT NULL DEFAULT 0,
+                ack_source TEXT,
+                acknowledged_at TEXT,
+                protocol_anomaly_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_receipt_events (
+                fingerprint TEXT PRIMARY KEY,
+                notification_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                FOREIGN KEY (notification_id) REFERENCES notification_receipts(notification_id)
+                    ON DELETE CASCADE
+            );
             """)
             try:
                 conn.execute("ALTER TABLE outbox ADD COLUMN next_retry_at TEXT;")
             except sqlite3.OperationalError:
                 pass
+            receipt_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(notification_receipts)").fetchall()
+            }
+            if "protocol_anomaly_count" not in receipt_columns:
+                conn.execute(
+                    "ALTER TABLE notification_receipts ADD COLUMN protocol_anomaly_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             occurrence_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(occurrences)").fetchall()
             }
@@ -718,6 +748,7 @@ class LifeService:
                 "reminder_id": reminder_id,
                 "title": title,
                 "scheduled_at": scheduled_at,
+                "expires_at": self._notification_expiry(scheduled_at),
                 "is_catchup": is_catchup,
             }
             payload_str = json.dumps(payload, ensure_ascii=False)
@@ -965,6 +996,234 @@ class LifeService:
                 (now_str, outbox_id),
             )
             conn.commit()
+
+    @staticmethod
+    def _notification_expiry(scheduled_at: str) -> str:
+        scheduled = datetime.fromisoformat(_normalize_utc_iso(scheduled_at).replace("Z", "+00:00"))
+        return (scheduled.astimezone(timezone.utc) + timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+
+    @classmethod
+    def build_reminder_notification(cls, item: Mapping[str, Any]) -> dict[str, Any]:
+        """Map an existing outbox row to the CR-017 allowlisted device payload."""
+        payload = item.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ValueError("reminder outbox payload is invalid")
+        occurrence_id = payload.get("occurrence_id")
+        reminder_id = payload.get("reminder_id")
+        scheduled_at = payload.get("scheduled_at") or item.get("created_at")
+        if not all(isinstance(value, str) and value for value in (occurrence_id, reminder_id, scheduled_at)):
+            raise ValueError("reminder outbox is missing notification identity or schedule")
+        expires_at = payload.get("expires_at") or cls._notification_expiry(scheduled_at)
+        return {
+            "notification_id": occurrence_id,
+            "reminder_id": reminder_id,
+            "occurrence_id": occurrence_id,
+            "title": payload.get("title", "Reminder"),
+            "scheduled_at": scheduled_at,
+            "expires_at": expires_at,
+            "is_catchup": payload.get("is_catchup", False),
+        }
+
+    def get_active_notification_contexts(self, now_iso: Optional[str] = None) -> dict[str, str]:
+        """Load pending/claimed reminder IDs and their existing 24-hour expiry on startup."""
+        now_str = now_iso or self._now_utc_str()
+        with self._lock, self._get_connection() as conn:
+            self._expire_stale_reminder_outbox(conn, now_str)
+            rows = conn.execute(
+                "SELECT payload_json, created_at FROM outbox "
+                "WHERE event_type = 'reminder.alert' AND state IN ('pending', 'dispatching', 'dispatched', 'cancelled')"
+            ).fetchall()
+            result: dict[str, str] = {}
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                    occurrence_id = payload["occurrence_id"]
+                    scheduled_at = payload.get("scheduled_at") or row["created_at"]
+                    expires_at = payload.get("expires_at") or self._notification_expiry(scheduled_at)
+                    expiry_dt = datetime.fromisoformat(_normalize_utc_iso(expires_at).replace("Z", "+00:00"))
+                    now_dt = datetime.fromisoformat(_normalize_utc_iso(now_str).replace("Z", "+00:00"))
+                    if isinstance(occurrence_id, str) and occurrence_id and now_dt <= expiry_dt:
+                        result[occurrence_id] = expires_at
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            conn.commit()
+            return result
+
+    def ensure_notification_receipt(self, notification: Mapping[str, Any], *, now_iso: Optional[str] = None) -> str:
+        """Create the durable unknown receipt before transport I/O for a claimed outbox row."""
+        notification_id = notification.get("notification_id")
+        if not isinstance(notification_id, str) or not notification_id or notification_id != notification.get("occurrence_id"):
+            return "ignored"
+        reminder_id = notification.get("reminder_id")
+        expires_at = notification.get("expires_at")
+        if not isinstance(reminder_id, str) or not isinstance(expires_at, str):
+            return "ignored"
+        now_str = _normalize_utc_iso(now_iso or self._now_utc_str())
+        now_dt = datetime.fromisoformat(now_str.replace("Z", "+00:00")).astimezone(timezone.utc)
+        expiry_dt = datetime.fromisoformat(_normalize_utc_iso(expires_at).replace("Z", "+00:00"))
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT payload_json, created_at FROM outbox "
+                "WHERE event_type = 'reminder.alert' AND state IN ('pending', 'dispatching')"
+            ).fetchall()
+            linked = False
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                    occurrence = payload.get("occurrence_id")
+                    scheduled = payload.get("scheduled_at") or row["created_at"]
+                    stored_expiry = payload.get("expires_at") or self._notification_expiry(scheduled)
+                    if occurrence == notification_id and _normalize_utc_iso(stored_expiry) == _normalize_utc_iso(expires_at):
+                        linked = True
+                        break
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            if not linked or now_dt > expiry_dt:
+                conn.commit()
+                return "ignored"
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO notification_receipts "
+                "(notification_id, reminder_id, occurrence_id, expires_at, delivery_status, updated_at) "
+                "VALUES (?, ?, ?, ?, 'unknown', ?)",
+                (notification_id, reminder_id, notification_id, _normalize_utc_iso(expires_at), now_str),
+            )
+            row = conn.execute(
+                "SELECT reminder_id, expires_at FROM notification_receipts WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            if not row or row["reminder_id"] != reminder_id or row["expires_at"] != _normalize_utc_iso(expires_at):
+                conn.rollback()
+                return "conflict"
+            conn.commit()
+            return "ready" if inserted.rowcount == 1 else "exists"
+
+    def get_notification_receipt(self, notification_id: str) -> Optional[dict[str, Any]]:
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM notification_receipts WHERE notification_id = ?", (notification_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def record_managed_notification_event(
+        self, event: Mapping[str, Any], *, now_iso: Optional[str] = None
+    ) -> str:
+        """Durably record an associated CR-017 event without changing reminder lifecycle."""
+        event_type = event.get("type")
+        notification_id = event.get("notification_id")
+        if not isinstance(notification_id, str) or not notification_id:
+            return "ignored"
+        if event_type == "notification.acknowledged":
+            source = event.get("source")
+            if not isinstance(source, str) or not source:
+                return "ignored"
+            normalized: dict[str, Any] = {
+                "type": event_type, "notification_id": notification_id, "source": source,
+            }
+        elif event_type == "notification.status":
+            status = event.get("status")
+            if status not in {"accepted", "rendered", "played", "failed", "expired", "unknown"}:
+                return "ignored"
+            # CR-018 is blocked: accepted remains an unverified observation, never a durable stage.
+            normalized = {
+                "type": event_type,
+                "notification_id": notification_id,
+                "status": "unknown" if status == "accepted" else status,
+            }
+            if status == "accepted" or event.get("unverified_device_status") == "accepted":
+                normalized["unverified_device_status"] = "accepted"
+        else:
+            return "ignored"
+
+        canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        now_str = _normalize_utc_iso(now_iso or self._now_utc_str())
+        now_dt = datetime.fromisoformat(now_str.replace("Z", "+00:00")).astimezone(timezone.utc)
+        with self._lock, self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT payload_json, created_at FROM outbox "
+                "WHERE event_type = 'reminder.alert' AND state IN ('pending', 'dispatching', 'dispatched', 'cancelled')"
+            ).fetchall()
+            linked: tuple[dict[str, Any], str] | None = None
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                    if payload.get("occurrence_id") != notification_id:
+                        continue
+                    scheduled_at = payload.get("scheduled_at") or row["created_at"]
+                    expires_at = payload.get("expires_at") or self._notification_expiry(scheduled_at)
+                    linked = (payload, expires_at)
+                    break
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            if linked is None:
+                conn.commit()
+                return "ignored"
+            payload, expires_at = linked
+            expiry_dt = datetime.fromisoformat(_normalize_utc_iso(expires_at).replace("Z", "+00:00"))
+            if now_dt > expiry_dt:
+                conn.commit()
+                return "ignored"
+
+            conn.execute(
+                "INSERT OR IGNORE INTO notification_receipts "
+                "(notification_id, reminder_id, occurrence_id, expires_at, delivery_status, updated_at) "
+                "VALUES (?, ?, ?, ?, 'unknown', ?)",
+                (notification_id, payload.get("reminder_id", ""), notification_id, expires_at, now_str),
+            )
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO notification_receipt_events "
+                "(fingerprint, notification_id, event_type, received_at) VALUES (?, ?, ?, ?)",
+                (fingerprint, notification_id, event_type, now_str),
+            ).rowcount
+            if not inserted:
+                conn.commit()
+                return "duplicate"
+
+            if event_type == "notification.acknowledged":
+                conn.execute(
+                    "UPDATE notification_receipts SET user_acknowledged = 1, ack_source = COALESCE(ack_source, ?), "
+                    "acknowledged_at = COALESCE(acknowledged_at, ?), updated_at = ? "
+                    "WHERE notification_id = ?",
+                    (normalized["source"], now_str, now_str, notification_id),
+                )
+            else:
+                current_row = conn.execute(
+                    "SELECT delivery_status FROM notification_receipts WHERE notification_id = ?",
+                    (notification_id,),
+                ).fetchone()
+                current = current_row["delivery_status"]
+                incoming = normalized["status"]
+                terminal = {"failed", "expired"}
+                rank = {"unknown": 0, "accepted": 1, "rendered": 2, "played": 3}
+                if current in terminal:
+                    merged = current
+                    if incoming not in {current, "unknown"}:
+                        conn.execute(
+                            "UPDATE notification_receipts SET protocol_anomaly_count = protocol_anomaly_count + 1 "
+                            "WHERE notification_id = ?",
+                            (notification_id,),
+                        )
+                elif incoming in terminal:
+                    if current == "played":
+                        conn.execute(
+                            "UPDATE notification_receipts SET protocol_anomaly_count = protocol_anomaly_count + 1 "
+                            "WHERE notification_id = ?",
+                            (notification_id,),
+                        )
+                        merged = current
+                    else:
+                        merged = incoming
+                elif rank.get(incoming, 0) > rank.get(current, 0):
+                    merged = incoming
+                else:
+                    merged = current
+                conn.execute(
+                    "UPDATE notification_receipts SET delivery_status = ?, updated_at = ? "
+                    "WHERE notification_id = ?",
+                    (merged, now_str, notification_id),
+                )
+            conn.commit()
+            return "recorded"
 
     def claim_reminder_alert(self, outbox_id: str) -> bool:
         """Atomically reserve a queued reminder alert before the worker sends it."""
