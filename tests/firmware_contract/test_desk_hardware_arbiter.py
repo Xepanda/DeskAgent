@@ -53,6 +53,8 @@ DESK_TOUCH_ACTION_SHORT_PRESS = 0
 DESK_TOUCH_ACTION_LONG_PRESS = 1
 DESK_TOUCH_ACTION_SCROLL_UP = 2
 DESK_TOUCH_ACTION_SCROLL_DOWN = 3
+DESK_ROLLER_DELTA_DOWN = -1
+DESK_ROLLER_DELTA_UP = 1
 
 
 class TestDeskHardwareArbiter(unittest.TestCase):
@@ -174,6 +176,13 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         cls.TOUCH_CB = TOUCH_CB
         cls.lib.desk_hardware_register_input_cb.restype = ctypes.c_int
         cls.lib.desk_hardware_register_input_cb.argtypes = [TOUCH_CB, ctypes.c_void_p]
+
+        ROLLER_DELTA_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
+        cls.ROLLER_DELTA_CB = ROLLER_DELTA_CB
+        cls.lib.desk_hardware_register_roller_delta_cb.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_roller_delta_cb.argtypes = [ROLLER_DELTA_CB, ctypes.c_void_p]
+        cls.lib.desk_hardware_feed_roller_delta.restype = ctypes.c_int
+        cls.lib.desk_hardware_feed_roller_delta.argtypes = [ctypes.c_int]
 
         cls.lib.desk_hardware_inject_touch_event.restype = ctypes.c_int
         cls.lib.desk_hardware_inject_touch_event.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -435,6 +444,36 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.assertEqual(len(received_events), 2)
         self.assertEqual(received_events[0], (DESK_TOUCH_TARGET_BACKTOUCH, DESK_TOUCH_ACTION_SHORT_PRESS))
         self.assertEqual(received_events[1], (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP))
+
+    def test_roller_detents_notify_observer_and_preserve_ui_events(self) -> None:
+        """Decoded roller detents reach both SDK observers and the existing UI callback."""
+        ui_events = []
+        roller_deltas = []
+
+        def on_touch(target, action, user_data):
+            ui_events.append((target, action))
+
+        def on_roller_delta(delta, user_data):
+            roller_deltas.append(delta)
+
+        touch_cb = self.TOUCH_CB(on_touch)
+        roller_cb = self.ROLLER_DELTA_CB(on_roller_delta)
+        self.lib.desk_hardware_register_input_cb(touch_cb, None)
+        self.lib.desk_hardware_register_roller_delta_cb(roller_cb, None)
+
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(DESK_ROLLER_DELTA_UP), DESK_HW_OK)
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(DESK_ROLLER_DELTA_DOWN), DESK_HW_OK)
+        # Buttons keep their existing TuyaOpen input path and must not become SDK roller events.
+        self.lib.desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SHORT_PRESS)
+        self.lib.desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_LONG_PRESS)
+
+        self.assertEqual(roller_deltas, [DESK_ROLLER_DELTA_UP, DESK_ROLLER_DELTA_DOWN])
+        self.assertEqual(ui_events, [
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP),
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_DOWN),
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SHORT_PRESS),
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_LONG_PRESS),
+        ])
 
     def test_uninitialized_camera_capture_fails_without_synthetic_picture(self) -> None:
         """Verifies camera capture returns DESK_HW_ERR_UNAVAILABLE (-2) when no real sensor/frame is present."""

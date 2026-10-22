@@ -54,9 +54,16 @@ typedef enum {
     DESK_TOUCH_ACTION_SCROLL_DOWN
 } desk_touch_action_t;
 
+typedef enum {
+    DESK_ROLLER_DELTA_DOWN = -1,
+    DESK_ROLLER_DELTA_UP = 1
+} desk_roller_delta_t;
+
 typedef void (*desk_touch_event_cb_t)(desk_touch_target_t target,
                                       desk_touch_action_t action,
                                       void *user_data);
+typedef void (*desk_roller_delta_cb_t)(desk_roller_delta_t delta,
+                                       void *user_data);
 
 typedef void (*desk_camera_frame_cb_t)(const uint8_t *jpeg_buf,
                                        size_t jpeg_len,
@@ -240,6 +247,10 @@ bool desk_hardware_is_display_initialized(void);
 int desk_hardware_register_input_cb(desk_touch_event_cb_t cb, void *user_data);
 int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_action_t action);
 int desk_hardware_feed_touch_event(desk_touch_target_t target, desk_touch_action_t action);
+/** Register an optional observer for decoded physical roller detents. Passing NULL unregisters it. */
+int desk_hardware_register_roller_delta_cb(desk_roller_delta_cb_t cb, void *user_data);
+/** Feed one decoded detent to the legacy UI input path and the optional observer. Callback must not block. */
+int desk_hardware_feed_roller_delta(desk_roller_delta_t delta);
 
 /* Strict Hardware Mode & Status Inspection */
 void desk_hardware_set_strict_mode(bool strict);

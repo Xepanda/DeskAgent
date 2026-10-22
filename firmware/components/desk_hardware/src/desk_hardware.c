@@ -68,6 +68,8 @@ static uint64_t mcu_get_time_ms(void)
 /* --- Touch & Input State --- */
 static desk_touch_event_cb_t s_touch_cb = NULL;
 static void *s_touch_cb_user_data = NULL;
+static desk_roller_delta_cb_t s_roller_delta_cb = NULL;
+static void *s_roller_delta_cb_user_data = NULL;
 
 /* --- Display & Expression State --- */
 static char s_current_preset[32] = "idle";
@@ -1345,4 +1347,29 @@ int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_acti
 int desk_hardware_feed_touch_event(desk_touch_target_t target, desk_touch_action_t action)
 {
     return desk_hardware_inject_touch_event(target, action);
+}
+
+int desk_hardware_register_roller_delta_cb(desk_roller_delta_cb_t cb, void *user_data)
+{
+    s_roller_delta_cb = cb;
+    s_roller_delta_cb_user_data = user_data;
+    return DESK_HW_OK;
+}
+
+int desk_hardware_feed_roller_delta(desk_roller_delta_t delta)
+{
+    desk_touch_action_t action;
+    if (delta == DESK_ROLLER_DELTA_UP) {
+        action = DESK_TOUCH_ACTION_SCROLL_UP;
+    } else if (delta == DESK_ROLLER_DELTA_DOWN) {
+        action = DESK_TOUCH_ACTION_SCROLL_DOWN;
+    } else {
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+
+    int rc = desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, action);
+    if (s_roller_delta_cb) {
+        s_roller_delta_cb(delta, s_roller_delta_cb_user_data);
+    }
+    return rc;
 }
