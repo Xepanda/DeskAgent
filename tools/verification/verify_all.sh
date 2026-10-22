@@ -66,6 +66,10 @@ step_pass "Firmware libdesk_hardware.a and libdesk_sdk_bridge.a compiled clean"
 # ------------------------------------------------------------------------------
 # 3. Level 2: Complete Python Test Suite (All domains, contract & e2e tests)
 # ------------------------------------------------------------------------------
+# Test environment prerequisite: see tests/requirements-sdk.txt for pinned SDK
+# dependencies needed by discovery. It is test-only; deploy/edge/install.sh
+# intentionally installs requirements.txt. Note the SDK's websockets>=14,<16
+# conflicts with the root requirements.txt websockets>=12,<14 constraint.
 echo ""
 echo "--- Step 3: Complete Python Test Suite (All domains & integration) ---"
 PYTHONPATH=. python3 -m unittest discover -s tests -t . -p "test_*.py" || step_fail "Python test suite failed"
