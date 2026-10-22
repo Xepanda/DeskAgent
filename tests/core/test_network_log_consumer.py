@@ -22,6 +22,21 @@ def camera_empty(sequence: int = 1) -> dict:
     }
 
 
+def queue_full_gap(first: int = 3, last: int = 5, count: int = 3) -> dict:
+    return {
+        "type": "sys.log.gap",
+        "data": {
+            "log_schema_version": "1.0.0",
+            "stream_id": "logstream_01",
+            "boot_id": "boot-opaque-id",
+            "first_dropped_sequence": first,
+            "last_dropped_sequence": last,
+            "dropped_count": count,
+            "reason": "QUEUE_FULL",
+        },
+    }
+
+
 class NetworkLogConsumerTests(unittest.TestCase):
     def test_disabled_by_default_and_requires_authorized_delivery(self) -> None:
         consumer = NetworkLogConsumer()
@@ -67,31 +82,31 @@ class NetworkLogConsumerTests(unittest.TestCase):
                 self.assertFalse(consumer.ingest(msg, authorized=True))
         self.assertEqual(consumer.snapshot()["rejected"], len(invalid))
 
-    def test_gap_is_rejected_until_contract_reason_enum_is_frozen(self) -> None:
+    def test_accepts_only_queue_full_gap_with_exact_contiguous_range(self) -> None:
         consumer = NetworkLogConsumer(enabled=True)
-        gap = {
-            "type": "sys.log.gap",
-            "data": {
-                "log_schema_version": "1.0.0",
-                "stream_id": "logstream_01",
-                "boot_id": "boot-opaque-id",
-                "first_dropped_sequence": 3,
-                "last_dropped_sequence": 5,
-                "dropped_count": 3,
-                "reason": "TEST_REASON",
-            },
-        }
-        # CR-009 requires a closed reason enum but does not list its members.
-        # The consumer therefore fails closed until A0 supplies that allowlist.
-        self.assertFalse(consumer.ingest(gap, authorized=True))
-        self.assertEqual(consumer.drain(), [])
+        gap = queue_full_gap()
+        self.assertTrue(consumer.ingest(gap, authorized=True))
+        self.assertEqual(consumer.drain(), [gap])
 
-        for reason in ("TEST_REASON", "QUEUE_FULL", "buffer overflow", "x" * 100):
-            with self.subTest(reason=reason):
-                candidate = {**gap, "data": {**gap["data"], "reason": reason}}
-                self.assertFalse(consumer.ingest(candidate, authorized=True))
-        inconsistent = {**gap, "data": {**gap["data"], "dropped_count": 4}}
-        self.assertFalse(consumer.ingest(inconsistent, authorized=True))
+    def test_rejects_unknown_gap_reason_schema_fields_and_inconsistent_ranges(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        base = queue_full_gap()
+        invalid = [
+            {**base, "data": {**base["data"], "reason": "TEST_REASON"}},
+            {**base, "data": {**base["data"], "reason": "DISCONNECTED"}},
+            {**base, "data": {**base["data"], "log_schema_version": "2.0.0"}},
+            {**base, "data": {**base["data"], "extra": "raw log"}},
+            {**base, "data": {**base["data"], "dropped_count": 2}},
+            {**base, "data": {**base["data"], "dropped_count": 4}},
+            {**base, "data": {**base["data"], "last_dropped_sequence": 2}},
+            {**base, "data": {**base["data"], "first_dropped_sequence": 0}},
+            {**base, "data": {**base["data"], "dropped_count": True}},
+        ]
+        for msg in invalid:
+            with self.subTest(message=msg):
+                self.assertFalse(consumer.ingest(msg, authorized=True))
+        self.assertEqual(consumer.snapshot()["rejected"], len(invalid))
+        self.assertEqual(consumer.drain(), [])
 
     def test_queue_drops_newest_and_close_discards_buffer(self) -> None:
         consumer = NetworkLogConsumer(enabled=True)

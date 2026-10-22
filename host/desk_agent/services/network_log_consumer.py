@@ -14,9 +14,9 @@ from typing import Any, Mapping, Optional
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
-_GAP_REASON = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 _LEVELS = frozenset({"ERROR", "WARN", "INFO", "DEBUG"})
 _EVENT_ID = "CAMERA_CAPTURE_EMPTY"
+_GAP_REASON = "QUEUE_FULL"
 _SCHEMA_VERSION = "1.0.0"
 _QUEUE_CAPACITY = 16
 
@@ -171,16 +171,22 @@ class NetworkLogConsumer:
         reason = data.get("reason")
         if not all(_is_nonnegative_int(value, allow_zero=False) for value in (first, last, count)):
             return None
-        if last < first or count > last - first + 1:
+        if last < first or count != last - first + 1:
             return None
-        # CR-009 requires a closed reason enum but has not yet enumerated it.
-        # Reject all gap records until an A0-approved allowlist is wired here;
-        # never infer the enum from an untrusted frame.
-        if not isinstance(reason, str) or not _GAP_REASON.fullmatch(reason):
+        if reason != _GAP_REASON:
             return None
-        # A0 has not frozen the closed reason enum yet. There is no production
-        # override: every gap remains rejected until that contract lands.
-        return None
+        return {
+            "type": "sys.log.gap",
+            "data": {
+                "log_schema_version": _SCHEMA_VERSION,
+                "stream_id": data["stream_id"],
+                "boot_id": data["boot_id"],
+                "first_dropped_sequence": first,
+                "last_dropped_sequence": last,
+                "dropped_count": count,
+                "reason": _GAP_REASON,
+            },
+        }
 
 
 def _valid_token(value: object) -> bool:
