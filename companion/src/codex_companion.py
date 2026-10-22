@@ -695,7 +695,7 @@ class CodexCompanion:
             elif method in ("turn/completed", "task/completed", "turn/finished"):
                 if task_id and task_id in self._tasks:
                     turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
-                    raw_status = str(turn.get("status") or params.get("status") or "completed").lower()
+                    raw_status = str(turn.get("status") or params.get("status") or "").lower()
                     error_info = params.get("error") or turn.get("error")
                     if raw_status in ("failed", "error") or error_info is not None:
                         self._tasks[task_id]["status"] = "failed"
@@ -740,6 +740,17 @@ class CodexCompanion:
                             "status": "interrupted",
                             "summary": summary,
                         })
+                    elif raw_status not in ("completed", "succeeded"):
+                        # A terminal notification without a recognized success
+                        # status is not proof that the turn completed. Match the
+                        # restart-recovery path: preserve the current task state
+                        # and reconcile against the app-server before reporting.
+                        self._set_recovery_pending(task_id, "unknown_turn_status")
+                        logger.warning(
+                            "Codex task %s received unrecognized terminal status %r; keeping it pending",
+                            task_id,
+                            raw_status or None,
+                        )
                     else:
                         assistant_output = (
                             self._assistant_text_from_items(turn.get("items"))

@@ -294,6 +294,40 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(status["summary"], "任务已成功完成")
         self.assertEqual(status["last_output"], "")
 
+    def test_missing_or_unknown_terminal_status_is_not_reported_as_success(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        companion.add_event_listener(lambda event, data: events.append((event, data)))
+
+        for task_id, terminal_payload in (
+            ("tsk-terminal-status-missing", {}),
+            ("tsk-terminal-status-future", {"status": "future_state"}),
+        ):
+            with self.subTest(task_id=task_id):
+                task = companion.submit_task(task_id, "test-project", "run task")
+                companion._handle_server_notification(
+                    "turn/completed",
+                    {
+                        "threadId": task["thread_id"],
+                        "turnId": task["turn_id"],
+                        **terminal_payload,
+                    },
+                )
+
+                status = companion.get_task_status(task_id)
+                self.assertEqual(status["status"], "running")
+                self.assertEqual(status["recovery_status"], "pending")
+                self.assertEqual(status["recovery_error_kind"], "unknown_turn_status")
+                self.assertEqual(status["summary"], "")
+                self.assertEqual(status["last_output"], "")
+
+        self.assertEqual(events, [])
+        companion.close()
+
     def test_failed_turn_is_reported_as_failure_with_server_error(self) -> None:
         db_path = os.path.join(self.workspace_dir, "failed-task.sqlite3")
         companion = CodexCompanion(
