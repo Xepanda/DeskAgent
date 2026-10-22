@@ -9,6 +9,7 @@ idf_component_register(
         "src/desk_watcher_camera.c"
         "src/desk_watcher_log_source.c"
         "src/desk_watcher_input.c"
+        "src/desk_notification.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
