@@ -2,7 +2,7 @@
 
 - **提出方：** A0
 - **提出日期：** 2026-10-22
-- **状态：** PROPOSED — 待 A1/A0 评审；未实现，语音链路 readiness 尚未验收
+- **状态：** BLOCKED — 完整 readiness 依赖 [CR-021 Tuya audio readiness public API](CR-021-tuya-audio-readiness-api.md)；现有 pin 无法公开报告 AFE/VAD/WakeNet/KWS 模型身份及运行期状态
 - **预期 owner：** A0 裁决跨层契约与依赖兼容性；A1 负责设备适配和固件接入；A7 验收
 - **范围：** 只定义语音输入从初始化到可唤醒的就绪语义。不修改 TuyaOpen/TClaw vendor 文件，不将 MQTT、AI agent 或 session 状态单独视作音频 ready。
 
@@ -30,7 +30,7 @@
 
 本次在 clean pinned checkout 使用 `git show HEAD:<path>` 与 `git grep <symbol> HEAD -- <path>` 审计，确认 HEAD/full SHA 为 `cdc064e78daeeae598157470244e351cd37cbbed`；KWS 符号与调用路径与 dirty checkout object database 中同一 locked commit 的查询一致。具体源码发现见上列第 4、7 项。dirty checkout 状态与 locked commit 的差异已明确分开记录，没有用当前 HEAD 推导上游行为。
 
-**A0 结论：当前不需要新增独立 CR。** 返回值传播、ready 状态和模型身份均属于本 CR 的语音 readiness 范围。TuyaOpen AI mode/main owner 应在 `ai_mode_wakeup.c` 检查并传播 VAD mode、KWS callback registration 与 enable 错误，并在 MQTT callback 仅于 `ai_mode_init()` 成功后设置 agent/mode-ready 标志；TuyaOpen KWS adapter/平台实现 owner 应提供受支持的 ready/model identity 查询（至少实际模型名或 ID、loaded/enabled 状态和失败码），运行期故障撤销 ready 则需状态变化/错误通知。A1 只消费公开接口，不得以私有 backend、回调注册成功或 PCM 曾产出推定模型已加载。若上游确认无法扩展该 API，再由 A0 拆分新的窄接口 CR 并裁决依赖 pin；本次不修改 vendor/生产代码。该结论不证明目标板 WakeNet/AFE 当前 ready。
+**A0 结论（2026-10-22）：固定 pin 的公开接口不足以满足完整 readiness 契约，依赖 CR-021。** pinned KWS adapter 有 init/callback/enable 操作，但没有公开的模型身份、loaded/enabled 查询或运行期失败事件；wake mode 还没有完整传播相关操作错误。`desk_hardware_audio_get_status()` 只能表示 DeskAgent 板级 HAL 状态，不能提供 AFE/VAD/KWS readiness。A1 可保留独立的 `audio_hal` 状态和 fail-closed 启动门，但不得将其命名或汇报为 `AUDIO_INPUT_READY`。CR-021 请求 TuyaOpen SDK typed status/event 与新 pin；只有上游 API 完成并经 A0 复核后，A1 才能接入完整门禁。源码审计是 L1，不证明目标板当前 WakeNet/AFE/KWS 已 ready。
 
 ## 2. 风险与复现条件
 
@@ -59,11 +59,11 @@
 
 方案选项：
 
-1. **优先：使用依赖 pin 支持的 typed readiness API/event。** API 应分别报告 audio-device open、AFE/VAD、KWS 模型加载与启动结果，以及失败阶段/错误码；A1 只消费公开接口并驱动设备状态。若当前 pin 没有该接口，由 A0 发起上游/API 或依赖升级裁决，更新 pin 后重做兼容验证。
-2. **备选：由适配层传播明确的 audio-init failure。** 仅在现有公开回调/返回值足以覆盖初始化和后续 WakeNet/AFE 失败时采用；同步初始化返回错误必须阻止语音 ready，运行期错误必须撤销 ready。若 SDK/TClaw 未暴露必要 hook，应先提交接口变更请求，不得通过私有符号、内部结构或本地 vendor patch 猜测状态。
+1. **裁决：依赖 CR-021 的 typed readiness API/event。** API 应分别报告 audio-device open、AFE/VAD、KWS 模型身份、loaded/enabled/运行状态，以及失败阶段/错误码；A1 只消费新 pin 中的公开接口并驱动设备状态。当前 pin 不具备此接口，故 CR-015 完整验收处于 BLOCKED。
+2. **有限本地门控：** A1 可独立记录板级 `audio_hal` readiness；该状态只代表 HAL，不解除 CR-015 阻塞，也不能对外作为唤醒 ready。同步 TClaw 初始化错误维持其自身错误归属。禁止通过私有符号、内部结构或本地 vendor patch 推断 AFE/WakeNet/KWS 状态。
 3. **不接受：** 仅用 MQTT、`ai_agent_init`、session 状态、输入线程创建成功或“未见错误日志”推定音频 ready；也不接受只在 `app_main` 忽略 runtime 错误的情况下继续显示/播报语音可用。
 
-推荐裁决为方案 1；先由 A0 确认当前 pin 是否有覆盖完整音频/模型生命周期的公开 readiness 接口。若没有，则提出受支持的上游接口/升级请求，再由 A1 接入。`app_main` 可保留 provisioning/MQTT 的 best-effort 启动，但必须保持语音失败状态可观察、语音入口 fail-closed。
+推荐裁决为方案 1。A0 已提出 CR-021 请求 TuyaOpen 提供受支持的上游公开接口并更新依赖 pin；在接口、pin 与兼容验证完成前，CR-015 的完整语音 readiness 接入保持 BLOCKED。`app_main` 可保留 provisioning/MQTT 的 best-effort 启动，但必须保持语音失败状态可观察、语音入口 fail-closed。
 
 ## 4. 诊断日志与指标
 
