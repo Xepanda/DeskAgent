@@ -107,7 +107,16 @@
         },
         "timestamp": { "type": "string", "format": "date-time" },
         "context_id": { "type": "string" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "new_state": { "type": "null" } },
+            "required": ["new_state"]
+          },
+          "then": { "not": { "required": ["attributes"] } }
+        }
+      ]
     }
   }
 }
