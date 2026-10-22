@@ -559,6 +559,70 @@ class TestHostDaemon(unittest.TestCase):
             with urlopen(release_request) as response:
                 self.assertTrue(json.loads(response.read().decode())["result"]["released"])
 
+    def test_camera_frame_endpoint_accepts_valid_bearer_and_rejects_invalid_bearer(self) -> None:
+        """The single-frame route enforces configured Bearer auth before serving a leased JPEG."""
+        auth_token = "camera-frame-test-token"
+        original_auth_token = self.app.config.get("auth_token")
+        client_id = "camera-frame-auth-viewer"
+        jpeg = b"\xff\xd8camera-frame-auth-test\xff\xd9"
+        self.app.config["auth_token"] = auth_token
+        self.app.camera_service.set_hardware_frame_source(lambda: jpeg)
+
+        acquire_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-camera-frame-auth-acquire",
+            "operation": "resource.camera.acquire",
+            "client_id": client_id,
+            "arguments": {"client_id": client_id, "lease_duration_ms": 5000},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        acquire_request = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(acquire_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {auth_token}"},
+            method="POST",
+        )
+
+        try:
+            with urlopen(acquire_request) as response:
+                self.assertEqual(json.loads(response.read().decode())["result"]["granted"], True)
+
+            frame_url = f"http://127.0.0.1:{self.port}/api/camera/frame?client_id={client_id}"
+            invalid_request = Request(frame_url, headers={"Authorization": "Bearer invalid-camera-token"})
+            with self.assertRaises(HTTPError) as invalid_response:
+                urlopen(invalid_request)
+            try:
+                self.assertEqual(invalid_response.exception.code, 401)
+            finally:
+                invalid_response.exception.close()
+
+            valid_request = Request(frame_url, headers={"Authorization": f"Bearer {auth_token}"})
+            with urlopen(valid_request, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get("Content-Type"), "image/jpeg")
+                self.assertEqual(response.read(), jpeg)
+        finally:
+            release_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-camera-frame-auth-release",
+                "operation": "resource.camera.release",
+                "client_id": client_id,
+                "arguments": {"client_id": client_id},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            release_request = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(release_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {auth_token}"},
+                method="POST",
+            )
+            try:
+                with urlopen(release_request) as response:
+                    self.assertTrue(json.loads(response.read().decode())["result"]["released"])
+            finally:
+                self.app.camera_service.set_hardware_frame_source(None)
+                self.app.config["auth_token"] = original_auth_token
+
     def test_snapshot_endpoint_unavailable_without_physical_image_source(self) -> None:
         """GET /snapshot reports unavailable when the Host has no physical image source."""
         snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
