@@ -322,7 +322,10 @@ static int camera_read_resynchronized_header(uint8_t header[HX_PTL_BASE_HEADER_S
     for (unsigned n = 0; n < CAM_PTL_RESYNC_MAX_CHUNKS && esp_timer_get_time() < deadline; ++n) {
         spi_transaction_t trans = {
             .length = sizeof(chunk) * 8U, .rxlength = sizeof(chunk) * 8U,
-            .rx_buffer = chunk, .flags = SPI_TRANS_CS_KEEP_ACTIVE,
+            /* Match the locked PTL receiver: recovery scan chunks end the
+             * transaction so HX can advance/realign its SPI stream between
+             * bounded reads. Only header-to-body reads hold CS active. */
+            .rx_buffer = chunk, .flags = 0,
         };
         esp_err_t err = spi_device_transmit(s_spi_dev, &trans);
         if (err != ESP_OK) {

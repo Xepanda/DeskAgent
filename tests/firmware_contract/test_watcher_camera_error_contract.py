@@ -199,6 +199,17 @@ int main(void) {
         self.assertIn("memcpy(s_ptl_body, chunk + i + 1U, *prefetched)", scan)
         self.assertNotIn("i + 1U - *prefetched", scan)
 
+    def test_resynchronization_ends_each_spi_chunk_to_match_locked_ptl_receiver(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        scan = source.split("static int camera_read_resynchronized_header(", 1)[1].split("\n}", 1)[0]
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        normal_header = capture.split("spi_transaction_t hdr_trans", 1)[1].split("};", 1)[0]
+
+        # The official receiver uses spi_read(..., false) for resync scans,
+        # but holds CS across the ordinary header/body pair.
+        self.assertIn(".rx_buffer = chunk, .flags = 0", scan)
+        self.assertIn(".flags = SPI_TRANS_CS_KEEP_ACTIVE", normal_header)
+
     def test_zero_ptl_header_has_distinct_empty_error_and_spi_failures_keep_stage(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
