@@ -119,11 +119,16 @@ class FrameCapturePipeline:
     def stop(self) -> None:
         self.request_stop()
         with self._lock:
-            if self._thread and self._thread.is_alive() and self._thread != threading.current_thread():
+            thread = self._thread
+            if thread and thread.is_alive() and thread != threading.current_thread():
                 try:
-                    self._thread.join(timeout=0.2)
+                    thread.join(timeout=0.2)
                 except Exception:
                     pass
+            # Keep the reference while a blocked source callback is still
+            # running. A rapid lease reacquire can then resume this worker
+            # instead of starting a second concurrent caller for the source.
+            if thread and not thread.is_alive():
                 self._thread = None
 
     def request_stop(self) -> None:

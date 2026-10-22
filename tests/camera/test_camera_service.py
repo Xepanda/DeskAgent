@@ -94,6 +94,40 @@ class TestCameraService(unittest.TestCase):
         cam.release_lease("sdk-owner")
         cam.stop_capture()
 
+    def test_release_and_reacquire_does_not_start_second_blocked_capture_worker(self) -> None:
+        entered_source = threading.Event()
+        unblock_source = threading.Event()
+        active_calls = 0
+        max_active_calls = 0
+        calls_lock = threading.Lock()
+
+        def blocked_source():
+            nonlocal active_calls, max_active_calls
+            with calls_lock:
+                active_calls += 1
+                max_active_calls = max(max_active_calls, active_calls)
+            entered_source.set()
+            unblock_source.wait(2.0)
+            with calls_lock:
+                active_calls -= 1
+            return TEST_JPEG
+
+        cam = CameraViewerService(auto_start_pipeline=True)
+        cam.set_hardware_frame_source(blocked_source)
+        cam.acquire_lease("viewer", lease_ms=5000)
+        self.assertTrue(entered_source.wait(1.0))
+        self.assertTrue(cam.release_lease("viewer"))
+
+        cam.acquire_lease("viewer", lease_ms=5000)
+        time.sleep(0.08)
+        with calls_lock:
+            self.assertEqual(max_active_calls, 1)
+            self.assertEqual(active_calls, 1)
+
+        unblock_source.set()
+        cam.release_lease("viewer")
+        cam.stop_capture()
+
     def test_no_frame_is_available_without_a_physical_source_even_if_legacy_flag_is_true(self) -> None:
         cam = CameraViewerService(auto_start_pipeline=True, allow_synthetic=True)
         cam.acquire_lease("viewer", lease_ms=1000)
