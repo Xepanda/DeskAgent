@@ -1,36 +1,40 @@
 # A4 implementation note: HA reconnect snapshot/event ordering
 
-**Status:** PROPOSED — A0 review only; not an approved contract or implementation instruction
-**Owner:** A4 implementation; A0 must approve any shared event freshness semantics
-**Evidence:** Level 1 (official HA WebSocket documentation) + Level 2 (source/test review)
+**Status:** BLOCKED — A0 decision; no ordering contract approved
+**Owner:** A0 owns shared semantics; A4 owns connector implementation and protocol PoC
+**Scope:** Reconnect cache freshness and event ordering only. CR-016 payload schema and event meanings remain unchanged.
+**Evidence:** Level 1 (official HA WebSocket/REST documentation) + Level 2 (DeskAgent source review). No live HA instance was accessed.
 
-## Finding
+## Decision
 
-Approved [CR-016](change-requests/CR-016-ha-state-snapshot-change-semantics.md) defines *what changes* produce `ha.state_changed`: state or complete attributes change, entity addition/removal, and the meaning of `attributes`/`new_state: null`. It does **not** define ordering or freshness between a WebSocket event and a REST snapshot, nor does it require a generation, sequence, or timestamp comparison.
+Do not approve timestamp-based ordering or a rule that treats a REST snapshot as globally ordered with WebSocket events. Do not add a private sequence number or change the CR-016 payload.
 
-The risk is real in the current reconnect path (`host/desk_agent/connectors/ha/ha_connector.py`, `_ws_worker`): A4 subscribes to `state_changed`, marks the socket connected, then calls REST `reconcile_states()` before it begins receiving queued WebSocket frames. A change event can therefore be waiting on the socket while the REST snapshot already reflects a later state. The snapshot updates `_cached_states`; the queued event is subsequently applied without comparing its version to the cache and can regress or remove that newer cached state. The polling worker also pauses as soon as `_ws_connected` is set. Current reconnect test covers an outage change observed by the reconnect snapshot, but not a queued pre-snapshot event that conflicts with the snapshot.
+The current connector subscribes to WebSocket `state_changed`, marks the socket connected, then calls REST `reconcile_states()` before it drains queued WebSocket frames (`host/desk_agent/connectors/ha/ha_connector.py`, `_ws_worker`). A queued event is applied to `_cached_states` without comparing its `old_state` with the cached snapshot. Therefore a stale queued transition or removal can regress/remove a newer snapshot. The existing `is_ws_connected` flag also does not represent whether reconnect reconciliation has completed.
 
-The official HA WebSocket API documents event subscriptions and their `time_fired` field, and documents `subscribe_entities` as sending initial states followed by changes on that subscription. It does not document a cross-transport ordering/freshness guarantee between a WebSocket event and a separate REST `/api/states` response. Thus this risk is not closed by relying on WebSocket frame order alone.
+The official WebSocket API documents `time_fired` on event frames, but does not document a cross-transport ordering guarantee against a separate REST `/api/states` request. The event and state timestamps are not approved as a cross-channel sequence. Comparing `old_state` with the cache can detect some duplicates or conflicts, but cannot determine the correct order for every valid intervening transition. On conflict, another REST read still does not order a later WebSocket event against that read. Consequently no safe, complete rule for the current `subscribe_events` + REST design can be approved while preserving CR-016 semantics.
 
-## Proposed minimum safe behavior (requires A0 approval)
+Home Assistant documents `subscribe_entities` as sending all states the client may read first, then only changes, in a compact format. This is a promising single-WebSocket baseline-and-update path and does not require changing the CR-016 payload. However, the public documentation does not specify an explicit completion marker for the initial-state portion. A4 must establish from the pinned/supported HA protocol implementation or a versioned official guarantee how the client knows the baseline is complete, including empty initial state sets, authorization filtering, and entity add/remove behavior. “First message”, “quiet period”, or REST response completion must not be treated as a completion marker without evidence.
 
-1. Never let an event known to be older than the cached HA state overwrite or remove that state. Use HA-provided state/event timestamps only where both are present and comparable; do not invent local sequence numbers or assume REST/WS response ordering.
-2. If ordering cannot be established (including missing/malformed timestamps), treat the event as an invalidation and reconcile from an authoritative current-state snapshot before publishing a state transition or declaring the cache current. Preserve the existing CR-016 payload shape.
-3. Keep connection health separate from state freshness: authenticated + subscribed may report WebSocket-connected, but do not claim the entity cache is reconciled until the reconnect baseline is complete.
-4. A4 should assess whether HA's documented `subscribe_entities` initial-state-plus-changes stream can provide the needed baseline/order without adding a private protocol. Any change to the shared callback/payload contract requires a separate A0 decision.
+## Gate to reopen approval
 
-## Required software acceptance tests if approved
+A4 should provide a source-backed protocol PoC proposal, without production edits, showing that a supported HA subscription can supply an unambiguous initial baseline and subsequent ordered changes on one WebSocket connection. It must account for the configured readable/allowed entity set and preserve existing CR-016 callback semantics. If no completion marker exists, A0 requires a different documented mechanism or explicit product acceptance of weaker semantics (for example, cache may remain stale/unknown and ambiguous events are withheld); A0 must approve that trade-off before implementation.
 
-- Queue an older state-change frame while the reconnect snapshot returns a newer state; after the frame is drained, cache and subscriber-visible state must remain at the newer value.
-- Queue an old removal while the snapshot contains the re-created entity; the entity must remain present.
-- Queue a change newer than the snapshot; it must be applied once and delivered with the CR-016 full-attributes semantics.
-- Missing/invalid timestamps must cause a fresh authoritative reconciliation before a transition is published; no guessed ordering.
-- Assert cache-freshness/readiness is false during reconnect reconciliation and true only after baseline completion; disconnect returns it to stale.
-- Retain the existing unchanged-snapshot, attribute-only, add/remove, callback failure, and reconnect tests.
+Once the protocol gate is met, A0 can approve the minimal rule: initialize cache only from the subscription's documented initial baseline; apply later updates in that same subscription's delivered order; mark freshness true only after a documented baseline-complete signal; mark stale on disconnect; do not compare REST and WebSocket timestamps or infer cross-transport order. If REST reconciliation remains necessary, it must not overwrite the live subscription cache unless a documented comparable version/order token exists.
 
-These are proposed L2 tests only. They do not establish behavior against a live HA instance or prove physical device actions (L3/L4).
+## Required software acceptance tests after approval
+
+- Reconnect receives an unambiguous initial baseline; freshness remains false until the documented completion signal and becomes true only afterward.
+- Initial baseline followed by a state change for the same entity yields the final state and one CR-016-compatible transition.
+- Initial baseline followed by entity removal, and initial absence followed by entity addition, produce the CR-016 removal/addition semantics exactly once.
+- Multiple updates for one entity are applied in WebSocket delivery order, including attribute-only changes and removed attributes.
+- Empty baseline, authorization-filtered entities, malformed frames, disconnect during baseline, and reconnect during queued updates fail closed and never claim fresh state prematurely.
+- No REST/WebSocket timestamp comparison, inferred sequence, or private wire field is used.
+- Retain existing unchanged-snapshot, attribute-only, add/remove, callback-failure, and reconnect tests.
+
+These are proposed Level 2 tests only. They do not establish behavior against a live HA instance or prove physical device actions (Level 3/4).
 
 ## References
 
-- [Home Assistant WebSocket API: event subscriptions and `subscribe_entities`](https://contributors.home-assistant.io/core/internals/websocket-api/)
-- [Home Assistant REST API](https://contributors.home-assistant.io/core/internals/rest-api/)
+- [Home Assistant WebSocket API](https://developers.home-assistant.io/docs/api/websocket/) — `subscribe_events` documents event `time_fired`; `subscribe_entities` documents initial readable states followed by changes, but no explicit initial-stream completion marker.
+- [Home Assistant REST API](https://developers.home-assistant.io/docs/api/rest/) — documents `/api/states`; no cross-transport ordering token is specified.
+- [CR-016: Define HA Attribute Changes and Entity Removal Events](change-requests/CR-016-ha-state-snapshot-change-semantics.md) — approved payload and transition semantics; unchanged by this decision.
