@@ -311,7 +311,7 @@
 
 ### 6.4 配对校验（对应工作包 4）
 
-**裁决 R4：错误码拒绝静默丢弃；配对码由设备本地用户确认后短时生成并显示，RAM 注入 A2。细节与分工见 [CR-003](change-requests/CR-003-pairing-code-production-injection.md)。**
+**裁决 R4：错误码拒绝静默丢弃；配对码由设备侧显式本机操作者动作短时生成并显示，RAM 注入 A2。当前批准入口是 A1 本机 CLI `pairing open|close`，不是已完成的产品物理 UI。细节、ownership 与设备验收阻塞见 [CR-003](change-requests/CR-003-pairing-code-production-injection.md)。**
 
 依据外部锁定官方 SDK `v0.1.11` (`8bc13967a06ef073459be47e930ff43ef37ee8fb`) 的 `watcherobot/runtime/daemon/pairing/protocol.py`（Level 1 证据）：
 
@@ -323,9 +323,9 @@
 **强制要求**：
 1. 设备侧必须校验 `pairing_code`：格式（6 位数字）与**与设备侧已配置的期望码精确匹配**。
 2. **校验通过前**，严禁置 `s_paired = true`，严禁生成或发放 `session_token`，严禁回复 `pair.accept`。
-3. 未配置活动配对码时，**必须 fail-closed**（不配对、不发 token）。依 CR-003 的 A0 推荐，A1 在设备端由 CSPRNG 生成六位码，经 `desk_sdk_bridge_set_pairing_code()` 显式注入并只在本机配对 UI 显示；不得硬编码、构建期注入、持久化或复用 Tuya provisioning 凭据。
+3. 未配置活动配对码时，**必须 fail-closed**（不配对、不发 token）。A1 当前通过本机 CLI `pairing open` 生成六位码，经 `desk_sdk_bridge_set_pairing_code()` 显式注入并只在本机配对显示层呈现；不得硬编码、构建期注入、持久化或复用 Tuya provisioning 凭据。CLI 入口不构成产品物理 UI 验收通过。
 4. 由于官方契约未定义校验失败响应，本阶段**不新增** wire 消息类型；失败时**不回复 `pair.accept`**（即不授予），并记录诊断日志（已脱敏）。
-5. 配对码生命周期与展示的实现任务登记于 **CR-003**；旧 CR-001 中配对码来源问题由 CR-003 取代。失败 wire response 仍未由官方定义，设备继续静默拒绝，不新增 `pair.reject` 或扩展 `pair.busy`。
+5. A2 在配对码成功消费、失败次数封锁或 A2 单调期限导致码失效后，释放 pairing mutex 再调用 A1 seam `desk_tclaw_pairing_ui_on_pairing_consumed()`；显式 session reset 在清理配对状态并释放锁后调用 `desk_tclaw_pairing_ui_on_sdk_session_reset()`。两者只清显示且不代表对端收到响应或完成 HardwareHello。A1 自己负责 CLI 取消/窗口计时/换码和显示初始化时清码/清屏。完整生命周期与关闭门槛见 **CR-003**；旧 CR-001 中配对码来源问题由 CR-003 取代。失败 wire response 仍未由官方定义，设备继续静默拒绝，不新增 `pair.reject` 或扩展 `pair.busy`。
 
 ### 6.5 Windows Companion 启动安全（对应工作包 5）
 

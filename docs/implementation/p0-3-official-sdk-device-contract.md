@@ -4,7 +4,7 @@
 
 核对范围：本地锁定副本 `.target_logging/sdk-acceptance/vendor/WatcheRobot_python_sdk`、`firmware/components/desk_sdk_bridge/`、`tests/sdk_contract/`。依据 `contracts/dependency_lock.json`，官方 Python SDK/Runtime 锁定为 tag `v0.1.11`、commit `8bc13967a06ef073459be47e930ff43ef37ee8fb`。A2 最新报告该互操作套件 **15 passed、2 subtests passed**。测试分层：静态/直接 handler 测试为 Level 2；`test_c_firmware_client_runtime_commands_results_events_media_and_reconnect` 会启动未修改 pinned `ExternalWebSocketServer`，用生产 C WebSocket client 在 localhost 建立真实 socket，往返命令/结果、事件、WSPK JPEG fixture 并验证重连；另有错误配对码拒绝测试。这些是 Runtime+C 软件 loopback 的 Level 2，不代表物理 ESP32-S3、真实相机 JPEG 或设备端到端 L3/L4 已通过。
 
-生产配对码采用 [CR-003](change-requests/CR-003-pairing-code-production-injection.md) 的 A0 推荐策略：用户在屏幕 UI 显式打开配对窗口后，由设备生成短时六位码，RAM 注入 A2 setter 并只在设备屏幕显示；配对成功、失败次数封锁、取消、超时、会话重置或重启均清零，重新开窗生成新码。A1/A2 的 UI 入口及 5 分钟窗口仍待实施验证，不能写成已实现。
+生产配对码遵循 [CR-003](change-requests/CR-003-pairing-code-production-injection.md)：当前批准的操作者入口是 A1 本机 CLI `pairing open|close`，生成短时六位码、RAM 注入 A2 setter 并仅在本机显示。成功消费后 A2 锁外通知 A1 清显示；取消/超时由 A1 清码；显式会话 reset 由 A2 在锁外通知；重启后 RAM 码不恢复，A1 在显示初始化后清 overlay。现有 CLI 不等于产品物理 UI 入口，具体屏幕操作尚待产品确认；官方 SDK 真机配对也未验证，因此该设备验收仍 OPEN。
 
 ## 必须实现的接入顺序
 
@@ -18,7 +18,7 @@
 
 - `firmware/main/src/app_main.c:428-439` 启动设备侧 `0.0.0.0:37020` TCP server 和 `:37021` UDP pairing server。桥接实现 `desk_sdk_bridge.c:1906-1963` 使用 `SOCK_STREAM` listen；SDK 则由 Runtime listen、设备连接。**官方 SDK 不会因当前设备 TCP 服务而连上。**
 - UDP wire message 校验已有：`desk_sdk_bridge.c:1028-1105` 检查六位格式/精确匹配，错码不发响应、不发 token；官方配对拒绝没有独立 wire 消息，静默丢弃是正确 fail-closed 行为。测试 `tests/sdk_contract/test_official_sdk_runtime_compat.py::test_official_udp_pairing_rejected_on_wrong_code` 覆盖错误码拒绝。
-- 配对码只有 `desk_sdk_bridge_set_pairing_code()` 注入入口（`desk_sdk_bridge.c:101-119`），全仓未发现生产调用点；启动路径只启动服务。未配置则所有配对静默失败。CR-003 已提出设备生成、屏幕显示、短时 RAM 注入策略；A1/A2 的 UI 入口和生命周期尚未实现，不能写入生产配置、Tuya license 或持久化 KV。
+- 配对码由 A1 `firmware/components/desk_cli/src/desk_cli.c` 的 `pairing open|close` 生产入口生成并调用 `desk_sdk_bridge_set_pairing_code()`；CLI 路径不在当前 AGENTS.md ownership 矩阵列出的 A1 路径中，CR-003 已明确本包按 A1 负责。`desk_tclaw_pairing_ui_on_pairing_consumed()` 和 `desk_tclaw_pairing_ui_on_sdk_session_reset()` 是 A1 UI 清除 seam，当前 A2 无调用者，须依 CR-003 增加锁外通知调用。未配置则所有配对静默失败。没有物理 UI 动作或官方 SDK 真机配对证据，不能声称已验收。
 - 现有 `sys.client.hello`（`desk_sdk_bridge.c` 约 1190 行起）按桌面 JSON bridge 返回 capability；HardwareHello 会话校验尚不等于目标硬件上的官方 Runtime 设备会话。SDK 官方 hello parser 位于 `runtime/daemon/pairing/protocol.py::parse_hardware_hello()`。测试既包含直接调用 C pairing/handler 的静态合同，也包含 Runtime+C localhost loopback；后者通过测试 shim 注入已校验的 Runtime 地址/端口，使用 `interop_4x3.jpg` fixture，不验证真实 UDP 网络发现或物理相机采集。
 - capability 常量在 `desk_sdk_bridge.h:29-36`：`inputs`, `motion`, `camera`, `expression.audio_follow.v1`（另有兼容别名）、`mcp_tools`；当前列表不包含 `audio.stream` / `audio_stream`。A2 已将四类音频控制命令显式 NACK 为 `UNSUPPORTED_OPERATION`，并移除 `audio_uplink` 协商（CR-010，L2）；A2 必须逐项证明 SDK 各 API 实际可用，不能把声明列表当功能验收。
 - 媒体打包和图片命令处理已在桥接层存在（`desk_sdk_bridge.c:900-1000, 1354-1445`）；连接官方 Runtime WebSocket 时发送端可通过 `desk_sdk_ws_client_send_binary()` 发送 WSPK，也保留自有 TCP fallback。Runtime+C loopback 测试已用 fixture JPEG 验证 WSPK binary；这不证明相机能采到真实 JPEG，当前相机实机仍须按 CR-004 验收。

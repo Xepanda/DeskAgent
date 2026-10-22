@@ -213,6 +213,16 @@ void desk_tclaw_pairing_ui_clear(void)
     }
 }
 
+void desk_tclaw_pairing_ui_on_pairing_consumed(void)
+{
+    desk_tclaw_pairing_ui_clear();
+}
+
+void desk_tclaw_pairing_ui_on_sdk_session_reset(void)
+{
+    desk_tclaw_pairing_ui_clear();
+}
+
 static int desk_tclaw_update_screen(const char *preset, const char *status)
 {
     const char *safe_preset = preset ? preset : "idle";
@@ -299,6 +309,11 @@ int desk_tclaw_init(void)
     s_ui_focus = WATCHER_UI_PAGE_HOME;
     s_ui_overlay_active = false;
     s_ui_page_open = false;
+    memset(s_ui_home_preset, 0, sizeof(s_ui_home_preset));
+    snprintf(s_ui_home_preset, sizeof(s_ui_home_preset), "idle");
+    memset(s_ui_home_status, 0, sizeof(s_ui_home_status));
+    snprintf(s_ui_home_status, sizeof(s_ui_home_status), "Ready");
+    desk_tclaw_pairing_ui_clear();
 
     desk_hardware_register_input_cb(watcher_ui_input_event, NULL);
     desk_tclaw_update_ui_screen("idle", "Ready");
@@ -312,6 +327,7 @@ void desk_tclaw_reset(void)
     s_ui_focus = WATCHER_UI_PAGE_HOME;
     s_ui_overlay_active = false;
     s_ui_page_open = false;
+    desk_tclaw_pairing_ui_clear();
     s_state = TCLAW_STATE_IDLE;
     s_turn_count = 0;
     s_last_response[0] = '\0';

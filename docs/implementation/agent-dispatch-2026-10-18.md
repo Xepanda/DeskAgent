@@ -251,7 +251,7 @@
 >
 > **禁止：** CR 未关闭不改协议；不硬编码/记录/读取配对码或 token；不接触真机配对。
 >
-> **验收：** 覆盖缺码、错码、格式错误、fail-closed/裁决的失败响应、敏感日志脱敏；跑 `python -m unittest tests.sdk_contract.test_sdk_bridge_protocol`。
+> **验收：** 覆盖缺码、错码、格式错误、fail-closed/裁决的失败响应、敏感日志脱敏；A2 在 pairing code 成功消费与显式 bridge session reset 时，于 pairing mutex 释放后分别调用 A1 `desk_tclaw_pairing_ui_on_pairing_consumed()` / `desk_tclaw_pairing_ui_on_sdk_session_reset()`；通知不得声称 UDP 已送达或 HardwareHello 已完成。跑 `python -m unittest tests.sdk_contract.test_sdk_bridge_protocol` 及相关 UI seam contract tests。
 >
 > **返回证据：** CR 引用、diff、测试命令/结果和 Level 2 边界。
 >
@@ -261,11 +261,11 @@
 
 > **目标：** 仅在 W7b0 裁决要求设备端生成/显示时，实现配对码的安全来源和用户可读展示。
 >
-> **范围：** `firmware/components/desk_tclaw/`、W5a 冻结的显示文件、`tests/firmware_contract/test_pairing_code_display.py`（新建）。
+> **范围：** `firmware/components/desk_tclaw/`、`firmware/components/desk_cli/`（CR-003 指定的 A1 责任路径，虽未列入 AGENTS.md ownership 表）、W5a 冻结的显示文件、`tests/firmware_contract/test_pairing_code_display.py`（新建）。
 >
-> **禁止：** W7b0 未要求则跳过；不改 bridge wire，不记录长期 Secret，不猜输入/过期规则。
+> **禁止：** W7b0/CR-003 未要求则跳过；不改 bridge wire，不记录长期 Secret，不绑定或猜测按钮/触摸/旋钮动作。当前批准入口为本机 CLI `pairing open|close`；产品物理 UI 导航仍待确认。
 >
-> **验收：** 按裁决测试码来源/过期/展示；target build。实机显示/配对另需明确授权。
+> **验收：** 按 CR-003 测试 CLI 调用、码来源/过期/取消/显示与清理；target build。只有产品物理入口确定且现场从实体设备完成官方 Runtime 配对，才可解除设备验收阻塞。
 >
 > **返回证据：** 裁决引用、diff、测试/build、脱敏观察。
 >

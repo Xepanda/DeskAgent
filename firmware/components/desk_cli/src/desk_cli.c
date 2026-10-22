@@ -19,6 +19,7 @@
 #include "desk_tclaw_bridge.h"
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_input.h"
+#include "desk_pairing_window.h"
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_audio.h"
 #include "desk_watcher_camera.h"
@@ -89,31 +90,82 @@ static bool cli_parse_duration_ms(const char *text, uint32_t *out_value)
 }
 
 #ifdef ESP_PLATFORM
-#define PAIRING_WINDOW_TTL_US (300ULL * 1000ULL * 1000ULL)
-#define PAIRING_CODE_SPACE 1000000U
 static esp_timer_handle_t s_pairing_expiry_timer = NULL;
 static SemaphoreHandle_t s_pairing_mutex = NULL;
-static char s_pairing_code[7] = {0};
-static int64_t s_pairing_expiry_deadline_us = 0;
+static desk_pairing_window_t s_pairing_window;
+static bool s_pairing_window_initialized = false;
 
-static void pairing_window_clear_locked(void)
+static uint32_t pairing_random_u32(void *context)
 {
-    (void)desk_sdk_bridge_set_pairing_code(NULL);
-    memset(s_pairing_code, 0, sizeof(s_pairing_code));
-    s_pairing_expiry_deadline_us = 0;
+    (void)context;
+    return esp_random();
+}
+
+static int pairing_set_code(const char *code, void *context)
+{
+    (void)context;
+    return desk_sdk_bridge_set_pairing_code(code);
+}
+
+static int pairing_show_code(const char *code, void *context)
+{
+    (void)context;
+    return desk_tclaw_pairing_ui_set_code(code);
+}
+
+static void pairing_clear_display(void *context)
+{
+    (void)context;
     desk_tclaw_pairing_ui_clear();
 }
+
+static int64_t pairing_monotonic_time_us(void *context)
+{
+    (void)context;
+    return esp_timer_get_time();
+}
+
+static int pairing_start_timer(uint64_t duration_us, void *context)
+{
+    (void)context;
+    return (int)esp_timer_start_once(s_pairing_expiry_timer, duration_us);
+}
+
+static void pairing_stop_timer(void *context)
+{
+    (void)context;
+    (void)esp_timer_stop(s_pairing_expiry_timer);
+}
+
+static void pairing_lock(void *context)
+{
+    (void)context;
+    if (s_pairing_mutex) (void)xSemaphoreTake(s_pairing_mutex, portMAX_DELAY);
+}
+
+static void pairing_unlock(void *context)
+{
+    (void)context;
+    if (s_pairing_mutex) (void)xSemaphoreGive(s_pairing_mutex);
+}
+
+static const desk_pairing_window_ops_t s_pairing_window_ops = {
+    .random_u32 = pairing_random_u32,
+    .set_pairing_code = pairing_set_code,
+    .show_pairing_code = pairing_show_code,
+    .clear_display = pairing_clear_display,
+    .monotonic_time_us = pairing_monotonic_time_us,
+    .start_expiry_timer = pairing_start_timer,
+    .stop_expiry_timer = pairing_stop_timer,
+    .lock = pairing_lock,
+    .unlock = pairing_unlock,
+    .context = NULL,
+};
 
 static void pairing_window_expired(void *arg)
 {
     (void)arg;
-    if (!s_pairing_mutex || xSemaphoreTake(s_pairing_mutex, portMAX_DELAY) != pdTRUE) return;
-    /* An old callback queued before a reopen must not clear the new code. */
-    if (s_pairing_expiry_deadline_us != 0 &&
-        esp_timer_get_time() >= s_pairing_expiry_deadline_us) {
-        pairing_window_clear_locked();
-    }
-    xSemaphoreGive(s_pairing_mutex);
+    desk_pairing_window_expire(&s_pairing_window, &s_pairing_window_ops);
 }
 
 static int pairing_expiry_timer_ensure(void)
@@ -121,6 +173,10 @@ static int pairing_expiry_timer_ensure(void)
     if (!s_pairing_mutex) {
         s_pairing_mutex = xSemaphoreCreateMutex();
         if (!s_pairing_mutex) return -1;
+    }
+    if (!s_pairing_window_initialized) {
+        desk_pairing_window_init(&s_pairing_window);
+        s_pairing_window_initialized = true;
     }
     if (s_pairing_expiry_timer) return 0;
     const esp_timer_create_args_t args = {
@@ -135,33 +191,7 @@ static int pairing_expiry_timer_ensure(void)
 static int pairing_window_open(void)
 {
     if (pairing_expiry_timer_ensure() != 0) return -1;
-    if (xSemaphoreTake(s_pairing_mutex, portMAX_DELAY) != pdTRUE) return -1;
-    (void)esp_timer_stop(s_pairing_expiry_timer);
-    pairing_window_clear_locked();
-
-    /* Rejection sampling keeps all six-digit decimal codes equally likely. */
-    const uint32_t range_limit = (UINT32_MAX / PAIRING_CODE_SPACE) * PAIRING_CODE_SPACE;
-    uint32_t random_value;
-    do {
-        random_value = esp_random();
-    } while (random_value >= range_limit);
-    snprintf(s_pairing_code, sizeof(s_pairing_code), "%06lu",
-             (unsigned long)(random_value % PAIRING_CODE_SPACE));
-
-    if (desk_sdk_bridge_set_pairing_code(s_pairing_code) != 0 ||
-        desk_tclaw_pairing_ui_set_code(s_pairing_code) != 0) {
-        pairing_window_clear_locked();
-        xSemaphoreGive(s_pairing_mutex);
-        return -1;
-    }
-    s_pairing_expiry_deadline_us = esp_timer_get_time() + (int64_t)PAIRING_WINDOW_TTL_US;
-    if (esp_timer_start_once(s_pairing_expiry_timer, PAIRING_WINDOW_TTL_US) != ESP_OK) {
-        pairing_window_clear_locked();
-        xSemaphoreGive(s_pairing_mutex);
-        return -1;
-    }
-    xSemaphoreGive(s_pairing_mutex);
-    return 0;
+    return desk_pairing_window_open(&s_pairing_window, &s_pairing_window_ops);
 }
 #endif
 
@@ -597,14 +627,12 @@ static void cmd_pairing(int argc, char *argv[])
         return;
     }
     if (argc == 2 && (strcmp(argv[1], "close") == 0 || strcmp(argv[1], "cancel") == 0)) {
-        if (pairing_expiry_timer_ensure() == 0 &&
-            xSemaphoreTake(s_pairing_mutex, portMAX_DELAY) == pdTRUE) {
-            (void)esp_timer_stop(s_pairing_expiry_timer);
-            pairing_window_clear_locked();
-            xSemaphoreGive(s_pairing_mutex);
+        if (pairing_expiry_timer_ensure() == 0) {
+            desk_pairing_window_close(&s_pairing_window, &s_pairing_window_ops);
         } else {
             (void)desk_sdk_bridge_set_pairing_code(NULL);
             desk_tclaw_pairing_ui_clear();
+            memset(&s_pairing_window, 0, sizeof(s_pairing_window));
         }
         printf("Pairing window closed; code cleared.\r\n");
         return;

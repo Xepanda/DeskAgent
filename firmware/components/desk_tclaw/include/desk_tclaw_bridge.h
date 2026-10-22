@@ -53,6 +53,10 @@ bool desk_tclaw_is_initialized(void);
 /* Short-lived display-only overlay used while an operator pairing window is open. */
 int desk_tclaw_pairing_ui_set_code(const char *code);
 void desk_tclaw_pairing_ui_clear(void);
+/* A2 must call these A1 UI notification seams after consuming a pairing code
+ * or resetting the SDK network session. They erase the locally displayed code. */
+void desk_tclaw_pairing_ui_on_pairing_consumed(void);
+void desk_tclaw_pairing_ui_on_sdk_session_reset(void);
 
 /**
  * @brief Inject synthetic user text into TClaw session (for automated testing).
