@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from typing import Any, Mapping, Optional
 from companion.src.codex_companion import CodexCompanion, DefaultMockTransport, JsonRpcTransport
 
@@ -1330,6 +1331,11 @@ class TestCodexCompanion(unittest.TestCase):
             transport=transport,
             db_path=db_file,
         )
+        self.addCleanup(resumed.close)
+        clock = [100.0]
+        clock_patcher = patch("companion.src.codex_companion.time.monotonic", side_effect=lambda: clock[0])
+        clock_patcher.start()
+        self.addCleanup(clock_patcher.stop)
         resumed.initialize()
 
         status = resumed.get_task_status("tsk-active-writer")
@@ -1341,11 +1347,22 @@ class TestCodexCompanion(unittest.TestCase):
 
         recovered = resumed.recover_pending_tasks()
         self.assertEqual(recovered, {"reconnected": 0, "reconciled": 0, "pending": 1})
+        self.assertEqual(transport.attempts, 1)
         status = resumed.get_task_status("tsk-active-writer")
         self.assertEqual(status["status"], "running")
         self.assertEqual(status["recovery_status"], "pending")
         self.assertEqual(status["recovery_error_kind"], "active_writer")
 
+        clock[0] += 2.0
+        recovered = resumed.recover_pending_tasks()
+        self.assertEqual(recovered, {"reconnected": 0, "reconciled": 0, "pending": 1})
+        self.assertEqual(transport.attempts, 2)
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "pending")
+        self.assertEqual(status["recovery_error_kind"], "active_writer")
+
+        clock[0] += 3.0
         recovered = resumed.recover_pending_tasks()
         self.assertEqual(recovered, {"reconnected": 1, "reconciled": 0, "pending": 0})
         status = resumed.get_task_status("tsk-active-writer")
@@ -1354,6 +1371,70 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertNotIn("recovery_error_kind", status)
         self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 0, "pending": 0})
         self.assertEqual(transport.attempts, 3)
+        resumed.close()
+
+    def test_active_writer_backoff_preserves_task_and_reconciles_terminal_assistant_result(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-active-writer-backoff.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        prompt = "private recovery prompt"
+        task = original.submit_task("tsk-active-writer-backoff", "test-project", prompt)
+        original.close()
+
+        class BackoffResumeTransport(JsonRpcTransport):
+            resume_calls = 0
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    self.resume_calls += 1
+                    if self.resume_calls == 1:
+                        raise RuntimeError("Codex JSON-RPC error: {'code': -32600, 'message': 'thread already has an active writer'}")
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"],
+                        "status": "completed",
+                        "items": [
+                            {"type": "userMessage", "text": prompt},
+                            {"type": "agentMessage", "text": "Recovered assistant result"},
+                        ],
+                    }]}}
+                return {}
+
+        transport = BackoffResumeTransport()
+        clock = [1000.0]
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        with patch("companion.src.codex_companion.time.monotonic", side_effect=lambda: clock[0]):
+            resumed.initialize()
+            state = resumed.get_task_status("tsk-active-writer-backoff")
+            self.assertEqual(state["status"], "running")
+            self.assertEqual(state["recovery_status"], "pending")
+            self.assertEqual(state["recovery_error_kind"], "active_writer")
+            self.assertEqual(state["thread_id"], task["thread_id"])
+            self.assertEqual(state["turn_id"], task["turn_id"])
+            self.assertEqual(state["prompt"], prompt)
+            self.assertEqual(transport.resume_calls, 1)
+
+            # Immediate retries remain pending and do not hammer the busy server.
+            self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 0, "pending": 1})
+            self.assertEqual(transport.resume_calls, 1)
+
+            # The retry becomes eligible after the short initial backoff.
+            clock[0] += 2.0
+            self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 1, "pending": 0})
+
+        final = resumed.get_task_status("tsk-active-writer-backoff")
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["summary"], "Recovered assistant result")
+        self.assertNotIn(prompt, final["summary"])
+        self.assertEqual(transport.resume_calls, 2)
         resumed.close()
 
     def test_legacy_cancelled_task_is_not_resumed(self) -> None:

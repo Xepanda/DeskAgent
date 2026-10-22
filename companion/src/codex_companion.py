@@ -30,6 +30,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -313,6 +314,9 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
 
 
 class CodexCompanion:
+    _RECOVERY_RETRY_BASE_SEC = 1.0
+    _RECOVERY_RETRY_MAX_SEC = 30.0
+
     def __init__(
         self,
         allowed_workspaces: Optional[dict[str, str]] = None,
@@ -333,6 +337,7 @@ class CodexCompanion:
         self._transport = transport
         self._initialized = False
         self._last_recovery_counts = {"reconnected": 0, "reconciled": 0, "pending": 0}
+        self._recovery_retry_deadlines: dict[str, float] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
         self._pending_approvals: dict[str, dict[str, Any]] = {}
         self._thread_to_task: dict[str, str] = {}
@@ -827,12 +832,22 @@ class CodexCompanion:
         terminal_statuses = {"completed", "failed", "interrupted", "cancelled", "succeeded", "error"}
         with self._recovery_lock:
             with self._lock:
+                now = time.monotonic()
+                active_tasks = [
+                    task for task in self._tasks.values()
+                    if str(task.get("status") or task.get("state") or "").lower() not in terminal_statuses
+                ]
                 candidates = [
                     dict(task)
-                    for task in self._tasks.values()
-                    if str(task.get("status") or task.get("state") or "").lower() not in terminal_statuses
-                    and task.get("recovery_status") in (None, "pending")
+                    for task in active_tasks
+                    if task.get("recovery_status") in (None, "pending")
+                    and self._recovery_retry_deadlines.get(task["task_id"], 0.0) <= now
                 ]
+                counts["pending"] = sum(
+                    1 for task in active_tasks
+                    if task.get("recovery_status") == "pending"
+                    and self._recovery_retry_deadlines.get(task["task_id"], 0.0) > now
+                )
 
             transport = self._get_transport()
             for task_snapshot in candidates:
@@ -930,6 +945,7 @@ class CodexCompanion:
                     with self._lock:
                         current = self._tasks.get(task_id)
                         if current is not None:
+                            self._recovery_retry_deadlines.pop(task_id, None)
                             current["recovery_status"] = "reconciled"
                             current.pop("recovery_error_kind", None)
                             self._persist_task(current)
@@ -940,6 +956,7 @@ class CodexCompanion:
                     with self._lock:
                         current = self._tasks.get(task_id)
                         if current is not None:
+                            self._recovery_retry_deadlines.pop(task_id, None)
                             current["state"] = "running"
                             current["status"] = "running"
                             current["recovery_status"] = "reconnected"
@@ -962,6 +979,7 @@ class CodexCompanion:
                 with self._lock:
                     current = self._tasks.get(task_id)
                     if current is not None:
+                        self._recovery_retry_deadlines.pop(task_id, None)
                         current["recovery_status"] = "reconciled"
                         current.pop("recovery_error_kind", None)
                         self._persist_task(current)
@@ -976,6 +994,12 @@ class CodexCompanion:
                 return
             task["recovery_status"] = "pending"
             task["recovery_error_kind"] = error_kind
+            attempts = max(1, int(task.get("recovery_attempts", 1)))
+            delay = min(
+                self._RECOVERY_RETRY_BASE_SEC * (2 ** min(attempts - 1, 10)),
+                self._RECOVERY_RETRY_MAX_SEC,
+            )
+            self._recovery_retry_deadlines[task_id] = time.monotonic() + delay
             # Persist the task's existing status and output without translating
             # a reconnect problem into a task failure or completion.
             self._persist_task(task)
