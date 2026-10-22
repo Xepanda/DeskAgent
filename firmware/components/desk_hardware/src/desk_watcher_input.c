@@ -179,8 +179,8 @@ static void watcher_input_worker_task(void *arg)
 
         /* --- 1. Knob Quadrature Decoding --- */
         if (s_status.knob.state == DESK_WATCHER_INPUT_READY) {
-            cur_a = gpio_get_level(WATCHER_KNOB_PIN_A);
-            cur_b = gpio_get_level(WATCHER_KNOB_PIN_B);
+            int cur_a = gpio_get_level(WATCHER_KNOB_PIN_A);
+            int cur_b = gpio_get_level(WATCHER_KNOB_PIN_B);
             int state = (cur_a << 1) | cur_b;
 
             if (state != last_state) {

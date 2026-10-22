@@ -25,6 +25,12 @@ class TestWatcherInputEncoderContract(unittest.TestCase):
         self.assertIn("watcher_knob_decode_step", worker)
         self.assertIn("DESK_TOUCH_TARGET_ROLLER", worker)
 
+    def test_rotary_worker_declares_gpio_samples_inside_poll_loop(self) -> None:
+        worker = self.input_source.split("while (s_input_task_running)", 1)[1]
+        knob_poll = worker.split("/* --- 2. Knob Button", 1)[0]
+        self.assertRegex(knob_poll, r"int\s+cur_a\s*=\s*gpio_get_level\(WATCHER_KNOB_PIN_A\)")
+        self.assertRegex(knob_poll, r"int\s+cur_b\s*=\s*gpio_get_level\(WATCHER_KNOB_PIN_B\)")
+
     def test_knob_press_duration_still_selects_existing_short_and_long_actions(self) -> None:
         self.assertRegex(self.input_source, r"duration_ms\s*>=\s*500")
         self.assertIn("DESK_TOUCH_ACTION_LONG_PRESS", self.input_source)
