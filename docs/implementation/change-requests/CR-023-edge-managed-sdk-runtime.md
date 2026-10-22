@@ -1,6 +1,6 @@
 # CR-023 Decision Record：Edge 通过官方 SDK 运行 Managed Application
 
-- **状态：** **A0 源码/部署配置审计完成；A3 实施被依赖解析、Linux Runtime 官方支持确认与 ARM64 部署验证阻塞**
+- **状态：** **A0 源码/部署配置审计完成；上游当前源码未确认 Linux Runtime 支持；A3 实施仍被依赖解析、Linux Runtime 官方支持确认与 ARM64 部署验证阻塞**
 - **范围：** 仅裁决官方 WatcheRobot Python SDK Managed Application 的 Edge 打包/启动路径。本文不改服务、依赖、安装脚本或生产代码，不代表 Edge 已部署。
 - **依据：** `contracts/dependency_lock.json` 当前记录的 Python SDK pin：`v0.1.11` / `8bc13967a06ef073459be47e930ff43ef37ee8fb`
 
@@ -33,12 +33,12 @@
 
 - **依赖范围冲突；API 冲突尚无源码证据：** 根 `requirements.txt` 将 Host 的 `websockets` 限定为 `>=12,<14`，SDK v0.1.11 `pyproject.toml` 要求 `>=14,<16`，因此目前的两个声明没有共同解析版本，安装元数据必须调整后才能在同一个 Runtime 环境安装。静态检查 Host 生产代码只找到 `host/desk_agent/connectors/ha/ha_connector.py` 使用该库：导入 `websockets.sync.client.connect` 和 `websockets.exceptions.WebSocketException`；连接时传入 `close_timeout=2.0`，随后用同步连接的 `recv(timeout=...)`、`send(...)`。这些调用没有显示出与 SDK 下界 14 的 API 不兼容；单凭当前源码不能断言升级到 14–15 会破坏 Host，也不能证明运行兼容。A3 最小验证方案：在目标 Linux ARM64 的干净 venv 中按候选完整锁安装 Host 与精确 SDK 工件，先运行 `python -m pip check`，再运行 `python -m unittest tests.connectors.test_ha_connector` 和 `python -m unittest tests.sdk_contract.test_official_sdk_runtime_compat`；同时在该环境确认 `python -c "import websockets; from websockets.sync.client import connect; from websockets.exceptions import WebSocketException; print(websockets.__version__)"` 输出 14.x 或 15.x。前两项通过后再做 SDK Managed Application 的 Edge smoke；不应仅因约束区间冲突就判断 API 必然冲突，也不能仅凭单测通过就冻结版本或宣称 ARM64 部署成功。本轮未安装依赖、未执行这些测试。
 - **发行物映射（必须先固化）：** 当前锁定的是源码 commit/tag，不是 PyPI wheel 版本/哈希。SDK README 的通用 `pip install watcherobot` 示例不证明 PyPI 上现存 wheel 对应该 commit。Edge 发布流程必须从锁定 commit 产生并校验 wheel/hash，或将等价的精确源码构建工件锁入 release；不能依赖浮动版本。
-- **Linux Runtime 支持与 ARM64 / Python（blocking，需上游确认并实测）：** SDK `runtime/daemon/application/manifest.py::_parse_supported_host_platforms()` 只允许 `windows` 或 `macos`，`current_host_platform()` 只映射 Windows/Darwin；Linux 不能作为受支持的 Host/Marketplace platform 声明。另一方面，SDK CLI `cli.py::run_application()` 加载 manifest 后直接 `ensure_runtime()`、选择并启动 app，没有调用 `supports_current_host_platform()` 作为本地运行门禁，因此源码证据并不支持“Linux 上 `watcherobot app run` 必然报错”的结论；它可能继续尝试启动，但属于未支持/未验证路径。必须先向 SDK 上游确认 Linux Runtime 支持，或由产品明确接受未支持平台试运行；之后仍须在目标 TaishanPi 或等价 Linux ARM64 Python 3.10–3.12 环境验证依赖安装、`watcherobot app run` offline smoke、Runtime 注入、真实设备配对/连接与 systemd stop/restart。SDK metadata 的 Python 版本范围不是 ARM64 平台兼容承诺，且本仓没有对应安装记录。
+- **Linux Runtime 支持与 ARM64 / Python（blocking，尚无上游支持确认，且需实测）：** 2026-10-22 只读核对官方远端 `main` HEAD `24e3823d8f218abd5e830db3cabff1fb4151d6c7`、发布分支 `release/watcherobot-0.1.12` commit `e1976f5111f03cd61febdc5353241cf7a64947d7` 和可见最新稳定 tag `v0.1.11`（`8bc13967a06ef073459be47e930ff43ef37ee8fb`）；main 与 0.1.12 发布分支的 `runtime/daemon/application/manifest.py::_SUPPORTED_HOST_PLATFORMS` 仍为 `windows`、`macos`，`current_host_platform()` 仍只映射 Windows/Darwin，未发现 Linux 支持新增。Linux 不能作为受支持的 Host/Marketplace platform 声明。另一方面，远端 SDK CLI `cli.py::run_application()` 加载 manifest 后直接 `ensure_runtime()`、选择并启动 app，没有调用 `supports_current_host_platform()` 作为本地运行门禁，因此源码证据并不支持“Linux 上 `watcherobot app run` 必然报错”的结论；它可能继续尝试启动，但属于未支持/未验证路径。上游当前源码没有确认 Linux Runtime 支持；A3 必须获得上游明确确认，或由产品明确接受未支持平台试运行，之后仍须在目标 TaishanPi 或等价 Linux ARM64 Python 3.10–3.12 环境验证依赖安装、`watcherobot app run` offline smoke、Runtime 注入、真实设备配对/连接与 systemd stop/restart。SDK metadata 的 Python 版本范围不是 ARM64 平台兼容承诺，且本仓没有对应安装记录。
 - **Runtime 可写目录与生命周期（必须验证）：** `ProtectHome=read-only` 下要使用上述 state/instance root override；需验证权限、日志写入、Daemon 子进程在 systemd cgroup 内的停止顺序及异常重启恢复。
 - **Application wrapper/配置（实施时必须落实）：** 当前仓库没有 SDK `app.json` / `app.py` wrapper；需要固定入口并证明其进入 `main.py` managed branch。该 wrapper 应作为受控 Edge release 文件，不在 systemd 内拼任意 Python 命令或手工伪造 `WATCHER_APP_*` 凭据/URL。
 
 ## 4. 证据等级
 
-- **L1 已确认：** SDK commit/tag/version/metadata/CLI/API 形状；当前根 requirements、测试说明、Edge installer/systemd 与 Host managed-entry 源码关系。
+- **L1 已确认：** 锁定 SDK commit/tag/version/metadata/CLI/API 形状；2026-10-22 查询的官方远端 main HEAD、release/watcherobot-0.1.12 分支及稳定 tags 的引用与平台源码；当前根 requirements、测试说明、Edge installer/systemd 与 Host managed-entry 源码关系。
 - **推断，未验：** pinned source 的 SDK CLI/Runtime 可能在 Linux 上尝试运行，且 wheel 可能可在 RK3566 Linux ARM64 安装；SDK 未声明 Linux 支持，本轮没有运行证据，不能作为部署承诺。systemd 下 SDK Daemon 与 Application 的启动、停止和故障恢复也未验证。
 - **未完成：** 本轮未构建 wheel、未解析依赖、未访问 Edge 设备、未运行 SDK CLI 或 systemd；以上实施方案是有明确门槛的 A3 建议，不是 Edge 部署通过结论。
