@@ -10,7 +10,7 @@
 
 本 CR 按仓库 `contracts/dependency_lock.json` 和 TClaw provenance 核对：
 
-- 构建使用的 TuyaOpen SDK pin 为 `cdc064e78daeeae598157470244e351cd37cbbed`。**当前 `D:\tuya_proj\TuyaOpen` checkout 已不是该干净 pin**：工作区 dirty，HEAD 为 `752b14bb7dbcba703ee5bcb36b31c32b4fcbcb05`。本次只读使用其 Git object database 中的锁定 `cdc064e` commit（对象存在），未切换、修改、清理或拉取该外部仓库，也未以 dirty HEAD 作为锁定源码证据。
+- 构建使用的 TuyaOpen SDK pin 为 `cdc064e78daeeae598157470244e351cd37cbbed`。已在 `C:\Users\maida\TuyaOpenIDE\TuyaOpenSDK` 的 pinned checkout（HEAD 正是该 SHA，除未跟踪 `_worktrees/` 外无工作区改动）复核锁定源码。**当前 `D:\tuya_proj\TuyaOpen` checkout 已不是该干净 pin**：工作区 dirty，HEAD 为 `752b14bb7dbcba703ee5bcb36b31c32b4fcbcb05`；本次也只读确认其 object database 中存在锁定 commit，未切换、修改、清理或拉取该外部仓库，未以 dirty HEAD 作为证据。
 - TClaw 应用源码 pin 为 `88bd37378f1d106fcc1175e61b368222cc8fabda`，由 `firmware/third_party/tclaw/PROVENANCE.md` 记录。该 TClaw 上游仓库的 `TuyaOpen` 子模块 gitlink 是 `e82840dc9b629cb77fa922fb04e3f820dc2e78b4`；子模块内容未 vendored。**运行构建依赖以 dependency lock 中的 TuyaOpen SDK pin 为准**，gitlink 只说明 TClaw 上游来源时使用的 SDK 版本。
 - 本文行号对应上列 SDK checkout 与仓库当前源码；后续 pin 改变时，必须重新核对行为和行号。
 
@@ -28,7 +28,7 @@
 
 ### A0 复核补记（2026-10-22，锁定对象只读审计）
 
-本次使用 `git show cdc064e:<path>` 与 `git grep <symbol> cdc064e -- <path>` 审计锁定对象，确认完整 commit SHA 为 `cdc064e78daeeae598157470244e351cd37cbbed`；具体源码发现见上列第 4、7 项。dirty checkout 状态与 locked commit 的差异已明确分开记录，没有用当前 HEAD 推导上游行为。
+本次在 clean pinned checkout 使用 `git show HEAD:<path>` 与 `git grep <symbol> HEAD -- <path>` 审计，确认 HEAD/full SHA 为 `cdc064e78daeeae598157470244e351cd37cbbed`；KWS 符号与调用路径与 dirty checkout object database 中同一 locked commit 的查询一致。具体源码发现见上列第 4、7 项。dirty checkout 状态与 locked commit 的差异已明确分开记录，没有用当前 HEAD 推导上游行为。
 
 **A0 结论：当前不需要新增独立 CR。** 返回值传播、ready 状态和模型身份均属于本 CR 的语音 readiness 范围。TuyaOpen AI mode/main owner 应在 `ai_mode_wakeup.c` 检查并传播 VAD mode、KWS callback registration 与 enable 错误，并在 MQTT callback 仅于 `ai_mode_init()` 成功后设置 agent/mode-ready 标志；TuyaOpen KWS adapter/平台实现 owner 应提供受支持的 ready/model identity 查询（至少实际模型名或 ID、loaded/enabled 状态和失败码），运行期故障撤销 ready 则需状态变化/错误通知。A1 只消费公开接口，不得以私有 backend、回调注册成功或 PCM 曾产出推定模型已加载。若上游确认无法扩展该 API，再由 A0 拆分新的窄接口 CR 并裁决依赖 pin；本次不修改 vendor/生产代码。该结论不证明目标板 WakeNet/AFE 当前 ready。
 
