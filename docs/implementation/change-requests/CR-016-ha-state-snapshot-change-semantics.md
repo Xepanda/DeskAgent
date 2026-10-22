@@ -1,6 +1,6 @@
 # CR-016: Define HA Attribute Changes and Entity Removal Events
 
-**Status:** APPROVED — A0 compatibility-minimal contract decision
+**Status:** APPROVED; A0 contract and A4 implementation verified at L2
 **Owner:** A0 owns this contract decision; A4 owns connector implementation
 **Scope:** HA state-change event semantics and connector subscriber/reconciliation behavior
 **Evidence level:** Level 2 (source, schema, fixture, and test review only)
@@ -33,6 +33,13 @@ No `old_attributes` or `new_attributes` fields are added. This preserves the exi
 4. Add connector tests for attributes-only WebSocket change, attributes-only polling/reconnect reconciliation, unchanged attributes, entity add/remove, and WebSocket removal. The shared schema validator must accept both the attributes-only and removal fixtures and reject invalid attribute payload types.
 5. Run the focused HA connector, HA event schema/fixture validator, and Host event query tests. These are software-only checks and do not constitute live HA or physical-device verification.
 
+## Implementation and verification result
+
+- A0 schema, fixtures, and contract tests were committed as `3849ad9`. The schema accepts state-only, attribute-only, entity-addition, and entity-removal events; it rejects non-object attributes and removal payloads that include `attributes`.
+- A4 implementation preserves complete post-change attributes, reports attribute-only changes and entity additions/removals, and avoids duplicate removal notifications. Host event records retain the agreed event fields.
+- Independent verification: HA schema/fixture tests **6 passed**; HA connector tests **46 passed**; Host event query tests **2 passed**; `git diff --check` passed.
+- Evidence level is **Level 2 only**: source, schema, fixture, and software test evidence. No live Home Assistant connection, service action, or physical entity action was exercised or verified.
+
 ## Limits
 
-No production code, tests, real Home Assistant instance, credentials, or hardware were accessed or changed for this CR. Current findings establish a source-level contract mismatch only; runtime delivery and physical outcomes remain unverified.
+No real Home Assistant instance, credentials, or hardware were accessed for this CR. Runtime delivery against a live HA service and physical entity outcomes remain unverified.
