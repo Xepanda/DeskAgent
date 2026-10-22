@@ -5,9 +5,24 @@
 - **关联：** CR-017、`contracts/dependency_lock.json` 的 `partition_table` 与 `partition_safety_invariants`、`firmware/partitions.csv`
 - **范围：** 仅定义 CR-017 所需设备端通知去重/阶段/确认回执的存储契约。本文不授权格式化、分区表变更、擦写任何 Flash 地址或创建新运行时存储实例。
 
-## 1. 裁决：当前没有获批的 app-owned 持久化面
+## 1. 裁决：当前没有获批且适用的 app-owned 持久化面
 
-当前固件的 `storage` SPIFFS 分区为 4 MiB（`0xD20000..0x111FFFF`），依赖锁和镜像清单将其归属 UI/动画静态资源。当前源码没有该分区的 SPIFFS mount，也没有 DeskAgent app-owned KV API。`desk_watcher_storage_init()` 注册的是 Flash 尾部 Tuya store（`tuya`）及 marker（`deskmeta`），不是 DeskAgent 应用 KV API；这段区域不得挪用。
+当前固件的 `storage` SPIFFS 分区为 4 MiB（`0xD20000..0x111FFFF`），依赖锁和镜像清单将其归属 UI/动画静态资源。源码中没有该分区的 SPIFFS mount/provider，也没有 DeskAgent 自有的通用 durable KV provider。准确地说，锁定 TuyaOpen SDK 确有 `tal_kv_init/set/get/del` API；但其 ESP32 backend 将 LittleFS 挂载在 Tuya `tuya` 分区内，并在 mount 失败后调用 `lfs_format()`。当前启动代码调用 `tal_kv_init()`，该能力已用于 TClaw / WebSocket token 等 Tuya/TClaw 数据，不能据此视为 DeskAgent app-owned、隔离或可安全复用的通知存储。
+
+固件还有 `desk_notification_store_ops_t` 形式的 A1 backend 接口和 16 槽记录缓存；`desk_hardware_notification_init()` 在没有注册的 load/save/erase provider 时 fail closed。当前生产启动路径没有调用 `desk_hardware_notification_register_store()`，所以这个接口只是可供未来实现的 seam，不是现成 provider。通知记录结构包含标题，而 store callback 对整条记录进行读写；因此在标题保留决策未定、provider 未实现前，不能把这个 seam 当作允许落盘标题的授权。
+
+`desk_watcher_storage_init()` 注册的是 Flash 尾部 Tuya store（`tuya`）及 marker（`deskmeta`），不是 DeskAgent 应用 KV API；这段区域不得挪用。SDK `tal_kv` 与这个 Tuya store 共用同一物理 `tuya` partition，并不是独立空间。
+
+### 1.1 已有接口/分区适用性审计（源码 L1）
+
+| 发现 | 源码/配置证据 | 对 CR-018 的结论 |
+|---|---|---|
+| Tuya `tal_kv` 是持久接口，但其 backend 是 LittleFS；`kv_storage_init()` 先 `lfs_mount()`，失败后会 `lfs_format()`。 | 锁定 TuyaOpen SDK `src/tal_kv/src/tal_kv.c` 的 `kv_storage_init()`、`tal_kv_init/set/get/del()`；`src/tal_kv/port/lfs_config.h`。 | 不可用于通知记录：其 mount/format 生命周期不能与通知 fail-closed 要求及已有 Tuya 数据隔离。API 级可写不等于产品授权或耐久契约。 |
+| `tkl_flash_get_one_type_info(TUYA_FLASH_TYPE_UF)` 返回 `tuya` partition 相对地址 `0x9000`、大小 `0x18000`（96 KiB）；`KV_DATA` 使用相对地址 `0x1000`、大小 `0x8000`。`tal_kv` LittleFS backend 使用 `UF`。 | 锁定 TuyaOpen SDK `platform/ESP32/tuya_open_sdk/tuyaos_adapter/src/drivers/tkl_flash.c` 的分区常量及 `tkl_flash_get_one_type_info()`；`src/tal_kv/src/tal_kv.c`。 | 这些是已有 Tuya 数据面的内部布局，不是 notification namespace/quota；96 KiB UF 空间本身低于本 CR 的 128 KiB 设计下限，且与 Tuya store 共用格式化/文件系统生命周期；禁止将其重命名、扩容或当作空闲区。 |
+| 本项目 `watcher_storage.c` 将 `tuya` 注册在 32 MiB Flash 尾部 `0x1FC0000..0x1FFFFFF`（256 KiB），并要求相关范围为空白或已有 marker；依赖锁的 factory partition table 不含这两个外部注册项。 | `firmware/main/src/watcher_storage.c`；`contracts/dependency_lock.json` 的 `partition_table`、`partition_safety_invariants`。 | Tuya KV 的相对 offset 落在共享 Tuya store 内；没有为通知另分区或预留配额。不能从 256 KiB 总尺寸推断有 128 KiB 可供通知使用。 |
+| `storage` 是 `0xD20000` 起的 4 MiB SPIFFS 分区，镜像/依赖锁将其描述为 UI/动画静态资源；固件源码未找到对此分区的 `esp_vfs_spiffs_register` / mount 或通知 provider。 | `firmware/partitions.csv`、`firmware/sdkconfig.defaults`、`docs/implementation/r1-build-and-image-manifest.md`；项目固件源码。 | 不能安全选择其作为现成 provider；共享资产供应物、格式化和配额/命名空间所有权没有获批。 |
+
+**决策：** 当前可见接口和分区都不能安全解除 CR-018 阻塞。保持 durable accepted/provider 部署阻塞；继续执行 provider 缺失时的 fail-closed wire contract。无需为此变更分区表、`sdkconfig` 或 `contracts/dependency_lock.json`。不在本 CR 中推断 `storage` 有空闲容量，也不为产品选定标题持久化、配额、保留期限或擦除语义。
 
 `nvs`（`0x9000`）、`phy_init`（`0x11000`）、`agentcfg`（`0x12000`，Tuya 凭据/license）、`model`（`0xC20000`，模型）、Tuya tail，以及未明确所有权的其他分区均不属于本功能的候选写入面。不得修改 `firmware/partitions.csv`、生成式分区表、启动时 NVS 流程或现有资产分区内容来绕过此缺口。
 
