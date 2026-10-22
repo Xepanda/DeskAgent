@@ -111,6 +111,7 @@ static const watcher_expression_t s_expressions[] = {
     { "thinking",  0xFD20 },
     { "speaking",  0x041F },
     { "happy",     0xFFE0 },
+    { "alert",     0xFD20 },
     { "error",     0xF800 },
     { "offline",   0x7BEF },
 };
@@ -500,6 +501,17 @@ static uint16_t watcher_bloub_render_pixel(const watcher_expression_t *expr,
                     return 0xFFFF;
                 }
             }
+        }
+    } else if (strcmp(preset_name, "alert") == 0) {
+        /* Notification state: two bright alert marks, distinct from dialogue error. */
+        for (int e = 0; e < 2; ++e) {
+            int ecx = (e == 0) ? left_cx : right_cx;
+            int rx = x - ecx;
+            int ry = y - eye_cy;
+            int ax = rx < 0 ? -rx : rx;
+            int ay = ry < 0 ? -ry : ry;
+            if ((ax <= 7 && ay >= 12 && ay <= 30) || (ax <= 3 && ay >= 36 && ay <= 42))
+                return 0xFFFF;
         }
     } else if (strcmp(preset_name, "error") == 0) {
         /* Diagonal 'X' cross eyes */

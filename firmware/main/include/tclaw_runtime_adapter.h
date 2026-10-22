@@ -22,6 +22,9 @@ typedef struct {
 /* Initializes the vendored TClaw runtime without owning Tuya's IoT client. */
 int desk_tclaw_runtime_init(void);
 
+/* Reports the authoritative Tuya MQTT state to the runtime UI event mapper. */
+void desk_tclaw_runtime_set_cloud_online(int online);
+
 /* Parses a real SDK bridge response and dispatches only a correlated result. */
 int desk_tclaw_runtime_handle_bridge_response(const char *response_json);
 

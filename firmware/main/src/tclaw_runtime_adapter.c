@@ -625,10 +625,22 @@ static const char *s_current_ai_preset = NULL;
 /* UI voice events require both TClaw init and HAL readiness. This gate does
  * not claim AFE/WakeNet/KWS readiness; the pinned SDK exposes no public hook. */
 static bool s_voice_event_ui_enabled;
+/* MQTT is the authoritative cloud connectivity signal for the home UI. */
+static bool s_cloud_online;
+
+void desk_tclaw_runtime_set_cloud_online(int online)
+{
+    s_cloud_online = online != 0;
+
+    const char *preset = s_cloud_online ? "happy" : "offline";
+    const char *status = s_cloud_online ? "Online" : "Cloud Offline";
+    s_current_ai_preset = s_cloud_online ? NULL : preset;
+    desk_hardware_set_screen_expression(preset, status);
+}
 
 static void __desk_ai_chat_event_handler(AI_NOTIFY_EVENT_T *event)
 {
-    if (!event || !s_voice_event_ui_enabled) return;
+    if (!event || !s_voice_event_ui_enabled || !s_cloud_online) return;
     const char *new_preset = NULL;
     const char *status_text = NULL;
 
@@ -671,6 +683,7 @@ static void __desk_ai_chat_event_handler(AI_NOTIFY_EVENT_T *event)
 int desk_tclaw_runtime_init(void)
 {
     s_voice_event_ui_enabled = false;
+    s_cloud_online = false;
     int first_error = 0;
     int rc = sys_bus_init();
     record_stage(STAGE_SYS_BUS, rc == OPRT_OK ? DESK_TCLAW_RUNTIME_READY : DESK_TCLAW_RUNTIME_FAILED, rc);

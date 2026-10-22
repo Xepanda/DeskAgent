@@ -8,6 +8,7 @@
 static int s_display_calls;
 static int s_audio_calls;
 static int s_status_calls;
+static char s_expected_preset[32] = "alert";
 static char s_expected_display[64] = "Late: Take medicine";
 static desk_notification_status_event_t s_events[16];
 /* Volatile in-process fixture only. This is not device persistence evidence. */
@@ -64,7 +65,7 @@ static int fake_store_erase(unsigned slot, void *user_data)
 static int mock_init(void) { return DESK_HW_OK; }
 static int mock_display(const char *preset, const char *text)
 {
-    assert(strcmp(preset, "alert") == 0);
+    assert(strcmp(preset, s_expected_preset) == 0);
     assert(strcmp(text, s_expected_display) == 0);
     ++s_display_calls;
     return DESK_HW_OK;
@@ -191,6 +192,9 @@ int main(void)
     assert(desk_hardware_notification_deliver(&invalid, &state) == DESK_HW_ERR_TIMEOUT);
     assert(state.status == DESK_NOTIFICATION_EXPIRED);
 
+    /* ACK dismisses the volatile overlay and restores the latest base state. */
+    snprintf(s_expected_preset, sizeof(s_expected_preset), "idle");
+    snprintf(s_expected_display, sizeof(s_expected_display), "Ready");
     assert(desk_hardware_notification_acknowledge("occurrence-001", "explicit_ui") == DESK_HW_OK);
     assert(s_events[s_status_calls - 1].status == DESK_NOTIFICATION_ACKNOWLEDGED);
     assert(s_events[s_status_calls - 1].acknowledged);

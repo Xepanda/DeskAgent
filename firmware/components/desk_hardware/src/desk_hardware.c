@@ -12,9 +12,12 @@
 #include <sys/time.h>
 #include <time.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #ifdef ESP_PLATFORM
 #include "driver/uart.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #endif
 
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
@@ -74,6 +77,82 @@ static void *s_roller_delta_cb_user_data = NULL;
 /* --- Display & Expression State --- */
 static char s_current_preset[32] = "idle";
 static char s_current_status[64] = "Ready";
+
+#define UI_OVERLAY_ID_MAX 64
+typedef struct {
+    bool active;
+    uint32_t generation;
+    uint64_t issued_epoch_us;
+    uint64_t expires_epoch_us;
+    uint64_t deadline_mono_us;
+    char notification_id[UI_OVERLAY_ID_MAX + 1];
+    char preset[32];
+    char status[64];
+} ui_overlay_state_t;
+
+static ui_overlay_state_t s_ui_overlay;
+static uint32_t s_ui_sequence;
+static bool s_ui_render_dirty;
+static char s_ui_base_preset[32] = "idle";
+static char s_ui_base_status[64] = "Ready";
+static char s_ui_expired_notification_id[UI_OVERLAY_ID_MAX + 1];
+#ifdef ESP_PLATFORM
+static portMUX_TYPE s_ui_state_mux = portMUX_INITIALIZER_UNLOCKED;
+#else
+static atomic_flag s_ui_state_lock = ATOMIC_FLAG_INIT;
+#endif
+
+static void ui_state_lock(void)
+{
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&s_ui_state_mux);
+#else
+    while (atomic_flag_test_and_set_explicit(&s_ui_state_lock, memory_order_acquire)) { }
+#endif
+}
+
+static void ui_state_unlock(void)
+{
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&s_ui_state_mux);
+#else
+    atomic_flag_clear_explicit(&s_ui_state_lock, memory_order_release);
+#endif
+}
+
+static uint64_t ui_now_epoch_us(void)
+{
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0 || now.tv_sec < 1577836800) return 0;
+    return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_usec;
+}
+
+static uint64_t ui_now_mono_us(void)
+{
+#ifdef ESP_PLATFORM
+    int64_t now = esp_timer_get_time();
+    return now > 0 ? (uint64_t)now : 0;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
+#endif
+}
+
+static uint32_t ui_next_generation(uint32_t value)
+{
+    ++value;
+    return value ? value : 1u;
+}
+
+static void ui_copy_string(char *destination, size_t capacity, const char *source)
+{
+    if (!destination || capacity == 0) return;
+    size_t length = 0;
+    if (source) while (length + 1 < capacity && source[length] != '\0') ++length;
+    if (length) memcpy(destination, source, length);
+    destination[length] = '\0';
+}
 
 /* --- Audio State & Ring Buffer --- */
 #define AUDIO_RING_BUFFER_SAMPLES 16384
@@ -1225,7 +1304,7 @@ int desk_hardware_camera_stream_stop(void)
 }
 
 /* Display & Expression API */
-int desk_hardware_display_set_expression(const char *preset_name, const char *status_text)
+static int desk_hardware_display_render_expression(const char *preset_name, const char *status_text)
 {
     if (!preset_name || strlen(preset_name) == 0) {
         return DESK_HW_ERR_INVALID_ARG;
@@ -1275,9 +1354,256 @@ int desk_hardware_display_set_expression(const char *preset_name, const char *st
     return rc;
 }
 
+static int ui_render_current(void)
+{
+    /* A render can race a base/overlay mutation. Retry from the newest snapshot
+     * a small bounded number of times; the board adapter serializes DMA draws. */
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        char preset[sizeof(s_ui_base_preset)];
+        char status[sizeof(s_ui_base_status)];
+        uint32_t sequence;
+        desk_resource_owner_t owner;
+        ui_state_lock();
+        sequence = s_ui_sequence;
+        bool overlay_active = s_ui_overlay.active;
+        const char *current_preset = overlay_active ? s_ui_overlay.preset : s_ui_base_preset;
+        const char *current_status = overlay_active ? s_ui_overlay.status : s_ui_base_status;
+        owner = overlay_active ? DESK_OWNER_SYSTEM_ALERT : DESK_OWNER_TCLAW_VOICE;
+        ui_copy_string(preset, sizeof(preset), current_preset);
+        ui_copy_string(status, sizeof(status), current_status);
+        ui_state_unlock();
+
+        if (desk_arbiter_acquire(DESK_RES_DISPLAY_UI, owner, 50) != DESK_ARBITER_OK) {
+            ui_state_lock();
+            s_ui_render_dirty = true;
+            ui_state_unlock();
+            return DESK_HW_ERR_BUSY;
+        }
+        int rc = desk_hardware_display_render_expression(preset, status);
+        desk_arbiter_release(DESK_RES_DISPLAY_UI, owner);
+        if (rc != DESK_HW_OK) {
+            ui_state_lock();
+            s_ui_render_dirty = true;
+            ui_state_unlock();
+            return rc;
+        }
+
+        ui_state_lock();
+        bool stable = sequence == s_ui_sequence;
+        if (stable) s_ui_render_dirty = false;
+        ui_state_unlock();
+        if (stable) return DESK_HW_OK;
+    }
+    ui_state_lock();
+    s_ui_render_dirty = true;
+    ui_state_unlock();
+    return DESK_HW_ERR_BUSY;
+}
+
+int desk_hardware_ui_overlay_present(const char *notification_id,
+                                     const char *preset_name,
+                                     const char *status_text,
+                                     uint64_t expires_epoch_us,
+                                     desk_hardware_ui_overlay_handle_t *out_handle)
+{
+    if (!notification_id || !memchr(notification_id, '\0', UI_OVERLAY_ID_MAX + 1) ||
+        notification_id[0] == '\0' || !preset_name ||
+        !memchr(preset_name, '\0', sizeof(s_ui_base_preset)) || preset_name[0] == '\0' ||
+        !status_text || !memchr(status_text, '\0', sizeof(s_ui_base_status)) || !out_handle)
+        return DESK_HW_ERR_INVALID_ARG;
+
+    uint64_t now_epoch = ui_now_epoch_us();
+    uint64_t now_mono = ui_now_mono_us();
+    if (!now_epoch || !now_mono) return DESK_HW_ERR_UNAVAILABLE;
+
+    bool expired_previous = false;
+    bool uncertain_previous = false;
+    bool expired_same_notification = false;
+    ui_state_lock();
+    if (strcmp(s_ui_expired_notification_id, notification_id) == 0) {
+        ui_state_unlock();
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    if (s_ui_overlay.active &&
+        (!now_epoch || now_epoch < s_ui_overlay.issued_epoch_us ||
+         now_epoch >= s_ui_overlay.expires_epoch_us || now_mono >= s_ui_overlay.deadline_mono_us)) {
+        expired_same_notification = strcmp(s_ui_overlay.notification_id, notification_id) == 0;
+        uncertain_previous = !now_epoch || now_epoch < s_ui_overlay.issued_epoch_us;
+        ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                       s_ui_overlay.notification_id);
+        s_ui_overlay.active = false;
+        s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+        s_ui_sequence = ui_next_generation(s_ui_sequence);
+        s_ui_render_dirty = true;
+        expired_previous = true;
+    }
+    if (s_ui_overlay.active) {
+        if (strcmp(s_ui_overlay.notification_id, notification_id) != 0) {
+            ui_state_unlock();
+            return DESK_HW_ERR_BUSY;
+        }
+        *out_handle = s_ui_overlay.generation;
+        ui_state_unlock();
+        return DESK_HW_OK; /* Same ID is idempotent; its deadline is immutable. */
+    }
+    if (uncertain_previous) {
+        ui_state_unlock();
+        (void)ui_render_current();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    if (expired_same_notification) {
+        ui_state_unlock();
+        (void)ui_render_current();
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    if (expires_epoch_us <= now_epoch) {
+        ui_state_unlock();
+        if (expired_previous) (void)ui_render_current();
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    uint64_t remaining = expires_epoch_us - now_epoch;
+    if (UINT64_MAX - now_mono < remaining) {
+        ui_state_unlock();
+        if (expired_previous) (void)ui_render_current();
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+
+    s_ui_overlay.active = true;
+    s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+    s_ui_overlay.issued_epoch_us = now_epoch;
+    s_ui_overlay.expires_epoch_us = expires_epoch_us;
+    s_ui_overlay.deadline_mono_us = now_mono + remaining;
+    ui_copy_string(s_ui_overlay.notification_id, sizeof(s_ui_overlay.notification_id), notification_id);
+    ui_copy_string(s_ui_overlay.preset, sizeof(s_ui_overlay.preset), preset_name);
+    ui_copy_string(s_ui_overlay.status, sizeof(s_ui_overlay.status), status_text);
+    s_ui_sequence = ui_next_generation(s_ui_sequence);
+    s_ui_render_dirty = true;
+    uint32_t generation = s_ui_overlay.generation;
+    ui_state_unlock();
+
+    int rc = ui_render_current();
+    if (rc != DESK_HW_OK) {
+        ui_state_lock();
+        if (s_ui_overlay.active && s_ui_overlay.generation == generation) {
+            s_ui_overlay.active = false;
+            s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+            s_ui_sequence = ui_next_generation(s_ui_sequence);
+            s_ui_render_dirty = true;
+            s_ui_render_dirty = true;
+        }
+        ui_state_unlock();
+        (void)ui_render_current();
+        return rc;
+    }
+    *out_handle = generation;
+    return DESK_HW_OK;
+}
+
+int desk_hardware_ui_overlay_dismiss(desk_hardware_ui_overlay_handle_t handle)
+{
+    if (!handle) return DESK_HW_ERR_INVALID_ARG;
+    uint64_t now_mono = ui_now_mono_us();
+    if (!now_mono) return DESK_HW_ERR_UNAVAILABLE;
+    bool was_expired = false;
+    ui_state_lock();
+    if (!s_ui_overlay.active || s_ui_overlay.generation != handle) {
+        ui_state_unlock();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    uint64_t now_epoch = ui_now_epoch_us();
+    was_expired = now_mono >= s_ui_overlay.deadline_mono_us ||
+                  (now_epoch && now_epoch >= s_ui_overlay.expires_epoch_us);
+    if (was_expired)
+        ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                       s_ui_overlay.notification_id);
+    s_ui_overlay.active = false;
+    s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+    s_ui_sequence = ui_next_generation(s_ui_sequence);
+    s_ui_render_dirty = true;
+    ui_state_unlock();
+    int rc = ui_render_current();
+    return rc != DESK_HW_OK ? rc : (was_expired ? DESK_HW_ERR_TIMEOUT : DESK_HW_OK);
+}
+
+int desk_hardware_ui_overlay_process_expiry(void)
+{
+    uint64_t now_mono = ui_now_mono_us();
+    if (!now_mono) {
+        ui_state_lock();
+        bool had_overlay = s_ui_overlay.active;
+        if (had_overlay) {
+            ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                           s_ui_overlay.notification_id);
+            s_ui_overlay.active = false;
+            s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+            s_ui_sequence = ui_next_generation(s_ui_sequence);
+            s_ui_render_dirty = true;
+        }
+        ui_state_unlock();
+        if (had_overlay) {
+            printf("[UI][WARN] stage=overlay_clock_untrusted; closing volatile overlay\n");
+            int rc = ui_render_current();
+            if (rc != DESK_HW_OK) return rc;
+        } else {
+            ui_state_lock();
+            bool dirty = s_ui_render_dirty;
+            ui_state_unlock();
+            if (dirty) (void)ui_render_current();
+        }
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    uint64_t now_epoch = ui_now_epoch_us();
+    ui_state_lock();
+    bool uncertain_clock = s_ui_overlay.active &&
+                           (!now_epoch || now_epoch < s_ui_overlay.issued_epoch_us);
+    bool expired = s_ui_overlay.active &&
+                   (now_mono >= s_ui_overlay.deadline_mono_us ||
+                    (now_epoch && now_epoch >= s_ui_overlay.expires_epoch_us));
+    if (uncertain_clock) expired = true;
+    if (expired) {
+        ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                       s_ui_overlay.notification_id);
+        s_ui_overlay.active = false;
+        s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+        s_ui_sequence = ui_next_generation(s_ui_sequence);
+        s_ui_render_dirty = true;
+    }
+    ui_state_unlock();
+    if (expired) {
+        if (uncertain_clock)
+            printf("[UI][WARN] stage=overlay_utc_untrusted; closing volatile overlay\n");
+        int rc = ui_render_current();
+        if (rc != DESK_HW_OK) return rc;
+        return uncertain_clock ? DESK_HW_ERR_UNAVAILABLE : DESK_HW_OK;
+    }
+    ui_state_lock();
+    bool dirty = !s_ui_overlay.active && s_ui_render_dirty;
+    ui_state_unlock();
+    if (dirty) return ui_render_current();
+    return DESK_HW_OK;
+}
+
 int desk_hardware_set_screen_expression(const char *preset_name, const char *status_text)
 {
-    return desk_hardware_display_set_expression(preset_name, status_text);
+    if (!preset_name || !preset_name[0] ||
+        !memchr(preset_name, '\0', sizeof(s_ui_base_preset))) return DESK_HW_ERR_INVALID_ARG;
+    if (status_text && !memchr(status_text, '\0', sizeof(s_ui_base_status)))
+        return DESK_HW_ERR_INVALID_ARG;
+
+    ui_state_lock();
+    ui_copy_string(s_ui_base_preset, sizeof(s_ui_base_preset), preset_name);
+    ui_copy_string(s_ui_base_status, sizeof(s_ui_base_status), status_text ? status_text : "");
+    s_ui_sequence = ui_next_generation(s_ui_sequence);
+    bool overlay_active = s_ui_overlay.active;
+    if (!overlay_active) s_ui_render_dirty = true;
+    ui_state_unlock();
+    return overlay_active ? DESK_HW_OK : ui_render_current();
+}
+
+int desk_hardware_display_set_expression(const char *preset_name, const char *status_text)
+{
+    /* All product-facing expression writes go through the UI state owner. */
+    return desk_hardware_set_screen_expression(preset_name, status_text);
 }
 
 int desk_hardware_display_self_test(desk_display_self_test_t *out_result)

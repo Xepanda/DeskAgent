@@ -80,6 +80,8 @@ int desk_hardware_notification_process_pending(void);
 
 /* Explicit acknowledgement seam; it does not change reminder ringing/completion state. */
 int desk_hardware_notification_acknowledge(const char *notification_id, const char *source);
+/* Dismisses only the matching volatile screen overlay; it does not create an ACK. */
+int desk_hardware_notification_dismiss(const char *notification_id);
 int desk_hardware_notification_get_status(const char *notification_id,
                                           desk_notification_status_event_t *out_status);
 

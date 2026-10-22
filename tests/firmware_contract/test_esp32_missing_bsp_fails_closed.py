@@ -68,7 +68,17 @@ int test_uart_write_count(void);
         )
         (tmp / "include" / "freertos").mkdir(parents=True)
         (tmp / "include" / "freertos" / "FreeRTOS.h").write_text(
-            "#pragma once\n#define pdMS_TO_TICKS(ms) (ms)\n", encoding="utf-8"
+            "#pragma once\n"
+            "#include <freertos/portmacro.h>\n"
+            "#define pdMS_TO_TICKS(ms) (ms)\n", encoding="utf-8"
+        )
+        (tmp / "include" / "freertos" / "portmacro.h").write_text(
+            "#pragma once\n"
+            "typedef int portMUX_TYPE;\n"
+            "#define portMUX_INITIALIZER_UNLOCKED 0\n"
+            "#define portENTER_CRITICAL(mux) ((void)(mux))\n"
+            "#define portEXIT_CRITICAL(mux) ((void)(mux))\n",
+            encoding="utf-8",
         )
         (tmp / "include" / "freertos" / "semphr.h").write_text(
             "#pragma once\n", encoding="utf-8"

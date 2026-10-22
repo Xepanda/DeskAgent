@@ -237,6 +237,16 @@ typedef struct {
 /* Display & Expression API (R2) */
 int desk_hardware_set_screen_expression(const char *preset_name, const char *status_text);
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text);
+typedef uint32_t desk_hardware_ui_overlay_handle_t;
+/* Base state is retained underneath one volatile notification overlay. */
+int desk_hardware_ui_overlay_present(const char *notification_id,
+                                     const char *preset_name,
+                                     const char *status_text,
+                                     uint64_t expires_epoch_us,
+                                     desk_hardware_ui_overlay_handle_t *out_handle);
+int desk_hardware_ui_overlay_dismiss(desk_hardware_ui_overlay_handle_t handle);
+/* Call from an existing serialized loop; no task/timer is created here. */
+int desk_hardware_ui_overlay_process_expiry(void);
 int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len, char *out_status, size_t max_status_len);
 int desk_hardware_display_self_test(desk_display_self_test_t *out_result);
 int desk_hardware_screen_self_test(desk_display_self_test_t *out_result);

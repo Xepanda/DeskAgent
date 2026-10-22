@@ -207,7 +207,7 @@ static void tuya_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *e
 #ifdef ESP_PLATFORM
         /* This is an observed network event. The native ai_chat/ai_agent event
          * subscribers own cloud audio; do not start the host dialogue shim. */
-        desk_hardware_set_screen_expression("happy", "Online");
+        desk_tclaw_runtime_set_cloud_online(1);
 #else
         desk_tclaw_on_tuya_mqtt_connected();
 #endif
@@ -220,7 +220,7 @@ static void tuya_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *e
                                             desk_provisioning_current_state()->error_code);
         printf("[TUYA][EVENT] stage=%s\n", desk_provisioning_stage_name(desk_provisioning_current_state()->stage));
 #ifdef ESP_PLATFORM
-        desk_hardware_set_screen_expression("idle", "Cloud Offline");
+        desk_tclaw_runtime_set_cloud_online(0);
 #else
         desk_tclaw_on_tuya_mqtt_disconnected();
 #endif
@@ -516,6 +516,7 @@ static int desk_agent_main_worker(void)
             printf("[TUYA][WARN] stage=yield rc=%d retry_in_ms=%u consecutive=%u\n",
                    yield_rc, delay_ms, s_yield_retry_state.consecutive_errors);
         }
+        (void)desk_hardware_ui_overlay_process_expiry();
         vTaskDelay(pdMS_TO_TICKS(delay_ms ? delay_ms : 50));
     }
 #endif

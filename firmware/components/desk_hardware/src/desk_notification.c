@@ -37,6 +37,9 @@ static desk_notification_store_ops_t s_store_ops;
 static bool s_store_registered;
 static desk_notification_status_cb_t s_status_cb;
 static void *s_status_user_data;
+/* Volatile UI identity only; it is deliberately excluded from stored records. */
+static desk_hardware_ui_overlay_handle_t s_active_overlay_handle;
+static char s_active_overlay_notification_id[DESK_NOTIFICATION_ID_MAX + 1];
 static bool valid_title_utf8(const char *text);
 
 static void emit_status(const char *id, desk_notification_status_t status, int error, const char *source)
@@ -159,6 +162,19 @@ static int find_record(const char *id)
         if (s_records[i].occupied && strcmp(s_records[i].notification_id, id) == 0) return (int)i;
     }
     return -1;
+}
+
+static void dismiss_active_overlay_for_id(const char *notification_id)
+{
+    if (!s_active_overlay_handle ||
+        strcmp(s_active_overlay_notification_id, notification_id) != 0) return;
+    int dismiss_rc = desk_hardware_ui_overlay_dismiss(s_active_overlay_handle);
+    s_active_overlay_handle = 0;
+    s_active_overlay_notification_id[0] = '\0';
+    if (dismiss_rc != DESK_HW_OK && dismiss_rc != DESK_HW_ERR_TIMEOUT &&
+        dismiss_rc != DESK_HW_ERR_UNAVAILABLE)
+        printf("[NOTIFICATION][WARN] stage=overlay_dismiss_after_ack rc=%d id=%s\n",
+               dismiss_rc, notification_id);
 }
 
 static void fill_status(const char *id, unsigned index, desk_notification_status_event_t *out)
@@ -347,8 +363,6 @@ int desk_hardware_notification_process_pending(void)
             return DESK_HW_ERR_TIMEOUT;
         }
         if (!entry->rendered) {
-            if (desk_arbiter_acquire(DESK_RES_DISPLAY_UI, DESK_OWNER_SDK_REMOTE, 0) != DESK_ARBITER_OK)
-                return DESK_HW_ERR_BUSY;
             char text[64];
             size_t offset = 0;
             if (entry->is_catchup) {
@@ -359,8 +373,19 @@ int desk_hardware_notification_process_pending(void)
             size_t title_len = utf8_prefix(entry->title, available);
             memcpy(text + offset, entry->title, title_len);
             text[offset + title_len] = '\0';
-            int display_rc = desk_hardware_display_set_expression("alert", text);
-            desk_arbiter_release(DESK_RES_DISPLAY_UI, DESK_OWNER_SDK_REMOTE);
+            desk_hardware_ui_overlay_handle_t overlay_handle = 0;
+            int display_rc = desk_hardware_ui_overlay_present(
+                entry->notification_id, "alert", text, entry->expires_epoch, &overlay_handle);
+            if (display_rc == DESK_HW_ERR_BUSY) return display_rc;
+            if (display_rc == DESK_HW_ERR_TIMEOUT) {
+                entry->pending = 0;
+                entry->status = DESK_NOTIFICATION_EXPIRED;
+                entry->error_code = DESK_HW_ERR_TIMEOUT;
+                if (store_save(i) != DESK_HW_OK) return DESK_HW_ERR_IO;
+                emit_status(entry->notification_id, DESK_NOTIFICATION_EXPIRED,
+                            DESK_HW_ERR_TIMEOUT, NULL);
+                return DESK_HW_ERR_TIMEOUT;
+            }
             if (display_rc != DESK_HW_OK) {
                 entry->pending = 0;
                 entry->status = DESK_NOTIFICATION_FAILED;
@@ -369,6 +394,9 @@ int desk_hardware_notification_process_pending(void)
                 emit_status(entry->notification_id, DESK_NOTIFICATION_FAILED, display_rc, NULL);
                 return display_rc;
             }
+            s_active_overlay_handle = overlay_handle;
+            snprintf(s_active_overlay_notification_id, sizeof(s_active_overlay_notification_id),
+                     "%s", entry->notification_id);
             entry->rendered = 1;
             entry->status = DESK_NOTIFICATION_RENDERED;
             entry->error_code = DESK_HW_OK;
@@ -407,7 +435,10 @@ int desk_hardware_notification_acknowledge(const char *notification_id, const ch
         !valid_text(source, DESK_NOTIFICATION_ACK_SOURCE_MAX + 1)) return DESK_HW_ERR_INVALID_ARG;
     int index = find_record(notification_id);
     if (index < 0) return DESK_HW_ERR_UNAVAILABLE;
-    if (s_records[index].acknowledged) return DESK_HW_OK;
+    if (s_records[index].acknowledged) {
+        dismiss_active_overlay_for_id(notification_id);
+        return DESK_HW_OK;
+    }
     s_records[index].acknowledged = 1;
     snprintf(s_records[index].ack_source, sizeof(s_records[index].ack_source), "%s", source);
     if (store_save((unsigned)index) != DESK_HW_OK) {
@@ -415,8 +446,25 @@ int desk_hardware_notification_acknowledge(const char *notification_id, const ch
         s_records[index].ack_source[0] = '\0';
         return DESK_HW_ERR_IO;
     }
+    dismiss_active_overlay_for_id(notification_id);
     emit_status(notification_id, DESK_NOTIFICATION_ACKNOWLEDGED, DESK_HW_OK, source);
     return DESK_HW_OK;
+}
+
+int desk_hardware_notification_dismiss(const char *notification_id)
+{
+    if (!s_initialized) return DESK_HW_ERR_UNAVAILABLE;
+    if (!valid_text(notification_id, DESK_NOTIFICATION_ID_MAX + 1))
+        return DESK_HW_ERR_INVALID_ARG;
+    if (!s_active_overlay_handle ||
+        strcmp(s_active_overlay_notification_id, notification_id) != 0)
+        return DESK_HW_ERR_UNAVAILABLE;
+    int rc = desk_hardware_ui_overlay_dismiss(s_active_overlay_handle);
+    if (rc == DESK_HW_OK || rc == DESK_HW_ERR_TIMEOUT || rc == DESK_HW_ERR_UNAVAILABLE) {
+        s_active_overlay_handle = 0;
+        s_active_overlay_notification_id[0] = '\0';
+    }
+    return rc;
 }
 
 int desk_hardware_notification_get_status(const char *notification_id,
