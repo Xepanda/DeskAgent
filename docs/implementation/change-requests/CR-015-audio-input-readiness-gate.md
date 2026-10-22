@@ -10,7 +10,7 @@
 
 本 CR 按仓库 `contracts/dependency_lock.json` 和 TClaw provenance 核对：
 
-- 构建使用的 TuyaOpen SDK pin 为 `cdc064e`；本机锁定 SDK checkout 当前解析为 `cdc064e78daeeae598157470244e351cd37cbbed`。锁文件记录其工作区 clean；本次审计时仅见预存的未跟踪 `_worktrees/`，未读取或更改其中内容。
+- 构建使用的 TuyaOpen SDK pin 为 `cdc064e78daeeae598157470244e351cd37cbbed`。**当前 `D:\tuya_proj\TuyaOpen` checkout 已不是该干净 pin**：工作区 dirty，HEAD 为 `752b14bb7dbcba703ee5bcb36b31c32b4fcbcb05`。本次只读使用其 Git object database 中的锁定 `cdc064e` commit（对象存在），未切换、修改、清理或拉取该外部仓库，也未以 dirty HEAD 作为锁定源码证据。
 - TClaw 应用源码 pin 为 `88bd37378f1d106fcc1175e61b368222cc8fabda`，由 `firmware/third_party/tclaw/PROVENANCE.md` 记录。该 TClaw 上游仓库的 `TuyaOpen` 子模块 gitlink 是 `e82840dc9b629cb77fa922fb04e3f820dc2e78b4`；子模块内容未 vendored。**运行构建依赖以 dependency lock 中的 TuyaOpen SDK pin 为准**，gitlink 只说明 TClaw 上游来源时使用的 SDK 版本。
 - 本文行号对应上列 SDK checkout 与仓库当前源码；后续 pin 改变时，必须重新核对行为和行号。
 
@@ -19,11 +19,18 @@
 1. `firmware/third_party/tclaw/src/tclaw_chat.c:239-248` 以 `AI_CHAT_MODE_WAKEUP` 为默认模式调用 `ai_chat_init()`，并传播其初始化错误。
 2. SDK `src/ai_components/ai_main/src/ai_chat_main.c:404-415` 中，`ai_chat_init()` **先**订阅 `EVENT_MQTT_CONNECTED` 的 `__ai_mqtt_connected_evt`，再调用 `ai_audio_input_init()`。若之后的 audio input 初始化失败，函数错误返回；该路径没有对已成功注册的 MQTT listener 做撤销。
 3. SDK `src/ai_components/ai_audio/src/ai_audio_input.c:357-389` 中，`ai_audio_input_init()` 依次查找音频设备、读取设备信息、创建 recorder、打开音频设备、按配置初始化 VAD（如启用）并启动输入；任何 `TUYA_CALL_ERR_RETURN` 失败都会中止并返回错误。返回成功是这些同步调用成功的证据，不是麦克风信号质量或后续模型长期运行的证明。
-4. 由于 listener 在 audio init 之前注册，若 MQTT 后续连接且事件总线保留该订阅，`__ai_mqtt_connected_evt()` 仍可能执行。SDK `ai_chat_main.c:317-331` 显示该回调调用 `ai_agent_init()`，然后**忽略** `ai_mode_init(mode)` 的返回值，并将 `sg_ai_agent_inited` 置为 `true`。
+4. 由于 listener 在 audio init 之前注册，若 MQTT 后续连接且事件总线保留该订阅，`__ai_mqtt_connected_evt()` 仍可能执行。固定 SDK `ai_chat_main.c:317-329` 显示该回调调用 `ai_agent_init()` 并检查其错误，但**忽略** `ai_mode_init(mode)` 的返回值，随后无条件将 `sg_ai_agent_inited` 置为 `true`。`ai_manage_mode.c:94-110` 的 `ai_mode_init()` 会传播 mode handler `init()` 错误，因此该错误在 MQTT event callback 这一层丢失。
 5. 该回调中的 `ai_agent_init()` 实现在 `src/ai_components/ai_agent/src/ai_agent.c:202-237`，进一步调用 `tuya_ai_agent_init()`，再到 `src/tuya_ai_service/svc_ai_agent/src/tuya_ai_input.c:567-591` 的 `tuya_ai_input_init()`；这段代码分配输入缓冲区、创建互斥量并启动 AI 输入线程。它不打开前述本地捕获设备，也不证明 AFE 或 KWS/WakeNet 已 ready。因此 AI agent 初始化成功不能覆盖先前 audio input 失败，也不能证明唤醒模式已成功初始化。
 6. 语音编排层 `firmware/main/src/tclaw_runtime_adapter.c:666-680` 记录 `tclaw_chat_init()` 错误；但 `firmware/main/src/app_main.c:441-459` 对 `desk_tclaw_runtime_init()` 失败只输出 WARN，随后仍调用 `tuya_iot_start()`，使 provisioning/MQTT 可以继续运行。这样做有利于保留配置通道，但必须避免把“系统/MQTT/agent 可用”上报成“语音输入已就绪”。
+7. 固定 SDK `tools/porting/adapter/kws/tkl_kws.h:21-43` 定义唤醒词 enum（含 `TKL_KWS_WAKEUP_NIHAO_XIAOZHI`）和 `tkl_kws_init/reg_wakeup_cb/enable/disable/deinit` 操作，但没有读取实际模型名/ID、KWS ready 状态或运行失败的查询 API。`ai_chat_init()` 在 `ai_chat_main.c:421` 检查 `tkl_kws_init()` 返回值；但 `ai_mode_wakeup.c:167-170` 忽略 `ai_audio_input_wakeup_mode_set()`、`tkl_kws_reg_wakeup_cb()` 和 `tkl_kws_enable()` 的返回值，调用者无法从 `ai_mode_init()` 得知这几项失败。对固定 commit 中 KWS adapter 与 AI main/mode 路径的符号检索未发现等价的 model/status getter。
 
 上述事实是对固定源码的 **L1 源码推导**。事件订阅在失败路径上的实际保留、回调的真实调度、音频硬件行为以及 WakeNet/AFE 实际状态仍需 L2/L3 验证。
+
+### A0 复核补记（2026-10-22，锁定对象只读审计）
+
+本次使用 `git show cdc064e:<path>` 与 `git grep <symbol> cdc064e -- <path>` 审计锁定对象，确认完整 commit SHA 为 `cdc064e78daeeae598157470244e351cd37cbbed`；具体源码发现见上列第 4、7 项。dirty checkout 状态与 locked commit 的差异已明确分开记录，没有用当前 HEAD 推导上游行为。
+
+**A0 结论：当前不需要新增独立 CR。** 返回值传播、ready 状态和模型身份均属于本 CR 的语音 readiness 范围。TuyaOpen AI mode/main owner 应在 `ai_mode_wakeup.c` 检查并传播 VAD mode、KWS callback registration 与 enable 错误，并在 MQTT callback 仅于 `ai_mode_init()` 成功后设置 agent/mode-ready 标志；TuyaOpen KWS adapter/平台实现 owner 应提供受支持的 ready/model identity 查询（至少实际模型名或 ID、loaded/enabled 状态和失败码），运行期故障撤销 ready 则需状态变化/错误通知。A1 只消费公开接口，不得以私有 backend、回调注册成功或 PCM 曾产出推定模型已加载。若上游确认无法扩展该 API，再由 A0 拆分新的窄接口 CR 并裁决依赖 pin；本次不修改 vendor/生产代码。该结论不证明目标板 WakeNet/AFE 当前 ready。
 
 ## 2. 风险与复现条件
 
