@@ -13,9 +13,48 @@ HARDWARE_C = ROOT / "firmware/components/desk_hardware/src/desk_hardware.c"
 CAMERA_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera.h"
 CAMERA_BUS_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera_bus.h"
 TCLAW_BRIDGE_C = ROOT / "firmware/components/desk_tclaw/src/desk_tclaw_bridge.c"
+CLI_C = ROOT / "firmware/components/desk_cli/src/desk_cli.c"
 
 
 class TestWatcherCameraErrorContract(unittest.TestCase):
+    def test_first_sync_readiness_deadline_has_camera_specific_error(self):
+        header = CAMERA_H.read_text(encoding="utf-8")
+        camera = CAMERA_C.read_text(encoding="utf-8")
+        tclaw = TCLAW_BRIDGE_C.read_text(encoding="utf-8")
+        cli = CLI_C.read_text(encoding="utf-8")
+
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT = -28", header)
+        capture = camera.split("int desk_watcher_camera_capture(", 1)[1]
+        initial_sync_wait = capture.split("/* SYNC is a FIFO readiness hint", 1)[0]
+        self.assertIn("SYNC timeout after capture deadline", initial_sync_wait)
+        self.assertIn(
+            "return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT);",
+            initial_sync_wait,
+        )
+        self.assertNotIn("return camera_capture_release(DESK_HW_ERR_TIMEOUT);", initial_sync_wait)
+
+        # Other deadline and transport cases retain their existing meanings.
+        acquire = camera.split("static int camera_capture_acquire_bus(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("DESK_HW_ERR_TIMEOUT", acquire)
+        retry_sync = capture.split("int retry_sync_rc = camera_sync_is_active(&active);", 1)[1]
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_SYNC_IO", retry_sync.split("if (active)", 1)[0])
+        empty_deadline = capture.split("if (!header_received)", 1)[1].split("int ptl_rc", 1)[0]
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_EMPTY", empty_deadline)
+
+        tclaw_names = tclaw.split("static const char *desk_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'case DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT: return "SYNC stayed low until deadline";',
+            tclaw_names,
+        )
+        retryable = tclaw.split("static bool desk_camera_capture_error_retryable(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("rc == DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT", retryable)
+
+        cli_names = cli.split("static const char *cli_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'case DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT: return "SYNC-low timeout";',
+            cli_names,
+        )
+
     def test_bus_acquire_uses_remaining_capture_deadline_ticks(self):
         source_text = CAMERA_C.read_text(encoding="utf-8")
         bus_header = CAMERA_BUS_H.read_text(encoding="utf-8")

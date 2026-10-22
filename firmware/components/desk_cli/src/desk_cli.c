@@ -60,6 +60,7 @@ static const char *cli_camera_capture_error_name(int rc)
     case DESK_WATCHER_CAMERA_ERR_PROTOCOL: return "protocol";
     case DESK_WATCHER_CAMERA_ERR_CRC: return "CRC";
     case DESK_WATCHER_CAMERA_ERR_SYNC_IO: return "SYNC I/O";
+    case DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT: return "SYNC-low timeout";
     case DESK_WATCHER_CAMERA_ERR_NOT_READY: return "not-ready";
     case DESK_WATCHER_CAMERA_ERR_SPI: return "SPI";
     case DESK_WATCHER_CAMERA_ERR_EMPTY: return "empty FIFO";

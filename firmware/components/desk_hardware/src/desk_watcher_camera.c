@@ -585,7 +585,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
 
     if (!sync_ready) {
         ESP_LOGE(TAG, "SYNC timeout after capture deadline %u ms: ready signal stayed low", (unsigned)timeout_ms);
-        return camera_capture_release(DESK_HW_ERR_TIMEOUT);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT);
     }
 
     /* SYNC is a FIFO readiness hint: upstream waits 2 ms after its rising

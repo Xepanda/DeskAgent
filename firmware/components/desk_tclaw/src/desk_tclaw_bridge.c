@@ -94,6 +94,7 @@ static const char *desk_camera_capture_error_name(int rc)
     case DESK_WATCHER_CAMERA_ERR_PROTOCOL: return "PTL/media protocol validation failed";
     case DESK_WATCHER_CAMERA_ERR_CRC: return "media payload CRC mismatch";
     case DESK_WATCHER_CAMERA_ERR_SYNC_IO: return "camera SYNC input read failed";
+    case DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT: return "SYNC stayed low until deadline";
     case DESK_WATCHER_CAMERA_ERR_NOT_READY: return "camera driver not ready";
     case DESK_WATCHER_CAMERA_ERR_SPI: return "SPI transport failed";
     case DESK_WATCHER_CAMERA_ERR_EMPTY: return "camera FIFO remained empty until deadline";
@@ -107,6 +108,7 @@ static bool desk_camera_capture_error_retryable(int rc)
 {
     return rc == DESK_HW_ERR_TIMEOUT || rc == DESK_HW_ERR_BUSY ||
            rc == DESK_WATCHER_CAMERA_ERR_SYNC_IO ||
+           rc == DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT ||
            rc == DESK_WATCHER_CAMERA_ERR_SPI ||
            rc == DESK_WATCHER_CAMERA_ERR_EMPTY;
 }
