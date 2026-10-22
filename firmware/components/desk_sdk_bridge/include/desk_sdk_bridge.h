@@ -44,6 +44,18 @@ typedef enum {
     DESK_SDK_REQ_STATE_TIMED_OUT
 } desk_sdk_req_state_t;
 
+/** Signed one-detent direction for SDK roller input events. */
+typedef enum {
+    DESK_SDK_ROLLER_DELTA_NEGATIVE = -1,
+    DESK_SDK_ROLLER_DELTA_POSITIVE = 1
+} desk_sdk_roller_delta_t;
+
+#define DESK_SDK_ROLLER_OK                    0
+#define DESK_SDK_ROLLER_ERR_INVALID          (-1)
+#define DESK_SDK_ROLLER_ERR_BUFFER           (-2)
+#define DESK_SDK_ROLLER_ERR_NOT_CONNECTED    (-3)
+#define DESK_SDK_ROLLER_ERR_SEND             (-4)
+
 /**
  * @brief WSPK Binary Framing Constants
  */
@@ -311,6 +323,31 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
                                      desk_touch_action_t action,
                                      char *out_event_json,
                                      size_t max_len);
+
+/**
+ * @brief Serialize one signed SDK roller detent as the official SDK event.
+ *
+ * This emits the WebSocket message (not the legacy EventEnvelope):
+ * {"type":"evt.sdk.input","data":{"source":"roller",
+ * "action":"rotate","delta":+1|-1,"timestamp_ms":T}}.
+ * `timestamp_ms` must be a nonnegative monotonic millisecond value.
+ * @return DESK_SDK_ROLLER_OK, ERR_INVALID for invalid direction/time, or
+ *         ERR_BUFFER when the output buffer is too small.
+ */
+int desk_sdk_bridge_format_roller_input(desk_sdk_roller_delta_t delta,
+                                        int64_t timestamp_ms,
+                                        char *out_json,
+                                        size_t max_len);
+
+/**
+ * @brief Queue one roller event on the active SDK WebSocket after Hello ACK.
+ *
+ * This is best effort: it does not wait for Runtime consumption. A missing
+ * Runtime WebSocket returns ERR_NOT_CONNECTED; a full/busy/failed writer queue
+ * returns ERR_SEND. It never falls back to the legacy TCP/control event path.
+ */
+int desk_sdk_bridge_send_roller_input(desk_sdk_roller_delta_t delta,
+                                      int64_t timestamp_ms);
 
 /**
  * @brief Forward external tool request from TClaw to Python Application.

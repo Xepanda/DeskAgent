@@ -209,6 +209,16 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             ctypes.c_size_t,
         ]
 
+        cls.lib.desk_sdk_bridge_format_roller_input.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_format_roller_input.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int64,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        cls.lib.desk_sdk_bridge_send_roller_input.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_send_roller_input.argtypes = [ctypes.c_int, ctypes.c_int64]
+
         cls.lib.desk_wspk_pack_header.restype = ctypes.c_int
         cls.lib.desk_wspk_pack_header.argtypes = [
             ctypes.c_uint8,
@@ -1035,6 +1045,65 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         jsonschema.validate(instance=event_dict, schema=envelope_schema)
         touch_payload_schema = domain_schema["definitions"]["touch_event_payload"]
         jsonschema.validate(instance=payload, schema=touch_payload_schema)
+
+    def test_sdk_roller_input_serialization_and_validation(self) -> None:
+        """SDK input uses its own event shape and accepts only signed detents."""
+        out_buf = ctypes.create_string_buffer(256)
+        for direction, delta in ((1, 1), (-1, -1)):
+            rc = self.lib.desk_sdk_bridge_format_roller_input(direction, 123456, out_buf, len(out_buf))
+            self.assertEqual(rc, 0)
+            message = json.loads(out_buf.value.decode("utf-8"))
+            self.assertEqual(message, {
+                "type": "evt.sdk.input",
+                "data": {
+                    "source": "roller",
+                    "action": "rotate",
+                    "delta": delta,
+                    "timestamp_ms": 123456,
+                },
+            })
+
+        self.assertLess(self.lib.desk_sdk_bridge_format_roller_input(0, 1, out_buf, len(out_buf)), 0)
+        self.assertLess(self.lib.desk_sdk_bridge_format_roller_input(2, 1, out_buf, len(out_buf)), 0)
+        self.assertLess(self.lib.desk_sdk_bridge_format_roller_input(1, -1, out_buf, len(out_buf)), 0)
+        self.assertLess(self.lib.desk_sdk_bridge_format_roller_input(1, 1, out_buf, 1), 0)
+
+    def test_sdk_roller_input_requires_runtime_websocket(self) -> None:
+        """A disconnected Runtime is observable as an error, never silent success."""
+        self.assertNotEqual(self.lib.desk_sdk_bridge_send_roller_input(1, 123456), 0)
+
+    def test_sdk_roller_input_matches_pinned_parser(self) -> None:
+        """Both serialized detent directions are accepted by pinned SDK v0.1.11."""
+        repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        sdk_src = os.path.join(repo_root, ".target_logging", "sdk-acceptance", "vendor",
+                               "WatcheRobot_python_sdk", "src")
+        if not os.path.isdir(sdk_src):
+            self.skipTest("Pinned WatcheRobot SDK source is unavailable")
+        sys.path.insert(0, sdk_src)
+        try:
+            from watcherobot.inputs import parse_input_event
+        finally:
+            sys.path.remove(sdk_src)
+
+        out_buf = ctypes.create_string_buffer(256)
+        for direction, expected_delta in ((1, 1), (-1, -1)):
+            self.assertEqual(self.lib.desk_sdk_bridge_format_roller_input(
+                direction, 123456, out_buf, len(out_buf)), 0)
+            event = json.loads(out_buf.value.decode("utf-8"))
+            parsed = parse_input_event(event["data"])
+            self.assertIsNotNone(parsed)
+            self.assertEqual(type(parsed).__name__, "RollerEvent")
+            self.assertEqual(parsed.delta, expected_delta)
+            self.assertEqual(parsed.timestamp_ms, 123456)
+
+        for bad_data in (
+            {"source": "roller", "action": "rotate", "delta": 0, "timestamp_ms": 1},
+            {"source": "roller", "action": "rotate", "delta": True, "timestamp_ms": 1},
+            {"source": "roller", "action": "rotate", "delta": "1", "timestamp_ms": 1},
+            {"source": "roller", "action": "rotate", "delta": 1, "timestamp_ms": -1},
+            {"source": "screen_touch", "action": "tap", "delta": 1, "timestamp_ms": 1},
+        ):
+            self.assertIsNone(parse_input_event(bad_data))
 
     def test_wspk_native_c_pack_and_unpack(self) -> None:
         """Verifies native C WSPK header serialization and deserialization."""

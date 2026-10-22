@@ -2573,6 +2573,43 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
     return 0;
 }
 
+int desk_sdk_bridge_format_roller_input(desk_sdk_roller_delta_t delta,
+                                        int64_t timestamp_ms,
+                                        char *out_json,
+                                        size_t max_len)
+{
+    if ((delta != DESK_SDK_ROLLER_DELTA_POSITIVE &&
+         delta != DESK_SDK_ROLLER_DELTA_NEGATIVE) ||
+        timestamp_ms < 0 || !out_json || max_len == 0) {
+        return DESK_SDK_ROLLER_ERR_INVALID;
+    }
+
+    int written = snprintf(out_json, max_len,
+        "{\"type\":\"evt.sdk.input\",\"data\":{"
+        "\"source\":\"roller\",\"action\":\"rotate\","
+        "\"delta\":%d,\"timestamp_ms\":%lld}}",
+        (int)delta, (long long)timestamp_ms);
+    if (written < 0 || (size_t)written >= max_len) {
+        out_json[0] = '\0';
+        return DESK_SDK_ROLLER_ERR_BUFFER;
+    }
+    return DESK_SDK_ROLLER_OK;
+}
+
+int desk_sdk_bridge_send_roller_input(desk_sdk_roller_delta_t delta,
+                                      int64_t timestamp_ms)
+{
+    char event_json[160];
+    int rc = desk_sdk_bridge_format_roller_input(delta, timestamp_ms,
+                                                  event_json, sizeof(event_json));
+    if (rc != DESK_SDK_ROLLER_OK) return rc;
+    if (!desk_sdk_ws_client_is_connected())
+        return DESK_SDK_ROLLER_ERR_NOT_CONNECTED;
+    return desk_sdk_ws_client_send_text(event_json) == 0
+        ? DESK_SDK_ROLLER_OK
+        : DESK_SDK_ROLLER_ERR_SEND;
+}
+
 int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
 {
     if (!request_envelope_json) return -1;
