@@ -192,6 +192,7 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
@@ -445,8 +446,10 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
         self.assertEqual(ack_hello.get("type"), "sys.ack")
         self.assertEqual(ack_hello.get("code"), 0)
         caps = ack_hello.get("data", {}).get("capabilities", [])
-        for cap in ["inputs", "motion", "camera", "audio.stream", "expression.audio_follow.v1"]:
+        for cap in ["inputs", "motion", "camera", "expression.audio_follow.v1", "mcp_tools"]:
             self.assertIn(cap, caps)
+        self.assertNotIn("audio.stream", caps)
+        self.assertNotIn("audio_stream", caps)
 
         # Step 9: Concurrently feed Tuya cloud dialogue audio & transition to speaking
         evt_stream = TuyaDialogueEvent()
