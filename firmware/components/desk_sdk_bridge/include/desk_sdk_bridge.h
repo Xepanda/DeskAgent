@@ -26,7 +26,6 @@ extern "C" {
 /**
  * @brief Capabilities declared by Desk Agent firmware to the Python SDK.
  */
-#define DESK_SDK_CAP_INPUTS        "inputs"
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"

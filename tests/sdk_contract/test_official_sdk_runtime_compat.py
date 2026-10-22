@@ -1274,7 +1274,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         })
         self.assertEqual(resp["type"], "sys.ack")
         caps = resp["data"]["capabilities"]
-        self.assertIn("inputs", caps)
+        self.assertNotIn("inputs", caps)
         self.assertIn("motion", caps)
         self.assertIn("camera", caps)
         self.assertNotIn("audio.stream", caps)

@@ -1520,8 +1520,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                 DESK_SDK_CAP_INPUTS,
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
                  DESK_SDK_CAP_EXPRESSION,
@@ -1538,9 +1537,8 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  rid,
-                 DESK_SDK_CAP_INPUTS,
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
                  DESK_SDK_CAP_EXPRESSION,

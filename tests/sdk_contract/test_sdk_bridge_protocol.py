@@ -506,11 +506,19 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         data = resp.get("data", {})
         self.assertEqual(data.get("role"), "device")
         caps = data.get("capabilities", [])
-        expected_caps = ["inputs", "motion", "camera", "expression.audio_follow.v1", "mcp_tools"]
-        for cap in expected_caps:
-            self.assertIn(cap, caps, f"Missing expected capability: {cap}")
+        expected_caps = ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools"]
+        self.assertEqual(caps, expected_caps)
+        self.assertNotIn("inputs", caps)
         self.assertNotIn("audio.stream", caps)
         self.assertNotIn("audio_stream", caps)
+
+    def test_ready_get_matches_capability_contract_without_inputs(self) -> None:
+        """Both SDK capability responses omit inputs and retain every other advertised domain."""
+        hello = self._process_cmd({"type": "sys.client.hello", "data": {"role": "desktop"}})
+        ready = self._process_cmd({"type": "sys.sdk.ready.get"})
+        expected_caps = ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools"]
+        self.assertEqual(hello.get("data", {}).get("capabilities"), expected_caps)
+        self.assertEqual(ready.get("data", {}).get("capabilities"), expected_caps)
 
     def test_motion_move_with_custom_angles(self) -> None:
         """Verifies motion command parses JSON arguments and sets hardware angles."""
