@@ -879,13 +879,14 @@ int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len)
     /* Check for ACK */
     if (flags == MCU_FRAME_FLAG_ACK_RESP && payload_len == 4 &&
         (msg_id == MCU_MOTION_MSG_ACK || msg_id == s_pending_msg_id)) {
-        s_mcu_ack_count++;
-        int16_t pan_x10 = (int16_t)(data[12] | ((uint16_t)data[13] << 8));
-        int16_t tilt_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
-        if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
-            s_current_pan = pan_x10 / 10.0f;
-            s_current_tilt = tilt_x10 / 10.0f;
+        uint16_t pan_x10 = (uint16_t)(data[12] | ((uint16_t)data[13] << 8));
+        uint16_t tilt_x10 = (uint16_t)(data[14] | ((uint16_t)data[15] << 8));
+        if (pan_x10 > 1800U || tilt_x10 < 1000U || tilt_x10 > 1400U) {
+            return DESK_HW_ERR_IO;
         }
+        s_mcu_ack_count++;
+        s_current_pan = pan_x10 / 10.0f;
+        s_current_tilt = tilt_x10 / 10.0f;
         s_pending_state = MCU_TX_ACKED;
         return DESK_HW_OK;
     }

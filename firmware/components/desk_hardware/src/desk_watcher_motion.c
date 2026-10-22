@@ -291,6 +291,11 @@ int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
      * acknowledged MOVE/STOP ID. Require command correlation and exact flags. */
     if (flags == MCU_FRAME_FLAG_ACK_RESP && payload_len == 4 &&
         (msg_id == MCU_MOTION_MSG_ACK || msg_id == expected_msg_id)) {
+        uint16_t pan_x10 = (uint16_t)frame[12] | ((uint16_t)frame[13] << 8);
+        uint16_t tilt_x10 = (uint16_t)frame[14] | ((uint16_t)frame[15] << 8);
+        if (pan_x10 > 1800U || tilt_x10 < 1000U || tilt_x10 > 1400U) {
+            return DESK_HW_ERR_IO;
+        }
         return DESK_HW_OK;
     }
     /* Valid command echoes and unrelated messages do not satisfy the request. */

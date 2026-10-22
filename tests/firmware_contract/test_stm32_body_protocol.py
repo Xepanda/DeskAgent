@@ -169,6 +169,15 @@ class TestSTM32BodyProtocol(unittest.TestCase):
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_uint8),
         ]
+        cls.lib.desk_watcher_motion_parse_ack.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_parse_ack.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_uint8,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.POINTER(ctypes.c_bool),
+        ]
 
         cls.lib.desk_hardware_motion_get_position.restype = ctypes.c_int
         cls.lib.desk_hardware_motion_get_position.argtypes = [
@@ -690,6 +699,9 @@ class TestSTM32BodyProtocol(unittest.TestCase):
             wrong_payload[10:12] = struct.pack("<H", 5)
             wrong_payload = wrong_payload[:16] + b"\x00" + wrong_payload[16:]
             send(wrong_payload)
+            invalid_angles = bytearray(valid)
+            invalid_angles[12:16] = struct.pack("<hh", 1801, 1200)
+            send(invalid_angles)
             trailing = bytearray(valid + b"\x00")
             outcomes.append(self.lib.desk_hardware_mcu_receive_bytes(
                 (ctypes.c_uint8 * len(trailing))(*trailing), len(trailing)
@@ -710,10 +722,71 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         self.lib.desk_hardware_set_mcu_max_retries(0)
         self.assertEqual(self.lib.desk_hardware_motion_move_to(90.0, 120.0, 300), DESK_HW_OK)
         self.assertEqual(outcomes, [DESK_HW_ERR_BUSY, DESK_HW_ERR_IO, DESK_HW_ERR_IO,
-                                    DESK_HW_ERR_IO, -3, DESK_HW_ERR_IO, DESK_HW_OK])
+                                    DESK_HW_ERR_IO, DESK_HW_ERR_IO, -3,
+                                    DESK_HW_ERR_IO, DESK_HW_OK])
         self.assertEqual(self.lib.desk_hardware_get_mcu_nack_count(), 0)
         self.lib.desk_hardware_set_mcu_max_retries(MCU_MAX_RETRIES)
         self.lib.desk_hardware_set_mcu_timeout_ms(MCU_ACK_TIMEOUT_MS)
+
+    def test_06d_watcher_ack_parser_rejects_out_of_range_angle_echo(self) -> None:
+        frame = (ctypes.c_uint8 * 64)()
+        frame_len = ctypes.c_size_t()
+        self.assertEqual(
+            self.lib.desk_hardware_format_stm32_ack_packet(
+                123, 900, 1200, frame, len(frame), ctypes.byref(frame_len)
+            ),
+            DESK_HW_OK,
+        )
+        valid = bytearray(frame[:frame_len.value])
+
+        def parse(raw: bytearray) -> int:
+            crc_end = 12 + (raw[10] | (raw[11] << 8))
+            raw[crc_end:crc_end + 2] = struct.pack(
+                "<H", python_crc16_ccitt(bytes(raw[:crc_end]))
+            )
+            c_frame = (ctypes.c_uint8 * len(raw))(*raw)
+            nack_code = ctypes.c_uint8()
+            is_nack = ctypes.c_bool()
+            return self.lib.desk_watcher_motion_parse_ack(
+                c_frame, len(raw), 123, MCU_MOTION_MSG_SERVO_MOVE,
+                ctypes.byref(nack_code), ctypes.byref(is_nack),
+            )
+
+        self.assertEqual(parse(bytearray(valid)), DESK_HW_OK)
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(
+                frame, frame_len.value, 43, MCU_MOTION_MSG_SERVO_MOVE,
+                ctypes.byref(ctypes.c_uint8()), ctypes.byref(ctypes.c_bool()),
+            ),
+            DESK_HW_ERR_BUSY,
+        )
+        bad_pan = bytearray(valid)
+        bad_pan[12:16] = struct.pack("<hh", 1801, 1200)
+        self.assertEqual(parse(bad_pan), DESK_HW_ERR_IO)
+        bad_tilt = bytearray(valid)
+        bad_tilt[12:16] = struct.pack("<hh", 900, 1401)
+        self.assertEqual(parse(bad_tilt), DESK_HW_ERR_IO)
+
+        nack_frame = (ctypes.c_uint8 * 64)()
+        nack_len = ctypes.c_size_t()
+        self.assertEqual(
+            self.lib.desk_hardware_format_stm32_nack_packet(
+                123, MCU_NACK_ERR_BUSY, 0x10, nack_frame, len(nack_frame),
+                ctypes.byref(nack_len),
+            ),
+            DESK_HW_OK,
+        )
+        nack_code = ctypes.c_uint8()
+        is_nack = ctypes.c_bool()
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(
+                nack_frame, nack_len.value, 123, MCU_MOTION_MSG_SERVO_MOVE,
+                ctypes.byref(nack_code), ctypes.byref(is_nack),
+            ),
+            DESK_HW_ERR_IO,
+        )
+        self.assertTrue(is_nack.value)
+        self.assertEqual(nack_code.value, MCU_NACK_ERR_BUSY)
 
     def test_06c_motion_rejects_non_finite_angles(self) -> None:
         for pan, tilt in ((float("nan"), 120.0), (90.0, float("nan")),
