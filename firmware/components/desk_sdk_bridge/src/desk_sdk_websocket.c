@@ -68,9 +68,13 @@ static bool s_ws_ready = false;
 /* A successful HardwareHello ACK observed on this socket, not cryptographic
  * peer authentication (the current transport is plaintext WebSocket). */
 static bool s_ws_authenticated = false;
+/* Exactly one first HardwareHello may be pending on a socket generation. */
+static bool s_ws_hello_pending = false;
+static uint32_t s_ws_hello_pending_generation = 0;
 /* Serializes only the ACK latch and its generation. It is never held while
  * taking the pairing mutex or doing network I/O. */
 static pthread_mutex_t s_ws_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_ws_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_ws_generation = 0;
 static desk_sdk_ws_state_t s_ws_state = DESK_SDK_WS_OFFLINE;
 #ifndef ESP_PLATFORM
@@ -380,6 +384,8 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     ++s_ws_generation;
     s_ws_ready = false;
     s_ws_authenticated = false;
+    s_ws_hello_pending = false;
+    s_ws_hello_pending_generation = 0;
     int fd = s_ws_fd;
     s_ws_fd = -1;
     if (fd >= 0) {
@@ -422,14 +428,200 @@ static int ws_socket_fd_for_generation(uint32_t generation)
     return fd;
 }
 
+typedef struct { const char *p; unsigned depth; } ws_json_parser_t;
+typedef struct { const char *start; const char *end; } ws_json_span_t;
+
+static void ws_json_ws(ws_json_parser_t *p)
+{
+    while (*p->p == ' ' || *p->p == '\t' || *p->p == '\r' || *p->p == '\n') ++p->p;
+}
+
+static bool ws_json_string(ws_json_parser_t *p, ws_json_span_t *span)
+{
+    if (*p->p != '"') return false;
+    const char *start = p->p++;
+    while (*p->p) {
+        unsigned char c = (unsigned char)*p->p++;
+        if (c == '"') { if (span) { span->start = start; span->end = p->p; } return true; }
+        if (c < 0x20) return false;
+        if (c == '\\') {
+            c = (unsigned char)*p->p++;
+            if (c == 'u') {
+                for (int i = 0; i < 4; ++i) {
+                    char h = *p->p++;
+                    if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) return false;
+                }
+            } else if (c != '"' && c != '\\' && c != '/' && c != 'b' && c != 'f' &&
+                       c != 'n' && c != 'r' && c != 't') return false;
+        }
+    }
+    return false;
+}
+
+static bool ws_json_key_equal(ws_json_span_t key, const char *expected)
+{
+    /* Schema keys are ASCII. Refuse escaped aliases so duplicate spellings
+     * cannot bypass this fail-closed, exact-key contract. */
+    size_t n = strlen(expected);
+    return key.end - key.start == (ptrdiff_t)(n + 2) && key.start[0] == '"' &&
+           memchr(key.start + 1, '\\', n) == NULL &&
+           memcmp(key.start + 1, expected, n) == 0;
+}
+
+static bool ws_json_value(ws_json_parser_t *p);
+
+static bool ws_json_object(ws_json_parser_t *p)
+{
+    ws_json_span_t keys[16]; size_t count = 0;
+    if (*p->p++ != '{') return false;
+    ws_json_ws(p);
+    if (*p->p == '}') { ++p->p; return true; }
+    for (;;) {
+        ws_json_span_t key;
+        if (count == sizeof(keys)/sizeof(keys[0]) || !ws_json_string(p, &key)) return false;
+        for (size_t i = 0; i < count; ++i) {
+            size_t a = (size_t)(key.end-key.start), b = (size_t)(keys[i].end-keys[i].start);
+            if (a == b && memcmp(key.start, keys[i].start, a) == 0) return false;
+        }
+        keys[count++] = key;
+        ws_json_ws(p);
+        if (*p->p++ != ':') return false;
+        if (!ws_json_value(p)) return false;
+        ws_json_ws(p);
+        if (*p->p == '}') { ++p->p; return true; }
+        if (*p->p++ != ',') return false;
+        ws_json_ws(p);
+    }
+}
+
+static bool ws_json_value(ws_json_parser_t *p)
+{
+    ws_json_ws(p);
+    if (++p->depth > 16) return false;
+    bool ok = false;
+    if (*p->p == '"') ok = ws_json_string(p, NULL);
+    else if (*p->p == '{') ok = ws_json_object(p);
+    else if (*p->p == '[') {
+        ++p->p; ws_json_ws(p);
+        if (*p->p == ']') { ++p->p; ok = true; }
+        else for (;;) {
+            if (!ws_json_value(p)) break;
+            ws_json_ws(p);
+            if (*p->p == ']') { ++p->p; ok = true; break; }
+            if (*p->p++ != ',') break;
+            ws_json_ws(p);
+        }
+    } else if (strncmp(p->p, "true", 4) == 0) { p->p += 4; ok = true; }
+    else if (strncmp(p->p, "false", 5) == 0) { p->p += 5; ok = true; }
+    else if (strncmp(p->p, "null", 4) == 0) { p->p += 4; ok = true; }
+    else {
+        const char *n = p->p;
+        if (*n == '-') ++n;
+        if (*n == '0') ++n;
+        else if (*n >= '1' && *n <= '9') { do { ++n; } while (*n >= '0' && *n <= '9'); }
+        else n = p->p;
+        if (n != p->p) {
+            if (*n == '.') { ++n; if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9'); }
+            if (n != p->p && (*n == 'e' || *n == 'E')) {
+                ++n; if (*n == '+' || *n == '-') ++n;
+                if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9');
+            }
+            if (n != p->p) { p->p = n; ok = true; }
+        }
+    }
+    --p->depth;
+    return ok;
+}
+
+static bool ws_json_span_string(ws_json_span_t span, const char *expected)
+{
+    size_t n = strlen(expected);
+    return span.end - span.start == (ptrdiff_t)(n + 2) && span.start[0] == '"' &&
+           memchr(span.start + 1, '\\', n) == NULL && memcmp(span.start + 1, expected, n) == 0;
+}
+
+static bool ws_json_span_object(ws_json_span_t span, const char *const *names,
+                                const char *const *strings, size_t count)
+{
+    ws_json_parser_t p = { .p = span.start, .depth = 0 };
+    if (*p.p++ != '{') return false;
+    bool seen[8] = {false};
+    if (count > sizeof(seen)/sizeof(seen[0])) return false;
+    ws_json_ws(&p);
+    for (;;) {
+        ws_json_span_t key, value;
+        if (!ws_json_string(&p, &key)) return false;
+        size_t field;
+        for (field = 0; field < count; ++field) if (ws_json_key_equal(key, names[field])) break;
+        if (field == count || seen[field]) return false;
+        seen[field] = true;
+        ws_json_ws(&p);
+        if (*p.p++ != ':') return false;
+        ws_json_ws(&p); value.start = p.p;
+        if (!ws_json_value(&p)) return false;
+        value.end = p.p;
+        if (strings[field] && !ws_json_span_string(value, strings[field])) return false;
+        if (count == 3 && field == 1) {
+            size_t number_len = (size_t)(value.end-value.start);
+            if (!((number_len == 1 && value.start[0] == '0') ||
+                  (number_len == 2 && value.start[0] == '-' && value.start[1] == '0'))) return false;
+        }
+        if (!strings[field] && ((count == 3 && field == 2) ||
+                                (count == 4 && field == 3) ||
+                                (count == 1 && field == 0))) {
+            if (*value.start != '{' || !ws_json_span_object(value,
+                field == 2 ? (const char *const[]){"type","role","session_state","negotiated"} :
+                field == 3 ? (const char *const[]){"audio_uplink"} :
+                             (const char *const[]){"codec","sample_rate","channels","frame_duration_ms","packetization","version"},
+                field == 2 ? (const char *const[]){"sys.client.hello","hardware","connected",NULL} :
+                field == 3 ? (const char *const[]){NULL} :
+                             (const char *const[]){"opus",NULL,NULL,NULL,"one_opus_packet_per_wspk",NULL},
+                field == 2 ? 4 : field == 3 ? 1 : 6)) return false;
+        }
+        if (count == 6 && field != 0 && field != 4) {
+            const char *expected_number = field == 1 ? "16000" : field == 2 ? "1" :
+                                          field == 3 ? "60" : "1";
+            if ((size_t)(value.end-value.start) != strlen(expected_number) ||
+                memcmp(value.start, expected_number, strlen(expected_number)) != 0) return false;
+        }
+        ws_json_ws(&p);
+        if (*p.p == '}') { ++p.p; break; }
+        if (*p.p++ != ',') return false;
+        ws_json_ws(&p);
+    }
+    ws_json_ws(&p);
+    if (p.p != span.end) return false;
+    for (size_t i = 0; i < count; ++i) if (!seen[i]) return false;
+    return true;
+}
+
+static bool ws_hardware_hello_ack_valid(const char *json)
+{
+    static const char *const fields[] = {"type", "code", "data"};
+    static const char *const values[] = {"sys.ack", NULL, NULL};
+    if (!json) return false;
+    ws_json_parser_t p = { .p = json, .depth = 0 };
+    ws_json_span_t whole = { .start = NULL, .end = NULL };
+    ws_json_ws(&p);
+    whole.start = p.p;
+    if (!ws_json_value(&p)) return false;
+    whole.end = p.p; ws_json_ws(&p);
+    if (*p.p || *whole.start != '{') return false;
+    return ws_json_span_object(whole, fields, values, 3);
+}
+
 static bool ws_commit_hardware_hello_ack(uint32_t generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
-    bool current = generation == s_ws_generation;
+    bool current = generation == s_ws_generation && s_ws_hello_pending &&
+                   s_ws_hello_pending_generation == generation && !s_ws_ready &&
+                   s_ws_state == DESK_SDK_WS_HELLO_SENT;
     if (current) {
         /* This records protocol ACK observation, not cryptographic peer auth. */
         s_ws_authenticated = true;
         s_ws_ready = true;
+        s_ws_hello_pending = false;
+        s_ws_hello_pending_generation = 0;
         s_ws_state = DESK_SDK_WS_CONNECTED;
     }
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
@@ -666,6 +858,7 @@ int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len)
 
 int desk_sdk_ws_client_connect_paired(void)
 {
+    pthread_mutex_lock(&s_ws_connect_mutex);
     char host[INET_ADDRSTRLEN], hello[512], key[32], expected[48];
     uint8_t key_raw[16];
     uint16_t port;
@@ -717,12 +910,20 @@ int desk_sdk_ws_client_connect_paired(void)
     if (tail_len) { memcpy(s_ws_rx, tail, tail_len); s_ws_rx_len = tail_len; }
     /* Before HardwareHello succeeds, the writer cannot enqueue frames and
      * the connection path is the only possible socket writer. */
-    if (ws_send_frame(0x1, (const uint8_t *)hello, strlen(hello)) != 0) goto fail;
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    if (connect_generation != s_ws_generation || s_ws_fd < 0) {
+        pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+        goto fail;
+    }
     s_ws_state = DESK_SDK_WS_HELLO_SENT;
+    s_ws_hello_pending = true;
+    s_ws_hello_pending_generation = connect_generation;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    if (ws_send_frame(0x1, (const uint8_t *)hello, strlen(hello)) != 0) goto fail;
     uint8_t opcode; size_t ack_len;
     if (ws_read_frame(3000, &opcode, s_ws_ack, sizeof(s_ws_ack)-1, &ack_len) != 0 || opcode != 0x1) goto fail;
     s_ws_ack[ack_len] = 0;
-    if (!strstr((char *)s_ws_ack, "\"type\":\"sys.ack\"") || !strstr((char *)s_ws_ack, "\"sys.client.hello\"") || !strstr((char *)s_ws_ack, "\"code\":0")) goto fail;
+    if (!ws_hardware_hello_ack_valid((const char *)s_ws_ack)) goto fail;
     if (ws_writer_start() != 0) goto fail;
     /* Commit only if no close/credential/policy/identity invalidation happened
      * while this connection was in flight. This remains protocol ACK evidence,
@@ -730,10 +931,12 @@ int desk_sdk_ws_client_connect_paired(void)
     if (!ws_commit_hardware_hello_ack(connect_generation)) goto fail;
     s_reconnect_failures = 0;
     s_ws_retry_at = 0;
+    pthread_mutex_unlock(&s_ws_connect_mutex);
     return 0;
 fail:
     ws_transport_close();
     if (s_pairing_target_valid) ws_schedule_reconnect();
+    pthread_mutex_unlock(&s_ws_connect_mutex);
     return -1;
 }
 

@@ -120,6 +120,10 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'uint32_t desk_sdk_test_ws_generation(void) { return ws_lifecycle_generation(); }\n'
                 'int desk_sdk_test_commit_hello_ack(uint32_t generation) { '
                 'return ws_commit_hardware_hello_ack(generation) ? 1 : 0; }\n'
+                'void desk_sdk_test_arm_hello_pending(uint32_t generation) { pthread_mutex_lock(&s_ws_lifecycle_mutex); '
+                's_ws_hello_pending = true; s_ws_hello_pending_generation = generation; '
+                's_ws_state = DESK_SDK_WS_HELLO_SENT; pthread_mutex_unlock(&s_ws_lifecycle_mutex); }\n'
+                'int desk_sdk_test_validate_hello_ack(const char *json) { return ws_hardware_hello_ack_valid(json) ? 1 : 0; }\n'
                 'int desk_sdk_test_preflight(void) { char host[64], hello[512]; uint16_t port = 0; '
                 'return desk_sdk_bridge_get_pairing_target(host, sizeof(host), &port) == 0 && '
                 'desk_sdk_bridge_build_hardware_hello(hello, sizeof(hello)) > 0 ? 1 : 0; }\n'
@@ -225,6 +229,10 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.lib.desk_sdk_test_ws_generation.argtypes = []
         cls.lib.desk_sdk_test_commit_hello_ack.restype = ctypes.c_int
         cls.lib.desk_sdk_test_commit_hello_ack.argtypes = [ctypes.c_uint32]
+        cls.lib.desk_sdk_test_arm_hello_pending.restype = None
+        cls.lib.desk_sdk_test_arm_hello_pending.argtypes = [ctypes.c_uint32]
+        cls.lib.desk_sdk_test_validate_hello_ack.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_validate_hello_ack.argtypes = [ctypes.c_char_p]
         cls.lib.desk_sdk_ws_client_send_text.restype = ctypes.c_int
         cls.lib.desk_sdk_ws_client_send_text.argtypes = [ctypes.c_char_p]
         cls.lib.desk_sdk_ws_client_connect_paired.restype = ctypes.c_int
@@ -377,11 +385,23 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
     def test_stale_inflight_hello_ack_cannot_restore_latch_after_invalidation(self) -> None:
         """A connection generation change rejects an ACK completion from the old attempt."""
         in_flight_generation = self.lib.desk_sdk_test_ws_generation()
+        self.lib.desk_sdk_test_arm_hello_pending(in_flight_generation)
         self.lib.desk_sdk_ws_client_close()
         self.assertEqual(
             self.lib.desk_sdk_test_commit_hello_ack(in_flight_generation), 0
         )
         self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+    def test_cr031_hello_ack_commit_requires_unique_pending_generation(self) -> None:
+        generation = self.lib.desk_sdk_test_ws_generation()
+        self.lib.desk_sdk_test_arm_hello_pending(generation)
+        self.assertEqual(self.lib.desk_sdk_test_commit_hello_ack(generation + 1), 0)
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.assertEqual(self.lib.desk_sdk_test_commit_hello_ack(generation), 1)
+        self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+        # A second response has no pending first-Hello correlation to consume.
+        self.assertEqual(self.lib.desk_sdk_test_commit_hello_ack(generation), 0)
+        self.lib.desk_sdk_ws_client_close()
 
     def test_cr009_ws_subscription_gate_duplicate_cancel_and_reconnect(self) -> None:
         def dispatch(message: dict) -> dict:
@@ -812,7 +832,12 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 hello = json.loads(await websocket.recv())
                 self.assertEqual(hello["type"], "sys.client.hello")
                 await websocket.send(json.dumps({"type": "sys.ack", "code": 0,
-                    "data": {"type": "sys.client.hello"}}, separators=(",", ":")))
+                    "data": {"type": "sys.client.hello", "role": "hardware",
+                             "session_state": "connected", "negotiated": {
+                                 "audio_uplink": {"codec": "opus", "sample_rate": 16000,
+                                     "channels": 1, "frame_duration_ms": 60,
+                                     "packetization": "one_opus_packet_per_wspk", "version": 1}}}},
+                    separators=(",", ":")))
                 await websocket.send(json.dumps({"type": "sys.log.subscribe", "code": 0,
                     "data": {"command_id": "11111111111111111111111111111111",
                              "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}},
@@ -923,6 +948,110 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
 
         asyncio.run(exercise_rejection())
+
+    def test_cr031_hardware_hello_ack_exact_json_schema(self) -> None:
+        ack = {
+            "type": "sys.ack", "code": 0,
+            "data": {
+                "type": "sys.client.hello", "role": "hardware",
+                "session_state": "connected",
+                "negotiated": {"audio_uplink": {
+                    "codec": "opus", "sample_rate": 16000, "channels": 1,
+                    "frame_duration_ms": 60,
+                    "packetization": "one_opus_packet_per_wspk", "version": 1,
+                }},
+            },
+        }
+        def accepts(raw: str) -> bool:
+            return self.lib.desk_sdk_test_validate_hello_ack(raw.encode("utf-8")) == 1
+
+        self.assertTrue(accepts(json.dumps(ack, separators=(",", ":"))))
+        self.assertTrue(accepts(json.dumps(ack, separators=(",", ":")).replace('"code":0', '"code":-0')))
+        self.assertTrue(accepts(" \r\n\t" + json.dumps(ack, separators=(",", ":"))))
+        rejected: list[str] = []
+        def reject(label: str, raw: str) -> None:
+            if accepts(raw): rejected.append(label)
+
+        for bad in ("sys.nack", "sys.client.hello", "hardware", "connected", "opus",
+                    "one_opus_packet_per_wspk"):
+            changed = json.loads(json.dumps(ack))
+            if bad in ("sys.nack", "sys.ack"):
+                changed["type"] = bad
+            elif bad == "sys.client.hello": changed["data"]["type"] = "wrong"
+            elif bad == "hardware": changed["data"]["role"] = "desktop"
+            elif bad == "connected": changed["data"]["session_state"] = "pending"
+            elif bad == "opus": changed["data"]["negotiated"]["audio_uplink"]["codec"] = "pcm"
+            else: changed["data"]["negotiated"]["audio_uplink"]["packetization"] = "other"
+            reject("wrong-value-" + bad, json.dumps(changed, separators=(",", ":")))
+        for code in (True, False, 0.0, "0", 1, None):
+            changed = json.loads(json.dumps(ack)); changed["code"] = code
+            reject("code-" + repr(code), json.dumps(changed, separators=(",", ":")))
+
+        mutations = [
+            ("top-missing", lambda x: x.pop("code")),
+            ("top-extra", lambda x: x.update(status="connected")),
+            ("data-missing", lambda x: x["data"].pop("role")),
+            ("data-extra", lambda x: x["data"].update(status="connected")),
+            ("negotiated-missing", lambda x: x["data"]["negotiated"].pop("audio_uplink")),
+            ("negotiated-extra", lambda x: x["data"]["negotiated"].update(extra=1)),
+            ("audio-missing", lambda x: x["data"]["negotiated"]["audio_uplink"].pop("version")),
+            ("audio-extra", lambda x: x["data"]["negotiated"]["audio_uplink"].update(extra=1)),
+            ("sample-rate-bool", lambda x: x["data"]["negotiated"]["audio_uplink"].update(sample_rate=True)),
+            ("channels-float", lambda x: x["data"]["negotiated"]["audio_uplink"].update(channels=1.0)),
+            ("duration-string", lambda x: x["data"]["negotiated"]["audio_uplink"].update(frame_duration_ms="60")),
+            ("version-zero", lambda x: x["data"]["negotiated"]["audio_uplink"].update(version=0)),
+            ("data-type-number", lambda x: x["data"].update(type=1)),
+            ("data-role-null", lambda x: x["data"].update(role=None)),
+            ("negotiated-null", lambda x: x["data"].update(negotiated=None)),
+            ("audio-array", lambda x: x["data"]["negotiated"].update(audio_uplink=[])),
+        ]
+        for label, mutate in mutations:
+            changed = json.loads(json.dumps(ack)); mutate(changed)
+            reject(label, json.dumps(changed, separators=(",", ":")))
+
+        duplicates = [
+            ('{"type":"sys.ack","type":"sys.ack","code":0,"data":{}}', "top"),
+            (json.dumps(ack, separators=(",", ":")).replace('"role":"hardware"', '"role":"hardware","role":"hardware"'), "data"),
+            (json.dumps(ack, separators=(",", ":")).replace('"audio_uplink":{', '"audio_uplink":{},"audio_uplink":{'), "negotiated"),
+            (json.dumps(ack, separators=(",", ":")).replace('"codec":"opus"', '"codec":"opus","codec":"opus"'), "audio"),
+        ]
+        for raw, level in duplicates: reject("duplicate-" + level, raw)
+        for raw, label in (("{", "truncated"), ('{"type":', "truncated-value"),
+                           ('{"type":"sys.ack",}', "trailing-comma"),
+                           (json.dumps(ack) + "garbage", "trailing-data"),
+                           (json.dumps(ack).replace('"code": 0', '"code": true'), "boolean-code")):
+            reject(label, raw)
+        self.assertEqual(rejected, [], f"unexpectedly accepted ACK cases: {rejected}")
+
+    def test_cr031_invalid_text_ack_closes_without_ready_latch(self) -> None:
+        async def run() -> None:
+            async def handler(websocket) -> None:
+                await websocket.recv()
+                # Looks like an ACK by substring, but is missing the pinned schema.
+                await websocket.send('{"type":"sys.ack","code":0,"data":{"type":"sys.client.hello"}}')
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                self.lib.desk_sdk_test_prepare_log_pair()
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port), 0)
+                self.assertNotEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.assertEqual(self.lib.desk_sdk_test_ws_state(), 0)
+        asyncio.run(run())
+
+    def test_cr031_nontext_first_response_closes_without_ready_latch(self) -> None:
+        async def run() -> None:
+            async def handler(websocket) -> None:
+                await websocket.recv()
+                await websocket.send(b'{"type":"sys.ack"}')
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                self.lib.desk_sdk_test_prepare_log_pair()
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port), 0)
+                self.assertNotEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        asyncio.run(run())
 
     def _exec_command(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")

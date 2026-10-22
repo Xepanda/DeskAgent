@@ -28,8 +28,10 @@ class WebSocketClientSourceContract(unittest.TestCase):
         self.assertIn('"Sec-WebSocket-Accept:"', self.ws)
         self.assertIn("desk_sdk_bridge_build_hardware_hello", self.ws)
         self.assertRegex(self.ws, r"ws_send_frame\(0x1,\s*\(const uint8_t \*\)hello")
-        self.assertIn('"\\\"type\\\":\\\"sys.ack\\\""', self.ws)
+        self.assertIn("ws_hardware_hello_ack_valid((const char *)s_ws_ack)", self.ws)
+        self.assertIn("s_ws_hello_pending_generation = connect_generation", self.ws)
         self.assertIn("s_ws_ready = true", self.ws)
+        self.assertNotIn('strstr((char *)s_ws_ack', self.ws)
 
     def test_client_frames_are_masked_and_server_frames_must_not_be(self) -> None:
         self.assertIn("0x80 | len", self.ws)
