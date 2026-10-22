@@ -252,7 +252,7 @@ class TestLifeService(unittest.TestCase):
         self.service = LifeService(self.db_path)
         self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "pending")
 
-    def test_snooze_occurrence_cancels_alert_and_creates_unique_occurrence_ids(self) -> None:
+    def test_snooze_occurrence_is_idempotent_across_retry_and_restart(self) -> None:
         occurrence_id = self._create_pending_reminder_alert("rem-snooze-outbox")
         fixed_now = datetime(2026, 10, 22, 1, 2, 3, tzinfo=timezone.utc)
 
@@ -270,7 +270,16 @@ class TestLifeService(unittest.TestCase):
             )
 
         self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
-        self.assertNotEqual(first["occurrence_id"], second["occurrence_id"])
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.service.get_all_occurrences("rem-snooze-outbox")), 2)
+
+        self.service.close()
+        self.service = LifeService(self.db_path)
+        after_restart = self.service.snooze_reminder(
+            "rem-snooze-outbox", snooze_minutes=10, occurrence_id=occurrence_id
+        )
+        self.assertEqual(after_restart, first)
+        self.assertEqual(len(self.service.get_all_occurrences("rem-snooze-outbox")), 2)
 
     def test_snooze_rejects_non_positive_duration_without_mutating_reminder(self) -> None:
         self.service.create_reminder(
@@ -395,6 +404,50 @@ class TestLifeService(unittest.TestCase):
         pending_outbox = new_instance.get_pending_outbox()
         self.assertEqual(len(pending_outbox), 1)
         new_instance.close()
+
+    def test_snooze_idempotency_migration_preserves_legacy_database(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy_life.db"
+        conn = sqlite3.connect(legacy_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE reminders (
+                    reminder_id TEXT PRIMARY KEY, title TEXT NOT NULL, due_at TEXT NOT NULL,
+                    timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai', repeat_rule TEXT,
+                    priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'scheduled',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE occurrences (
+                    occurrence_id TEXT PRIMARY KEY, reminder_id TEXT NOT NULL,
+                    scheduled_at TEXT NOT NULL, delivered_at TEXT,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    FOREIGN KEY (reminder_id) REFERENCES reminders(reminder_id) ON DELETE CASCADE
+                );
+                INSERT INTO reminders VALUES (
+                    'legacy-reminder', 'Legacy', '2026-10-15T08:00:00Z', 'UTC', NULL,
+                    'normal', 'ringing', '2026-10-15T08:00:00Z', '2026-10-15T08:00:00Z'
+                );
+                INSERT INTO occurrences VALUES (
+                    'legacy-occurrence', 'legacy-reminder', '2026-10-15T08:00:00Z', NULL, 'ringing'
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        migrated = LifeService(legacy_path)
+        try:
+            result = migrated.snooze_reminder(
+                "legacy-reminder", snooze_minutes=5, occurrence_id="legacy-occurrence"
+            )
+            retry = migrated.snooze_reminder(
+                "legacy-reminder", snooze_minutes=5, occurrence_id="legacy-occurrence"
+            )
+            self.assertEqual(retry, result)
+            self.assertEqual(len(migrated.get_all_occurrences("legacy-reminder")), 2)
+        finally:
+            migrated.close()
 
     # -------------------------------------------------------------------------
     # 7. Recurrence Rules & Automatic Next Occurrence

@@ -304,6 +304,7 @@ class LifeService:
                 scheduled_at TEXT NOT NULL,
                 delivered_at TEXT,
                 state TEXT NOT NULL DEFAULT 'pending',
+                snoozed_from_occurrence_id TEXT,
                 FOREIGN KEY (reminder_id) REFERENCES reminders(reminder_id) ON DELETE CASCADE
             );
 
@@ -331,6 +332,16 @@ class LifeService:
                 conn.execute("ALTER TABLE outbox ADD COLUMN next_retry_at TEXT;")
             except sqlite3.OperationalError:
                 pass
+            occurrence_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(occurrences)").fetchall()
+            }
+            if "snoozed_from_occurrence_id" not in occurrence_columns:
+                conn.execute("ALTER TABLE occurrences ADD COLUMN snoozed_from_occurrence_id TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrences_snoozed_from "
+                "ON occurrences(snoozed_from_occurrence_id) "
+                "WHERE snoozed_from_occurrence_id IS NOT NULL"
+            )
             # Recover only alerts whose occurrence is still active; confirmations
             # committed before a crash must never be replayed after restart.
             dispatching = conn.execute(
@@ -782,8 +793,33 @@ class LifeService:
         new_occ_id = f"occ-{reminder_id}-{uuid.uuid4().hex}"
 
         with self._lock, self._get_connection() as conn:
+            reminder = conn.execute(
+                "SELECT reminder_id FROM reminders WHERE reminder_id = ?", (reminder_id,)
+            ).fetchone()
+            if not reminder:
+                raise KeyError(f"Reminder '{reminder_id}' not found")
+
             # Mark current occurrence snoozed if supplied
             if occurrence_id:
+                source = conn.execute(
+                    "SELECT state FROM occurrences WHERE occurrence_id = ? AND reminder_id = ?",
+                    (occurrence_id, reminder_id),
+                ).fetchone()
+                if not source:
+                    raise KeyError(f"Occurrence '{occurrence_id}' not found for reminder '{reminder_id}'")
+                if source["state"] == "snoozed":
+                    existing = conn.execute(
+                        "SELECT occurrence_id, scheduled_at FROM occurrences "
+                        "WHERE snoozed_from_occurrence_id = ?",
+                        (occurrence_id,),
+                    ).fetchone()
+                    if existing:
+                        return {
+                            "reminder_id": reminder_id,
+                            "occurrence_id": existing["occurrence_id"],
+                            "snoozed_until": existing["scheduled_at"],
+                            "status": "snoozed",
+                        }
                 cursor = conn.execute(
                     "UPDATE occurrences SET state = 'snoozed' WHERE occurrence_id = ? AND reminder_id = ?",
                     (occurrence_id, reminder_id),
@@ -797,8 +833,10 @@ class LifeService:
 
             # Create new occurrence
             conn.execute(
-                "INSERT INTO occurrences (occurrence_id, reminder_id, scheduled_at, state) VALUES (?, ?, ?, 'pending')",
-                (new_occ_id, reminder_id, new_due),
+                "INSERT INTO occurrences "
+                "(occurrence_id, reminder_id, scheduled_at, state, snoozed_from_occurrence_id) "
+                "VALUES (?, ?, ?, 'pending', ?)",
+                (new_occ_id, reminder_id, new_due, occurrence_id),
             )
             conn.execute(
                 "UPDATE reminders SET due_at = ?, status = 'snoozed', updated_at = ? WHERE reminder_id = ?",
