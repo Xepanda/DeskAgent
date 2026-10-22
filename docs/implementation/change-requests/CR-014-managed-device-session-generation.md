@@ -157,3 +157,27 @@ A3 可在本接口实现并经 pin 后，将 CR-009 Host 授权从常量 deny �
 4. 如何在 L2 测试中注入连接替换、observer 竞态、Runtime 重启和 stale message。
 
 评审通过只批准 Runtime/SDK 接口实现，不自动打开 CR-009 Host authorization，也不构成 L3/L4 验收或部署授权。
+
+## 9. A0 源码复核补充（2026-10-23）
+
+复核锁定 WatcheRobot Python SDK `v0.1.11` / SHA `8bc13967a06ef073459be47e930ff43ef37ee8fb` 后，结论仍为：**当前 pin 没有足够的公开 managed API，可由 A3 仅包装出 CR-014 所需的 session generation 与生命周期保证。CR-014 必须由 Runtime/SDK owner 实现公共 API 并发布可锁定版本；在此之前 CR-009 Host authorization 继续 fail-closed。**
+
+源码中有可供 Runtime 实现该公共接口的内部接缝，但它们不构成可由托管 Application 安全消费的现成 API：
+
+- `runtime/daemon/connections/websocket_server.py` 持有当前 WebSocket connection，并有内部 disconnect/session-end listener；`runtime/daemon/runtime.py` 将它们接到 pairing 状态变更。断连回调仅收到 peer IP，显式 `DeviceSessionEnd` 依据 `pair_request_id` 结束 pairing 状态。它们未向 `ApplicationContext` 暴露原子 snapshot/observer，也没有把不可变来源 generation 附到每条转发给 Application 的消息。
+- `DevicePairingSession.snapshot()` 是 pairing 状态快照，不含物理连接身份或 generation。`request_id` 在断连重连期间可能沿用，不能区分一次 WebSocket connection 与下一次。
+- `daemon_instance_id` 不是 CR-014 的 `runtime_instance_id`：`DeviceBindingsStore` 将它持久化，用于 Runtime 重启后设备重新配对/恢复绑定。故不能以它标识单次 Runtime 进程生命期；也不得用这个对设备可见的配对身份替代 Host 本地生命周期代次。
+- `ApplicationContext` 只公开 `robot`、`desktop`、`rtc` 等对象。`DaemonApplicationTransport` 的 `_resource_generation` / `_snapshot_generation` 是 metadata snapshot 一致性计数，不是连接代次。`WATCHER_APP_DEVICE_STATUS_URL` 与 Desktop state event 也没有可证明的原子撤销和每消息来源代次语义。
+- `DeviceSessionEnd` 是设备发来的协议消息。它能结束当前 pairing slot，但 `pair_request_id` 不是 connection generation；在 Runtime 提供同步关联之前，不能作为 Host lease 撤销/重建的充分证据。
+
+### 9.1 最小 Runtime/SDK 交付范围
+
+本 CR 所需的最小改动仍是一个**Runtime 管理、版本化、注入到 managed Application 的公开本地 API**，而不是增加设备 wire 字段或另建 Host 连接：
+
+1. Runtime 在接受 HardwareHello 并完成当前 connection 的 pairing 校验后，为该实际 WebSocket connection 绑定新的 `(runtime_instance_id, generation)`。`runtime_instance_id` 每次进程启动更换且不持久化；`generation` 在该 instance 内单调递增、不得回绕复用。不得由 Application 按连接事件自行猜测或计数。
+2. 对同一个 Runtime 状态锁/原子执行器提供 snapshot + observer registration；回调携带不可变完整快照和有序 `event_sequence`。任何旧 connection 失效必须先从 Runtime 消息路由门控中移除，再异步通知 observer；所有 managed message 同时携带来源 `(runtime_instance_id, generation)`，或由 Runtime 提供等价、同步、不可绕过的来源验证。
+3. 生命周期顺序固定为：认证通过并绑定后发布 `CONNECTED`；WebSocket close、已接受的 `DeviceSessionEnd`、认证/pairing 上下文失效、连接被替换或 Runtime shutdown 时，先禁止该 connection 后续路由并撤销 generation，再通知 `REVOKED`；替换连接时旧 `REVOKED` 必须先于新 `CONNECTED`。`DeviceSessionEnd` 的 handler 若不关闭 socket，也仍须立即撤销其 generation，直到该连接重新认证并绑定新代次前不得继续把它视为可授权 session。
+4. pairing pending/cancel/timeout 从未形成 Host session lease；当前连接 close 后重连，即使 request/token/peer 地址相同，也必须建立新 generation。Application `close()` / Runtime stop 应幂等取消 observer 并释放 lease；observer callback 失败、漏序或其有界接收队列溢出时 Host 立即 fail-closed。未知 revoke reason 一律按撤销处理。
+5. L2 最小验收必须在 pinned Runtime 的生产消息路由上覆盖原子注册竞态、旧连接消息拒绝、相同 pairing 信息重连产生新 generation、`DeviceSessionEnd` 与 websocket close 撤销、Runtime 进程重启产生新 `runtime_instance_id`、observer close/overflow 和凭据不出现在 API 数据中。只通过 Application 自己模拟 generation 或测试一个 wrapper，不足以验收。
+
+这些要求可在 Runtime 内部复用现有 HardwareHello/pairing/disconnect/session-end 接缝，但必须由 Runtime owner 实现并公开；不能由 A3 读取 SDK 私有 transport、pairing registry 或 socket 对象来替代。公开接口和消息来源 metadata 合入 Runtime 后，Runtime owner 应提供版本/SHA 与 L2 测试；A0 再审核 pin/契约，A3 才接入 generation-bound lease。部署、实际设备网络日志接收及 L3/L4 仍需分别验收。
