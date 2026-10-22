@@ -5,8 +5,11 @@ Unit test for Host Daemon App and HTTP endpoints.
 from __future__ import annotations
 
 import tempfile
+import asyncio
 import threading
 import time
+import subprocess
+import sys
 import unittest
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -15,7 +18,13 @@ from urllib.error import HTTPError
 import json
 from types import SimpleNamespace
 
-from host.desk_agent.main import DeskAgentHostApp, make_request_handler, ThreadedHTTPServer
+from host.desk_agent.main import (
+    DeskAgentHostApp,
+    _run_managed_application,
+    _serve_host,
+    make_request_handler,
+    ThreadedHTTPServer,
+)
 from host.desk_agent.camera.camera_service import (
     CameraStreamCapacityError,
     CameraStreamFrameUnavailable,
@@ -58,6 +67,114 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(resp.status, 200)
             data = json.loads(resp.read().decode())
             self.assertEqual(data["status"], "healthy")
+
+    def test_unconfigured_auth_is_rejected_on_non_loopback_routes(self) -> None:
+        """An accidental wildcard bind must not expose RPC or legacy camera routes."""
+        handler = make_request_handler(self.app)
+        server = ThreadedHTTPServer(("0.0.0.0", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            rpc_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "unauthorized-lan-rpc",
+                "operation": "ha.get_state",
+                "arguments": {"entity_id": "light.desk"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            rpc = Request(
+                f"http://127.0.0.1:{port}/api/rpc",
+                data=json.dumps(rpc_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            for request in (
+                rpc,
+                Request(f"http://127.0.0.1:{port}/api/camera/frame?client_id=unauth"),
+                Request(f"http://127.0.0.1:{port}/api/camera/snapshot"),
+            ):
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request)
+                self.assertEqual(raised.exception.code, 401)
+                raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_host_config_check_rejects_non_loopback_without_auth_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({
+                    "server": {"host": "0.0.0.0", "port": 0},
+                    "auth_token": "",
+                    "storage": {"db_path": str(Path(temp_dir) / "life.db")},
+                }),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, "-m", "host.desk_agent.main", "--config", str(config_path), "--check-config"],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("auth_token", proc.stderr)
+
+    def test_host_config_check_allows_loopback_without_auth_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({
+                    "server": {"host": "127.0.0.1", "port": 0},
+                    "storage": {"db_path": str(Path(temp_dir) / "life.db")},
+                }),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, "-m", "host.desk_agent.main", "--config", str(config_path), "--check-config"],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"status": "valid"', proc.stdout)
+
+    def test_normal_startup_rejects_non_loopback_cli_override_without_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({"server": {"host": "127.0.0.1", "port": 0}, "auth_token": ""}),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, "-m", "host.desk_agent.main", "--config", str(config_path), "--host", "0.0.0.0"],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("auth_token", proc.stderr)
+
+    def test_serve_host_rejects_non_loopback_without_token_before_binding(self) -> None:
+        self.app.config["auth_token"] = None
+        with self.assertRaisesRegex(ValueError, "auth_token"):
+            _serve_host(self.app, "0.0.0.0", 0)
+
+    def test_managed_startup_rejects_non_loopback_without_token_before_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({"server": {"host": "0.0.0.0", "port": 0}, "auth_token": ""}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "auth_token"):
+                asyncio.run(_run_managed_application(str(config_path), "0.0.0.0", 0))
 
     def test_rpc_endpoint(self) -> None:
         req_payload = {

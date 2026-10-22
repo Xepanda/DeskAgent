@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -58,6 +60,78 @@ from companion.src.codex_companion import RemoteCodexCompanionClient
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
+
+
+def _address_is_loopback(address: Any) -> bool:
+    """Return whether a bound socket address is loopback-only."""
+    host = address[0] if isinstance(address, tuple) else address
+    try:
+        parsed = ipaddress.ip_address(str(host).split("%", 1)[0])
+        if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+            return parsed.ipv4_mapped.is_loopback
+        return parsed.is_loopback
+    except ValueError:
+        return False
+
+
+def _host_is_loopback(host: str) -> bool:
+    """Resolve a configured bind host and require every result to be loopback."""
+    if not host:
+        return False  # HTTPServer treats an empty bind host as a wildcard.
+    try:
+        parsed = ipaddress.ip_address(host.split("%", 1)[0])
+        if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+            return parsed.ipv4_mapped.is_loopback
+        return parsed.is_loopback
+    except ValueError:
+        pass
+    try:
+        results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return bool(results) and all(_address_is_loopback(result[4]) for result in results)
+
+
+def _validate_listener_auth(host: str, auth_token: Any) -> None:
+    if not _host_is_loopback(host) and (not isinstance(auth_token, str) or not auth_token.strip()):
+        raise ValueError("Non-loopback Host listener requires a non-empty auth_token")
+
+
+def _load_host_config(config_path: Optional[str]) -> dict[str, Any]:
+    default_cfg = {
+        "device_id": "desk-agent-r1-host",
+        "server": {"host": "127.0.0.1", "port": 8088},
+        "auth_token": None,
+        "storage": {"db_path": "life_service.db"},
+        "home_assistant": {
+            "base_url": "http://homeassistant.local:8123",
+            "allowed_domains": ["light", "switch", "cover", "climate", "fan", "media_player", "scene", "input_boolean"],
+        },
+        "camera": {"default_lease_ms": 10000},
+        "robot": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "tcp_port": 37020,
+            "udp_port": 37021,
+            "auto_pair": True,
+            "reconnect_interval": 2.0,
+        },
+        "codex": {
+            "workspaces": {
+                "epanda-desk-agent": os.path.realpath("."),
+                "desk-agent-core": os.path.realpath("."),
+            }
+        },
+    }
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                user_cfg = json.load(config_file)
+                default_cfg.update(user_cfg)
+                logger.info("Loaded configuration from %s", config_path)
+        except Exception as exc:
+            logger.error("Failed to parse config file %s: %s; using defaults", config_path, exc)
+    return default_cfg
 
 
 class DeskAgentHostApp:
@@ -467,40 +541,7 @@ class DeskAgentHostApp:
         self.life_service.close()
 
     def _load_config(self, config_path: Optional[str]) -> dict[str, Any]:
-        default_cfg = {
-            "device_id": "desk-agent-r1-host",
-            "server": {"host": "127.0.0.1", "port": 8088},
-            "auth_token": None,
-            "storage": {"db_path": "life_service.db"},
-            "home_assistant": {
-                "base_url": "http://homeassistant.local:8123",
-                "allowed_domains": ["light", "switch", "cover", "climate", "fan", "media_player", "scene", "input_boolean"],
-            },
-            "camera": {"default_lease_ms": 10000},
-            "robot": {
-                "enabled": True,
-                "host": "127.0.0.1",
-                "tcp_port": 37020,
-                "udp_port": 37021,
-                "auto_pair": True,
-                "reconnect_interval": 2.0,
-            },
-            "codex": {
-                "workspaces": {
-                    "epanda-desk-agent": os.path.realpath("."),
-                    "desk-agent-core": os.path.realpath("."),
-                }
-            },
-        }
-        if config_path and os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    user_cfg = json.load(f)
-                    default_cfg.update(user_cfg)
-                    logger.info("Loaded configuration from %s", config_path)
-            except Exception as e:
-                logger.error("Failed to parse config file %s: %s; using defaults", config_path, e)
-        return default_cfg
+        return _load_host_config(config_path)
 
     def _register_routes(self) -> None:
         # HA
@@ -1013,8 +1054,11 @@ def make_request_handler(app: DeskAgentHostApp):
     class DeskAgentHTTPHandler(BaseHTTPRequestHandler):
         def _check_auth(self) -> bool:
             auth_token = app.config.get("auth_token")
-            if not auth_token:
-                return True
+            if not isinstance(auth_token, str) or not auth_token.strip():
+                # Empty-token local-only mode remains available on loopback;
+                # wildcard or LAN listeners fail closed even if startup checks
+                # were bypassed by an embedding caller.
+                return _address_is_loopback(self.server.server_address)
             auth_hdr = self.headers.get("Authorization", "")
             tok_hdr = self.headers.get("X-Desk-Agent-Token", "")
             if auth_hdr.startswith("Bearer "):
@@ -1418,6 +1462,7 @@ def make_request_handler(app: DeskAgentHostApp):
 
 
 def _serve_host(app: DeskAgentHostApp, host: str, port: int, *, shutdown_check: Optional[Callable[[], bool]] = None) -> None:
+    _validate_listener_auth(host, app.config.get("auth_token"))
     handler_cls = make_request_handler(app)
     httpd = ThreadedHTTPServer((host, port), handler_cls)
 
@@ -1450,6 +1495,8 @@ def _serve_host(app: DeskAgentHostApp, host: str, port: int, *, shutdown_check: 
 
 async def _run_managed_application(config_path: Optional[str], host: str, port: int) -> None:
     """Run the Host inside the one Runtime-authorized SDK managed Application session."""
+    launch_config = _load_host_config(config_path)
+    _validate_listener_auth(host, launch_config.get("auth_token"))
     from watcherobot.application import ApplicationContext
 
     context = ApplicationContext.from_environment()
@@ -1511,8 +1558,13 @@ def main() -> None:
     parser.add_argument("--check-config", action="store_true", help="Perform pre-flight configuration check and exit")
     args = parser.parse_args()
 
+    launch_config = _load_host_config(args.config)
+    port = args.port or launch_config.get("server", {}).get("port", 8088)
+    host = args.host or launch_config.get("server", {}).get("host", "127.0.0.1")
+
     if args.check_config:
         try:
+            _validate_listener_auth(host, launch_config.get("auth_token"))
             test_app = DeskAgentHostApp(config_path=args.config)
             test_app.close()
             print(json.dumps({"status": "valid", "config": args.config or "default"}))
@@ -1521,10 +1573,7 @@ def main() -> None:
             print(json.dumps({"status": "invalid", "error": str(exc)}), file=sys.stderr)
             sys.exit(1)
 
-    config_loader = DeskAgentHostApp.__new__(DeskAgentHostApp)
-    launch_config = config_loader._load_config(args.config)
-    port = args.port or launch_config.get("server", {}).get("port", 8088)
-    host = args.host or launch_config.get("server", {}).get("host", "127.0.0.1")
+    _validate_listener_auth(host, launch_config.get("auth_token"))
     managed_env_names = (
         "WATCHER_APP_ID",
         "WATCHER_APP_RUN_CREDENTIAL",
