@@ -1,6 +1,7 @@
 """L2 source contracts for truthful hardware CLI status and body commands."""
 
 from pathlib import Path
+import re
 import unittest
 
 
@@ -12,6 +13,14 @@ HARDWARE_C = ROOT / "firmware/components/desk_hardware/src/desk_hardware.c"
 def function_body(source: str, signature: str, next_signature: str) -> str:
     definitions = source.split("static const desk_cli_command_t s_default_cmds[]", 1)[1]
     return definitions.split(signature, 1)[1].split(next_signature, 1)[0]
+
+
+def conditional_body(source: str, condition: str) -> re.Match[str] | None:
+    return re.search(
+        rf"\bif\s*\(\s*{re.escape(condition)}\s*\)\s*\{{(?P<body>[^{{}}]*)\}}",
+        source,
+        re.DOTALL,
+    )
 
 
 class TestDeskCliStatusTruthfulness(unittest.TestCase):
@@ -56,7 +65,7 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn("Capture Driver State  : UNKNOWN", camera)
         self.assertIn("desk_hardware_is_display_initialized", display)
         self.assertIn("desk_hardware_display_get_expression", display)
-        self.assertIn("Display status: UNKNOWN", display)
+        self.assertIn("Display Software Shadow: UNKNOWN", display)
         self.assertIn("rc == 0", network)
         self.assertIn('link_name = "UNKNOWN"', network)
         self.assertIn("rc == 0", wifi)
@@ -65,6 +74,60 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn("status == NETMGR_LINK_DOWN", wifi)
         self.assertNotIn("? \"LINK_UP\" : \"LINK_DOWN\"", wifi)
         self.assertIn("UNKNOWN (host simulation; no radio state)", wifi)
+
+    def test_system_does_not_infer_arbiter_readiness_from_resource_owners(self) -> None:
+        system = function_body(self.source, "static void cmd_system(int argc, char *argv[])\n{",
+                               "static void cmd_display(int argc, char *argv[])\n{")
+
+        self.assertIn("Hardware Arbiter Readiness: UNKNOWN (no readiness/status API)", system)
+        self.assertIn("Display Driver Initialization: %s", system)
+        self.assertIn("physical scanout not exposed", system)
+        self.assertNotIn("Hardware Arbiter    : ACTIVE", system)
+        self.assertNotIn("desk_arbiter_get_owner", system)
+
+    def test_display_reports_initialization_shadow_and_scanout_independently(self) -> None:
+        display = function_body(self.source, "static void cmd_display(int argc, char *argv[])\n{",
+                                "static void cmd_audio(int argc, char *argv[])\n{")
+
+        self.assertIn("Display Driver Initialization: %s", display)
+        self.assertIn("Display Software Shadow: UNKNOWN (driver not initialized)", display)
+        self.assertIn("Display Software Shadow: AVAILABLE (cached expression)", display)
+        self.assertIn("Display Software Shadow: UNKNOWN (readback rc=%d)", display)
+        self.assertIn("Display Physical Scanout: UNKNOWN (no physical scanout status API)", display)
+        self.assertNotIn("Display status: READY", display)
+
+    def test_display_status_branches_keep_errors_and_success_on_their_own_paths(self) -> None:
+        display = function_body(self.source, "static void cmd_display(int argc, char *argv[])\n{",
+                                "static void cmd_audio(int argc, char *argv[])\n{")
+
+        self.assert_display_status_branch_contract(display)
+
+    def assert_display_status_branch_contract(self, display: str) -> None:
+        not_initialized = conditional_body(display, "!initialized")
+        self.assertIsNotNone(not_initialized)
+        not_initialized_body = not_initialized.group("body")
+        self.assertIn('Display Software Shadow: UNKNOWN (driver not initialized)', not_initialized_body)
+        self.assertRegex(not_initialized_body, r"\breturn\s*;")
+
+        getter_failed = conditional_body(display, "rc != DESK_HW_OK")
+        self.assertIsNotNone(getter_failed)
+        getter_failed_body = getter_failed.group("body")
+        self.assertIn('Display Software Shadow: UNKNOWN (readback rc=%d)', getter_failed_body)
+        self.assertRegex(getter_failed_body, r"\breturn\s*;")
+
+        available = re.search(
+            r'Display Software Shadow: AVAILABLE \(cached expression\)', display
+        )
+        self.assertIsNotNone(available)
+        self.assertGreater(available.start(), getter_failed.end())
+
+    def test_display_status_contract_rejects_reversed_initialization_guard(self) -> None:
+        display = function_body(self.source, "static void cmd_display(int argc, char *argv[])\n{",
+                                "static void cmd_audio(int argc, char *argv[])\n{")
+        wrong_control_flow = display.replace("if (!initialized)", "if (initialized)", 1)
+
+        with self.assertRaises(AssertionError):
+            self.assert_display_status_branch_contract(wrong_control_flow)
 
     def test_camera_capture_cli_names_specific_driver_failures(self) -> None:
         camera = function_body(self.source, "static void cmd_camera(int argc, char *argv[])\n{",

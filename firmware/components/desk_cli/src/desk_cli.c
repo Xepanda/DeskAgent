@@ -362,9 +362,10 @@ static void cmd_system(int argc, char *argv[])
     printf("SDK UDP Pairing Port: %d (%s)\r\n", udp_port,
            udp_port <= 0 ? "NOT_LISTENING" : "LISTENING");
 
-    /* Arbiter State */
-    printf("Hardware Arbiter    : ACTIVE (Unified Resource Arbiter)\r\n");
-    printf("Display Initialized : %s\r\n", desk_hardware_is_display_initialized() ? "YES" : "NO");
+    /* No public arbiter readiness API exists; resource owners are not a health signal. */
+    printf("Hardware Arbiter Readiness: UNKNOWN (no readiness/status API)\r\n");
+    printf("Display Driver Initialization: %s (software flag only; physical scanout not exposed)\r\n",
+           desk_hardware_is_display_initialized() ? "INITIALIZED" : "NOT_INITIALIZED");
     printf("----------------------------------\r\n");
 }
 
@@ -378,16 +379,21 @@ static void cmd_display(int argc, char *argv[])
     } else {
         char preset[32] = "";
         char status[64] = "";
-        if (!desk_hardware_is_display_initialized()) {
-            printf("Display status: NOT_INITIALIZED\r\n");
+        bool initialized = desk_hardware_is_display_initialized();
+        printf("Display Driver Initialization: %s\r\n",
+               initialized ? "INITIALIZED" : "NOT_INITIALIZED");
+        printf("Display Physical Scanout: UNKNOWN (no physical scanout status API)\r\n");
+        if (!initialized) {
+            printf("Display Software Shadow: UNKNOWN (driver not initialized)\r\n");
             return;
         }
         int rc = desk_hardware_display_get_expression(preset, sizeof(preset), status, sizeof(status));
         if (rc != DESK_HW_OK) {
-            printf("Display status: UNKNOWN (readback rc=%d)\r\n", rc);
+            printf("Display Software Shadow: UNKNOWN (readback rc=%d)\r\n", rc);
             return;
         }
-        printf("Display status: READY; current preset='%s', status='%s'\r\n", preset, status);
+        printf("Display Software Shadow: AVAILABLE (cached expression); preset='%s', status='%s'\r\n",
+               preset, status);
     }
 }
 
