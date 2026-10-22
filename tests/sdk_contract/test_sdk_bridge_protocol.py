@@ -136,6 +136,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_notification.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
@@ -2022,6 +2023,32 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(response.get("request_id"), "req-action-not-implemented")
         self.assertEqual(response.get("error", {}).get("code"), "UNSUPPORTED_OPERATION")
         self.assertNotIn("job_id", response.get("data", {}))
+
+    def test_notification_deliver_is_not_exposed_on_legacy_tcp(self) -> None:
+        """The notification command is WebSocket-only; legacy TCP must never invoke A1."""
+        sock = self._open_tcp_session()
+        command = {
+            "type": "notification.deliver",
+            "code": 0,
+            "data": {
+                "notification_id": "occurrence-tcp-001",
+                "reminder_id": "reminder-tcp-001",
+                "occurrence_id": "occurrence-tcp-001",
+                "title": "Legacy path must reject",
+                "scheduled_at": "2035-01-02T10:00:00Z",
+                "expires_at": "2035-01-02T11:00:00Z",
+                "is_catchup": False,
+                "command_id": "0123456789abcdef0123456789abcdef",
+            },
+        }
+        sock.sendall((json.dumps(command) + "\n").encode("utf-8"))
+        self._pump(3)
+        responses = self._recv_lines(sock)
+        self.assertEqual(len(responses), 1)
+        response = json.loads(responses[0])
+        self.assertEqual(response.get("type"), "sys.nack")
+        self.assertEqual(response.get("error", {}).get("code"), "UNKNOWN_OPERATION")
+        self.assertNotEqual(response.get("code"), 0)
 
     def test_hello_auth_failure_nack_echoes_request_id(self) -> None:
         """The 401 nack must correlate to its request_id like any other response."""

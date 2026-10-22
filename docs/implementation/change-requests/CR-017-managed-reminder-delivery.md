@@ -25,6 +25,8 @@ Pinned official Python SDK 有 `ApplicationContext.robot.audio.play_file()/play_
 
 CR-018 provider 缺失、未挂载或不可用时，`notification.deliver` 必须拒绝命令：不得返回 `sys.ack`，不得报告应用 `accepted`，不得呈现/播放；返回符合现有 authenticated WebSocket NACK 形状的 `{"type":"sys.nack","code":503,"data":{"type":"notification.deliver","command_id":"<原样回显 SDK command_id>","error":"STORAGE_UNAVAILABLE"}}`。`data.type`、`data.command_id`、`data.error` 字符串与 `desk_sdk_log_nack()` 已生成的结构一致；不在 `data.error` 内增加嵌套对象或扩展字段。错误码的固定通用 message 为 `Notification storage provider is unavailable`，不含通知标题、提醒内容、token、秘钥或其他凭据；其 retryable 语义由 `contracts/error_codes.json` 登记为 true，不在线上 NACK 中另加字段。`command_id` 只关联一次 SDK 命令应答，不能代替稳定 `notification_id` 幂等键；同一通知重试必须沿用原 `notification_id`，但使用新一轮 SDK command_id。重试语义表示 provider 恢复后可安全重试同一 ID，不代表当前发生 durable acceptance。
 
+其他同步 `desk_hardware_notification_deliver()` 失败同样必须映射到 SDK `sys.nack`，不能让非零 `DESK_HW_*` 返回导致 Runtime waiter 超时，也不能成功 ACK。代码/错误码、retryability 和固定通用 message 见 CR-018 §2.1：A1 专用 `DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE (-100)` 映射 `STORAGE_UNAVAILABLE`；普通 `DESK_HW_ERR_UNAVAILABLE (-2)` 仍有 init/clock 歧义，映射 `NOTIFICATION_DELIVERY_FAILED`；未认证 gate 返回 `401/AUTH_REQUIRED`。`process_pending()` 是接受后的异步工作，忙碌重试与阶段事件不得冒充原始命令 NACK。
+
 此 SDK WebSocket `sys.nack` 不得序列化为 DeskAgent `ResponseEnvelope`。跨模块 DeskAgent `ResponseEnvelope` 若由 Host 另行生成，须使用其自身的顶层 `schema_version/request_id/status="failed"/timestamp/error` 字段；其中 error 为 `code="STORAGE_UNAVAILABLE"`、同一通用 message、`retryable:true`。它没有 `type/code/data/command_id` 字段。详见 `contracts/schemas/sdk_sys_nack.json`；此合同只冻结 wire 语义，不证明 SDK 当前设备实际发出该响应。
 
 ### 幂等与重复

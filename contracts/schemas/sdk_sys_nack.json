@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://deskagent.xepanda.com/schemas/sdk_sys_nack.json",
-  "title": "NotificationStorageUnavailableSysNack",
-  "description": "Fail-closed notification.deliver provider-unavailable response for the pinned Watcherobot SDK Application channel. This is not a DeskAgent ResponseEnvelope.",
+  "title": "NotificationDeliverSysNack",
+  "description": "Fail-closed notification.deliver error responses for the pinned Watcherobot SDK Application channel. This is not a DeskAgent ResponseEnvelope.",
   "type": "object",
   "required": ["type", "code", "data"],
   "additionalProperties": false,
   "properties": {
     "type": { "const": "sys.nack" },
-    "code": { "const": 503 },
+    "code": { "type": "integer", "enum": [400, 401, 410, 500, 503, 507] },
     "data": {
       "type": "object",
       "required": ["type", "command_id", "error"],
@@ -20,8 +20,28 @@
           "pattern": "^[0-9a-f]{32}$",
           "description": "Echo the command_id supplied in the originating SDK command data."
         },
-        "error": { "const": "STORAGE_UNAVAILABLE" }
+        "error": {
+          "type": "string",
+          "enum": [
+            "INVALID_ARGUMENT",
+            "AUTH_REQUIRED",
+            "EXPIRED",
+            "STORAGE_FULL",
+            "STORAGE_ERROR",
+            "STORAGE_UNAVAILABLE",
+            "NOTIFICATION_DELIVERY_FAILED"
+          ]
+        }
       }
     }
-  }
+  },
+  "allOf": [
+    { "if": { "properties": { "data": { "properties": { "error": { "const": "INVALID_ARGUMENT" } } } } }, "then": { "properties": { "code": { "const": 400 } } } },
+    { "if": { "properties": { "data": { "properties": { "error": { "const": "AUTH_REQUIRED" } } } } }, "then": { "properties": { "code": { "const": 401 } } } },
+    { "if": { "properties": { "data": { "properties": { "error": { "const": "EXPIRED" } } } } }, "then": { "properties": { "code": { "const": 410 } } } },
+    { "if": { "properties": { "data": { "properties": { "error": { "const": "STORAGE_FULL" } } } } }, "then": { "properties": { "code": { "const": 507 } } } },
+    { "if": { "properties": { "data": { "properties": { "error": { "const": "STORAGE_ERROR" } } } } }, "then": { "properties": { "code": { "const": 500 } } } },
+    { "if": { "properties": { "data": { "properties": { "error": { "const": "STORAGE_UNAVAILABLE" } } } } }, "then": { "properties": { "code": { "const": 503 } } } },
+    { "if": { "properties": { "data": { "properties": { "error": { "const": "NOTIFICATION_DELIVERY_FAILED" } } } } }, "then": { "properties": { "code": { "enum": [500, 503] } } } }
+  ]
 }

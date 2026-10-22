@@ -16,6 +16,9 @@ extern "C" {
 #define DESK_NOTIFICATION_OCCURRENCE_ID_MAX 64
 #define DESK_NOTIFICATION_ACK_SOURCE_MAX 31
 #define DESK_NOTIFICATION_STORE_SLOT_EMPTY 1
+/* Distinct from DESK_HW_ERR_UNAVAILABLE (for example, an untrusted clock).
+ * Returned only when the durable notification provider is known unavailable. */
+#define DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE (-100)
 
 typedef struct {
     char notification_id[DESK_NOTIFICATION_ID_MAX + 1];

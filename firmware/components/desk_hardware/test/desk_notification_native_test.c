@@ -15,11 +15,17 @@ static uint8_t s_fake_store[128][512];
 static size_t s_fake_store_len[128];
 static int s_fake_store_fail_next_save;
 static int s_fake_store_corrupt_next_readback;
+static int s_fake_store_unavailable_next_load;
+static int s_fake_store_unavailable_next_save;
 
 static int fake_store_load(unsigned slot, void *out, size_t capacity, size_t *out_len, void *user_data)
 {
     (void)user_data;
     if (slot >= 128 || !out || !out_len) return DESK_HW_ERR_INVALID_ARG;
+    if (s_fake_store_unavailable_next_load) {
+        s_fake_store_unavailable_next_load = 0;
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
     if (!s_fake_store_len[slot]) return DESK_NOTIFICATION_STORE_SLOT_EMPTY;
     if (s_fake_store_len[slot] > capacity) return DESK_HW_ERR_INVALID_ARG;
     memcpy(out, s_fake_store[slot], s_fake_store_len[slot]);
@@ -34,6 +40,10 @@ static int fake_store_save(unsigned slot, const void *record, size_t len, void *
 {
     (void)user_data;
     if (slot >= 128 || !record || len > sizeof(s_fake_store[slot])) return DESK_HW_ERR_INVALID_ARG;
+    if (s_fake_store_unavailable_next_save) {
+        s_fake_store_unavailable_next_save = 0;
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
     if (s_fake_store_fail_next_save) {
         s_fake_store_fail_next_save = 0;
         return DESK_HW_ERR_IO;
@@ -95,7 +105,7 @@ int main(void)
     assert(desk_arbiter_init() == DESK_ARBITER_OK);
     assert(desk_hardware_register_driver_ops(&ops) == DESK_HW_OK);
     desk_hardware_set_strict_mode(false);
-    assert(desk_hardware_notification_init(on_status, NULL) == DESK_HW_ERR_UNAVAILABLE);
+    assert(desk_hardware_notification_init(on_status, NULL) == DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE);
     assert(s_status_calls == 0); /* No provider means no accepted/status event. */
     const desk_notification_store_ops_t store_ops = {
         .load = fake_store_load,
@@ -103,11 +113,15 @@ int main(void)
         .erase = fake_store_erase,
     };
     assert(desk_hardware_notification_register_store(&store_ops) == DESK_HW_OK);
+    desk_notification_input_t uninitialized = notification("uninitialized", "2035-01-02T10:00:00.000001Z");
+    desk_notification_status_event_t state = {0};
+    assert(desk_hardware_notification_deliver(&uninitialized, &state) == DESK_HW_ERR_UNAVAILABLE);
+    s_fake_store_unavailable_next_load = 1;
+    assert(desk_hardware_notification_init(on_status, NULL) == DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE);
     assert(desk_hardware_notification_init(on_status, NULL) == DESK_HW_OK);
 
     /* A successful callback is not enough: readback must verify the committed record. */
     desk_notification_input_t readback_failure = notification("readback-fail", "2035-01-02T10:00:00.000001Z");
-    desk_notification_status_event_t state = {0};
     s_fake_store_corrupt_next_readback = 1;
     assert(desk_hardware_notification_deliver(&readback_failure, &state) == DESK_HW_ERR_IO);
     assert(s_status_calls == 0);
@@ -119,7 +133,12 @@ int main(void)
     s_fake_store_fail_next_save = 1;
     assert(desk_hardware_notification_deliver(&save_failure, &state) == DESK_HW_ERR_IO);
     assert(s_status_calls == 0);
-    assert(desk_hardware_notification_process_pending() == DESK_HW_ERR_UNAVAILABLE);
+    assert(desk_hardware_notification_init(on_status, NULL) == DESK_HW_OK);
+    desk_notification_input_t provider_down = notification("provider-down", "2035-01-02T10:00:00.000001Z");
+    s_fake_store_unavailable_next_save = 1;
+    assert(desk_hardware_notification_deliver(&provider_down, &state) == DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE);
+    assert(s_status_calls == 0);
+    assert(desk_hardware_notification_process_pending() == DESK_HW_OK);
     assert(desk_hardware_notification_init(on_status, NULL) == DESK_HW_OK);
 
     desk_notification_input_t input = notification("occurrence-001", "2035-01-02T10:00:00.000001Z");

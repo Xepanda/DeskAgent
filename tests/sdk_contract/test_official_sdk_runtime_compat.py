@@ -100,6 +100,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             shim.write(
                 f'#include "{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c"\n'
                 f'#include "{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c"\n'
+                'int desk_sdk_test_notification_result_nack(int rc, char *out, size_t cap, const char *id) { '
+                'return desk_sdk_notification_result_nack(out, cap, id, rc); }\n'
                 'int desk_sdk_test_set_pairing_target(const char *host, unsigned short port) {\n'
                 '  if (!host || !port || !s_paired || strlen(host) >= sizeof(s_pair_host)) return -1;\n'
                 '  strcpy(s_pair_host, host); s_pair_websocket_port = port; return 0;\n'
@@ -159,6 +161,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_notification.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             shim_path,
@@ -202,6 +205,13 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         cls.lib.desk_sdk_bridge_init.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_init.argtypes = []
+
+        cls.lib.desk_hardware_notification_init.restype = ctypes.c_int
+        cls.lib.desk_hardware_notification_init.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cls.lib.desk_sdk_test_notification_result_nack.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_notification_result_nack.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
+        ]
 
         cls.lib.desk_sdk_ws_client_is_connected.restype = ctypes.c_bool
         cls.lib.desk_sdk_ws_client_is_connected.argtypes = []
@@ -433,6 +443,150 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.lib.desk_sdk_test_seed_ws_auth_latch()
         self.assertEqual(dispatch(sub("00000000000000000000000000000009"))["type"], "sys.ack")
         self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    @staticmethod
+    def _notification_deliver(command_id: str = "0123456789abcdef0123456789abcdef") -> dict:
+        from datetime import datetime, timedelta, timezone
+
+        scheduled = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0)
+        expires = scheduled + timedelta(hours=1)
+        return {
+            "type": "notification.deliver",
+            "code": 0,
+            "data": {
+                "notification_id": "occurrence-sdk-001",
+                "reminder_id": "reminder-sdk-001",
+                "occurrence_id": "occurrence-sdk-001",
+                "title": "Reminder 🗓️",
+                "scheduled_at": scheduled.isoformat().replace("+00:00", "Z"),
+                "expires_at": expires.isoformat().replace("+00:00", "Z"),
+                "is_catchup": False,
+                "command_id": command_id,
+            },
+        }
+
+    def _dispatch_notification_ws(self, command: dict) -> dict:
+        out = ctypes.create_string_buffer(4096)
+        rc = self.lib.desk_sdk_bridge_process_ws_command(
+            json.dumps(command).encode("utf-8"), out, len(out)
+        )
+        self.assertEqual(rc, 0)
+        return json.loads(out.value)
+
+    def test_notification_deliver_requires_authenticated_websocket(self) -> None:
+        command = self._notification_deliver()
+        response = self._dispatch_notification_ws(command)
+        self.assertEqual(response, {
+            "type": "sys.nack",
+            "code": 401,
+            "data": {
+                "type": "notification.deliver",
+                "command_id": command["data"]["command_id"],
+                "error": "AUTH_REQUIRED",
+            },
+        })
+
+    def test_notification_a1_result_nack_mappings_fail_closed(self) -> None:
+        command_id = "0123456789abcdef0123456789abcdef"
+        mappings = (
+            (-100, 503, "STORAGE_UNAVAILABLE"),
+            (-5, 507, "STORAGE_FULL"),
+            (-4, 500, "STORAGE_ERROR"),
+            (-3, 410, "EXPIRED"),
+            (-1, 400, "INVALID_ARGUMENT"),
+            (-2, 503, "NOTIFICATION_DELIVERY_FAILED"),
+            (-6, 500, "NOTIFICATION_DELIVERY_FAILED"),
+            (-999, 500, "NOTIFICATION_DELIVERY_FAILED"),
+        )
+        for a1_rc, code, error in mappings:
+            with self.subTest(a1_rc=a1_rc):
+                out = ctypes.create_string_buffer(512)
+                rc = self.lib.desk_sdk_test_notification_result_nack(
+                    a1_rc, out, len(out), command_id.encode("ascii")
+                )
+                self.assertEqual(rc, 0)
+                self.assertEqual(json.loads(out.value), {
+                    "type": "sys.nack",
+                    "code": code,
+                    "data": {
+                        "type": "notification.deliver",
+                        "command_id": command_id,
+                        "error": error,
+                    },
+                })
+                self.assertNotIn("accepted", json.loads(out.value))
+
+    def test_notification_deliver_valid_payload_fails_closed_without_provider(self) -> None:
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), -100)
+        first = self._notification_deliver("0123456789abcdef0123456789abcdef")
+        retry = self._notification_deliver("fedcba9876543210fedcba9876543210")
+
+        first_response = self._dispatch_notification_ws(first)
+        retry_response = self._dispatch_notification_ws(retry)
+        for command, response in ((first, first_response), (retry, retry_response)):
+            self.assertEqual(response, {
+                "type": "sys.nack",
+                "code": 503,
+                "data": {
+                    "type": "notification.deliver",
+                    "command_id": command["data"]["command_id"],
+                    "error": "STORAGE_UNAVAILABLE",
+                },
+            })
+            self.assertNotIn("accepted", response)
+            self.assertNotIn("status", response.get("data", {}))
+        self.assertEqual(first["data"]["notification_id"], retry["data"]["notification_id"])
+        self.assertNotEqual(first["data"]["command_id"], retry["data"]["command_id"])
+
+    def test_notification_deliver_rejects_malformed_payload_fields(self) -> None:
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        valid = self._notification_deliver()
+        malformed = []
+
+        missing_title = json.loads(json.dumps(valid))
+        del missing_title["data"]["title"]
+        malformed.append(missing_title)
+
+        extra_field = json.loads(json.dumps(valid))
+        extra_field["data"]["body"] = "not approved"
+        malformed.append(extra_field)
+
+        wrong_catchup_type = json.loads(json.dumps(valid))
+        wrong_catchup_type["data"]["is_catchup"] = "false"
+        malformed.append(wrong_catchup_type)
+
+        mismatched_id = json.loads(json.dumps(valid))
+        mismatched_id["data"]["occurrence_id"] = "another-occurrence"
+        malformed.append(mismatched_id)
+
+        bad_timestamp = json.loads(json.dumps(valid))
+        bad_timestamp["data"]["expires_at"] = "not-a-timestamp"
+        malformed.append(bad_timestamp)
+
+        for index, command in enumerate(malformed):
+            command["data"]["command_id"] = f"{index + 1:032x}"
+            response = self._dispatch_notification_ws(command)
+            self.assertEqual(response, {
+                "type": "sys.nack",
+                "code": 400,
+                "data": {
+                    "type": "notification.deliver",
+                    "command_id": command["data"]["command_id"],
+                    "error": "INVALID_ARGUMENT",
+                },
+            })
+
+    def test_notification_deliver_unknown_command_remains_unknown(self) -> None:
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        response = self._dispatch_notification_ws({
+            "type": "notification.deliver.unknown",
+            "code": 0,
+            "data": {"command_id": "0123456789abcdef0123456789abcdef"},
+        })
+        self.assertEqual(response["type"], "sys.nack")
+        self.assertEqual(response["code"], 404)
+        self.assertEqual(response["error"]["code"], "UNKNOWN_OPERATION")
 
     def test_cr009_event_and_queue_full_gap_are_serialized_in_sequence_order(self) -> None:
         self.lib.desk_sdk_test_prepare_log_pair()

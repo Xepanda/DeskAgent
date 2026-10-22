@@ -6,6 +6,7 @@
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_log_source.h"
 #include "desk_tclaw_bridge.h"
+#include "desk_notification.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2103,6 +2104,250 @@ static bool desk_log_object_keys_allowed(const char *object, const char *const *
     }
 }
 
+static bool desk_sdk_notification_append_utf8(uint32_t codepoint, char *out, size_t cap, size_t *used)
+{
+    uint8_t bytes[4];
+    size_t count;
+    if (codepoint == 0 || codepoint < 0x20 || codepoint == 0x7f || codepoint > 0x10ffff ||
+        (codepoint >= 0xd800 && codepoint <= 0xdfff)) return false;
+    if (codepoint < 0x80) { bytes[0] = (uint8_t)codepoint; count = 1; }
+    else if (codepoint < 0x800) {
+        bytes[0] = (uint8_t)(0xc0 | (codepoint >> 6));
+        bytes[1] = (uint8_t)(0x80 | (codepoint & 0x3f)); count = 2;
+    } else if (codepoint < 0x10000) {
+        bytes[0] = (uint8_t)(0xe0 | (codepoint >> 12));
+        bytes[1] = (uint8_t)(0x80 | ((codepoint >> 6) & 0x3f));
+        bytes[2] = (uint8_t)(0x80 | (codepoint & 0x3f)); count = 3;
+    } else {
+        bytes[0] = (uint8_t)(0xf0 | (codepoint >> 18));
+        bytes[1] = (uint8_t)(0x80 | ((codepoint >> 12) & 0x3f));
+        bytes[2] = (uint8_t)(0x80 | ((codepoint >> 6) & 0x3f));
+        bytes[3] = (uint8_t)(0x80 | (codepoint & 0x3f)); count = 4;
+    }
+    if (*used + count >= cap) return false;
+    memcpy(out + *used, bytes, count);
+    *used += count;
+    return true;
+}
+
+static bool desk_sdk_notification_utf8_valid(const char *text)
+{
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        unsigned char lead = *p++;
+        size_t continuation_count;
+        unsigned char second_min = 0x80, second_max = 0xbf;
+        if (lead < 0x80) {
+            if (lead < 0x20 || lead == 0x7f) return false;
+            continue;
+        }
+        if (lead >= 0xc2 && lead <= 0xdf) continuation_count = 1;
+        else if (lead >= 0xe0 && lead <= 0xef) {
+            continuation_count = 2;
+            if (lead == 0xe0) second_min = 0xa0;
+            if (lead == 0xed) second_max = 0x9f;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            continuation_count = 3;
+            if (lead == 0xf0) second_min = 0x90;
+            if (lead == 0xf4) second_max = 0x8f;
+        } else return false;
+        for (size_t i = 0; i < continuation_count; ++i) {
+            unsigned char next = *p++;
+            if (!next || (next & 0xc0) != 0x80 || (i == 0 && (next < second_min || next > second_max))) return false;
+        }
+    }
+    return true;
+}
+
+static int desk_sdk_notification_hex4(const char *s, uint32_t *value)
+{
+    uint32_t result = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        char c = s[i];
+        unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+                         c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10) :
+                         c >= 'A' && c <= 'F' ? (unsigned)(c - 'A' + 10) : 16u;
+        if (digit > 15) return -1;
+        result = (result << 4) | digit;
+    }
+    *value = result;
+    return 0;
+}
+
+/* Decode one top-level JSON string member, including escaped Unicode and
+ * surrogate pairs. Field capacity checks apply to decoded UTF-8 bytes. */
+static bool desk_sdk_notification_get_string(const char *object, const char *key,
+                                             char *out, size_t out_cap)
+{
+    char raw[1024];
+    if (desk_log_get_member(object, key, raw, sizeof(raw)) != 1 || raw[0] != '"') return false;
+    size_t raw_len = strlen(raw);
+    if (raw_len < 2 || raw[raw_len - 1] != '"') return false;
+    size_t used = 0;
+    for (size_t i = 1; i + 1 < raw_len; ++i) {
+        uint32_t cp = (unsigned char)raw[i];
+        if (raw[i] == '\\') {
+            if (++i + 1 >= raw_len) return false;
+            char esc = raw[i];
+            if (esc == '"' || esc == '\\' || esc == '/') cp = (unsigned char)esc;
+            else if (esc == 'b') cp = '\b';
+            else if (esc == 'f') cp = '\f';
+            else if (esc == 'n') cp = '\n';
+            else if (esc == 'r') cp = '\r';
+            else if (esc == 't') cp = '\t';
+            else if (esc == 'u') {
+                if (i + 4 >= raw_len) return false;
+                if (desk_sdk_notification_hex4(raw + i + 1, &cp) != 0) return false;
+                i += 4;
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (i + 6 >= raw_len || raw[i + 1] != '\\' || raw[i + 2] != 'u') return false;
+                    uint32_t low;
+                    if (desk_sdk_notification_hex4(raw + i + 3, &low) != 0 || low < 0xdc00 || low > 0xdfff) return false;
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                    i += 6;
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) return false;
+            } else return false;
+            if (cp < 0x80) {
+                if (cp == 0 || cp < 0x20 || cp == 0x7f || used + 1 >= out_cap) return false;
+                out[used++] = (char)cp;
+            } else if (!desk_sdk_notification_append_utf8(cp, out, out_cap, &used)) return false;
+        } else {
+            if ((unsigned char)raw[i] < 0x20 || used + 1 >= out_cap) return false;
+            out[used++] = raw[i];
+        }
+    }
+    out[used] = '\0';
+    return used > 0 && desk_sdk_notification_utf8_valid(out);
+}
+
+static bool desk_sdk_notification_parse_timestamp(const char *text, uint64_t *out_us)
+{
+    size_t len = strlen(text);
+    if ((len != 20 && (len < 22 || len > 27)) || text[4] != '-' || text[7] != '-' ||
+        text[10] != 'T' || text[13] != ':' || text[16] != ':' || text[len - 1] != 'Z') return false;
+    const unsigned positions[] = {0,1,2,3,5,6,8,9,11,12,14,15,17,18};
+    for (size_t i = 0; i < sizeof(positions) / sizeof(positions[0]); ++i)
+        if (text[positions[i]] < '0' || text[positions[i]] > '9') return false;
+    int year = (text[0]-'0')*1000 + (text[1]-'0')*100 + (text[2]-'0')*10 + text[3]-'0';
+    int month = (text[5]-'0')*10 + text[6]-'0';
+    int day = (text[8]-'0')*10 + text[9]-'0';
+    int hour = (text[11]-'0')*10 + text[12]-'0';
+    int minute = (text[14]-'0')*10 + text[15]-'0';
+    int second = (text[17]-'0')*10 + text[18]-'0';
+    if (year < 1970 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+    static const unsigned month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (day < 1 || (unsigned)day > month_days[month - 1] + (month == 2 && leap ? 1u : 0u)) return false;
+    uint32_t micros = 0;
+    if (len != 20) {
+        if (text[19] != '.') return false;
+        unsigned digits = 0;
+        for (size_t i = 20; i < len - 1; ++i) {
+            if (text[i] < '0' || text[i] > '9' || digits == 6) return false;
+            micros = micros * 10u + (unsigned)(text[i] - '0');
+            ++digits;
+        }
+        if (!digits) return false;
+        while (digits++ < 6) micros *= 10u;
+    }
+    int y = year - (month <= 2);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    int shifted_month = month + (month > 2 ? -3 : 9);
+    unsigned doy = (153u * (unsigned)shifted_month + 2u) / 5u + (unsigned)day - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    int64_t days = (int64_t)era * 146097 + (int64_t)doe - 719468;
+    if (days < 0) return false;
+    *out_us = (((uint64_t)days * 86400u + (uint64_t)hour * 3600u +
+                (uint64_t)minute * 60u + (uint64_t)second) * 1000000u) + micros;
+    return true;
+}
+
+static int desk_sdk_notification_nack(char *out, size_t cap, const char *command_id,
+                                      const char *error, int code)
+{
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.nack\",\"code\":%d,\"data\":{\"type\":\"notification.deliver\",\"command_id\":\"%s\",\"error\":\"%s\"}}",
+        code, command_id, error);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int desk_sdk_notification_result_nack(char *out, size_t cap, const char *command_id, int rc)
+{
+    if (rc == DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE)
+        return desk_sdk_notification_nack(out, cap, command_id, "STORAGE_UNAVAILABLE", 503);
+    if (rc == DESK_HW_ERR_BUSY)
+        return desk_sdk_notification_nack(out, cap, command_id, "STORAGE_FULL", 507);
+    if (rc == DESK_HW_ERR_IO)
+        return desk_sdk_notification_nack(out, cap, command_id, "STORAGE_ERROR", 500);
+    if (rc == DESK_HW_ERR_TIMEOUT)
+        return desk_sdk_notification_nack(out, cap, command_id, "EXPIRED", 410);
+    if (rc == DESK_HW_ERR_INVALID_ARG)
+        return desk_sdk_notification_nack(out, cap, command_id, "INVALID_ARGUMENT", 400);
+    if (rc == DESK_HW_ERR_UNAVAILABLE)
+        return desk_sdk_notification_nack(out, cap, command_id, "NOTIFICATION_DELIVERY_FAILED", 503);
+    return desk_sdk_notification_nack(out, cap, command_id, "NOTIFICATION_DELIVERY_FAILED", 500);
+}
+
+static bool desk_sdk_notification_command_id_valid(const char *id)
+{
+    if (!id || strlen(id) != 32) return false;
+    for (size_t i = 0; i < 32; ++i)
+        if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return false;
+    return true;
+}
+
+static int desk_sdk_notification_dispatch(const char *json_in, char *out_buf, size_t max_out_len,
+                                          const char *data)
+{
+    static const char *const root_keys[] = { "type", "code", "data" };
+    static const char *const data_keys[] = {
+        "notification_id", "reminder_id", "occurrence_id", "title",
+        "scheduled_at", "expires_at", "is_catchup", "command_id"
+    };
+    char root_code[16] = "", command_id[40] = "";
+    unsigned code_count = desk_log_get_member(json_in, "code", root_code, sizeof(root_code));
+    bool outer_valid = desk_log_object_keys_allowed(json_in, root_keys, 3) &&
+                       code_count == 1 && strcmp(root_code, "0") == 0 &&
+                       desk_log_object_keys_allowed(data, data_keys, 8);
+    bool has_command_id = desk_sdk_notification_get_string(data, "command_id", command_id, sizeof(command_id)) &&
+                         desk_sdk_notification_command_id_valid(command_id);
+    if (!has_command_id) return -1;
+    if (!outer_valid)
+        return desk_sdk_notification_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    if (!desk_sdk_ws_client_is_authenticated())
+        return desk_sdk_notification_nack(out_buf, max_out_len, command_id, "AUTH_REQUIRED", 401);
+
+    desk_notification_input_t input = {0};
+    char catchup_raw[8] = "";
+    uint64_t scheduled_us = 0, expires_us = 0;
+    bool fields_valid =
+        desk_sdk_notification_get_string(data, "notification_id", input.notification_id, sizeof(input.notification_id)) &&
+        desk_sdk_notification_get_string(data, "reminder_id", input.reminder_id, sizeof(input.reminder_id)) &&
+        desk_sdk_notification_get_string(data, "occurrence_id", input.occurrence_id, sizeof(input.occurrence_id)) &&
+        desk_sdk_notification_get_string(data, "title", input.title, sizeof(input.title)) &&
+        desk_sdk_notification_get_string(data, "scheduled_at", input.scheduled_at, sizeof(input.scheduled_at)) &&
+        desk_sdk_notification_get_string(data, "expires_at", input.expires_at, sizeof(input.expires_at)) &&
+        desk_log_get_member(data, "is_catchup", catchup_raw, sizeof(catchup_raw)) == 1 &&
+        (strcmp(catchup_raw, "true") == 0 || strcmp(catchup_raw, "false") == 0) &&
+        desk_sdk_notification_parse_timestamp(input.scheduled_at, &scheduled_us) &&
+        desk_sdk_notification_parse_timestamp(input.expires_at, &expires_us) &&
+        expires_us > scheduled_us &&
+        strcmp(input.notification_id, input.occurrence_id) == 0;
+    if (!fields_valid)
+        return desk_sdk_notification_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    input.is_catchup = strcmp(catchup_raw, "true") == 0;
+
+    desk_notification_status_event_t status = {0};
+    int rc = desk_hardware_notification_deliver(&input, &status);
+    if (rc != DESK_HW_OK)
+        return desk_sdk_notification_result_nack(out_buf, max_out_len, command_id, rc);
+    int n = snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"notification.deliver\",\"command_id\":\"%s\"}}",
+        command_id);
+    return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
+}
+
 static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
 {
     desk_log_json_parser_t p = { .p = raw, .depth = 0 };
@@ -2123,13 +2368,15 @@ static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
  * TCP line server continues to use desk_sdk_bridge_process_command(). */
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len)
 {
-    char type_raw[96] = "", data[512] = "", code_raw[16] = "";
+    char type_raw[96] = "", data[3072] = "", code_raw[16] = "";
     if (!json_in || strnlen(json_in, DESK_SDK_MAX_FRAME_LEN + 1U) > DESK_SDK_MAX_FRAME_LEN ||
         !desk_log_json_valid(json_in)) return -1;
     if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1 ||
         !desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;
     char type[64] = "";
     if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "notification.deliver") == 0)
+        return desk_sdk_notification_dispatch(json_in, out_buf, max_out_len, data);
     if (strcmp(type, "sys.log.subscribe") != 0 && strcmp(type, "sys.log.unsubscribe") != 0)
         return desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
     static const char *const root_keys[] = { "type", "code", "data" };

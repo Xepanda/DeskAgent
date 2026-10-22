@@ -41,6 +41,25 @@
 
 该线格式是 Watcherobot SDK Application WebSocket command response，不是 `contracts/schemas/envelope_response.json` 的 DeskAgent `ResponseEnvelope`。后者保持 `schema_version/request_id/status/timestamp` 与顶层 `error` 结构；Host 如需映射，使用 `status="failed"`、相同大写 domain code/message、`error.retryable=true`，但不得将 SDK `command_id` 冒充 DeskAgent `request_id`。单独 schema：`contracts/schemas/sdk_sys_nack.json`。`code:503` 适配现有 integer NACK code 字段；当前没有针对 storage provider 的 deployed handler/端到端证据，因此 A2 若发现具体已部署 SDK/runtime 对 503 拒绝或改写，必须提交 A2/A0 change request，不得宣称该响应已可直接部署。
 
+#### `notification.deliver` 的同步 A1 返回值到 SDK NACK 映射
+
+所有同步失败使用同一 shape：`{"type":"sys.nack","code":<integer>,"data":{"type":"notification.deliver","command_id":"<echo>","error":"<UPPERCASE_CODE>"}}`。错误 message 和 retryability 属于 `contracts/error_codes.json` 的域语义，不增加 wire 字段。映射仅允许在识别失败后回 NACK；未知非零返回必须 fail closed，绝不能生成成功 `sys.ack`。
+
+| A1 `desk_hardware_notification_deliver()` 返回/可确认条件 | SDK NACK `code` | `data.error` | Registry `retryable` | 固定通用 message / 处理 |
+|---|---:|---|---|---|
+| A1 专用 `DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE` (`-100`)：provider missing/unmounted/unavailable 已可靠确认 | 503 | `STORAGE_UNAVAILABLE` | true | `Notification storage provider is unavailable`；按同一 `notification_id` 重试 |
+| `DESK_HW_ERR_BUSY` 且来自 deliver 的记录槽容量耗尽 | 507 | `STORAGE_FULL` | false | `Notification storage is full`；空间未恢复前不自动重试 |
+| `DESK_HW_ERR_IO`：保存、回读、校验或擦除失败，提交结果可能不确定 | 500 | `STORAGE_ERROR` | true | `Notification storage operation failed`；Host 保持 unknown 并仅以同一 ID 重试 |
+| `DESK_HW_ERR_TIMEOUT` 表示 `expires_at` 已到期 | 410 | `EXPIRED` | false | `Notification has expired`；终止投递，不重试 |
+| `DESK_HW_ERR_INVALID_ARG` 或 command/schema 校验失败 | 400 | `INVALID_ARGUMENT` | false | `Invalid notification request`；修正输入后由新请求处理 |
+| Host 认证 gate 未通过（早于 A1 调用） | 401 | `AUTH_REQUIRED` | false | `Notification delivery requires an authenticated device session`；先完成认证，不重试同一会话 |
+| 普通 `DESK_HW_ERR_UNAVAILABLE` (`-2`)：未初始化或系统时间无效，无法可靠归因为 provider 故障 | 503 | `NOTIFICATION_DELIVERY_FAILED` | true | `Notification delivery failed`；保守 fail closed，Host 保留 unknown/同 ID 重试，不伪称 provider 原因 |
+| 任何未登记非零返回（含 `DESK_HW_ERR_STALL`） | 500 | `NOTIFICATION_DELIVERY_FAILED` | true | `Notification delivery failed`；保守 fail closed，Host 保留 unknown/同 ID 重试 |
+
+A1 当前用专用 `DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE (-100)` 表示 provider 未注册/不可用；普通 `DESK_HW_ERR_UNAVAILABLE (-2)` 仍表示 `!s_initialized`（但 provider 已注册）或 `now_epoch_us()==0`，所以 A2 将 `-100` 映射到 `STORAGE_UNAVAILABLE`、将 `-2` 映射到通用 `NOTIFICATION_DELIVERY_FAILED`。未认证 `401/AUTH_REQUIRED` 是 A2 认证 gate 错误，不是 A1 return code，但属于相同 SDK WebSocket NACK shape，纳入本 schema。当前同步映射由 A2 `desk_sdk_notification_result_nack()` 实现；所有非零返回都必须及时 NACK，不能以 `return -1` 让 SDK waiter 超时。
+
+`desk_hardware_notification_process_pending()` 是 ACK 后独立的异步处理，不存在可安全回显的原命令 waiter。其 `DESK_HW_ERR_BUSY` 是显示/音频仲裁占用，应保留 pending 并稍后重试；超时/显示/音频结果按持久状态事件上报；IO 或未知错误 fail closed，绝不能为早已结束的 `notification.deliver` 伪造迟到 NACK。尤其是 `deliver` 返回 OK 后，表示已 durable accepted，可回 transport `sys.ack`；它不表示渲染/播放成功。
+
 ## 3. 决策后必须遵守的逻辑存储契约
 
 以下是 backend provider 的要求；**不是当前分区兼容声明，也不批准将候选空间落盘**。

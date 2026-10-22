@@ -100,13 +100,14 @@ static uint64_t now_epoch_us(void)
 
 static int store_load(void)
 {
-    if (!s_store_registered || !s_store_ops.load) return DESK_HW_ERR_UNAVAILABLE;
+    if (!s_store_registered || !s_store_ops.load) return DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE;
     memset(s_records, 0, sizeof(s_records));
     for (unsigned i = 0; i < NOTIFICATION_RECORDS_MAX; ++i) {
         size_t size = 0;
         int rc = s_store_ops.load(i, &s_records[i], sizeof(notification_record_t), &size,
                                   s_store_ops.user_data);
         if (rc == DESK_NOTIFICATION_STORE_SLOT_EMPTY) continue;
+        if (rc == DESK_HW_ERR_UNAVAILABLE) return DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE;
         if (rc != DESK_HW_OK || size != sizeof(notification_record_t) ||
             s_records[i].magic != NOTIFICATION_STORE_MAGIC ||
             s_records[i].version != NOTIFICATION_STORE_VERSION ||
@@ -120,9 +121,10 @@ static int store_load(void)
 
 static int store_save(unsigned index)
 {
-    if (!s_store_registered || !s_store_ops.save) return DESK_HW_ERR_UNAVAILABLE;
+    if (!s_store_registered || !s_store_ops.save) return DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE;
     int rc = s_store_ops.save(index, &s_records[index], sizeof(notification_record_t),
                               s_store_ops.user_data);
+    if (rc == DESK_HW_ERR_UNAVAILABLE) return DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE;
     if (rc == DESK_HW_OK) {
         notification_record_t verified = {0};
         size_t verified_len = 0;
@@ -146,8 +148,9 @@ static int store_save(unsigned index)
 
 static int store_erase(unsigned index)
 {
-    if (!s_store_registered || !s_store_ops.erase) return DESK_HW_ERR_UNAVAILABLE;
-    return s_store_ops.erase(index, s_store_ops.user_data);
+    if (!s_store_registered || !s_store_ops.erase) return DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE;
+    int rc = s_store_ops.erase(index, s_store_ops.user_data);
+    return rc == DESK_HW_ERR_UNAVAILABLE ? DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE : rc;
 }
 
 static int find_record(const char *id)
@@ -234,7 +237,8 @@ int desk_hardware_notification_init(desk_notification_status_cb_t callback, void
         record->pending = 0;
         record->status = DESK_NOTIFICATION_UNKNOWN;
         record->error_code = DESK_HW_ERR_UNAVAILABLE;
-        if (store_save(i) != DESK_HW_OK) return DESK_HW_ERR_IO;
+        int save_rc = store_save(i);
+        if (save_rc != DESK_HW_OK) return save_rc;
         emit_status(record->notification_id, DESK_NOTIFICATION_UNKNOWN, DESK_HW_ERR_UNAVAILABLE, NULL);
     }
     s_initialized = true;
@@ -253,7 +257,8 @@ int desk_hardware_notification_register_store(const desk_notification_store_ops_
 int desk_hardware_notification_deliver(const desk_notification_input_t *input,
                                        desk_notification_status_event_t *out_status)
 {
-    if (!s_initialized) return DESK_HW_ERR_UNAVAILABLE;
+    if (!s_initialized) return s_store_registered ? DESK_HW_ERR_UNAVAILABLE :
+                                                    DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE;
     if (!input || !out_status ||
         !valid_text(input->notification_id, sizeof(input->notification_id)) ||
         !valid_text(input->reminder_id, sizeof(input->reminder_id)) ||
@@ -297,7 +302,11 @@ int desk_hardware_notification_deliver(const desk_notification_input_t *input,
         }
     }
     if (index < 0) return DESK_HW_ERR_BUSY;
-    if (s_records[index].occupied && store_erase((unsigned)index) != DESK_HW_OK) return DESK_HW_ERR_IO;
+    if (s_records[index].occupied) {
+        int erase_rc = store_erase((unsigned)index);
+        if (erase_rc != DESK_HW_OK) return erase_rc == DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE ?
+                                               erase_rc : DESK_HW_ERR_IO;
+    }
     memset(&s_records[index], 0, sizeof(s_records[index]));
     s_records[index].magic = NOTIFICATION_STORE_MAGIC;
     s_records[index].version = NOTIFICATION_STORE_VERSION;
@@ -311,9 +320,10 @@ int desk_hardware_notification_deliver(const desk_notification_input_t *input,
     s_records[index].status = DESK_NOTIFICATION_ACCEPTED;
     s_records[index].pending = 1;
     s_records[index].is_catchup = input->is_catchup ? 1 : 0;
-    if (store_save((unsigned)index) != DESK_HW_OK) {
+    int save_rc = store_save((unsigned)index);
+    if (save_rc != DESK_HW_OK) {
         memset(&s_records[index], 0, sizeof(s_records[index]));
-        return DESK_HW_ERR_IO;
+        return save_rc == DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE ? save_rc : DESK_HW_ERR_IO;
     }
     fill_status(input->notification_id, (unsigned)index, out_status);
     emit_status(input->notification_id, DESK_NOTIFICATION_ACCEPTED, DESK_HW_OK, NULL);
