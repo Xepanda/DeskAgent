@@ -321,6 +321,8 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(status["summary"], "app-server rejected the operation")
         self.assertEqual(events, [("codex.failed", {
             "task_id": "tsk-failed-turn",
+            "thread_id": task["thread_id"],
+            "turn_id": task["turn_id"],
             "status": "failed",
             "summary": "app-server rejected the operation",
         })])
@@ -370,6 +372,10 @@ class TestCodexCompanion(unittest.TestCase):
 
         self.assertEqual([event for event, _ in events], ["codex.failed", "codex.interrupted"])
         self.assertEqual([data["status"] for _, data in events], ["failed", "interrupted"])
+        self.assertEqual(events[0][1]["thread_id"], failed["thread_id"])
+        self.assertEqual(events[0][1]["turn_id"], failed["turn_id"])
+        self.assertEqual(events[1][1]["thread_id"], interrupted["thread_id"])
+        self.assertEqual(events[1][1]["turn_id"], interrupted["turn_id"])
         self.assertNotIn(prompt, json.dumps(events))
         self.assertIn("[user request omitted]", events[0][1]["summary"])
         self.assertIn("[user request omitted]", events[1][1]["summary"])
@@ -750,6 +756,8 @@ class TestCodexCompanion(unittest.TestCase):
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][0], "codex.turn_completed")
+        self.assertEqual(events[0][1]["thread_id"], "thread-safe-completion")
+        self.assertEqual(events[0][1]["turn_id"], "turn-safe-completion")
         self.assertEqual(
             events[0][1]["summary"],
             "assistant response echoed request: [user request omitted]",

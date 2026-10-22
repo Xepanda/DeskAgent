@@ -716,6 +716,8 @@ class CodexCompanion:
                         self._tasks[task_id]["last_output"] = summary
                         self._dispatch_event("codex.failed", {
                             "task_id": task_id,
+                            "thread_id": self._tasks[task_id].get("thread_id", ""),
+                            "turn_id": self._tasks[task_id].get("turn_id", ""),
                             "status": "failed",
                             "summary": summary,
                         })
@@ -733,6 +735,8 @@ class CodexCompanion:
                         self._persist_task(self._tasks[task_id])
                         self._dispatch_event("codex.interrupted", {
                             "task_id": task_id,
+                            "thread_id": self._tasks[task_id].get("thread_id", ""),
+                            "turn_id": self._tasks[task_id].get("turn_id", ""),
                             "status": "interrupted",
                             "summary": summary,
                         })
@@ -756,6 +760,8 @@ class CodexCompanion:
                         self._persist_task(self._tasks[task_id])
                         self._dispatch_event("codex.turn_completed", {
                             "task_id": task_id,
+                            "thread_id": self._tasks[task_id].get("thread_id", ""),
+                            "turn_id": self._tasks[task_id].get("turn_id", ""),
                             "status": "completed",
                             "summary": summary,
                         })
@@ -1561,6 +1567,16 @@ class RemoteCodexCompanionClient:
 
                     event_payload = {
                         "task_id": task_id,
+                        "thread_id": (
+                            res_dict.get("thread_id")
+                            or res.get("thread_id")
+                            or task_meta.get("thread_id", "")
+                        ),
+                        "turn_id": (
+                            res_dict.get("turn_id")
+                            or res.get("turn_id")
+                            or task_meta.get("turn_id", "")
+                        ),
                         "status": "completed",
                         "summary": summary,
                     }
@@ -1581,6 +1597,16 @@ class RemoteCodexCompanionClient:
                     summary = _safe_task_summary(summary, task_meta.get("prompt"), f"Task {task_id} interrupted")
                     event_payload = {
                         "task_id": task_id,
+                        "thread_id": (
+                            res_dict.get("thread_id")
+                            or res.get("thread_id")
+                            or task_meta.get("thread_id", "")
+                        ),
+                        "turn_id": (
+                            res_dict.get("turn_id")
+                            or res.get("turn_id")
+                            or task_meta.get("turn_id", "")
+                        ),
                         "status": "interrupted",
                         "summary": summary,
                     }
@@ -1611,6 +1637,16 @@ class RemoteCodexCompanionClient:
                     err_msg = _safe_task_summary(err_msg, task_meta.get("prompt"), f"Task {task_id} failed")
                     event_payload = {
                         "task_id": task_id,
+                        "thread_id": (
+                            res_dict.get("thread_id")
+                            or res.get("thread_id")
+                            or task_meta.get("thread_id", "")
+                        ),
+                        "turn_id": (
+                            res_dict.get("turn_id")
+                            or res.get("turn_id")
+                            or task_meta.get("turn_id", "")
+                        ),
                         "status": "failed",
                         "summary": err_msg,
                     }
