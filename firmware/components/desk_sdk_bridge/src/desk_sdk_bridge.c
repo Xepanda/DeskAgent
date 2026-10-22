@@ -4,6 +4,7 @@
  */
 
 #include "desk_sdk_bridge.h"
+#include "desk_watcher_log_source.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,16 +70,25 @@ static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
 static bool desk_sdk_is_lower_hex_64(const char *s);
 
-/* CR-009 L2: protocol state only. A1 still owns the bounded source queue and
- * must call a future narrow event-consumer seam; no raw logger is forwarded. */
+/* CR-009 L2 stream lease. Only structured A1 records are serialized. */
 static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool s_local_log_enabled = false;
 static bool s_log_stream_active = false;
 static bool s_log_camera_only = false;
 static char s_log_stream_id[33] = "";
 static char s_log_min_level[8] = "WARN";
-static uint32_t s_log_sequence = 0;
 static char s_log_boot_id[33] = "";
+static desk_watcher_log_record_t s_log_pending_record;
+static desk_watcher_log_gap_t s_log_pending_gap;
+static bool s_log_has_pending_record;
+static bool s_log_has_pending_gap;
+
+static void desk_sdk_log_source_reset_locked(void)
+{
+    desk_watcher_log_source_set_enabled(false);
+    s_log_has_pending_record = false;
+    s_log_has_pending_gap = false;
+}
 
 void desk_sdk_bridge_set_local_log_enabled(bool enabled)
 {
@@ -87,6 +97,7 @@ void desk_sdk_bridge_set_local_log_enabled(bool enabled)
     if (!enabled) {
         s_log_stream_active = false;
         s_log_stream_id[0] = '\0';
+        desk_sdk_log_source_reset_locked();
     }
     pthread_mutex_unlock(&s_log_mutex);
 }
@@ -97,7 +108,50 @@ void desk_sdk_bridge_log_session_closed(void)
     s_log_stream_active = false;
     s_log_camera_only = false;
     s_log_stream_id[0] = '\0';
+    desk_sdk_log_source_reset_locked();
     pthread_mutex_unlock(&s_log_mutex);
+}
+
+int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len)
+{
+    if (!out_json || out_len == 0) return -1;
+    pthread_mutex_lock(&s_log_mutex);
+    if (!s_local_log_enabled || !s_log_stream_active ||
+        !desk_sdk_ws_client_is_authenticated() ||
+        !desk_watcher_log_source_is_enabled()) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return 0;
+    }
+    if (!s_log_has_pending_record)
+        s_log_has_pending_record = desk_watcher_log_source_try_dequeue(&s_log_pending_record);
+    if (!s_log_has_pending_gap)
+        s_log_has_pending_gap = desk_watcher_log_source_take_gap(&s_log_pending_gap);
+
+    int n = 0;
+    if (s_log_has_pending_gap && (!s_log_has_pending_record ||
+        s_log_pending_gap.first_dropped_sequence < s_log_pending_record.sequence)) {
+        n = snprintf(out_json, out_len,
+            "{\"type\":\"sys.log.gap\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"first_dropped_sequence\":%llu,\"last_dropped_sequence\":%llu,\"dropped_count\":%llu,\"reason\":\"QUEUE_FULL\"}}",
+            s_log_stream_id, s_log_boot_id,
+            (unsigned long long)s_log_pending_gap.first_dropped_sequence,
+            (unsigned long long)s_log_pending_gap.last_dropped_sequence,
+            (unsigned long long)s_log_pending_gap.dropped_count);
+        s_log_has_pending_gap = false;
+    } else if (s_log_has_pending_record) {
+        if (s_log_pending_record.event_id != DESK_WATCHER_LOG_EVENT_CAMERA_CAPTURE_EMPTY) {
+            s_log_has_pending_record = false;
+            pthread_mutex_unlock(&s_log_mutex);
+            return 0;
+        }
+        n = snprintf(out_json, out_len,
+            "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"WARN\",\"component\":\"camera\",\"event_id\":\"CAMERA_CAPTURE_EMPTY\",\"fields\":{}}}",
+            s_log_stream_id, s_log_boot_id,
+            (unsigned long long)s_log_pending_record.sequence,
+            (unsigned long long)s_log_pending_record.uptime_ms);
+        s_log_has_pending_record = false;
+    }
+    pthread_mutex_unlock(&s_log_mutex);
+    return n > 0 && (size_t)n < out_len ? n : (n < 0 ? -1 : 0);
 }
 
 #define DESK_SDK_PAIRING_CODE_TTL_MS (5ULL * 60ULL * 1000ULL)
@@ -1039,10 +1093,6 @@ int desk_sdk_bridge_init(void)
 {
     desk_sdk_ws_client_close();
     desk_sdk_bridge_set_local_log_enabled(false);
-    pthread_mutex_lock(&s_log_mutex);
-    s_log_sequence = 0;
-    s_log_boot_id[0] = '\0';
-    pthread_mutex_unlock(&s_log_mutex);
     s_client_connected = false;
     s_event_seq = 0;
     s_outbound_cb = NULL;
@@ -1067,10 +1117,6 @@ void desk_sdk_bridge_reset(void)
 {
     desk_sdk_ws_client_close();
     desk_sdk_bridge_set_local_log_enabled(false);
-    pthread_mutex_lock(&s_log_mutex);
-    s_log_sequence = 0;
-    s_log_boot_id[0] = '\0';
-    pthread_mutex_unlock(&s_log_mutex);
     s_client_connected = false;
     s_event_seq = 0;
     pthread_mutex_lock(&s_pairing_code_mutex);
@@ -2109,10 +2155,19 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
         s_log_stream_active = true;
         s_log_camera_only = camera_only;
         strcpy(s_log_min_level, min_level);
+        s_log_has_pending_record = false;
+        s_log_has_pending_gap = false;
+        desk_watcher_log_source_set_enabled(true);
         int n = snprintf(out_buf, max_out_len,
-            "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.subscribe\",\"command_id\":\"%s\",\"accepted\":true,\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"next_sequence\":%u,\"min_level\":\"%s\",\"components\":%s}}",
-            command_id, s_log_stream_id, s_log_boot_id, s_log_sequence + 1U,
+            "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.subscribe\",\"command_id\":\"%s\",\"accepted\":true,\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"next_sequence\":%llu,\"min_level\":\"%s\",\"components\":%s}}",
+            command_id, s_log_stream_id, s_log_boot_id,
+            (unsigned long long)desk_watcher_log_source_next_sequence(),
             s_log_min_level, s_log_camera_only ? "[\"camera\"]" : "[]");
+        if (n < 0 || (size_t)n >= max_out_len) {
+            s_log_stream_active = false;
+            s_log_stream_id[0] = '\0';
+            desk_sdk_log_source_reset_locked();
+        }
         pthread_mutex_unlock(&s_log_mutex);
         return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
     }
@@ -2125,6 +2180,7 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
     }
     s_log_stream_active = false;
     s_log_stream_id[0] = '\0';
+    desk_sdk_log_source_reset_locked();
     int n = snprintf(out_buf, max_out_len,
         "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.unsubscribe\",\"command_id\":\"%s\",\"accepted\":true}}",
         command_id);

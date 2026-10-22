@@ -266,6 +266,8 @@ void desk_sdk_ws_client_close(void);
 void desk_sdk_bridge_set_local_log_enabled(bool enabled);
 /* Internal transport lifecycle seam; clears the current log stream lease. */
 void desk_sdk_bridge_log_session_closed(void);
+/* Internal A2 writer seam: returns one serialized v1 event/gap, or 0 if idle. */
+int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len);
 
 /**
  * @brief Parse top-level string field from JSON payload.

@@ -21,6 +21,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import socket
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -118,6 +121,19 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'int desk_sdk_test_preflight(void) { char host[64], hello[512]; uint16_t port = 0; '
                 'return desk_sdk_bridge_get_pairing_target(host, sizeof(host), &port) == 0 && '
                 'desk_sdk_bridge_build_hardware_hello(hello, sizeof(hello)) > 0 ? 1 : 0; }\n'
+                'int desk_sdk_test_deadline_write(int fd, const uint8_t *payload, size_t len, unsigned deadline_ms) { '
+                'int old_fd = s_ws_fd; s_ws_fd = fd; int rc = ws_send_frame_deadline(0x1, payload, len, deadline_ms); '
+                's_ws_fd = old_fd; return rc; }\n'
+                'int desk_sdk_test_binary_deadline_write(int fd, const uint8_t *payload, size_t len, unsigned deadline_ms) { '
+                'int old_fd = s_ws_fd; s_ws_fd = fd; int rc = ws_send_frame_deadline(0x2, payload, len, deadline_ms); '
+                's_ws_fd = old_fd; return rc; }\n'
+                'int desk_sdk_test_outbound_queue_is_zero(void) { int clean = 1; '
+                'pthread_mutex_lock(&s_ws_writer_mutex); '
+                'for (size_t i = 0; i < sizeof(s_ws_control_queue); ++i) if (((const uint8_t *)s_ws_control_queue)[i]) clean = 0; '
+                'for (size_t i = 0; i < sizeof(s_ws_writer_current); ++i) if (((const uint8_t *)&s_ws_writer_current)[i]) clean = 0; '
+                'pthread_mutex_unlock(&s_ws_writer_mutex); return clean; }\n'
+                'void desk_sdk_test_pause_writer_without_thread(void) { s_ws_writer_started = true; }\n'
+                'void desk_sdk_test_resume_writer(void) { s_ws_writer_started = false; }\n'
             )
 
         # Compile C shared library
@@ -134,6 +150,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             shim_path,
             "-lcrypto",
             "-o",
@@ -205,6 +222,20 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.lib.desk_sdk_bridge_process_ws_command.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
         cls.lib.desk_sdk_bridge_set_local_log_enabled.restype = None
         cls.lib.desk_sdk_bridge_set_local_log_enabled.argtypes = [ctypes.c_bool]
+        cls.lib.desk_watcher_log_source_publish_camera_capture_empty.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_camera_capture_empty.argtypes = []
+        cls.lib.desk_sdk_bridge_log_next_text.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_log_next_text.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        cls.lib.desk_sdk_test_deadline_write.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_deadline_write.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint]
+        cls.lib.desk_sdk_test_binary_deadline_write.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_binary_deadline_write.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint]
+        cls.lib.desk_sdk_test_outbound_queue_is_zero.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_outbound_queue_is_zero.argtypes = []
+        cls.lib.desk_sdk_test_pause_writer_without_thread.restype = None
+        cls.lib.desk_sdk_test_pause_writer_without_thread.argtypes = []
+        cls.lib.desk_sdk_test_resume_writer.restype = None
+        cls.lib.desk_sdk_test_resume_writer.argtypes = []
         cls.lib.desk_sdk_test_prepare_log_pair.restype = None
         cls.lib.desk_sdk_test_prepare_log_pair.argtypes = []
 
@@ -348,6 +379,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         first = dispatch(sub(first_id))
         self.assertEqual((first["type"], first["data"]["command_id"]), ("sys.ack", first_id))
         original_stream = first["data"]["stream_id"]
+        first_sequence = first["data"]["next_sequence"]
         duplicate_id = "00000000000000000000000000000003"
         duplicate = dispatch(sub(duplicate_id))
         self.assertEqual((duplicate["type"], duplicate["data"]["error"]), ("sys.nack", "ALREADY_SUBSCRIBED"))
@@ -362,22 +394,170 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         cancel = {"type": "sys.log.unsubscribe", "code": 0, "data": {
             "command_id": "00000000000000000000000000000006", "log_schema_version": "1.0.0", "stream_id": original_stream}}
+        self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+        self.lib.desk_watcher_log_source_publish_camera_capture_empty()
         self.assertEqual(dispatch(cancel)["data"]["command_id"], cancel["data"]["command_id"])
+        stale = ctypes.create_string_buffer(768)
+        self.assertEqual(self.lib.desk_sdk_bridge_log_next_text(stale, len(stale)), 0)
         again = dispatch(sub("00000000000000000000000000000007"))
         self.assertEqual(again["type"], "sys.ack")
         self.assertNotEqual(again["data"]["stream_id"], original_stream)
+        self.assertEqual(again["data"]["next_sequence"], first_sequence + 2)
 
+        self.lib.desk_watcher_log_source_publish_camera_capture_empty()
         self.lib.desk_sdk_ws_client_close()
         self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        resumed = dispatch(sub("00000000000000000000000000000010"))
+        self.assertEqual(resumed["data"]["next_sequence"], first_sequence + 3)
+        self.assertEqual(self.lib.desk_sdk_bridge_log_next_text(stale, len(stale)), 0)
+        self.lib.desk_sdk_ws_client_close()
         denied_reconnect = dispatch(sub("00000000000000000000000000000008"))
         self.assertEqual(denied_reconnect["data"]["error"], "AUTH_REQUIRED")
         self.lib.desk_sdk_test_seed_ws_auth_latch()
         self.assertEqual(dispatch(sub("00000000000000000000000000000009"))["type"], "sys.ack")
         self.lib.desk_sdk_bridge_set_local_log_enabled(False)
 
+    def test_cr009_event_and_queue_full_gap_are_serialized_in_sequence_order(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        subscribe = {"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": "00000000000000000000000000000031",
+            "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}}
+        out = ctypes.create_string_buffer(1024)
+        self.assertEqual(self.lib.desk_sdk_bridge_process_ws_command(
+            json.dumps(subscribe).encode(), out, len(out)), 0)
+        ack = json.loads(out.value)
+        first_sequence = ack["data"]["next_sequence"]
+
+        for _ in range(18):
+            self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+        messages = []
+        for _ in range(17):
+            frame = ctypes.create_string_buffer(768)
+            n = self.lib.desk_sdk_bridge_log_next_text(frame, len(frame))
+            self.assertGreater(n, 0)
+            messages.append(json.loads(frame.value))
+        events = [m for m in messages if m["type"] == "sys.log.event"]
+        gaps = [m for m in messages if m["type"] == "sys.log.gap"]
+        self.assertEqual([m["data"]["sequence"] for m in events],
+                         list(range(first_sequence, first_sequence + 16)))
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["data"], {
+            "log_schema_version": "1.0.0", "stream_id": ack["data"]["stream_id"],
+            "boot_id": ack["data"]["boot_id"], "first_dropped_sequence": first_sequence + 16,
+            "last_dropped_sequence": first_sequence + 17, "dropped_count": 2, "reason": "QUEUE_FULL"})
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    def test_cr009_deadline_writer_times_out_on_a_full_socket(self) -> None:
+        sender, receiver = socket.socketpair()
+        try:
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+            sender.setblocking(False)
+            while True:
+                try:
+                    sender.send(b"x" * 4096)
+                except BlockingIOError:
+                    break
+            payload = ctypes.create_string_buffer(b"deadline")
+            start = time.monotonic()
+            rc = self.lib.desk_sdk_test_deadline_write(sender.fileno(), payload, 8, 150)
+            elapsed = time.monotonic() - start
+            self.assertNotEqual(rc, 0)
+            self.assertGreaterEqual(elapsed, 0.12)
+            self.assertLess(elapsed, 0.5)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_deadline_writer_reassembles_short_writes(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        receiver.settimeout(0.5)
+        payload = bytes(range(256)) * 32
+        result: dict[str, int] = {}
+        def write() -> None:
+            result["rc"] = self.lib.desk_sdk_test_deadline_write(
+                sender.fileno(), ctypes.create_string_buffer(payload), len(payload), 250)
+        writer = threading.Thread(target=write)
+        writer.start()
+        wire = bytearray()
+        try:
+            while writer.is_alive() or len(wire) < len(payload) + 8:
+                try:
+                    chunk = receiver.recv(256)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                wire.extend(chunk)
+                time.sleep(0.0005)
+            writer.join(timeout=1)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(result.get("rc"), 0)
+            self.assertEqual(wire[0], 0x81)
+            self.assertEqual(wire[1] & 0x7F, 126)
+            self.assertEqual(int.from_bytes(wire[2:4], "big"), len(payload))
+            mask = wire[4:8]
+            decoded = bytes(byte ^ mask[index % 4] for index, byte in enumerate(wire[8:]))
+            self.assertEqual(decoded, payload)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_binary_frame_over_8k_survives_short_writes(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        receiver.settimeout(0.5)
+        payload = bytes(range(256)) * 64
+        result: dict[str, int] = {}
+        def write() -> None:
+            result["rc"] = self.lib.desk_sdk_test_binary_deadline_write(
+                sender.fileno(), ctypes.create_string_buffer(payload), len(payload), 250)
+        writer = threading.Thread(target=write)
+        writer.start()
+        wire = bytearray()
+        try:
+            while writer.is_alive() or len(wire) < len(payload) + 8:
+                try:
+                    chunk = receiver.recv(512)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                wire.extend(chunk)
+                time.sleep(0.0002)
+            writer.join(timeout=1)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(result.get("rc"), 0)
+            self.assertEqual(wire[0], 0x82)
+            self.assertEqual(wire[1] & 0x7F, 126)
+            self.assertEqual(int.from_bytes(wire[2:4], "big"), len(payload))
+            mask = wire[4:8]
+            decoded = bytes(byte ^ mask[index % 4] for index, byte in enumerate(wire[8:]))
+            self.assertEqual(decoded, payload)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_full_control_queue_fails_closed_without_blocking(self) -> None:
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_test_pause_writer_without_thread()
+        start = time.monotonic()
+        results = [self.lib.desk_sdk_ws_client_send_text(b'{"type":"sys.ping"}') for _ in range(4)]
+        elapsed = time.monotonic() - start
+        self.assertEqual(results[:3], [0, 0, 0])
+        self.assertNotEqual(results[3], 0)
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(self.lib.desk_sdk_test_outbound_queue_is_zero(), 1)
+        self.lib.desk_sdk_test_resume_writer()
+
     def test_cr009_command_is_dispatched_from_live_websocket_receive_loop(self) -> None:
         async def exercise() -> dict:
             received: dict = {}
+            received_event: dict = {}
             async def handler(websocket) -> None:
                 hello = json.loads(await websocket.recv())
                 self.assertEqual(hello["type"], "sys.client.hello")
@@ -388,6 +568,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                              "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}},
                     separators=(",", ":")))
                 received.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+                received_event.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
 
             async with websockets.serve(handler, "127.0.0.1", 0) as server:
                 port = server.sockets[0].getsockname()[1]
@@ -397,16 +578,20 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
                 self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
                 self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 1000), 0)
-                await asyncio.sleep(0)
+                self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+                await asyncio.sleep(0.05)
                 self.lib.desk_sdk_ws_client_close()
                 self.lib.desk_sdk_bridge_set_local_log_enabled(False)
-            return received
+            return {"ack": received, "event": received_event}
 
         response = asyncio.run(exercise())
-        self.assertEqual(response["type"], "sys.ack")
-        self.assertEqual(response["data"]["type"], "sys.log.subscribe")
-        self.assertEqual(response["data"]["command_id"], "11111111111111111111111111111111")
-        self.assertTrue(response["data"]["accepted"])
+        self.assertEqual(response["ack"]["type"], "sys.ack")
+        self.assertEqual(response["ack"]["data"]["type"], "sys.log.subscribe")
+        self.assertEqual(response["ack"]["data"]["command_id"], "11111111111111111111111111111111")
+        self.assertTrue(response["ack"]["data"]["accepted"])
+        self.assertEqual(response["event"]["type"], "sys.log.event")
+        self.assertEqual(response["event"]["data"]["event_id"], "CAMERA_CAPTURE_EMPTY")
+        self.assertEqual(response["event"]["data"]["sequence"], response["ack"]["data"]["next_sequence"])
 
     def test_cr009_rejects_malformed_or_ambiguous_json_filters(self) -> None:
         self.lib.desk_sdk_test_prepare_log_pair()
