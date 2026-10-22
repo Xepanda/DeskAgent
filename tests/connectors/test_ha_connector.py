@@ -479,6 +479,33 @@ class TestHAConnector(unittest.TestCase):
         self.assertIsNone(res["state_changed"])
         self.assertIsNone(res["physical_action_confirmed"])
 
+    def test_execute_reports_accepted_but_unobserved_when_ha_state_reads_stay_offline(self) -> None:
+        """An accepted service with unavailable follow-up state reads is not reported as changed or acted."""
+        requests: list[tuple[str, float]] = []
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            requests.append((method, timeout))
+            if method == "POST":
+                return 200, []
+            return 503, {"message": "state endpoint unavailable"}
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123", token="token", timeout_sec=5.0, transport=mock_transport,
+        )
+        res = ha.execute(
+            "light.desk", "turn_on",
+            wait_for_state={"expected_state": "on", "timeout_ms": 80},
+        )
+
+        self.assertTrue(res["accepted"])
+        self.assertIsNone(res["observed_state"])
+        self.assertFalse(res["state_confirmed"])
+        self.assertIsNone(res["state_changed"])
+        self.assertIsNone(res["physical_action_confirmed"])
+        state_reads = [timeout for method, timeout in requests if method == "GET"]
+        self.assertGreaterEqual(len(state_reads), 2)  # Baseline and bounded confirmation reads.
+        self.assertTrue(all(timeout <= 0.08 for timeout in state_reads), state_reads)
+
     def test_execute_with_wait_for_state_timeout(self) -> None:
         """When state does NOT reach expected_state before timeout, state_confirmed is False."""
         def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
