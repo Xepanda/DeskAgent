@@ -1437,6 +1437,71 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(transport.resume_calls, 2)
         resumed.close()
 
+    def test_active_writer_uses_read_only_snapshot_until_terminal_then_recovers_after_restart(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-active-writer-snapshot.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-active-writer-snapshot", "test-project", "private prompt")
+        original.close()
+
+        class SnapshotTransport(JsonRpcTransport):
+            snapshot_calls = 0
+            methods: list[str] = []
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                self.methods.append(method)
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    return {"error": {"code": -32600, "message": "thread already has an active writer"}}
+                if method == "thread/read":
+                    self.snapshot_calls += 1
+                    status = "inProgress" if self.snapshot_calls == 1 else "completed"
+                    items = [] if status == "inProgress" else [
+                        {"type": "userMessage", "text": "private prompt"},
+                        {"type": "agentMessage", "text": "assistant result recovered from snapshot"},
+                    ]
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": status, "items": items,
+                    }]}}
+                return {}
+
+        transport = SnapshotTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        self.addCleanup(resumed.close)
+        clock = [2000.0]
+        with patch("companion.src.codex_companion.time.monotonic", side_effect=lambda: clock[0]):
+            resumed.initialize()
+            first = resumed.get_task_status("tsk-active-writer-snapshot")
+            self.assertEqual(first["status"], "running")
+            self.assertEqual(first["recovery_status"], "pending")
+            self.assertEqual(first["recovery_error_kind"], "active_writer")
+            self.assertEqual(transport.methods, ["initialize", "thread/resume", "thread/read"])
+
+            # An active snapshot is not ownership or event-stream recovery.
+            self.assertEqual(resumed._thread_to_task.get(task["thread_id"]), "tsk-active-writer-snapshot")
+            self.assertEqual(resumed._turn_to_task.get(task["turn_id"]), "tsk-active-writer-snapshot")
+            self.assertEqual(resumed.get_task_status("tsk-active-writer-snapshot")["recovery_status"], "pending")
+
+            clock[0] += 2.0
+            self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 1, "pending": 0})
+
+        final = resumed.get_task_status("tsk-active-writer-snapshot")
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["summary"], "assistant result recovered from snapshot")
+        self.assertNotIn("private prompt", final["summary"])
+        self.assertEqual(transport.snapshot_calls, 2)
+        self.assertNotIn("turn/start", transport.methods)
+        self.assertNotIn("turn/append", transport.methods)
+        resumed.close()
+
     def test_legacy_cancelled_task_is_not_resumed(self) -> None:
         db_file = os.path.join(self.temp_dir.name, "legacy-cancelled.db")
         original = CodexCompanion(

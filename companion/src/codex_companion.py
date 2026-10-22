@@ -867,6 +867,8 @@ class CodexCompanion:
                     counts["pending"] += 1
                     continue
 
+                active_writer_snapshot = False
+
                 try:
                     response = transport.send_request("thread/resume", {
                         "threadId": thread_id,
@@ -876,18 +878,30 @@ class CodexCompanion:
                 except Exception as exc:
                     error_text = str(exc).lower()
                     error_kind = "active_writer" if "already has an active writer" in error_text else "resume_error"
-                    self._set_recovery_pending(task_id, error_kind)
-                    counts["pending"] += 1
-                    logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
-                    continue
+                    if error_kind == "active_writer":
+                        response = self._read_thread_snapshot(transport, thread_id)
+                        active_writer_snapshot = response is not None
+                    else:
+                        response = None
+                    if response is None:
+                        self._set_recovery_pending(task_id, error_kind)
+                        counts["pending"] += 1
+                        logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
+                        continue
 
                 if isinstance(response, dict) and isinstance(response.get("error"), dict):
                     error_text = str(response["error"].get("message") or "").lower()
                     error_kind = "active_writer" if "already has an active writer" in error_text else "resume_error"
-                    self._set_recovery_pending(task_id, error_kind)
-                    counts["pending"] += 1
-                    logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
-                    continue
+                    if error_kind == "active_writer":
+                        response = self._read_thread_snapshot(transport, thread_id)
+                        active_writer_snapshot = response is not None
+                    else:
+                        response = None
+                    if response is None:
+                        self._set_recovery_pending(task_id, error_kind)
+                        counts["pending"] += 1
+                        logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
+                        continue
 
                 thread = response.get("thread") if isinstance(response, dict) else None
                 if not isinstance(thread, dict):
@@ -953,6 +967,15 @@ class CodexCompanion:
                     continue
 
                 if turn_status == "inprogress":
+                    if active_writer_snapshot:
+                        # thread/read is observational only. It cannot subscribe
+                        # this Companion to the other writer's notifications or
+                        # transfer thread ownership, so keep polling snapshots
+                        # with backoff until an authoritative terminal turn is
+                        # visible (or thread/resume becomes available).
+                        self._set_recovery_pending(task_id, "active_writer")
+                        counts["pending"] += 1
+                        continue
                     with self._lock:
                         current = self._tasks.get(task_id)
                         if current is not None:
@@ -986,6 +1009,20 @@ class CodexCompanion:
                 counts["reconciled"] += 1
 
         return counts
+
+    @staticmethod
+    def _read_thread_snapshot(transport: JsonRpcTransport, thread_id: str) -> Optional[dict[str, Any]]:
+        """Reads persisted thread state without claiming its active writer lease."""
+        try:
+            response = transport.send_request("thread/read", {"threadId": thread_id, "includeTurns": True})
+        except Exception:
+            return None
+        if not isinstance(response, dict) or isinstance(response.get("error"), dict):
+            return None
+        thread = response.get("thread")
+        if not isinstance(thread, dict) or not isinstance(thread.get("turns"), list):
+            return None
+        return response
 
     def _set_recovery_pending(self, task_id: str, error_kind: str) -> None:
         with self._lock:
