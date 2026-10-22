@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import sqlite3
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import gc
@@ -251,6 +253,64 @@ class TestLifeService(unittest.TestCase):
         self.service.close()
         self.service = LifeService(self.db_path)
         self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "pending")
+
+    def test_forced_process_exit_preserves_due_reminder_and_recovers_claim(self) -> None:
+        """A hard process exit must retain a due reminder and reclaim an unacked alert."""
+        self.service.close()
+        due_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        create_script = r"""
+import os, sys
+from host.desk_agent.services.life_service import LifeService
+service = LifeService(sys.argv[1])
+service.create_reminder("rem-process-crash", "Crash recovery", sys.argv[2])
+os._exit(0)
+"""
+        create = subprocess.run(
+            [sys.executable, "-c", create_script, str(self.db_path), due_at],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(create.returncode, 0, create.stderr)
+
+        self.service = LifeService(self.db_path)
+        reminder = self.service.get_reminder("rem-process-crash")
+        self.assertIsNotNone(reminder)
+        due = self.service.get_due_occurrences()
+        self.assertEqual(len(due), 1)
+        self.assertTrue(due[0]["is_catchup"])
+        occurrence_id = due[0]["occurrence_id"]
+        alert = self.service.trigger_occurrence_to_outbox(occurrence_id)
+        self.assertIsNotNone(alert)
+        self.service.close()
+
+        claim_script = r"""
+import os, sys
+from host.desk_agent.services.life_service import LifeService
+service = LifeService(sys.argv[1])
+items = service.get_pending_outbox()
+alert = next(item for item in items if item["event_type"] == "reminder.alert")
+assert service.claim_reminder_alert(alert["outbox_id"])
+os._exit(0)
+"""
+        claim = subprocess.run(
+            [sys.executable, "-c", claim_script, str(self.db_path)],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(claim.returncode, 0, claim.stderr)
+
+        self.service = LifeService(self.db_path)
+        pending = self.service.get_pending_outbox()
+        recovered = [item for item in pending if item["event_type"] == "reminder.alert"]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["payload"]["occurrence_id"], occurrence_id)
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "pending")
+        occurrence = self.service.get_all_occurrences("rem-process-crash")[0]
+        self.assertEqual(occurrence["state"], "ringing")
 
     def test_snooze_occurrence_is_idempotent_across_retry_and_restart(self) -> None:
         occurrence_id = self._create_pending_reminder_alert("rem-snooze-outbox")
