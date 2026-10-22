@@ -1,55 +1,35 @@
 # CR-024 — 暂停宣告 SDK `inputs` capability
 
-- **状态：** A0 裁决已由 A2 实施；软件 L2 contract 验收通过。锁定 SDK runtime loopback 与目标设备 L3 尚未验证。
-- **范围：** A2 在 `sys.client.hello`（桌面 JSON bridge 的 capability ACK）与 `sys.sdk.ready.get` 中移除 `inputs`。不改事件协议、不改设备输入采集、不改本地交互。
-- **依据版本：** `contracts/dependency_lock.json` 锁定 WatcheRobot Python SDK v0.1.11，commit `8bc13967a06ef073459be47e930ff43ef37ee8fb`；本地 pinned checkout `git rev-parse HEAD` 与之相同。
+- **状态：** **L2 软件合同项已由 CR-025 验收并解除暂停；当前 capability 已按 `inputs={roller}` 恢复。设备 L3/L4 仍未验证。**
+- **范围：** 本 CR 原批准 A2 从 `sys.client.hello`（桌面 JSON bridge capability ACK）和 `sys.sdk.ready.get` 移除 `inputs`，避免宣告尚无消费链路的输入能力。该暂停已按 CR-025 的恢复门槛解除。
+- **依据版本：** `contracts/dependency_lock.json` 锁定 WatcheRobot Python SDK v0.1.11，commit `8bc13967a06ef073459be47e930ff43ef37ee8fb`；pinned checkout 与此版本一致。
+- **后续契约：** [CR-025](CR-025-sdk-roller-input-capability.md) 批准仅支持滚轮旋转的 `inputs={roller}` 子集及恢复条件。
 
-## 裁决
+## 原始暂停裁决与背景
 
-当前移除 `inputs` capability，直到固件完成可验收的 SDK 输入事件发布链路后再由 A0 单独恢复。设备不得向 SDK/Runtime 承诺目前无法消费的输入功能。A2 仅修改 capability 宣告，不删除/屏蔽硬件采集或 UI 行为。
+CR-024 最初移除 `inputs`，因为固件只有本地输入采集/UI/TuyaOpen 处理，没有向 SDK 发布 `evt.sdk.input` 的生产路径。此项 truthfulness 修复完成后，A2/A1 按 CR-025 增加 roller observer、事件序列化和 Runtime 输入路径。以下恢复判定以 CR-025 为准；CR-024 原“保持缺席”的要求已由本次验收取代。
 
-## 证据与当前语义
+SDK v0.1.11 仅将 `type == "evt.sdk.input"` 的 `data` 交给 `parse_input_event()` 并推送至 `robot.inputs`。其 parser 接受 back touch、带坐标的 screen tap 和 roller rotate；当前设备只实现 roller rotate。设备 UI 导航与 TuyaOpen 旋钮短按/长按继续保持本地处理。screen touch、back touch 和按钮输入不属于本 capability。
 
-1. 锁定 SDK `src/watcherobot/robot.py` 在 `_handle_message` 对 `type == "evt.sdk.input"` 才调用 `parse_input_event(data)` 并推送 `robot.inputs` 队列。没有该事件就没有 SDK 输入消费路径。
-2. `src/watcherobot/inputs.py::parse_input_event` 接受三类精确数据：
-   - `{source:"back_touch", action:"press"|"release"|"long_press", touch_id:0..255, timestamp_ms:非负整数}`；
-   - `{source:"screen_touch", action:"tap", x:非负整数, y:非负整数, timestamp_ms:非负整数}`；
-   - `{source:"roller", action:"rotate", delta:非零整数, timestamp_ms:非负整数}`。
-3. 当前固件 `firmware/components/desk_hardware/src/desk_watcher_input.c` 将旋钮编码器步进映射为 `DESK_TOUCH_TARGET_ROLLER + SCROLL_UP/DOWN`，按键短按/长按映射为 roller + `SHORT_PRESS/LONG_PRESS`，触摸映射为 screentouch + 短按/长按/上下滚动。采样后仅调用 `desk_hardware_feed_touch_event()`，没有 SDK event 发布调用。
-4. `firmware/components/desk_tclaw/src/desk_tclaw_bridge.c` 对旋钮滚动继续执行 UI 导航；旋钮短按/长按继续映射 TuyaOpen `AT_KEY_TALK` / `AT_LONG_KEY_TALK`。这些本地语义必须保留。
-5. 当前事件采集没有保留屏幕触点 x/y；因此无法构造 SDK 所需 `screen_touch/tap`。固件亦未采集/提供独立背部触摸源；不能把屏幕触摸冒充 back_touch。SDK schema 没有 knob-button 短按/长按事件类型，不能擅自映射成 roller rotate。
+## A2/A1 实施与 L2 验收结果
 
-## A2 实施结果（软件 L2 contract）
+生产 `sys.client.hello` 与 `sys.sdk.ready.get` 两个 endpoint 当前都按相同顺序报告 `motion`, `camera`, `expression.audio_follow.v1`, `expression`, `mcp_tools`, `inputs`。此处的 `inputs` 仅表示 roller 旋转事件，不能解读为 SDK 支持其他输入源。
 
-A2 已从 `sys.client.hello` 与 `sys.sdk.ready.get` 的 capability 列表移除 `inputs`，并删除不再使用的 `DESK_SDK_CAP_INPUTS` 常量；本地输入采集、UI 和 TuyaOpen 按键处理代码未改。两个响应的精确列表相同，顺序为：`motion`, `camera`, `expression.audio_follow.v1`, `expression`, `mcp_tools`。`tests/sdk_contract/test_sdk_bridge_protocol.py` 对两者做精确列表断言，`test_mcp_tool_bridge_contract.py` 对生产 C handler 的列表做精确断言，SDK compat 测试断言 `inputs` 缺席。
+Root 在隔离 pinned venv 中独立复跑三个 SDK contract 模块，**127 tests passed**（Level 2）：
 
-执行记录：merged WSL unittest suite 共 **119/119 passed**，包括 `test_mcp_tool_bridge_contract`、`test_sdk_bridge_protocol` 与 `test_official_sdk_runtime_compat`；其中官方 Runtime compatibility 的 34 项本次均实际运行并通过，使用仓库已有 `.target_logging/sdk-acceptance/sdk-venv` 与 pinned vendor SDK，经 `PYTHONPATH` 加载，未安装依赖。C harness 同时补入生产 `desk_notification.c` 链接源以完成构建。此结果是软件 L2 contract/测试证据；不据此声称目标设备互通或 L3/L4 通过。
+1. `tests/sdk_contract/test_sdk_bridge_protocol.py`：锁定 parser 正例/反例、生产 C roller observer、方向及本地 UI/按键回归、发送失败路径、capability 精确列表。
+2. `tests/sdk_contract/test_official_sdk_runtime_compat.py`：pinned Runtime + 生产 C WebSocket client localhost loopback 接收正反方向 roller events；断开时发送失败，重连后旧事件不重放、新事件可达；真实 `InputDomain` 容量 64 队列两轮各接收 68 个事件，逐轮 `dropped_events` 增加 4，保留最新 64 项且顺序正确。
+3. `tests/sdk_contract/test_mcp_tool_bridge_contract.py`：生产 C handler capability 精确列表，并确认 `inputs` 仅指 SDK roller events、button/touch 不包括在内，两个 endpoint 一致。
 
-## A2 实施要求
+这些测试是静态、native harness 与 localhost Runtime 软件互通证据（L2）；observer 测试使用输入抽象，不证明真实 GPIO 或实体设备事件。不得将其描述为设备连接或现场输入验收。
 
-- 从 capability 列表移除 `inputs`，并确保 hello 与 `sys.sdk.ready.get` 完全一致；其他 capability 不在本 CR 范围。
-- 不得新增 `evt.sdk.input` 发布，不得把输入转发至 Host，不得改输入/UI/Tuya 语义，不得以 hello 的硬件角色 ACK 为由扩张 capability。
-- 不得删除 A1 输入驱动、本地 UI 导航、按键语音调用或诊断计数。
+## 当前契约与剩余验收
 
-## 兼容性与恢复门槛
+- **当前已恢复：** A2 可在两个 capability endpoint 一致宣告 `inputs`，但覆盖仅为 `inputs={roller}`。任何变化都须保持两个列表精确一致，并更新对应能力范围说明。
+- **L2：** CR-025 四项恢复门槛已通过上述 127 项组合复跑，软件 capability truthfulness 项解除暂停。
+- **L3 未验证：** 目标板实体旋钮多步输入及 SDK 收件；设备 UI 滚动；短按/长按仍触发 TuyaOpen 语义；目标设备连接官方 Runtime。
+- **L4 未验证：** 设备/Host/Runtime 重启与恢复、断连期间不重放及恢复后新事件闭环、持续输入压力和长稳行为。
 
-Capability 缺席意味着 SDK consumer 应将输入视为不可用；不得据此假定事件会到达。恢复前由 A0 再审并要求：
+## 结论
 
-1. 明确并保留本地 UI/按键语义，决定哪些原始输入可同时发布；任何争用由 A1/A0 裁决，不得改变 TuyaOpen 短按/长按用途。
-2. 对每个 SDK 事件源给出由真实采样数据到 schema 字段的无歧义映射；增加屏幕触点坐标采集后才可发 `screen_touch/tap`。未实现的 back touch 不得宣告支持。
-3. 使用锁定 SDK parser 做正例/反例测试，覆盖 source/action、整数类型（bool 不可作为整数）、边界、毫秒时间戳、方向 delta；验证 SDK 未宣告时能力检查失败/域按设计不可依赖。
-4. 加入生产 C 路径测试，证明输入样本产生严格合法 `evt.sdk.input` JSON，同时本地 `desk_hardware_feed_touch_event()` 仍收到并处理原事件；验证重复、非法、断连行为及事件不误路由为命令结果。
-5. 通过 localhost pinned Runtime+C loopback 证明 SDK `robot.inputs.wait()` 收到对应事件。这是 Level 2 软件互通；若宣称设备互通，仍须另行完成目标板 Level 3，端到端场景另按 Level 4 验收。
-
-## 验收（本 CR）
-
-- 静态/合同测试断言 `sys.client.hello` 和 `sys.sdk.ready.get` 均不含 `inputs`，并确认列表除该项外保持既有值。
-- 锁定 SDK 检查显示 capability 不存在时不会将 `robot.inputs` 描述为受支持输入能力；不得因空事件流误报成功。
-- 回归测试确认本地滚轮 UI 导航与旋钮短按/长按既有映射未被修改（软件层）；此项不代表板上输入已实测。
-- 本 CR 的 capability truthfulness 软件合同已通过；不要求当前实现 SDK 输入事件，因为 capability 已撤下。后续若恢复 `inputs`，须另行提交 A0 决策并满足上文恢复门槛。
-
-## 验收限制
-
-A2 capability 移除与一致性已有 Level 2 contract 测试证据，pinned SDK compatibility suite 的 34 项也已在本次 merged WSL suite 中实际运行通过。测试结果不构成目标设备上的 SDK 连接、输入硬件工作、L3/L4 或真实输入事件送达证明；目标硬件验收仍未验证。
-
-
+CR-024 原暂停决定已按 CR-025 的 L2 门槛解除。当前固件可宣告 `inputs`，但只表示 roller 旋转；本结论不构成设备 L3 或系统 L4 验收。
