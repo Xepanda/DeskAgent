@@ -1,6 +1,9 @@
 """Source contracts for preserving actionable Watcher camera errors."""
 
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 
@@ -8,9 +11,65 @@ ROOT = Path(__file__).resolve().parents[2]
 CAMERA_C = ROOT / "firmware/components/desk_hardware/src/desk_watcher_camera.c"
 HARDWARE_C = ROOT / "firmware/components/desk_hardware/src/desk_hardware.c"
 CAMERA_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera.h"
+CAMERA_BUS_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera_bus.h"
 
 
 class TestWatcherCameraErrorContract(unittest.TestCase):
+    def test_spi_bus_ownership_releases_once_after_reacquire_deadline(self):
+        """Exercise the same ownership transition used by capture cleanup."""
+        harness = r'''#include <assert.h>
+#include <stdbool.h>
+#include "desk_watcher_camera_bus.h"
+
+static unsigned release_calls;
+static void release_bus(void) { ++release_calls; }
+static void cleanup(bool *owned) {
+    if (desk_watcher_camera_bus_take_release(owned)) release_bus();
+}
+
+int main(void) {
+    bool owned = false;
+    desk_watcher_camera_bus_set_acquired(&owned, true);
+    cleanup(&owned); /* empty header closed before retry */
+    assert(!owned && release_calls == 1);
+    desk_watcher_camera_bus_set_acquired(&owned, true); /* retry reacquired */
+    cleanup(&owned); /* capture deadline expires before next header */
+    assert(!owned && release_calls == 2);
+    cleanup(&owned);
+    assert(release_calls == 2); /* no double release */
+    desk_watcher_camera_bus_set_acquired(&owned, false); /* failed acquire */
+    cleanup(&owned);
+    assert(release_calls == 2);
+    return 0;
+}
+'''
+        source_text = CAMERA_C.read_text(encoding="utf-8")
+        capture = source_text.split("int desk_watcher_camera_capture(", 1)[1]
+        self.assertIn("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)", capture)
+        self.assertIn("camera_capture_release_bus()", capture)
+        empty_deadline = capture.split("if (!header_received)", 1)[1].split("int ptl_rc", 1)[0]
+        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", empty_deadline)
+        release = source_text.split("static int camera_capture_release(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("camera_capture_release_bus()", release)
+        bus_release = source_text.split("static void camera_capture_release_bus(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("desk_watcher_camera_bus_take_release(&s_capture_bus_acquired)", bus_release)
+        compiler = shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("native gcc is unavailable; C harness is ready for host CI")
+
+        with tempfile.TemporaryDirectory(prefix="desk-camera-bus-owner-") as temp_dir:
+            source = Path(temp_dir) / "camera_bus_owner_test.c"
+            executable = Path(temp_dir) / "camera_bus_owner_test.exe"
+            source.write_text(harness, encoding="utf-8")
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 f"-I{CAMERA_BUS_H.parent}", str(source), "-o", str(executable)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            run = subprocess.run([str(executable)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
     def test_hardware_wrapper_propagates_camera_driver_error(self):
         source = HARDWARE_C.read_text(encoding="utf-8")
         capture = source.split("int desk_hardware_camera_capture_jpeg(", 1)[1]
@@ -46,8 +105,10 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
     def test_zero_ptl_header_has_distinct_empty_error_and_spi_failures_keep_stage(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
-        self.assertIn("if (header_or != 0) break", capture)
-        self.assertIn("CAM_PTL_EMPTY_RETRY_LIMIT", capture)
+        self.assertIn("if (header_or != 0)", capture)
+        self.assertIn("CAM_PTL_CAPTURE_TIMEOUT_MS", capture)
+        self.assertIn("camera_capture_deadline_us", capture)
+        self.assertIn("CAM_PTL_EMPTY_BACKOFF_MS", capture)
         self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", capture)
         self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI)", capture)
         self.assertGreaterEqual(capture.count("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI)"), 2)
@@ -97,10 +158,30 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
     def test_empty_ptl_poll_records_raw_header_and_sync_observation(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
-        empty_poll = capture.split("if (header_or != 0) break;", 1)[1].split("if (empty_attempt + 1U >=", 1)[0]
+        empty_poll = capture.split("if (header_or != 0)", 1)[1].split("vTaskDelay(pdMS_TO_TICKS(CAM_PTL_EMPTY_BACKOFF_MS));", 1)[0]
         self.assertIn("camera_sync_is_active", empty_poll)
         self.assertIn("base_header[0]", empty_poll)
         self.assertIn("sync read rc=%d", empty_poll)
+
+    def test_empty_headers_retry_until_capture_deadline_and_allow_later_valid_header(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        self.assertIn("while (esp_timer_get_time() < camera_capture_deadline_us)", capture)
+        self.assertIn("if (header_or != 0)", capture)
+        self.assertNotIn("CAM_PTL_EMPTY_RETRY_LIMIT", capture)
+        self.assertIn("camera_capture_deadline_us", capture)
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_EMPTY", capture)
+
+    def test_capture_timeout_is_passed_from_hardware_api_to_board_driver(self):
+        header = (ROOT / "firmware/components/desk_hardware/include/desk_hardware.h").read_text(encoding="utf-8")
+        hardware = HARDWARE_C.read_text(encoding="utf-8")
+        camera_header = CAMERA_H.read_text(encoding="utf-8")
+        camera = CAMERA_C.read_text(encoding="utf-8")
+        self.assertIn("size_t *out_len, uint32_t timeout_ms);", header)
+        self.assertIn("&drv_len, timeout_ms)", hardware)
+        self.assertIn("size_t *out_len, uint32_t timeout_ms);", camera_header)
+        self.assertIn("size_t *out_len, uint32_t timeout_ms)", camera)
+        self.assertIn("(unsigned)timeout_ms", camera)
 
 
 if __name__ == "__main__":

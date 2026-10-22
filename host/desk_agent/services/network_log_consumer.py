@@ -33,6 +33,11 @@ class NetworkLogConsumer:
         self._queue: deque[dict[str, Any]] = deque()
         self._lock = threading.Lock()
         self._closed = False
+        self._session_active = True
+        self._active_stream_id: Optional[str] = None
+        self._active_boot_id: Optional[str] = None
+        self._active_session_id: Optional[str] = None
+        self._subscription_pending = False
         self._accepted = 0
         self._rejected = 0
         self._unauthorized = 0
@@ -42,7 +47,7 @@ class NetworkLogConsumer:
         """Accept one message only when explicitly enabled and session-authorized."""
 
         with self._lock:
-            if self._closed or not self.enabled:
+            if self._closed or not self.enabled or not self._session_active:
                 self._rejected += 1
                 return False
             if authorized is not True:
@@ -57,6 +62,9 @@ class NetworkLogConsumer:
                 self._dropped += 1
                 return False
             self._queue.append(safe_message)
+            data = safe_message["data"]
+            self._active_stream_id = data.get("stream_id")
+            self._active_boot_id = data.get("boot_id")
             self._accepted += 1
             return True
 
@@ -71,14 +79,37 @@ class NetworkLogConsumer:
         """Discard queued events when the authorized Device session changes."""
 
         with self._lock:
-            self._queue.clear()
+            self._clear_session_locked()
+
+    def on_disconnect(self) -> None:
+        """Fail closed until an owner explicitly establishes a new authorized session."""
+        with self._lock:
+            self._session_active = False
+            self._clear_session_locked()
+
+    def begin_session(self, session_id: Optional[str] = None) -> None:
+        """Enable a fresh session only when the caller has a new authorization."""
+        with self._lock:
+            if self._closed:
+                return
+            self._clear_session_locked()
+            self._active_session_id = session_id
+            self._session_active = True
+
+    def _clear_session_locked(self) -> None:
+        self._queue.clear()
+        self._active_stream_id = None
+        self._active_boot_id = None
+        self._active_session_id = None
+        self._subscription_pending = False
 
     def close(self) -> None:
         """Stop accepting events and discard buffered content."""
 
         with self._lock:
             self._closed = True
-            self._queue.clear()
+            self._session_active = False
+            self._clear_session_locked()
 
     def snapshot(self) -> dict[str, int | bool]:
         """Return counters and queue depth without exposing event contents."""

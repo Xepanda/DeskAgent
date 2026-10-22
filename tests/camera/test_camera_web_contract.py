@@ -148,6 +148,55 @@ const response = { body: { getReader: () => ({
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute browser freshness handling")
+    def test_browser_hides_expired_frame_and_abort_stops_retry_wait(self) -> None:
+        source = WEB.read_text(encoding="utf-8")
+        script = source.split("<script>", 1)[1].split("</script>", 1)[0]
+        helpers = script[script.index("function hideFrame"):script.index("function markStreamRetrying")]
+        checks = r'''
+const assert = require("node:assert/strict");
+const nodes = new Map();
+for (const id of ["cameraFrame", "videoPlaceholder", "frameStats", "cameraConnectionStatus"]) {
+  nodes.set(id, { style: {}, innerText: "", removeAttribute() {} });
+}
+global.document = { getElementById: id => nodes.get(id) };
+global.leaseActive = true;
+global.frameExpiryTimer = null;
+global.currentObjectUrl = null;
+global.lastFrameSeq = null;
+let expiry;
+let created = 0;
+global.Blob = class { constructor(parts) { this.parts = parts; } };
+global.createImageBitmap = async () => ({ close() {} });
+global.URL = { createObjectURL: () => `blob:${++created}`, revokeObjectURL() {} };
+global.clearTimeout = () => {};
+global.setTimeout = callback => { expiry = callback; return 1; };
+(async () => {
+  const jpeg = Uint8Array.from([255, 216, 1, 2, 255, 217]);
+  await renderStreamFrame(jpeg, 4, 2001);
+  assert.equal(created, 0, "a stale incoming frame must never be displayed");
+  await renderStreamFrame(jpeg, 5, 10);
+  assert.equal(created, 1);
+  assert.equal(nodes.get("cameraFrame").style.display, "block");
+  expiry();
+  assert.equal(nodes.get("cameraFrame").style.display, "none", "the last image must disappear at its freshness deadline");
+  assert.equal(nodes.get("cameraConnectionStatus").innerText, "不可用");
+
+  const controller = new AbortController();
+  const pendingRetry = waitForRetry(30000, controller.signal);
+  controller.abort();
+  await pendingRetry;
+  assert.equal(controller.signal.aborted, true, "closing the viewer must cancel a pending reconnect delay");
+})().catch(err => { console.error(err); process.exitCode = 1; });
+''';
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", helpers + "\n" + checks],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_disconnect_expiry_and_page_exit_clear_or_stop_the_viewer(self) -> None:
         source = WEB.read_text(encoding="utf-8")
         self.assertIn("frameExpiryTimer", source)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,41 @@ TEST_JPEG = b"\xff\xd8test-image-payload\xff\xd9"
 
 
 class TestCameraService(unittest.TestCase):
+    def test_upstream_disconnect_invalidates_lease_without_callback_or_thread_join(self) -> None:
+        entered_source = threading.Event()
+        unblock_source = threading.Event()
+        teardown_events = []
+
+        def blocked_source():
+            entered_source.set()
+            unblock_source.wait(2.0)
+            return TEST_JPEG
+
+        cam = CameraViewerService(
+            auto_start_pipeline=True,
+            on_lease_released=lambda owner, reason: teardown_events.append((owner, reason)),
+        )
+        cam.set_hardware_frame_source(blocked_source)
+        cam.acquire_lease("sdk-owner", lease_ms=5000)
+        cam.ingest_robot_frame(TEST_JPEG)
+        self.assertTrue(entered_source.wait(1.0))
+
+        started = time.monotonic()
+        self.assertTrue(cam.invalidate_owner_on_upstream_disconnect("sdk-owner"))
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.1, "disconnect invalidation must not wait for the capture worker")
+        self.assertIsNone(cam._active_lease_owner)
+        self.assertIsNone(cam._latest_jpeg)
+        self.assertEqual(cam._latest_frame_time, 0.0)
+        self.assertFalse(cam._is_hardware_frame)
+        self.assertFalse(cam.pipeline._running)
+        self.assertIsNone(cam.get_latest_frame("sdk-owner"))
+        self.assertEqual(teardown_events, [], "upstream disconnect must not invoke lease teardown callbacks")
+
+        unblock_source.set()
+        cam.stop_capture()
+
     def test_no_frame_is_available_without_a_physical_source_even_if_legacy_flag_is_true(self) -> None:
         cam = CameraViewerService(auto_start_pipeline=True, allow_synthetic=True)
         cam.acquire_lease("viewer", lease_ms=1000)

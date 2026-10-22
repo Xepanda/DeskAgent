@@ -61,6 +61,9 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn('link_name = "UNKNOWN"', network)
         self.assertIn("rc == 0", wifi)
         self.assertIn('link_name = "UNKNOWN"', wifi)
+        self.assertIn("status == NETMGR_LINK_UP", wifi)
+        self.assertIn("status == NETMGR_LINK_DOWN", wifi)
+        self.assertNotIn("? \"LINK_UP\" : \"LINK_DOWN\"", wifi)
         self.assertIn("UNKNOWN (host simulation; no radio state)", wifi)
 
     def test_body_move_parses_required_args_and_delegates_limits_and_result_to_hal(self) -> None:

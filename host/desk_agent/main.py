@@ -27,7 +27,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, ResponseStatus
 from host.desk_agent.core.router import Router
+from host.desk_agent.core.managed_sdk_listener import ManagedSdkMessageListener
+from host.desk_agent.core.managed_sdk_lifecycle import ManagedSdkLifecycleObservers
 from host.desk_agent.services.life_service import LifeService
+from host.desk_agent.services.network_log_consumer import NetworkLogConsumer
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
 from host.desk_agent.camera.camera_service import (
     CameraStreamCapacityError,
@@ -36,7 +39,10 @@ from host.desk_agent.camera.camera_service import (
     CameraViewerService,
 )
 from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
-from host.desk_agent.connectors.robot.official_camera_adapter import OfficialRobotCameraAdapter
+from host.desk_agent.connectors.robot.official_camera_adapter import (
+    MAX_WSPK_FRAME_BYTES,
+    OfficialRobotCameraAdapter,
+)
 from host.desk_agent.connectors.robot.managed_codex_feedback_adapter import ManagedCodexFeedbackAdapter
 from companion.src.codex_companion import CodexCompanion
 
@@ -80,6 +86,13 @@ class DeskAgentHostApp:
             auto_start_pipeline=cam_cfg.get("auto_start_pipeline", False),
             allow_synthetic=cam_cfg.get("allow_synthetic", False),
         )
+        network_log_cfg = self.config.get("network_logs", {})
+        self.network_log_consumer = NetworkLogConsumer(
+            enabled=bool(network_log_cfg.get("enabled", False))
+        )
+        self._managed_network_log_listener: Optional[ManagedSdkMessageListener] = None
+        # CR-009 authorization/subscription is not implemented by this lifecycle hook.
+        self._network_log_authorized = False
         self.official_camera_adapter: Optional[OfficialRobotCameraAdapter] = None
 
         codex_cfg = self.config.get("codex", {})
@@ -430,6 +443,14 @@ class DeskAgentHostApp:
             self._delivery_thread.join(timeout=2.0)
         if self.official_camera_adapter:
             self.official_camera_adapter.close()
+        if self._managed_network_log_listener is not None:
+            try:
+                self._managed_network_log_listener.remove(self._on_managed_sdk_message)
+            except Exception as exc:
+                logger.warning("Managed SDK message listener cleanup failed (%s)", type(exc).__name__)
+            self._managed_network_log_listener = None
+        if getattr(self, "network_log_consumer", None) is not None:
+            self.network_log_consumer.close()
         if getattr(self, "robot_adapter", None):
             self.robot_adapter.stop()
         if getattr(self, "_ha_sub_stop", None):
@@ -769,7 +790,7 @@ class DeskAgentHostApp:
             robot,
             send_command=command_sender,
             ingest_frame=self.camera_service.ingest_robot_frame,
-            clear_frame=self.camera_service.release_lease,
+            clear_frame=self.camera_service.invalidate_owner_on_upstream_disconnect,
         )
         self.official_camera_adapter = adapter
 
@@ -780,7 +801,7 @@ class DeskAgentHostApp:
 
         self.camera_service.on_lease_released = release_device_lease
         if on_disconnect is not None:
-            on_disconnect(adapter.disconnect)
+            on_disconnect(adapter.on_sdk_disconnect)
         return adapter
 
     def register_managed_sdk_codex_feedback_session(
@@ -792,6 +813,15 @@ class DeskAgentHostApp:
         adapter = ManagedCodexFeedbackAdapter(command_sender)
         self.managed_codex_feedback_adapter = adapter
         return adapter
+
+    def register_managed_sdk_network_log_session(self, context: object) -> None:
+        """Route parsed Device JSON to the bounded consumer, fail closed absent CR-009 auth."""
+        listener = ManagedSdkMessageListener(context)
+        listener.add(self._on_managed_sdk_message)
+        self._managed_network_log_listener = listener
+
+    def _on_managed_sdk_message(self, message: dict[str, Any]) -> None:
+        self.network_log_consumer.ingest(message, authorized=self._network_log_authorized)
 
     def has_robot_hardware_connected(self) -> bool:
         """Checks if physical robot hardware link is actively connected."""
@@ -1425,24 +1455,52 @@ async def _run_managed_application(config_path: Optional[str], host: str, port: 
     context = ApplicationContext.from_environment()
     async with context:
         app = DeskAgentHostApp(config_path=config_path, managed_sdk_session=True)
-        # Pinned SDK currently keeps the command transport private on ApplicationContext.
-        # This is a version-bound compatibility point: send_command itself is public on
-        # DaemonApplicationTransport, but ApplicationContext exposes no transport property.
-        transport = context._transport
-        app.register_official_sdk_camera_session(
-            context.robot,
-            command_sender=transport.send_command,
-        )
-        app.register_managed_sdk_codex_feedback_session(command_sender=transport.send_command)
-        # A disconnect makes the next bounded SDK capture fail; the camera adapter
-        # then clears the Host lease/frame without replacing the SDK's private callback.
-        await asyncio.to_thread(
-            _serve_host,
-            app,
-            host,
-            port,
-            shutdown_check=lambda: context.shutdown_requested,
-        )
+        lifecycle: Optional[ManagedSdkLifecycleObservers] = None
+        host_loop_started = False
+        try:
+            # Pinned SDK currently keeps the command transport private on ApplicationContext.
+            # This is a version-bound compatibility point: send_command itself is public on
+            # DaemonApplicationTransport, but ApplicationContext exposes no transport property.
+            transport = context._transport
+            sdk_binary = getattr(transport, "_binary_callback", None)
+            if not callable(sdk_binary):
+                raise RuntimeError("pinned SDK transport has no binary callback")
+            lifecycle = ManagedSdkLifecycleObservers(transport)
+
+            def bounded_sdk_binary(frame: Any) -> None:
+                payload = getattr(frame, "payload", None)
+                if not isinstance(payload, bytes) or len(payload) + 16 > MAX_WSPK_FRAME_BYTES:
+                    logger.warning("Dropped malformed or oversized official SDK WSPK frame")
+                    return
+                sdk_binary(frame)
+
+            # The pinned Runtime uses max_size=None. Bound the parsed WSPK payload
+            # before the SDK can queue or assemble it, while retaining its handler.
+            transport._binary_callback = bounded_sdk_binary
+
+            app.register_official_sdk_camera_session(
+                context.robot,
+                command_sender=transport.send_command,
+                on_disconnect=lifecycle.add,
+            )
+            app.register_managed_sdk_network_log_session(context)
+            lifecycle.add(app.network_log_consumer.on_disconnect)
+            app.register_managed_sdk_codex_feedback_session(command_sender=transport.send_command)
+            host_loop_started = True
+            await asyncio.to_thread(
+                _serve_host,
+                app,
+                host,
+                port,
+                shutdown_check=lambda: context.shutdown_requested,
+            )
+        finally:
+            try:
+                if lifecycle is not None:
+                    lifecycle.close()
+            finally:
+                if not host_loop_started:
+                    app.close()
 
 
 def main() -> None:

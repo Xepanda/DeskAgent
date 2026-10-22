@@ -33,10 +33,10 @@ class TestWatcherLogSourceContract(unittest.TestCase):
     def test_only_exhausted_empty_ptl_header_publishes_event(self):
         camera = CAMERA_C.read_text(encoding="utf-8")
         capture = camera.split("int desk_watcher_camera_capture(", 1)[1]
-        empty_path = capture.split("if (header_or != 0) break;", 1)[1].split(
-            "vTaskDelay(pdMS_TO_TICKS(CAM_PTL_EMPTY_BACKOFF_MS));", 1
+        empty_path = capture.split("if (header_or != 0)", 1)[1].split(
+            "int ptl_rc = desk_watcher_camera_parse_ptl_header", 1
         )[0]
-        self.assertIn("if (empty_attempt + 1U >= CAM_PTL_EMPTY_RETRY_LIMIT)", empty_path)
+        self.assertIn("camera_capture_deadline_us", empty_path)
         self.assertIn("desk_watcher_log_source_publish_camera_capture_empty()", empty_path)
         self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", empty_path)
 

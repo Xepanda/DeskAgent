@@ -648,8 +648,9 @@ static int default_driver_motion_stop(bool emergency)
     return mcu_execute_transaction(s_last_mcu_frame, s_last_mcu_frame_len, seq);
 }
 
-static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len)
+static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
 {
+    (void)timeout_ms;
 #ifdef ESP_PLATFORM
     /* On ESP-IDF with Himax HX6538 SPI2 / PTL sensor */
     (void)out_buf; (void)max_len; (void)out_len;
@@ -1143,8 +1144,6 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
 {
     if (out_len) *out_len = 0;
     if (!out_buf || !out_len) return DESK_HW_ERR_INVALID_ARG;
-    (void)timeout_ms;
-
 #ifndef ESP_PLATFORM
     /* Host simulator frames are the capture source for L2 tests. The default
      * host driver intentionally reports unavailable, so consume an injected
@@ -1160,7 +1159,7 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
     /* First attempt capturing live frame from registered hardware driver */
     if (s_board_driver_ops && s_board_driver_ops->camera_capture) {
         size_t drv_len = 0;
-        int drv_ret = s_board_driver_ops->camera_capture(out_buf, max_len, &drv_len);
+        int drv_ret = s_board_driver_ops->camera_capture(out_buf, max_len, &drv_len, timeout_ms);
         if (drv_ret == 0 && drv_len > 0) {
             *out_len = drv_len;
             return DESK_HW_OK;

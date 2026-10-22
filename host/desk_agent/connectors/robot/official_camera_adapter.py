@@ -15,6 +15,7 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_JPEG_BYTES = 64 * 1024
+MAX_WSPK_FRAME_BYTES = 131088  # 16-byte header + 128 KiB payload
 
 
 class OfficialRobotCameraAdapter:
@@ -82,6 +83,7 @@ class OfficialRobotCameraAdapter:
                     return {"granted": False, "reason": self._error_code(ack), "device_ack": ack}
                 self._lease_ms = lease_ms
                 self._lease_deadline = time.monotonic() + lease_ms / 1000
+                self._interval = 1.0 / target_fps
                 return {"granted": True, "client_id": client_id, "lease_duration_ms": lease_ms}
 
             ack = self._send_command(
@@ -135,6 +137,7 @@ class OfficialRobotCameraAdapter:
         return True
 
     def disconnect(self) -> None:
+        """Explicit cleanup path; may wait for an in-flight capture to finish."""
         with self._lock:
             self._connected = False
             owner = self._owner
@@ -148,6 +151,23 @@ class OfficialRobotCameraAdapter:
                 stop_event.set()
         if thread and thread is not threading.current_thread():
             thread.join(timeout=self._capture_timeout + 0.25)
+        if owner and self._clear_frame:
+            self._clear_frame(owner)
+
+    def on_sdk_disconnect(self) -> None:
+        """Non-blocking SDK callback path: signal capture stop and clear stale frame."""
+        with self._lock:
+            self._connected = False
+            owner = self._owner
+            self._owner = None
+            self._lease_ms = 0
+            self._lease_deadline = 0.0
+            stop_event = self._stop_event
+            self._stop_event = None
+            self._thread = None
+            self._last_error = "official SDK device session disconnected"
+            if stop_event:
+                stop_event.set()
         if owner and self._clear_frame:
             self._clear_frame(owner)
 
@@ -166,7 +186,7 @@ class OfficialRobotCameraAdapter:
                 deadline = self._lease_deadline
             remaining_lease = deadline - started
             if remaining_lease <= 0:
-                self._expire_owner(owner, stop_event)
+                self._stop_owner(owner, stop_event, "lease expired")
                 return
             try:
                 image = self._robot.camera.capture(timeout=min(self._capture_timeout, remaining_lease))
@@ -183,28 +203,31 @@ class OfficialRobotCameraAdapter:
                 with self._lock:
                     if self._owner != owner or not self._connected or self._closed:
                         return
-                    if time.monotonic() >= self._lease_deadline:
-                        self._expire_owner(owner, stop_event)
-                        return
+                    expired = time.monotonic() >= self._lease_deadline
                     self._last_error = None
                     interval = self._interval
+                if expired:
+                    self._stop_owner(owner, stop_event, "lease expired")
+                    return
                 self._ingest_frame(data)
             except Exception as error:
                 with self._lock:
                     self._last_error = str(error)
                 logger.warning("Official SDK camera capture failed: %s", error)
-                # Do not reuse a cached image after a failed capture.
-                if self._clear_frame:
-                    self._clear_frame(owner)
-                interval = self._interval
+                # A failed request has no trustworthy fresh image. Stop this
+                # lease instead of retrying forever or leaving the prior JPEG
+                # available as if it were the result of the failed capture.
+                self._stop_owner(owner, stop_event, "capture failed")
+                return
             stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
 
-    def _expire_owner(self, owner: str, stop_event: threading.Event) -> None:
+    def _stop_owner(self, owner: str, stop_event: threading.Event, reason: str) -> None:
         with self._lock:
             if self._owner != owner:
                 return
             self._owner = None
             self._lease_deadline = 0.0
+            self._lease_ms = 0
             if self._stop_event is stop_event:
                 self._stop_event = None
                 self._thread = None
@@ -215,8 +238,8 @@ class OfficialRobotCameraAdapter:
                 raise RuntimeError(f"device rejected camera release: {ack!r}")
         except Exception as error:
             with self._lock:
-                self._last_error = f"expired camera release unconfirmed: {error}"
-            logger.warning("Expired official SDK camera lease release unconfirmed: %s", error)
+                self._last_error = f"{reason} camera release unconfirmed: {error}"
+            logger.warning("Official SDK camera lease release unconfirmed after %s: %s", reason, error)
         if self._clear_frame:
             self._clear_frame(owner)
 

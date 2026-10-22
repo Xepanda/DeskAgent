@@ -111,15 +111,27 @@ class FrameCapturePipeline:
             self._thread.start()
 
     def stop(self) -> None:
+        self.request_stop()
         with self._lock:
-            self._running = False
-            self._consumer = None
             if self._thread and self._thread.is_alive() and self._thread != threading.current_thread():
                 try:
                     self._thread.join(timeout=0.2)
                 except Exception:
                     pass
                 self._thread = None
+
+    def request_stop(self) -> None:
+        """Requests capture shutdown without waiting for the capture worker.
+
+        Use this from upstream disconnect callbacks, where the frame source may
+        currently be blocked in transport I/O. Call ``stop`` later when joining
+        the worker is safe and desired.
+        """
+        # These assignments intentionally do not acquire _lock: stop() may hold
+        # it while joining the worker, so the disconnect callback must stay
+        # independent of that join and any in-flight frame-source call.
+        self._running = False
+        self._consumer = None
 
     def update_coordinates(self, pan: float, tilt: float) -> None:
         with self._lock:
@@ -260,6 +272,27 @@ class CameraViewerService:
                 return False
         self.pipeline.stop()
         self._trigger_teardown(owner, "explicit_release")
+        return True
+
+    def invalidate_owner_on_upstream_disconnect(self, client_id: str) -> bool:
+        """Invalidates camera state after the owning SDK transport disconnects.
+
+        This is deliberately a non-blocking invalidation path: it clears the
+        owner's lease and buffered frame, wakes stream waiters, and requests
+        capture shutdown without invoking ``on_lease_released`` or joining the
+        capture worker. The normal ``release_lease`` path remains responsible
+        for teardown callbacks and synchronous pipeline stopping.
+        """
+        with self._lock:
+            if self._active_lease_owner != client_id:
+                return False
+            self._active_lease_owner = None
+            self._lease_expires_at = 0.0
+            self._latest_jpeg = None
+            self._latest_frame_time = 0.0
+            self._is_hardware_frame = False
+            self._frame_changed.notify_all()
+        self.pipeline.request_stop()
         return True
 
     def is_lease_valid(self) -> bool:

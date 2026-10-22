@@ -73,7 +73,7 @@ typedef struct {
     int (*audio_play_pcm)(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
     int (*motion_move)(float pan_deg, float tilt_deg, uint32_t duration_ms);
     int (*motion_stop)(bool emergency);
-    int (*camera_capture)(uint8_t *out_buf, size_t max_len, size_t *out_len);
+    int (*camera_capture)(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
     int (*display_expression)(const char *preset_name, const char *status_text);
     int (*deinit)(void);
 } desk_board_driver_ops_t;

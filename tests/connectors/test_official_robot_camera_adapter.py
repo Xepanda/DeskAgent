@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from host.desk_agent.connectors.robot.official_camera_adapter import OfficialRobotCameraAdapter
+from host.desk_agent.camera.camera_service import CameraViewerService
 
 
 JPEG = b"\xff\xd8local-jpeg\xff\xd9"
@@ -43,6 +44,78 @@ class Robot:
 
 
 class OfficialRobotCameraAdapterTests(unittest.TestCase):
+    def test_sdk_disconnect_invalidates_camera_lease_without_release_command(self) -> None:
+        camera = Camera()
+        camera.release.clear()
+        commands: list[str] = []
+        teardown_events: list[tuple[str, str]] = []
+        viewer = CameraViewerService(
+            on_lease_released=lambda owner, reason: teardown_events.append((owner, reason))
+        )
+        self.assertTrue(viewer.acquire_lease("viewer-x", lease_ms=5000)["granted"])
+        viewer.ingest_robot_frame(JPEG)
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda name, *_a, **_k: commands.append(name) or {"type": "sys.ack", "code": 0},
+            ingest_frame=viewer.ingest_robot_frame,
+            clear_frame=viewer.invalidate_owner_on_upstream_disconnect,
+            capture_timeout=5.0,
+        )
+        capture_thread = None
+        try:
+            self.assertTrue(adapter.acquire("viewer-x", 5000)["granted"])
+            self.assertTrue(camera.entered.wait(1))
+            capture_thread = adapter._thread
+            adapter.on_sdk_disconnect()
+
+            self.assertFalse(viewer.is_lease_valid())
+            self.assertIsNone(viewer.get_latest_frame("viewer-x"))
+            self.assertEqual(commands, ["ctrl.camera.acquire"])
+            self.assertEqual(teardown_events, [])
+            self.assertTrue(capture_thread.is_alive(), "disconnect path must not join in-flight camera capture")
+        finally:
+            camera.release.set()
+            if capture_thread and capture_thread.is_alive():
+                capture_thread.join(timeout=1)
+            adapter.close()
+
+    def test_sdk_disconnect_observer_does_not_wait_for_capture_thread(self) -> None:
+        camera = Camera()
+        camera.release.clear()
+        cleared: list[str] = []
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda *_a, **_k: {"type": "sys.ack", "code": 0},
+            ingest_frame=lambda _frame: None,
+            clear_frame=cleared.append,
+            capture_timeout=5.0,
+        )
+        capture_thread = None
+        try:
+            self.assertTrue(adapter.acquire("viewer-fast", 10000)["granted"])
+            self.assertTrue(camera.entered.wait(1))
+            capture_thread = adapter._thread
+            stop_event = adapter._stop_event
+            self.assertIsNotNone(capture_thread)
+            self.assertIsNotNone(stop_event)
+            started = time.monotonic()
+            adapter.on_sdk_disconnect()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue(capture_thread.is_alive(), "disconnect observer must not join capture thread")
+            self.assertTrue(stop_event.is_set(), "disconnect observer signals capture worker to stop")
+            self.assertFalse(adapter.is_connected)
+            self.assertIsNone(adapter._owner)
+            self.assertIsNone(adapter._thread)
+            self.assertEqual(cleared, ["viewer-fast"])
+        finally:
+            camera.release.set()
+            if capture_thread and capture_thread.is_alive():
+                capture_thread.join(timeout=1)
+            # Explicit close remains the blocking owner cleanup path.
+            adapter.close()
+
     def test_device_lease_capture_and_release_use_sdk_camera_api(self) -> None:
         camera = Camera()
         commands: list[tuple[str, dict, float | None]] = []
@@ -143,6 +216,38 @@ class OfficialRobotCameraAdapterTests(unittest.TestCase):
             self.assertTrue(adapter.acquire("viewer-a", 10000)["granted"])
             self.assertTrue(adapter.release("viewer-a"))
             self.assertIn("device rejected camera release", adapter.last_error or "")
+        finally:
+            adapter.close()
+
+    def test_capture_failure_clears_frame_releases_device_and_stops_retrying(self) -> None:
+        class FailingCamera(Camera):
+            def capture(self, *, timeout: float) -> ImageFrame:
+                self.calls += 1
+                self.entered.set()
+                raise TimeoutError("no image before timeout")
+
+        camera = FailingCamera()
+        commands: list[str] = []
+        cleared: list[str] = []
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda name, *_a, **_k: commands.append(name) or {"type": "sys.ack", "code": 0},
+            ingest_frame=lambda _frame: self.fail("failed capture must not deliver a frame"),
+            clear_frame=cleared.append,
+            capture_timeout=0.1,
+        )
+        try:
+            self.assertTrue(adapter.acquire("viewer-a", 5000, target_fps=30)["granted"])
+            self.assertTrue(camera.entered.wait(1))
+            deadline = time.monotonic() + 1
+            while adapter._owner is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            self.assertIsNone(adapter._owner)
+            self.assertEqual(camera.calls, 1)
+            self.assertEqual(commands, ["ctrl.camera.acquire", "ctrl.camera.release"])
+            self.assertEqual(cleared, ["viewer-a"])
+            self.assertIn("no image before timeout", adapter.last_error or "")
         finally:
             adapter.close()
 

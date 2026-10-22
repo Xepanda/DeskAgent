@@ -9,6 +9,7 @@
  */
 
 #include "desk_watcher_camera.h"
+#include "desk_watcher_camera_bus.h"
 #include "desk_watcher_board.h"
 #include "desk_watcher_log_source.h"
 #include <stdio.h>
@@ -54,8 +55,8 @@
 #define CAM_CONTROL_TIMEOUT_MS    700U
 #define CAM_CONTROL_RETRIES       3U
 #define CAM_CONTROL_MODE_TIMEOUT_MS 3500U
-#define CAM_PTL_EMPTY_RETRY_LIMIT 3U
 #define CAM_PTL_EMPTY_BACKOFF_MS  5U
+#define CAM_PTL_CAPTURE_TIMEOUT_MS 500U
 #define CAM_PTL_RESYNC_TIMEOUT_MS 50U
 #define CAM_PTL_RESYNC_CHUNK_SIZE 16U
 #define CAM_PTL_RESYNC_MAX_CHUNKS 256U
@@ -94,6 +95,7 @@ static bool s_ptl_resynchronizing = false;
 static spi_device_handle_t s_spi_dev = NULL;
 static SemaphoreHandle_t s_cam_mutex = NULL;
 static bool s_spi_bus_owned = false;
+static bool s_capture_bus_acquired = false;
 static bool s_hx_uart_owned = false;
 static uint32_t s_hx_request_id = 0;
 #endif
@@ -266,8 +268,18 @@ static void camera_control_deinit(void)
     }
 }
 
+static void camera_capture_release_bus(void)
+{
+    if (desk_watcher_camera_bus_take_release(&s_capture_bus_acquired)) {
+        spi_device_release_bus(s_spi_dev);
+    }
+}
+
 static int camera_capture_release(int result)
 {
+    /* Every capture exit, including an expired retry deadline, drops any SPI
+     * lease still held after the most recent successful reacquire. */
+    camera_capture_release_bus();
     int stop_rc = camera_control_mode(0U, 0U);
     if (s_cam_mutex) xSemaphoreGive(s_cam_mutex);
     return stop_rc != 0 && result == DESK_HW_OK ? DESK_WATCHER_CAMERA_ERR_CONTROL : result;
@@ -489,7 +501,7 @@ int desk_watcher_camera_validate_frame(const uint8_t *body, size_t body_size, co
     return 0;
 }
 
-int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len)
+int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
 {
     if (out_len) *out_len = 0;
     if (!out_buf || !out_len || max_len == 0) return DESK_HW_ERR_INVALID_ARG;
@@ -505,6 +517,8 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         return DESK_HW_ERR_BUSY;
     }
 
+    if (timeout_ms == 0U) timeout_ms = CAM_PTL_CAPTURE_TIMEOUT_MS;
+    const int64_t camera_capture_deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     if (camera_control_mode(1U, 0U) != 0) {
         xSemaphoreGive(s_cam_mutex);
         ESP_LOGE(TAG, "HX6538 failed to enter PTL capture mode");
@@ -513,9 +527,8 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
 
     /* SYNC is a readiness hint during aligned reads. During recovery, scan
      * the bounded stream even if the edge was lost with the malformed frame. */
-    int64_t start = esp_timer_get_time();
     bool sync_ready = s_ptl_resynchronizing;
-    while (!sync_ready && (esp_timer_get_time() - start) < (int64_t)(CAM_SYNC_TIMEOUT_MS * 1000)) {
+    while (!sync_ready && esp_timer_get_time() < camera_capture_deadline_us) {
         bool sync_active = false;
         int sync_rc = camera_sync_is_active(&sync_active);
         if (sync_rc != DESK_HW_OK) {
@@ -530,7 +543,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     }
 
     if (!sync_ready) {
-        ESP_LOGE(TAG, "SYNC timeout after %d ms: ready signal stayed low", CAM_SYNC_TIMEOUT_MS);
+        ESP_LOGE(TAG, "SYNC timeout after capture deadline %u ms: ready signal stayed low", (unsigned)timeout_ms);
         return camera_capture_release(DESK_HW_ERR_TIMEOUT);
     }
 
@@ -544,6 +557,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         ESP_LOGE(TAG, "SPI bus acquire failed: %s (%d)", esp_err_to_name(err), (int)err);
         return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI);
     }
+    desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true);
 
     size_t prefetched = 0;
     uint32_t body_size = 0;
@@ -554,14 +568,16 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             uint8_t dummy = 0;
             spi_transaction_t close_trans = {.length = 8, .rxlength = 8, .rx_buffer = &dummy, .flags = 0};
             (void)spi_device_transmit(s_spi_dev, &close_trans);
-            spi_device_release_bus(s_spi_dev);
+            camera_capture_release_bus();
             return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL);
         }
         s_ptl_resynchronizing = false;
     } else {
-    /* Empty FIFO is a transient state: close it, back off, and retry a bounded
-     * number of times. SYNC remains a readiness hint for each fresh read. */
-    for (unsigned empty_attempt = 0; ; ++empty_attempt) {
+    /* Empty FIFO is a transient state: close it, back off, and retry until the
+     * caller's capture deadline. SYNC remains a readiness hint per fresh read. */
+    unsigned empty_attempt = 0;
+    bool header_received = false;
+    while (esp_timer_get_time() < camera_capture_deadline_us) {
         spi_transaction_t hdr_trans = {
             .length = sizeof(base_header) * 8,
             .rxlength = sizeof(base_header) * 8,
@@ -571,42 +587,50 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         err = spi_device_transmit(s_spi_dev, &hdr_trans);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "SPI PTL header transfer failed: %s (%d)", esp_err_to_name(err), (int)err);
-            spi_device_release_bus(s_spi_dev);
+            camera_capture_release_bus();
             s_ptl_resynchronizing = true;
             memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
             return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI);
         }
         uint8_t header_or = 0;
         for (size_t i = 0; i < sizeof(base_header); ++i) header_or |= base_header[i];
-        if (header_or != 0) break;
+        if (header_or != 0) {
+            header_received = true;
+            break;
+        }
 
         bool sync_active_after_read = false;
         int sync_read_rc = camera_sync_is_active(&sync_active_after_read);
         ESP_LOGW(TAG,
-                 "PTL empty FIFO poll %u/%u: raw=%02x%02x%02x%02x%02x%02x%02x sync=%d sync read rc=%d",
-                 empty_attempt + 1U, CAM_PTL_EMPTY_RETRY_LIMIT, base_header[0], base_header[1], base_header[2],
+                 "PTL empty FIFO poll %u (deadline %u ms): raw=%02x%02x%02x%02x%02x%02x%02x sync=%d sync read rc=%d",
+                 ++empty_attempt, (unsigned)timeout_ms, base_header[0], base_header[1], base_header[2],
                  base_header[3], base_header[4], base_header[5], base_header[6], sync_active_after_read, sync_read_rc);
         uint8_t dummy = 0;
         spi_transaction_t close_trans = {.length = 8, .rxlength = 8, .rx_buffer = &dummy, .flags = 0};
         (void)spi_device_transmit(s_spi_dev, &close_trans);
-        spi_device_release_bus(s_spi_dev);
-        if (empty_attempt + 1U >= CAM_PTL_EMPTY_RETRY_LIMIT) {
-            (void)desk_watcher_log_source_publish_camera_capture_empty();
-            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY);
-        }
+        camera_capture_release_bus();
         vTaskDelay(pdMS_TO_TICKS(CAM_PTL_EMPTY_BACKOFF_MS));
-        int64_t retry_start = esp_timer_get_time();
         bool retry_sync = false;
-        while (esp_timer_get_time() - retry_start < (int64_t)CAM_SYNC_TIMEOUT_MS * 1000) {
+        while (esp_timer_get_time() < camera_capture_deadline_us) {
             bool active = false;
             if (camera_sync_is_active(&active) != DESK_HW_OK) return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO);
             if (active) { retry_sync = true; break; }
             vTaskDelay(pdMS_TO_TICKS(1));
         }
-        if (!retry_sync) return camera_capture_release(DESK_HW_ERR_TIMEOUT);
+        if (!retry_sync) {
+            break;
+        }
         vTaskDelay(pdMS_TO_TICKS(CAM_SYNC_GUARD_MS));
         err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
         if (err != ESP_OK) return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI);
+        desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true);
+    }
+
+    if (!header_received) {
+        (void)desk_watcher_log_source_publish_camera_capture_empty();
+        ESP_LOGW(TAG, "PTL warmup deadline expired after %u ms and %u empty headers",
+                 (unsigned)timeout_ms, empty_attempt);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY);
     }
 
     int ptl_rc = desk_watcher_camera_parse_ptl_header(base_header, sizeof(base_header), &body_size);
@@ -625,7 +649,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             .flags = 0,
         };
         (void)spi_device_transmit(s_spi_dev, &close_trans);
-        spi_device_release_bus(s_spi_dev);
+        camera_capture_release_bus();
         s_ptl_resynchronizing = true;
         memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
         return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL);
@@ -643,7 +667,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         .flags = 0,
     };
     err = spi_device_transmit(s_spi_dev, &body_trans);
-    spi_device_release_bus(s_spi_dev);
+    camera_capture_release_bus();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SPI PTL body transfer failed (body_size=%u): %s (%d)",
                  (unsigned)body_size, esp_err_to_name(err), (int)err);

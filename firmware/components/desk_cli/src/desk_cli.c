@@ -623,7 +623,10 @@ static void cmd_wifi(int argc, char *argv[])
     netmgr_status_e status = NETMGR_LINK_DOWN;
     int rc = netmgr_conn_get(NETCONN_AUTO, NETCONN_CMD_STATUS, &status);
     const char *link_name = "UNKNOWN";
-    if (rc == 0) link_name = status == NETMGR_LINK_UP ? "LINK_UP" : "LINK_DOWN";
+    if (rc == 0) {
+        if (status == NETMGR_LINK_UP) link_name = "LINK_UP";
+        else if (status == NETMGR_LINK_DOWN) link_name = "LINK_DOWN";
+    }
     printf("Wi-Fi status: rc=%d link=%s (%d)\r\n", rc, link_name, (int)status);
 #else
     printf("Wi-Fi status: UNKNOWN (host simulation; no radio state)\r\n");

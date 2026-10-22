@@ -123,6 +123,7 @@ class TestSTM32BodyProtocol(unittest.TestCase):
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_motion.c",
             "-o",
             cls.so_path,
         ]
@@ -153,6 +154,21 @@ class TestSTM32BodyProtocol(unittest.TestCase):
 
         cls.lib.desk_hardware_motion_stop.restype = ctypes.c_int
         cls.lib.desk_hardware_motion_stop.argtypes = [ctypes.c_bool]
+
+        cls.lib.desk_watcher_motion_move.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_move.argtypes = [
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint32,
+        ]
+        cls.lib.desk_watcher_motion_pack_move.restype = ctypes.c_size_t
+        cls.lib.desk_watcher_motion_pack_move.argtypes = [
+            ctypes.c_float,
+            ctypes.c_float,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8),
+        ]
 
         cls.lib.desk_hardware_motion_get_position.restype = ctypes.c_int
         cls.lib.desk_hardware_motion_get_position.argtypes = [
@@ -705,6 +721,18 @@ class TestSTM32BodyProtocol(unittest.TestCase):
             self.assertEqual(
                 self.lib.desk_hardware_motion_move_to(pan, tilt, 300),
                 DESK_HW_ERR_INVALID_ARG,
+            )
+
+            # The Watcher board driver is also a public boundary and must
+            # reject invalid floats before its packer performs integer casts.
+            self.assertEqual(
+                self.lib.desk_watcher_motion_move(pan, tilt, 300),
+                DESK_HW_ERR_INVALID_ARG,
+            )
+            frame = (ctypes.c_uint8 * 32)()
+            self.assertEqual(
+                self.lib.desk_watcher_motion_pack_move(pan, tilt, 300, 1, frame),
+                0,
             )
 
     # ------------------------------------------------------------------

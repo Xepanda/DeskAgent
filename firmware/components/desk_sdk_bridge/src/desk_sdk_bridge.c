@@ -1614,12 +1614,14 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    /* Motion action play: ctrl.motion.action.play */
+    /* Do not mint a synthetic job: this firmware has no action playback engine. */
     else if (strcmp(msg_type, "ctrl.motion.action.play") == 0 || strcmp(msg_type, "motion.action.play") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"job_id\":1,\"status\":\"accepted\",\"accepted\":true}}",
+                 "{\"type\":\"sys.nack\",%s\"code\":501,\"error\":{"
+                 "\"code\":\"UNSUPPORTED_OPERATION\","
+                 "\"message\":\"Motion action playback is not implemented on this device\"}}",
                  rid);
         return 0;
     }

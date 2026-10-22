@@ -135,6 +135,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-o",
@@ -1968,7 +1969,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             ("motion.move", "sys.ack", {"type": "ctrl.motion.move",
                                         "data": {"pan_deg": 30.0, "tilt_deg": 120.0, "duration_ms": 200}}),
             ("motion.stop", "sys.ack", {"type": "ctrl.motion.stop", "data": {"emergency": True}}),
-            ("motion.action.play", "sys.ack", {"type": "ctrl.motion.action.play", "data": {}}),
+            ("motion.action.play", "sys.nack", {"type": "ctrl.motion.action.play", "data": {}}),
             ("camera.acquire", "sys.ack", {"type": "ctrl.camera.acquire",
                                            "data": {"client_id": "corr-client", "lease_duration_ms": 2000}}),
             ("camera.capture", "sys.ack", {"type": "ctrl.camera.capture", "data": {}}),
@@ -1993,6 +1994,19 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             resp = self._process_cmd(payload)
             self.assertEqual(resp.get("type"), expected_type, f"{name}: unexpected response type")
             self.assertEqual(resp.get("request_id"), req_id, f"{name}: request_id was not echoed")
+
+    def test_unimplemented_motion_action_is_not_accepted(self) -> None:
+        """Do not mint a fake SDK job for an action engine that is not wired."""
+        response = self._process_cmd({
+            "type": "ctrl.motion.action.play",
+            "request_id": "req-action-not-implemented",
+            "data": {"action_id": "wave"},
+        })
+        self.assertEqual(response.get("type"), "sys.nack")
+        self.assertEqual(response.get("code"), 501)
+        self.assertEqual(response.get("request_id"), "req-action-not-implemented")
+        self.assertEqual(response.get("error", {}).get("code"), "UNSUPPORTED_OPERATION")
+        self.assertNotIn("job_id", response.get("data", {}))
 
     def test_hello_auth_failure_nack_echoes_request_id(self) -> None:
         """The 401 nack must correlate to its request_id like any other response."""

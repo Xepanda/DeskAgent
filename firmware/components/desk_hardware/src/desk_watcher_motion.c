@@ -11,6 +11,7 @@
  */
 
 #include "desk_watcher_motion.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -56,6 +57,9 @@ static uint16_t motion_calc_crc16(const uint8_t *data, size_t len)
 
 static size_t motion_pack_move(float pan, float tilt, uint32_t duration_ms, uint32_t seq, uint8_t *out_buf)
 {
+    /* Do not convert NaN/Inf to an integer: that conversion is undefined. */
+    if (!out_buf || !isfinite(pan) || !isfinite(tilt)) return 0;
+
     /* Mechanical clamping */
     if (pan < DESK_MOTION_PAN_MIN_DEG) pan = DESK_MOTION_PAN_MIN_DEG;
     if (pan > DESK_MOTION_PAN_MAX_DEG) pan = DESK_MOTION_PAN_MAX_DEG;
@@ -396,7 +400,8 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
 
 int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms)
 {
-    if (pan_deg < DESK_MOTION_PAN_MIN_DEG || pan_deg > DESK_MOTION_PAN_MAX_DEG ||
+    if (!isfinite(pan_deg) || !isfinite(tilt_deg) ||
+        pan_deg < DESK_MOTION_PAN_MIN_DEG || pan_deg > DESK_MOTION_PAN_MAX_DEG ||
         tilt_deg < DESK_MOTION_TILT_MIN_DEG || tilt_deg > DESK_MOTION_TILT_MAX_DEG) {
         return DESK_HW_ERR_INVALID_ARG;
     }
@@ -404,6 +409,7 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
     uint8_t tx_buf[32];
     uint32_t seq = ++s_mcu_sequence;
     size_t len = motion_pack_move(pan_deg, tilt_deg, duration_ms, seq, tx_buf);
+    if (len == 0) return DESK_HW_ERR_INVALID_ARG;
     return motion_send_and_wait_ack(tx_buf, len, seq);
 }
 

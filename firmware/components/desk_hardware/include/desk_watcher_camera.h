@@ -41,7 +41,7 @@ typedef struct {
 } desk_watcher_camera_resync_t;
 
 int desk_watcher_camera_init(void);
-int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len);
+int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
 int desk_watcher_camera_deinit(void);
 bool desk_watcher_camera_is_ready(void);
 
