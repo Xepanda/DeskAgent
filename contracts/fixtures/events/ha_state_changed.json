@@ -7,7 +7,7 @@
   "timestamp": "2026-10-11T22:45:02Z",
   "payload": {
     "entity_id": "light.living_room_ceiling",
-    "old_state": "off",
+    "old_state": "on",
     "new_state": "on",
     "attributes": {
       "brightness": 200,

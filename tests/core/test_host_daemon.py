@@ -196,6 +196,45 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data["status"], "succeeded")
             self.assertEqual(data["request_id"], "req-daemon-test-01")
 
+    def test_ha_event_query_preserves_attribute_only_snapshot(self) -> None:
+        attributes = {"brightness": 90, "nested": {"mode": "brightness"}}
+        self.app._on_ha_state_change("light.desk", "on", "on", attributes)
+        attributes["brightness"] = 10
+        attributes["nested"]["mode"] = "changed-after-callback"
+        request = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-ha-attribute-event",
+            operation="ha.list_changes",
+            arguments={},
+            expires_at="2030-01-01T00:00:00Z",
+        )
+
+        response = self.app.router.dispatch(request)
+
+        self.assertEqual(response.status.value, "succeeded")
+        event = response.result["changes"][-1]
+        self.assertEqual(event["old_state"], "on")
+        self.assertEqual(event["new_state"], "on")
+        self.assertEqual(event["attributes"], {"brightness": 90, "nested": {"mode": "brightness"}})
+
+    def test_ha_event_query_preserves_removal_without_attributes(self) -> None:
+        self.app._on_ha_state_change("light.removed", "off", None, None)
+        request = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-ha-removal-event",
+            operation="ha.list_changes",
+            arguments={},
+            expires_at="2030-01-01T00:00:00Z",
+        )
+
+        response = self.app.router.dispatch(request)
+
+        self.assertEqual(response.status.value, "succeeded")
+        event = response.result["changes"][-1]
+        self.assertEqual(event["old_state"], "off")
+        self.assertIsNone(event["new_state"])
+        self.assertNotIn("attributes", event)
+
     def test_rpc_reminder_flow(self) -> None:
         create_payload = {
             "schema_version": "1.0.0",

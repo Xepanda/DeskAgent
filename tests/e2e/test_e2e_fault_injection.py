@@ -137,8 +137,13 @@ class TestE2EFaultInjection(unittest.TestCase):
         received_events = []
         event_received = threading.Event()
 
-        def on_state_change(eid: str, old_st: Optional[str], new_st: Optional[str]) -> None:
-            received_events.append((eid, old_st, new_st))
+        def on_state_change(
+            eid: str,
+            old_st: Optional[str],
+            new_st: Optional[str],
+            attributes: Optional[dict[str, Any]],
+        ) -> None:
+            received_events.append((eid, old_st, new_st, attributes))
             if new_st == "on":
                 event_received.set()
 
@@ -171,7 +176,7 @@ class TestE2EFaultInjection(unittest.TestCase):
 
             self.assertTrue(ha.is_ws_connected, "WebSocket must reconnect after backoff")
             self.assertGreaterEqual(reconcile_call_count, 1)
-            self.assertIn(("light.desk", "off", "on"), received_events)
+            self.assertIn(("light.desk", "off", "on", {}), received_events)
         finally:
             stop_sub()
             ha.close()

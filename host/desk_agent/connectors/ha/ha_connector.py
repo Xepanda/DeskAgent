@@ -13,6 +13,7 @@ Implements real Home Assistant REST API interactions and WebSocket real-time eve
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -93,8 +94,14 @@ def _state_snapshot_changed(before: Optional[Mapping[str, Any]], after: Optional
         return None
     return (
         before.get("state") != after.get("state")
-        or before.get("attributes", {}) != after.get("attributes", {})
+        or _snapshot_attributes(before) != _snapshot_attributes(after)
     )
+
+
+def _snapshot_attributes(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return an independent, normalized copy of a snapshot's full attributes."""
+    attributes = snapshot.get("attributes")
+    return copy.deepcopy(dict(attributes)) if isinstance(attributes, Mapping) else {}
 
 KNOWN_ATTRIBUTE_KEYS = frozenset({
     "brightness",
@@ -274,8 +281,13 @@ class HAConnector:
             new_st = item.get("state")
             old_item = self._cached_states.get(eid)
             old_st = old_item.get("state") if old_item else None
-            if old_st != new_st:
-                changes.append({"entity_id": eid, "old_state": old_st, "new_state": new_st})
+            if old_item is None or _state_snapshot_changed(old_item, item):
+                changes.append({
+                    "entity_id": eid,
+                    "old_state": old_st,
+                    "new_state": new_st,
+                    "attributes": _snapshot_attributes(item),
+                })
             self._cached_states[eid] = item
 
         # HA can remove an entity without returning a replacement state in
@@ -294,7 +306,7 @@ class HAConnector:
 
     def subscribe_state_changes(
         self,
-        callback: Callable[[str, Optional[str], Optional[str]], None],
+        callback: Callable[[str, Optional[str], Optional[str], Optional[Mapping[str, Any]]], None],
         interval_sec: float = 1.0,
     ) -> Callable[[], None]:
         """
@@ -342,7 +354,7 @@ class HAConnector:
 
     def _start_polling_fallback(
         self,
-        callback: Callable[[str, Optional[str], Optional[str]], None],
+        callback: Callable[[str, Optional[str], Optional[str], Optional[Mapping[str, Any]]], None],
         interval_sec: float = 1.0,
         run_only_when_ws_down: bool = False,
     ) -> Callable[[], None]:
@@ -356,7 +368,7 @@ class HAConnector:
                         res = self.reconcile_states()
                         for chg in res["reconciled_changes"]:
                             try:
-                                callback(chg["entity_id"], chg["old_state"], chg["new_state"])
+                                callback(chg["entity_id"], chg["old_state"], chg["new_state"], chg.get("attributes"))
                             except Exception as callback_err:
                                 # A consumer failure must not suppress other changes from
                                 # this snapshot. Reconciliation updates the cache first,
@@ -445,7 +457,7 @@ class HAConnector:
                     for change in report["reconciled_changes"]:
                         for cb in active_subs:
                             try:
-                                cb(change["entity_id"], change["old_state"], change["new_state"])
+                                cb(change["entity_id"], change["old_state"], change["new_state"], change.get("attributes"))
                             except Exception as cb_err:
                                 logger.exception("Error in HA reconnect state subscriber: %s", cb_err)
                 except Exception as rec_err:
@@ -471,24 +483,34 @@ class HAConnector:
                             if entity_id and self.is_entity_allowed(entity_id):
                                 old_obj = payload.get("old_state")
                                 new_obj = payload.get("new_state")
-                                old_st = old_obj.get("state") if isinstance(old_obj, dict) else None
-                                new_st = new_obj.get("state") if isinstance(new_obj, dict) else None
+                                cached_obj = self._cached_states.get(entity_id)
+                                old_snapshot = cached_obj if isinstance(cached_obj, Mapping) else old_obj
 
-                                if isinstance(new_obj, dict):
-                                    self._cached_states[entity_id] = new_obj
+                                if isinstance(new_obj, Mapping):
+                                    changed = old_snapshot is None or _state_snapshot_changed(old_snapshot, new_obj) is True
+                                    self._cached_states[entity_id] = dict(new_obj)
+                                    event_attributes: Optional[Mapping[str, Any]] = _snapshot_attributes(new_obj)
+                                    new_st = new_obj.get("state")
+                                    old_st = old_snapshot.get("state") if isinstance(old_snapshot, Mapping) else None
                                 else:
-                                    self._cached_states.pop(entity_id, None)
+                                    changed = isinstance(cached_obj, Mapping)
+                                    if changed:
+                                        self._cached_states.pop(entity_id, None)
+                                    event_attributes = None
+                                    new_st = None
+                                    old_st = cached_obj.get("state") if isinstance(cached_obj, Mapping) else None
 
-                                with self._state_condition:
-                                    self._state_condition.notify_all()
+                                if changed:
+                                    with self._state_condition:
+                                        self._state_condition.notify_all()
 
-                                with self._subscribers_lock:
-                                    active_subs = list(self._subscribers)
-                                for cb in active_subs:
-                                    try:
-                                        cb(entity_id, old_st, new_st)
-                                    except Exception as cb_err:
-                                        logger.exception("Error in state subscriber callback: %s", cb_err)
+                                    with self._subscribers_lock:
+                                        active_subs = list(self._subscribers)
+                                    for cb in active_subs:
+                                        try:
+                                            cb(entity_id, old_st, new_st, event_attributes)
+                                        except Exception as cb_err:
+                                            logger.exception("Error in state subscriber callback: %s", cb_err)
 
             except Exception as exc:
                 self._ws_connected.clear()

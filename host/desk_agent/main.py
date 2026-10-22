@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import ipaddress
 import json
 import logging
@@ -219,21 +220,10 @@ class DeskAgentHostApp:
 
         # HA State Subscription
         self._ha_state_changes: list[dict[str, Any]] = []
-        def _on_ha_state_change(entity_id: str, old_state: Optional[str], new_state: Optional[str]) -> None:
-            logger.info("HA entity %s changed: %s -> %s", entity_id, old_state, new_state)
-            self._ha_state_changes.append({
-                "entity_id": entity_id,
-                "old_state": old_state,
-                "new_state": new_state,
-                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            })
-            if len(self._ha_state_changes) > 100:
-                self._ha_state_changes.pop(0)
-
         ha_cfg = self.config.get("home_assistant", {})
         if ha_cfg.get("subscribe_events", True):
             self._ha_sub_stop: Optional[Callable[[], None]] = self.ha_connector.subscribe_state_changes(
-                _on_ha_state_change,
+                self._on_ha_state_change,
                 interval_sec=float(ha_cfg.get("poll_interval_sec", 2.0)),
             )
         else:
@@ -542,6 +532,27 @@ class DeskAgentHostApp:
 
     def _load_config(self, config_path: Optional[str]) -> dict[str, Any]:
         return _load_host_config(config_path)
+
+    def _on_ha_state_change(
+        self,
+        entity_id: str,
+        old_state: Optional[str],
+        new_state: Optional[str],
+        attributes: Optional[Mapping[str, Any]],
+    ) -> None:
+        logger.info("HA entity %s changed: %s -> %s", entity_id, old_state, new_state)
+        change: dict[str, Any] = {
+            "entity_id": entity_id,
+            "old_state": old_state,
+            "new_state": new_state,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        if new_state is not None:
+            snapshot = dict(attributes) if isinstance(attributes, Mapping) else {}
+            change["attributes"] = copy.deepcopy(snapshot)
+        self._ha_state_changes.append(change)
+        if len(self._ha_state_changes) > 100:
+            self._ha_state_changes.pop(0)
 
     def _register_routes(self) -> None:
         # HA
