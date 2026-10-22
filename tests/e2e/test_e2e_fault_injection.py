@@ -22,10 +22,14 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -176,22 +180,32 @@ class TestE2EFaultInjection(unittest.TestCase):
     # 2. Sudden Crash & SQLite WAL Durability & Reminder Catch-up
     # -------------------------------------------------------------------------
     def test_crash_recovery_and_reminder_catchup(self) -> None:
-        """Simulates abrupt process crash, verifying WAL durability and missed reminder catch-up on reboot."""
-        # Phase 1: Service instance creates recurring reminder
-        srv1 = LifeService(self.db_path)
-        rem1 = srv1.create_reminder(
-            reminder_id="rem-morning-tea",
-            title="Drink morning tea",
-            due_at="2026-10-16T08:00:00Z",
-            repeat_rule="daily",
+        """Uses os._exit in a child process to prove SQLite WAL recovery after an unclean exit."""
+        scheduled_at = (datetime.now(timezone.utc) - timedelta(minutes=90)).replace(microsecond=0)
+        due_at = scheduled_at.isoformat().replace("+00:00", "Z")
+        expected_next = (scheduled_at + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        child = r"""
+import os, sys
+from host.desk_agent.services.life_service import LifeService
+service = LifeService(sys.argv[1])
+assert service._get_connection().execute('PRAGMA journal_mode').fetchone()[0].lower() == 'wal'
+service.create_reminder('rem-morning-tea', 'Drink morning tea', sys.argv[2], repeat_rule='daily')
+service.queue_outbox_message('system.log', {'event': 'service_started'})
+os._exit(0)
+"""
+        crashed = subprocess.run(
+            [sys.executable, "-c", child, str(self.db_path), due_at],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        self.assertEqual(rem1["status"], "scheduled")
+        self.assertEqual(crashed.returncode, 0, crashed.stderr)
+        wal_path = Path(f"{self.db_path}-wal")
+        self.assertTrue(wal_path.exists(), "unclean child exit must leave an uncheckpointed WAL sidecar")
+        self.assertGreater(wal_path.stat().st_size, 0, "WAL must contain committed reminder/outbox frames")
 
-        srv1.queue_outbox_message("system.log", {"event": "service_started"})
-        # Abrupt crash: terminate without clean close() or WAL checkpoint
-        del srv1
-
-        # Phase 2: Service reboots after downtime (current time is 09:30:00Z, 1.5h late)
+        # Phase 2: Service reboots after a simulated 90-minute downtime.
         srv2 = LifeService(self.db_path)
         try:
             # Check WAL survived and reminder exists
@@ -204,7 +218,8 @@ class TestE2EFaultInjection(unittest.TestCase):
             self.assertGreaterEqual(len(outbox), 1)
 
             # Detect missed occurrences with catchup flag
-            due_occurrences = srv2.get_due_occurrences(now_iso="2026-10-16T09:30:00Z")
+            now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            due_occurrences = srv2.get_due_occurrences(now_iso=now_iso)
             self.assertEqual(len(due_occurrences), 1)
             occ = due_occurrences[0]
             self.assertTrue(occ["is_catchup"], "Missed reminder must be flagged as catchup")
@@ -214,7 +229,7 @@ class TestE2EFaultInjection(unittest.TestCase):
             srv2.mark_occurrence_ringing(occ["occurrence_id"])
             all_occs = srv2.get_all_occurrences("rem-morning-tea")
             self.assertEqual(len(all_occs), 2)
-            self.assertEqual(all_occs[1]["scheduled_at"], "2026-10-17T08:00:00Z")
+            self.assertEqual(all_occs[1]["scheduled_at"], expected_next)
         finally:
             srv2.close()
 

@@ -38,18 +38,26 @@
         },
         "wait_for_state": {
           "type": "object",
-          "required": ["expected_state", "timeout_ms"],
           "additionalProperties": false,
           "properties": {
             "expected_state": {
               "type": "string",
-              "description": "Expected state to observe before reporting state_confirmed=true"
+              "description": "Optional expected HA entity state. May be omitted when confirming expected_attributes only."
+            },
+            "expected_attributes": {
+              "type": "object",
+              "description": "Optional attribute values to confirm in the observed HA entity snapshot. When omitted, known attributes from parameters may be used."
+            },
+            "check_parameters": {
+              "type": "boolean",
+              "default": true,
+              "description": "When true, infer expected attributes from recognized parameters if expected_attributes is omitted."
             },
             "timeout_ms": {
-              "type": "integer",
-              "minimum": 500,
+              "type": "number",
+              "minimum": 0,
               "maximum": 30000,
-              "description": "Maximum duration to poll/wait for observed physical state transition"
+              "description": "Finite non-negative maximum wait in milliseconds, capped at 30000. Defaults to 2000 when omitted."
             }
           }
         }
@@ -57,7 +65,7 @@
     },
     "ha_execute_result": {
       "type": "object",
-      "required": ["entity_id", "action", "accepted", "state_confirmed"],
+      "required": ["entity_id", "action", "accepted", "state_confirmed", "state_changed", "physical_action_confirmed"],
       "additionalProperties": false,
       "properties": {
         "entity_id": { "type": "string" },
@@ -66,7 +74,15 @@
         "observed_state": { "type": ["string", "null"] },
         "state_confirmed": {
           "type": "boolean",
-          "description": "Must be false if the state could not be independently verified from the entity readout"
+          "description": "True only when the target state and any requested attributes match the observed HA entity snapshot. This does not prove a physical action."
+        },
+        "state_changed": {
+          "type": ["boolean", "null"],
+          "description": "Whether a best-effort pre-call HA snapshot differs from the observed snapshot; null when comparison is unavailable or no wait was requested."
+        },
+        "physical_action_confirmed": {
+          "type": ["boolean", "null"],
+          "description": "Independent physical feedback status. The current connector always returns null because it only observes HA state."
         },
         "note": { "type": "string" }
       }

@@ -484,8 +484,11 @@ static int desk_agent_main_worker(void)
     for (int r = 0; r < DESK_RES_MAX; r++) {
 #ifdef ESP_PLATFORM
         /* Native TClaw deliberately owns audio while its capture worker is
-         * open. This must not abort the IoT yield loop before provisioning. */
-        if (r == DESK_RES_AUDIO_RECORD || r == DESK_RES_AUDIO_PLAYBACK) continue;
+         * open, and display rendering can briefly own the UI arbiter while
+         * startup events update the screen. Neither transient lease should
+         * abort the only Tuya IoT yield loop before provisioning. */
+        if (r == DESK_RES_AUDIO_RECORD || r == DESK_RES_AUDIO_PLAYBACK ||
+            r == DESK_RES_DISPLAY_UI) continue;
 #endif
         if (desk_arbiter_get_owner((desk_resource_type_t)r) != DESK_OWNER_NONE) {
             printf("[ERROR] Safety violation: Resource arbiter %d not in clean state at boot!\n", r);

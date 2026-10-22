@@ -4,6 +4,8 @@
  */
 
 #include "desk_sdk_bridge.h"
+#include "desk_watcher_log_source.h"
+#include "desk_tclaw_bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +61,175 @@ static uint32_t s_last_heartbeat_time = 0;
  * via desk_sdk_bridge_set_pairing_code(); never hardcoded, never logged. */
 static char s_expected_pairing_code[8] = "";
 static bool s_pairing_code_configured = false;
+static unsigned s_pairing_failed_attempts = 0;
+static uint64_t s_pairing_code_expires_at_ms = 0;
+static pthread_mutex_t s_pairing_code_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char s_pair_request_id[33] = "";
+static char s_pair_daemon_instance_id[33] = "";
+static char s_pair_target_mode[32] = "";
+static char s_pair_host[INET_ADDRSTRLEN] = "";
+static uint16_t s_pair_websocket_port = 0;
+static bool desk_sdk_is_lower_hex_64(const char *s);
+
+/* CR-009 L2 stream lease. Only structured A1 records are serialized. */
+static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool s_local_log_enabled = false;
+static bool s_log_stream_active = false;
+static bool s_log_camera_only = false;
+static char s_log_stream_id[33] = "";
+static char s_log_min_level[8] = "WARN";
+static char s_log_boot_id[33] = "";
+static desk_watcher_log_record_t s_log_pending_record;
+static desk_watcher_log_gap_t s_log_pending_gap;
+static bool s_log_has_pending_record;
+static bool s_log_has_pending_gap;
+
+static void desk_sdk_log_source_reset_locked(void)
+{
+    desk_watcher_log_source_set_enabled(false);
+    s_log_has_pending_record = false;
+    s_log_has_pending_gap = false;
+}
+
+void desk_sdk_bridge_set_local_log_enabled(bool enabled)
+{
+    pthread_mutex_lock(&s_log_mutex);
+    s_local_log_enabled = enabled;
+    if (!enabled) {
+        s_log_stream_active = false;
+        s_log_stream_id[0] = '\0';
+        desk_sdk_log_source_reset_locked();
+    }
+    pthread_mutex_unlock(&s_log_mutex);
+}
+
+void desk_sdk_bridge_log_session_closed(void)
+{
+    pthread_mutex_lock(&s_log_mutex);
+    s_log_stream_active = false;
+    s_log_camera_only = false;
+    s_log_stream_id[0] = '\0';
+    desk_sdk_log_source_reset_locked();
+    pthread_mutex_unlock(&s_log_mutex);
+}
+
+int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len)
+{
+    if (!out_json || out_len == 0) return -1;
+    pthread_mutex_lock(&s_log_mutex);
+    if (!s_local_log_enabled || !s_log_stream_active ||
+        !desk_sdk_ws_client_is_authenticated() ||
+        !desk_watcher_log_source_is_enabled()) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return 0;
+    }
+    if (!s_log_has_pending_record)
+        s_log_has_pending_record = desk_watcher_log_source_try_dequeue(&s_log_pending_record);
+    if (!s_log_has_pending_gap)
+        s_log_has_pending_gap = desk_watcher_log_source_take_gap(&s_log_pending_gap);
+
+    int n = 0;
+    if (s_log_has_pending_gap && (!s_log_has_pending_record ||
+        s_log_pending_gap.first_dropped_sequence < s_log_pending_record.sequence)) {
+        n = snprintf(out_json, out_len,
+            "{\"type\":\"sys.log.gap\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"first_dropped_sequence\":%llu,\"last_dropped_sequence\":%llu,\"dropped_count\":%llu,\"reason\":\"QUEUE_FULL\"}}",
+            s_log_stream_id, s_log_boot_id,
+            (unsigned long long)s_log_pending_gap.first_dropped_sequence,
+            (unsigned long long)s_log_pending_gap.last_dropped_sequence,
+            (unsigned long long)s_log_pending_gap.dropped_count);
+        s_log_has_pending_gap = false;
+    } else if (s_log_has_pending_record) {
+        if (s_log_pending_record.event_id != DESK_WATCHER_LOG_EVENT_CAMERA_CAPTURE_EMPTY) {
+            s_log_has_pending_record = false;
+            pthread_mutex_unlock(&s_log_mutex);
+            return 0;
+        }
+        n = snprintf(out_json, out_len,
+            "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"WARN\",\"component\":\"camera\",\"event_id\":\"CAMERA_CAPTURE_EMPTY\",\"fields\":{}}}",
+            s_log_stream_id, s_log_boot_id,
+            (unsigned long long)s_log_pending_record.sequence,
+            (unsigned long long)s_log_pending_record.uptime_ms);
+        s_log_has_pending_record = false;
+    }
+    pthread_mutex_unlock(&s_log_mutex);
+    return n > 0 && (size_t)n < out_len ? n : (n < 0 ? -1 : 0);
+}
+
+#define DESK_SDK_PAIRING_CODE_TTL_MS (5ULL * 60ULL * 1000ULL)
+
+#ifdef DESK_SDK_TESTING
+static uint64_t s_test_monotonic_now_ms;
+
+void desk_sdk_test_set_monotonic_ms(uint64_t now_ms)
+{
+    s_test_monotonic_now_ms = now_ms;
+}
+
+static bool desk_sdk_monotonic_now_ms(uint64_t *now_ms)
+{
+    if (!now_ms) return false;
+    *now_ms = s_test_monotonic_now_ms;
+    return true;
+}
+#else
+static bool desk_sdk_monotonic_now_ms(uint64_t *now_ms)
+{
+    if (!now_ms) return false;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0) return false;
+    *now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+    return true;
+}
+#endif
+
+static bool desk_sdk_is_lower_hex_32(const char *s)
+{
+    if (!s || strlen(s) != 32) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len)
+{
+    if (!out_json || max_len == 0) return -1;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    if (!s_paired ||
+        !desk_sdk_is_lower_hex_32(s_pair_request_id) ||
+        !desk_sdk_is_lower_hex_32(s_pair_daemon_instance_id) ||
+        !desk_sdk_is_lower_hex_64(s_active_pairing_token) ||
+        !(strcmp(s_pair_target_mode, "python_sdk") == 0 ||
+          strcmp(s_pair_target_mode, "desktop_link") == 0)) {
+        pthread_mutex_unlock(&s_pairing_code_mutex);
+        return -1;
+    }
+
+    int n = snprintf(out_json, max_len,
+        "{\"type\":\"sys.client.hello\",\"code\":0,\"data\":{"
+        "\"role\":\"hardware\",\"pairing_protocol\":\"watcher-lan-pairing\","
+        "\"pairing_version\":\"1.0\",\"pair_request_id\":\"%s\","
+        "\"daemon_instance_id\":\"%s\",\"session_token\":\"%s\",\"mode\":\"%s\"}}",
+        s_pair_request_id, s_pair_daemon_instance_id, s_active_pairing_token,
+        s_pair_target_mode);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return n >= 0 && (size_t)n < max_len ? n : -1;
+}
+
+int desk_sdk_bridge_get_pairing_target(char *host, size_t host_len, uint16_t *port)
+{
+    if (!host || host_len == 0 || !port) return -1;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    if (s_pair_host[0] == '\0' || s_pair_websocket_port == 0 || !s_paired ||
+        strlen(s_pair_host) + 1 > host_len) {
+        pthread_mutex_unlock(&s_pairing_code_mutex);
+        return -1;
+    }
+    strcpy(host, s_pair_host);
+    *port = s_pair_websocket_port;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return 0;
+}
 
 /* True when the string is exactly 6 ASCII decimal digits (^[0-9]{6}$). */
 static bool desk_sdk_is_six_digits(const char *s)
@@ -84,39 +255,99 @@ static bool desk_sdk_secure_equals(const char *a, const char *b)
     return diff == 0;
 }
 
-/* Official redact_sensitive_fields rule: session_token -> [redacted:<last4>]. */
-static void desk_sdk_redact_token(const char *token, char *out, size_t out_len)
+static bool desk_sdk_pairing_code_clear_locked(void)
 {
-    if (!out || out_len == 0) return;
-    size_t n = token ? strlen(token) : 0;
-    if (n == 0) {
-        snprintf(out, out_len, "[redacted]");
-    } else if (n >= 4) {
-        snprintf(out, out_len, "[redacted:%s]", token + (n - 4));
-    } else {
-        snprintf(out, out_len, "[redacted]");
+    bool was_configured = s_pairing_code_configured;
+    memset(s_expected_pairing_code, 0, sizeof(s_expected_pairing_code));
+    s_pairing_code_configured = false;
+    s_pairing_failed_attempts = 0;
+    s_pairing_code_expires_at_ms = 0;
+    return was_configured;
+}
+
+/* Return true when no valid code remains; `cleared` is true only when this
+ * call consumed an active window and therefore owns the one UI notification. */
+static bool desk_sdk_pairing_code_expire_if_needed_locked(bool *cleared)
+{
+    if (cleared) *cleared = false;
+    uint64_t now_ms = 0;
+    if (!s_pairing_code_configured) return true;
+    if (!desk_sdk_monotonic_now_ms(&now_ms) || now_ms >= s_pairing_code_expires_at_ms) {
+        bool was_configured = desk_sdk_pairing_code_clear_locked();
+        if (cleared) *cleared = was_configured;
+        return true;
     }
+    return false;
+}
+
+static void desk_sdk_pairing_ui_notify_consumed(bool notify)
+{
+    if (notify) desk_tclaw_pairing_ui_on_pairing_consumed();
+}
+
+static void desk_sdk_pairing_code_expire_if_needed(void)
+{
+    bool cleared = false;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    (void)desk_sdk_pairing_code_expire_if_needed_locked(&cleared);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_pairing_ui_notify_consumed(cleared);
+}
+
+static bool desk_sdk_pairing_code_failed_attempt_locked(void)
+{
+    if (s_pairing_failed_attempts < DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS) {
+        ++s_pairing_failed_attempts;
+    }
+    if (s_pairing_failed_attempts >= DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS) {
+        return desk_sdk_pairing_code_clear_locked();
+    }
+    return false;
 }
 
 int desk_sdk_bridge_set_pairing_code(const char *code)
 {
+    pthread_mutex_lock(&s_pairing_code_mutex);
     if (!code || code[0] == '\0') {
-        s_expected_pairing_code[0] = '\0';
-        s_pairing_code_configured = false;
+        desk_sdk_pairing_code_clear_locked();
+        pthread_mutex_unlock(&s_pairing_code_mutex);
         return 0;
     }
     if (!desk_sdk_is_six_digits(code)) {
         /* Reject malformed provisioning input; keep the previous configuration. */
+        pthread_mutex_unlock(&s_pairing_code_mutex);
         return -1;
     }
+    uint64_t now_ms = 0;
+    if (!desk_sdk_monotonic_now_ms(&now_ms) || UINT64_MAX - now_ms < DESK_SDK_PAIRING_CODE_TTL_MS) {
+        desk_sdk_pairing_code_clear_locked();
+        pthread_mutex_unlock(&s_pairing_code_mutex);
+        return -1;
+    }
+    memset(s_expected_pairing_code, 0, sizeof(s_expected_pairing_code));
     memcpy(s_expected_pairing_code, code, 7);
     s_pairing_code_configured = true;
+    s_pairing_failed_attempts = 0;
+    s_pairing_code_expires_at_ms = now_ms + DESK_SDK_PAIRING_CODE_TTL_MS;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
+}
+
+void desk_sdk_bridge_clear_pairing_code(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    desk_sdk_pairing_code_clear_locked();
+    pthread_mutex_unlock(&s_pairing_code_mutex);
 }
 
 bool desk_sdk_bridge_is_pairing_code_configured(void)
 {
-    return s_pairing_code_configured;
+    bool cleared = false;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    bool configured = !desk_sdk_pairing_code_expire_if_needed_locked(&cleared);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_pairing_ui_notify_consumed(cleared);
+    return configured;
 }
 
 #ifdef ESP_PLATFORM
@@ -178,7 +409,11 @@ int desk_sdk_bridge_set_pairing_token(const char *token)
 {
     if (!token) {
         /* No value supplied: mint a fresh credential (always 64 lowercase hex). */
+        pthread_mutex_lock(&s_pairing_code_mutex);
+        desk_sdk_ws_client_close();
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
+        desk_sdk_ws_client_close();
+        pthread_mutex_unlock(&s_pairing_code_mutex);
         return 0;
     }
 
@@ -189,28 +424,51 @@ int desk_sdk_bridge_set_pairing_token(const char *token)
         return -1;
     }
 
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    bool token_changed = strcmp(s_active_pairing_token, token) != 0;
+    if (token_changed) {
+        /* A changed credential invalidates the current socket's handshake. */
+        desk_sdk_ws_client_close();
+    }
     memcpy(s_active_pairing_token, token, sizeof(s_active_pairing_token));
     /* R9 (interfaces.md 6.6): this provisioning entry point sets credential
      * material ONLY. `s_paired` means "a client has successfully completed a
      * pairing handshake" and may only be set by the validated pairing path in
      * desk_sdk_bridge_process_pairing_udp() (interfaces.md 6.4). */
+    if (token_changed) {
+        /* Invalidate any connect that began while the token was replaced. */
+        desk_sdk_ws_client_close();
+    }
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
 }
 
 int desk_sdk_bridge_get_pairing_token(char *token, size_t max_len)
 {
     if (!token || max_len == 0) return -1;
+    pthread_mutex_lock(&s_pairing_code_mutex);
     if (s_active_pairing_token[0] == '\0') {
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
     }
     strncpy(token, s_active_pairing_token, max_len - 1);
     token[max_len - 1] = '\0';
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
 }
 
 void desk_sdk_bridge_set_auth_required(bool required)
 {
+    bool policy_changed = s_auth_required != required;
+    if (policy_changed) {
+        /* Changing the handshake policy invalidates any prior session latch. */
+        desk_sdk_ws_client_close();
+    }
     s_auth_required = required;
+    if (policy_changed) {
+        /* Invalidate connects that crossed the policy update before they can
+         * commit their previous handshake result. */
+        desk_sdk_ws_client_close();
+    }
 }
 
 /* Socket Server State */
@@ -567,6 +825,8 @@ typedef struct {
     uint32_t timeout_ms;
     desk_sdk_req_state_t state;
     char last_status[32];
+    char result_payload[512];
+    bool has_response;
     bool in_use;
 } desk_sdk_pending_req_t;
 
@@ -603,6 +863,8 @@ static int desk_sdk_req_table_add(const char *request_id, const char *operation,
             }
             s_req_table[i].updated_at_ms = now;
             s_req_table[i].state = DESK_SDK_REQ_STATE_PENDING;
+            s_req_table[i].has_response = false;
+            s_req_table[i].result_payload[0] = '\0';
             strncpy(s_req_table[i].last_status, "pending", sizeof(s_req_table[i].last_status) - 1);
             pthread_mutex_unlock(&s_req_mutex);
             return 0;
@@ -654,7 +916,7 @@ static int desk_sdk_req_table_add(const char *request_id, const char *operation,
     return 0;
 }
 
-static int desk_sdk_req_table_update(const char *request_id, const char *status)
+static int desk_sdk_req_table_update_with_payload(const char *request_id, const char *status, const char *payload)
 {
     if (!request_id || !status) return -1;
 
@@ -673,6 +935,11 @@ static int desk_sdk_req_table_update(const char *request_id, const char *status)
         desk_sdk_pending_req_t *entry = &s_req_table[found_idx];
         entry->updated_at_ms = now;
         snprintf(entry->last_status, sizeof(entry->last_status), "%s", status);
+        if (payload && payload[0] != '\0') {
+            strncpy(entry->result_payload, payload, sizeof(entry->result_payload) - 1);
+            entry->result_payload[sizeof(entry->result_payload) - 1] = '\0';
+        }
+        entry->has_response = true;
 
         if (strcmp(status, "accepted") == 0) {
             entry->state = DESK_SDK_REQ_STATE_ACCEPTED;
@@ -693,6 +960,11 @@ static int desk_sdk_req_table_update(const char *request_id, const char *status)
     for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
         if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
             snprintf(s_req_table[i].last_status, sizeof(s_req_table[i].last_status), "%s", status);
+            if (payload && payload[0] != '\0') {
+                strncpy(s_req_table[i].result_payload, payload, sizeof(s_req_table[i].result_payload) - 1);
+                s_req_table[i].result_payload[sizeof(s_req_table[i].result_payload) - 1] = '\0';
+            }
+            s_req_table[i].has_response = true;
             if (strcmp(status, "accepted") == 0) {
                 s_req_table[i].state = DESK_SDK_REQ_STATE_ACCEPTED;
             } else if (strcmp(status, "completed") == 0 || strcmp(status, "succeeded") == 0) {
@@ -705,6 +977,46 @@ static int desk_sdk_req_table_update(const char *request_id, const char *status)
     }
     pthread_mutex_unlock(&s_req_mutex);
     return 0;
+}
+
+
+int desk_sdk_bridge_wait_tool_response(const char *request_id,
+                                       uint32_t timeout_ms,
+                                       char *out_status, size_t status_max_len,
+                                       char *out_result, size_t result_max_len)
+{
+    if (!request_id || request_id[0] == '\0') return -1;
+    uint64_t deadline = desk_sdk_time_ms() + timeout_ms;
+
+    while (desk_sdk_time_ms() < deadline) {
+        pthread_mutex_lock(&s_req_mutex);
+        for (size_t i = 0; i < DESK_SDK_MAX_PENDING_REQUESTS; i++) {
+            if (s_req_table[i].in_use && strcmp(s_req_table[i].request_id, request_id) == 0) {
+                if (s_req_table[i].has_response) {
+                    if (out_status && status_max_len > 0) {
+                        strncpy(out_status, s_req_table[i].last_status, status_max_len - 1);
+                        out_status[status_max_len - 1] = '\0';
+                    }
+                    if (out_result && result_max_len > 0) {
+                        strncpy(out_result, s_req_table[i].result_payload, result_max_len - 1);
+                        out_result[result_max_len - 1] = '\0';
+                    }
+                    s_req_table[i].has_response = false;
+                    pthread_mutex_unlock(&s_req_mutex);
+                    return 0;
+                }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&s_req_mutex);
+
+#ifdef ESP_PLATFORM
+        usleep(20000);
+#else
+        usleep(20000);
+#endif
+    }
+    return -1;
 }
 
 int desk_sdk_bridge_get_pending_request_count(void)
@@ -796,6 +1108,8 @@ bool desk_sdk_bridge_is_heartbeat_alive(uint32_t timeout_sec)
 
 int desk_sdk_bridge_init(void)
 {
+    desk_sdk_ws_client_close();
+    desk_sdk_bridge_set_local_log_enabled(false);
     s_client_connected = false;
     s_event_seq = 0;
     s_outbound_cb = NULL;
@@ -806,27 +1120,46 @@ int desk_sdk_bridge_init(void)
     s_client_fd = -1;
     s_bound_port = 0;
     s_last_heartbeat_time = 0;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    desk_sdk_pairing_code_clear_locked();
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_ws_client_close();
     desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
+    desk_sdk_ws_client_close();
     return 0;
 }
 
 void desk_sdk_bridge_reset(void)
 {
+    desk_sdk_ws_client_close();
+    desk_sdk_bridge_set_local_log_enabled(false);
     s_client_connected = false;
     s_event_seq = 0;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    bool had_pairing_state = s_pairing_code_configured || s_paired ||
+        s_pair_request_id[0] != '\0' || s_pair_daemon_instance_id[0] != '\0' ||
+        s_pair_host[0] != '\0' || s_pair_websocket_port != 0;
     s_active_pairing_token[0] = '\0';
     s_paired = false;
+    s_pair_request_id[0] = '\0';
+    s_pair_daemon_instance_id[0] = '\0';
+    s_pair_target_mode[0] = '\0';
+    s_pair_host[0] = '\0';
+    s_pair_websocket_port = 0;
+    desk_sdk_pairing_code_clear_locked();
+    pthread_mutex_unlock(&s_pairing_code_mutex);
     s_auth_required = false;
+    desk_sdk_ws_client_close();
     s_last_heartbeat_time = 0;
     desk_sdk_req_table_init();
-    /* Provisioned expected pairing code intentionally survives a reset. */
     desk_sdk_socket_rx_reset();
+    if (had_pairing_state) desk_tclaw_pairing_ui_on_sdk_session_reset();
 }
 
 bool desk_sdk_bridge_is_connected(void)
 {
-    return s_client_connected;
+    return s_client_connected || desk_sdk_ws_client_is_connected();
 }
 
 int desk_sdk_bridge_register_outbound(desk_sdk_outbound_send_cb_t cb, void *user_data)
@@ -924,7 +1257,6 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
 
 static uint16_t s_camera_session_id = 100;
 static uint32_t s_camera_seq = 0;
-static uint16_t s_mic_session_id = 200;
 
 int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
                                      uint8_t flags,
@@ -951,7 +1283,11 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
     int rc = desk_sdk_bridge_pack_media_frame(frame_type, flags, stream_id, sequence,
                                               payload, payload_len, target_buf, target_size, &packed_len);
     if (rc == 0) {
-        if (s_client_fd >= 0) {
+        if (packed_len > DESK_WSPK_MAX_FRAME_SIZE) {
+            rc = -4;
+        } else if (desk_sdk_ws_client_is_connected()) {
+            if (desk_sdk_ws_client_send_binary(target_buf, packed_len) != 0) rc = -3;
+        } else if (s_client_fd >= 0) {
             /* WSPK framing is unchanged; only the write path now guarantees the
              * full frame is transmitted (interfaces.md 6.3.5). */
             if (desk_sdk_socket_write_all(s_client_fd, target_buf, packed_len) != 0) {
@@ -959,7 +1295,7 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
                 rc = -3;
             }
         }
-        if (s_outbound_cb) {
+        if (rc == 0 && s_outbound_cb) {
             s_outbound_cb((const char *)target_buf, packed_len, s_outbound_user_data);
         }
     }
@@ -971,8 +1307,11 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
 }
 
 /* UDP Pairing (watcher_lan_pairing_v1 on port 37021) */
-int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len)
+static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *udp_out,
+                                                       size_t max_out_len,
+                                                       bool *notify_pairing_consumed)
 {
+    if (notify_pairing_consumed) *notify_pairing_consumed = false;
     if (!udp_in || !udp_out || max_out_len < 128) return DESK_SDK_PAIRING_ERR_ARG;
 
     /* Fail-closed default: nothing is emitted unless validation fully passes. */
@@ -993,48 +1332,49 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
     }
     json_parse_str(udp_in, "target_mode", target_mode, sizeof(target_mode));
     json_parse_str(udp_in, "pairing_code", pairing_code, sizeof(pairing_code));
+    int32_t websocket_port = json_parse_int(udp_in, "websocket_port", -1);
 
     /* interfaces.md 6.4 / CR-001: never grant a pairing before the pairing code
      * has been validated against the explicitly provisioned device-side code.
-     * pairing_code is never logged in clear text (redact_sensitive_fields). */
-    if (!s_pairing_code_configured) {
-        printf("[SDK-PAIR] pair.request rejected: no expected pairing code provisioned "
-               "(pairing_code=[redacted], request_id=%s)\n", req_id);
+ * diagnostics contain only a reason and request_id. */
+    bool code_expired = false;
+    if (desk_sdk_pairing_code_expire_if_needed_locked(&code_expired)) {
+        if (notify_pairing_consumed) *notify_pairing_consumed = code_expired;
+        printf("[SDK-PAIR] pair.request rejected: reason=window_closed request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
     if (!desk_sdk_is_six_digits(pairing_code)) {
-        printf("[SDK-PAIR] pair.request rejected: malformed pairing_code "
-               "(pairing_code=[redacted], request_id=%s)\n", req_id);
+        if (notify_pairing_consumed)
+            *notify_pairing_consumed = desk_sdk_pairing_code_failed_attempt_locked();
+        printf("[SDK-PAIR] pair.request rejected: reason=malformed_code request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
     if (!desk_sdk_secure_equals(pairing_code, s_expected_pairing_code)) {
-        printf("[SDK-PAIR] pair.request rejected: pairing_code mismatch "
-               "(pairing_code=[redacted], request_id=%s)\n", req_id);
+        if (notify_pairing_consumed)
+            *notify_pairing_consumed = desk_sdk_pairing_code_failed_attempt_locked();
+        printf("[SDK-PAIR] pair.request rejected: reason=code_mismatch request_id=%s\n", req_id);
         return DESK_SDK_PAIRING_REJECTED;
     }
 
-    if (strlen(req_id) == 0 && strlen(daemon_id) == 0) {
-        strncpy(req_id, "req-pair-01", sizeof(req_id) - 1);
-        strncpy(daemon_id, "daemon-pair-01", sizeof(daemon_id) - 1);
+    if (!desk_sdk_is_lower_hex_32(req_id) || !desk_sdk_is_lower_hex_32(daemon_id) ||
+        websocket_port < 1 || websocket_port > 65535 ||
+        !(strcmp(target_mode, "python_sdk") == 0 || strcmp(target_mode, "desktop_link") == 0)) {
+        printf("[SDK-PAIR] pair.request rejected: reason=malformed_metadata request_id=%s\n", req_id);
+        return DESK_SDK_PAIRING_REJECTED;
     }
 
-    /* Validation passed: only now generate/issue a session token and pair. */
+    /* Validation passed: only now generate/issue a session token. */
     if (s_active_pairing_token[0] == '\0') {
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
     }
-    s_paired = true;
 
     char proto[64] = "";
     json_parse_str(udp_in, "protocol", proto, sizeof(proto));
 
-    char redacted_token[32];
-    desk_sdk_redact_token(s_active_pairing_token, redacted_token, sizeof(redacted_token));
-    printf("[SDK-PAIR] pair.accept issued (session_token=%s, request_id=%s)\n",
-           redacted_token, req_id);
-
     /* Strict official watcher-lan-pairing protocol check per PairAccept contract */
+    int reply_len;
     if (strcmp(proto, "watcher-lan-pairing") == 0) {
-        snprintf(udp_out, max_out_len,
+        reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"protocol\":\"watcher-lan-pairing\","
                  "\"version\":\"1.0\","
@@ -1047,7 +1387,7 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
                  strlen(target_mode) > 0 ? target_mode : "python_sdk",
                  s_active_pairing_token);
     } else {
-        snprintf(udp_out, max_out_len,
+        reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"status\":\"accepted\","
                  "\"device_id\":\"desk_agent_r1\","
@@ -1068,7 +1408,39 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
                  s_active_pairing_token);
     }
 
+    if (reply_len < 0 || (size_t)reply_len >= max_out_len) {
+        udp_out[0] = '\0';
+        printf("[SDK-PAIR] pair.request rejected: reason=reply_too_small request_id=%s\n", req_id);
+        return DESK_SDK_PAIRING_REJECTED;
+    }
+
+    /* A new accepted pairing replaces the identity/target bound to the old
+     * socket, so tear it down before mutating those fields. */
+    desk_sdk_ws_client_close();
+    s_paired = true;
+    memcpy(s_pair_request_id, req_id, sizeof(s_pair_request_id));
+    memcpy(s_pair_daemon_instance_id, daemon_id, sizeof(s_pair_daemon_instance_id));
+    snprintf(s_pair_target_mode, sizeof(s_pair_target_mode), "%s", target_mode);
+    s_pair_websocket_port = (uint16_t)websocket_port;
+    if (notify_pairing_consumed)
+        *notify_pairing_consumed = desk_sdk_pairing_code_clear_locked();
+    else
+        (void)desk_sdk_pairing_code_clear_locked();
+    desk_sdk_ws_client_close();
+    printf("[SDK-PAIR] pair.accept issued: reason=validated request_id=%s\n", req_id);
+
     return DESK_SDK_PAIRING_OK;
+}
+
+int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_t max_out_len)
+{
+    bool notify_pairing_consumed = false;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    int rc = desk_sdk_bridge_process_pairing_udp_locked(udp_in, udp_out, max_out_len,
+                                                        &notify_pairing_consumed);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_pairing_ui_notify_consumed(notify_pairing_consumed);
+    return rc;
 }
 
 /* Command processing */
@@ -1131,21 +1503,14 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         char role[32] = "";
         json_parse_str(json_in, "role", role, sizeof(role));
 
-        /* If role is hardware (as in runtime pair sequence), reply with official negotiated session ack */
+        /* Do not negotiate audio_uplink until capture, Opus encoding, WSPK
+         * uplink and session teardown are implemented end to end. */
         if (strcmp(role, "hardware") == 0) {
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
                      "\"type\":\"sys.client.hello\","
                      "\"role\":\"hardware\","
-                     "\"session_state\":\"connected\","
-                     "\"negotiated\":{"
-                     "\"audio_uplink\":{"
-                     "\"codec\":\"opus\","
-                     "\"sample_rate\":16000,"
-                     "\"channels\":1,"
-                     "\"frame_duration_ms\":60,"
-                     "\"packetization\":\"one_opus_packet_per_wspk\","
-                     "\"version\":1}}}}");
+                     "\"session_state\":\"connected\"}}");
             return 0;
         }
 
@@ -1154,13 +1519,11 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  DESK_SDK_CAP_INPUTS,
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_AUDIO_STREAM,
                  DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_AUDIO_STREAM_ALT,
                  DESK_SDK_CAP_EXPRESSION_ALT,
                  DESK_SDK_CAP_MCP_TOOLS);
         return 0;
@@ -1174,14 +1537,12 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
                  "\"role\":\"device\","
                  "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
                  rid,
                  DESK_SDK_CAP_INPUTS,
                  DESK_SDK_CAP_MOTION,
                  DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_AUDIO_STREAM,
                  DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_AUDIO_STREAM_ALT,
                  DESK_SDK_CAP_EXPRESSION_ALT,
                  DESK_SDK_CAP_MCP_TOOLS);
         return 0;
@@ -1287,12 +1648,14 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    /* Motion action play: ctrl.motion.action.play */
+    /* Do not mint a synthetic job: this firmware has no action playback engine. */
     else if (strcmp(msg_type, "ctrl.motion.action.play") == 0 || strcmp(msg_type, "motion.action.play") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"job_id\":1,\"status\":\"accepted\",\"accepted\":true}}",
+                 "{\"type\":\"sys.nack\",%s\"code\":501,\"error\":{"
+                 "\"code\":\"UNSUPPORTED_OPERATION\","
+                 "\"message\":\"Motion action playback is not implemented on this device\"}}",
                  rid);
         return 0;
     }
@@ -1348,6 +1711,14 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
              strcmp(msg_type, "ctrl.camera.capture_with_feedback") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        if (!desk_arbiter_camera_is_lease_active()) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                     "\"code\":\"NO_ACTIVE_LEASE\","
+                     "\"message\":\"No active camera lease held on device\"}}",
+                     rid);
+            return 0;
+        }
         size_t max_jpeg = 65536;
         uint8_t *jpeg_buf = (uint8_t *)desk_psram_malloc(max_jpeg);
         if (!jpeg_buf) {
@@ -1386,25 +1757,18 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    /* Microphone open / close: ctrl.microphone.open / ctrl.microphone.close */
-    else if (strcmp(msg_type, "ctrl.microphone.open") == 0) {
+    /* Audio transport is unsupported until both directions have real media
+     * paths and the capture owner can be negotiated without stopping TClaw. */
+    else if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0 ||
+             strcmp(msg_type, "ctrl.audio.stop") == 0 ||
+             strcmp(msg_type, "ctrl.microphone.open") == 0 ||
+             strcmp(msg_type, "ctrl.microphone.close") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        int rate = json_parse_int(json_in, "sample_rate_hz", 16000);
-        desk_hardware_audio_record_start((uint32_t)rate);
-        s_mic_session_id = (s_mic_session_id % 65534) + 1;
         snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"session_id\":%u}}",
-                 rid, (unsigned int)s_mic_session_id);
-        return 0;
-    }
-
-    else if (strcmp(msg_type, "ctrl.microphone.close") == 0) {
-        char rid_scratch[128];
-        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        desk_hardware_audio_record_stop();
-        snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"status\":\"accepted\",\"accepted\":true}}",
+                 "{\"type\":\"sys.nack\",%s\"code\":501,\"error\":{"
+                 "\"code\":\"UNSUPPORTED_OPERATION\","
+                 "\"message\":\"SDK audio transport is not implemented on this device\"}}",
                  rid);
         return 0;
     }
@@ -1545,6 +1909,321 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     }
 }
 
+static bool desk_sdk_log_pairing_is_complete(void)
+{
+    bool complete;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    complete = s_paired && desk_sdk_is_lower_hex_32(s_pair_request_id) &&
+               desk_sdk_is_lower_hex_32(s_pair_daemon_instance_id) &&
+               desk_sdk_is_lower_hex_64(s_active_pairing_token) &&
+               (strcmp(s_pair_target_mode, "python_sdk") == 0 ||
+                strcmp(s_pair_target_mode, "desktop_link") == 0) &&
+               s_pair_host[0] != '\0' && s_pair_websocket_port != 0;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return complete;
+}
+
+static int desk_sdk_log_nack(char *out, size_t cap, const char *type,
+                             const char *command_id, const char *error, int code)
+{
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.nack\",\"code\":%d,\"data\":{\"type\":\"%s\",\"command_id\":\"%s\",\"error\":\"%s\"}}",
+        code, type, command_id, error);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static bool desk_sdk_log_command_id_valid(const char *id)
+{
+    if (!id || strlen(id) != 32) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+typedef struct { const char *p; unsigned depth; } desk_log_json_parser_t;
+
+static void desk_log_json_ws(desk_log_json_parser_t *p)
+{
+    while (*p->p == ' ' || *p->p == '\t' || *p->p == '\r' || *p->p == '\n') ++p->p;
+}
+
+static bool desk_log_json_string(desk_log_json_parser_t *p, const char **begin, const char **end)
+{
+    if (*p->p != '"') return false;
+    const char *start = p->p++;
+    while (*p->p) {
+        unsigned char c = (unsigned char)*p->p++;
+        if (c == '"') { if (begin) *begin = start; if (end) *end = p->p; return true; }
+        if (c < 0x20) return false;
+        if (c == '\\') {
+            c = (unsigned char)*p->p++;
+            if (c == 'u') {
+                for (int i = 0; i < 4; ++i) {
+                    char h = *p->p++;
+                    if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) return false;
+                }
+            } else if (c != '"' && c != '\\' && c != '/' && c != 'b' && c != 'f' && c != 'n' && c != 'r' && c != 't') return false;
+        }
+    }
+    return false;
+}
+
+static bool desk_log_json_value(desk_log_json_parser_t *p)
+{
+    desk_log_json_ws(p);
+    if (++p->depth > 16) return false;
+    bool ok = false;
+    if (*p->p == '"') ok = desk_log_json_string(p, NULL, NULL);
+    else if (*p->p == '{') {
+        ++p->p; desk_log_json_ws(p);
+        if (*p->p == '}') { ++p->p; ok = true; }
+        else {
+            ok = true;
+            for (;;) {
+                if (!desk_log_json_string(p, NULL, NULL)) { ok = false; break; }
+                desk_log_json_ws(p);
+                if (*p->p++ != ':') { ok = false; break; }
+                if (!desk_log_json_value(p)) { ok = false; break; }
+                desk_log_json_ws(p);
+                if (*p->p == '}') { ++p->p; break; }
+                if (*p->p++ != ',') { ok = false; break; }
+                desk_log_json_ws(p);
+            }
+        }
+    } else if (*p->p == '[') {
+        ++p->p; desk_log_json_ws(p);
+        if (*p->p == ']') { ++p->p; ok = true; }
+        else {
+            ok = true;
+            for (;;) {
+                if (!desk_log_json_value(p)) { ok = false; break; }
+                desk_log_json_ws(p);
+                if (*p->p == ']') { ++p->p; break; }
+                if (*p->p++ != ',') { ok = false; break; }
+                desk_log_json_ws(p);
+            }
+        }
+    } else if (*p->p == 't' && strncmp(p->p, "true", 4) == 0) { p->p += 4; ok = true; }
+    else if (*p->p == 'f' && strncmp(p->p, "false", 5) == 0) { p->p += 5; ok = true; }
+    else if (*p->p == 'n' && strncmp(p->p, "null", 4) == 0) { p->p += 4; ok = true; }
+    else {
+        const char *n = p->p;
+        if (*n == '-') ++n;
+        if (*n == '0') ++n;
+        else if (*n >= '1' && *n <= '9') { do { ++n; } while (*n >= '0' && *n <= '9'); }
+        else n = p->p;
+        if (n != p->p) {
+            if (*n == '.') { ++n; if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9'); }
+            if (n != p->p && (*n == 'e' || *n == 'E')) {
+                ++n; if (*n == '+' || *n == '-') ++n;
+                if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9');
+            }
+            if (n != p->p) { p->p = n; ok = true; }
+        }
+    }
+    --p->depth;
+    return ok;
+}
+
+static bool desk_log_json_valid(const char *json)
+{
+    if (!json) return false;
+    desk_log_json_parser_t p = { .p = json, .depth = 0 };
+    if (!desk_log_json_value(&p)) return false;
+    desk_log_json_ws(&p);
+    return *p.p == '\0';
+}
+
+static bool desk_log_plain_key(const char *start, const char *end, const char *key)
+{
+    size_t len = strlen(key);
+    return (size_t)(end - start) == len + 2 && start[0] == '"' &&
+           memcmp(start + 1, key, len) == 0 && end[-1] == '"';
+}
+
+static unsigned desk_log_get_member(const char *object, const char *name, char *out, size_t cap)
+{
+    if (!object || !out || cap == 0) return 0;
+    out[0] = '\0';
+    desk_log_json_parser_t p = { .p = object, .depth = 0 };
+    desk_log_json_ws(&p);
+    if (*p.p++ != '{') return 0;
+    desk_log_json_ws(&p);
+    unsigned matches = 0;
+    if (*p.p == '}') return 0;
+    for (;;) {
+        const char *ks, *ke;
+        if (!desk_log_json_string(&p, &ks, &ke)) return 0;
+        desk_log_json_ws(&p);
+        if (*p.p++ != ':') return 0;
+        desk_log_json_ws(&p);
+        const char *vs = p.p;
+        if (!desk_log_json_value(&p)) return 0;
+        const char *ve = p.p;
+        if (desk_log_plain_key(ks, ke, name)) {
+            ++matches;
+            size_t n = (size_t)(ve - vs);
+            if (n >= cap) return 0;
+            memcpy(out, vs, n); out[n] = '\0';
+        }
+        desk_log_json_ws(&p);
+        if (*p.p == '}') break;
+        if (*p.p++ != ',') return 0;
+        desk_log_json_ws(&p);
+    }
+    return matches;
+}
+
+static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed, size_t allowed_count)
+{
+    desk_log_json_parser_t p = { .p = object, .depth = 0 };
+    bool seen[8] = { false };
+    if (allowed_count > sizeof(seen) / sizeof(seen[0])) return false;
+    desk_log_json_ws(&p);
+    if (*p.p++ != '{') return false;
+    desk_log_json_ws(&p);
+    if (*p.p == '}') return true;
+    for (;;) {
+        const char *ks, *ke;
+        if (!desk_log_json_string(&p, &ks, &ke)) return false;
+        size_t matched = allowed_count;
+        for (size_t i = 0; i < allowed_count; ++i) {
+            if (desk_log_plain_key(ks, ke, allowed[i])) { matched = i; break; }
+        }
+        if (matched == allowed_count || seen[matched]) return false;
+        seen[matched] = true;
+        desk_log_json_ws(&p);
+        if (*p.p++ != ':') return false;
+        if (!desk_log_json_value(&p)) return false;
+        desk_log_json_ws(&p);
+        if (*p.p == '}') return true;
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+}
+
+static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
+{
+    desk_log_json_parser_t p = { .p = raw, .depth = 0 };
+    desk_log_json_ws(&p);
+    if (*p.p++ != '[') return false;
+    desk_log_json_ws(&p);
+    if (*p.p == ']') { ++p.p; desk_log_json_ws(&p); *camera_only = false; return *p.p == '\0'; }
+    const char *start, *end;
+    if (!desk_log_json_string(&p, &start, &end) || !desk_log_plain_key(start, end, "camera")) return false;
+    desk_log_json_ws(&p);
+    if (*p.p++ != ']') return false;
+    desk_log_json_ws(&p);
+    *camera_only = true;
+    return *p.p == '\0';
+}
+
+/* This is deliberately called only by the WebSocket receive loop. The legacy
+ * TCP line server continues to use desk_sdk_bridge_process_command(). */
+int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len)
+{
+    char type_raw[96] = "", data[512] = "", code_raw[16] = "";
+    if (!json_in || strnlen(json_in, DESK_SDK_MAX_FRAME_LEN + 1U) > DESK_SDK_MAX_FRAME_LEN ||
+        !desk_log_json_valid(json_in)) return -1;
+    if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1 ||
+        !desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;
+    char type[64] = "";
+    if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "sys.log.subscribe") != 0 && strcmp(type, "sys.log.unsubscribe") != 0)
+        return desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
+    static const char *const root_keys[] = { "type", "code", "data" };
+    static const char *const subscribe_keys[] = { "command_id", "log_schema_version", "min_level", "components" };
+    static const char *const unsubscribe_keys[] = { "command_id", "log_schema_version", "stream_id" };
+    char command_id[65] = "";
+    if (!out_buf || max_out_len < 128 ||
+        (strcmp(type_raw, "\"sys.log.subscribe\"") != 0 &&
+         strcmp(type_raw, "\"sys.log.unsubscribe\"") != 0) ||
+        !desk_log_object_keys_allowed(json_in, root_keys, sizeof(root_keys) / sizeof(root_keys[0])) ||
+        desk_log_get_member(json_in, "data", data, sizeof(data)) != 1 ||
+        desk_log_get_member(json_in, "code", code_raw, sizeof(code_raw)) != 1 || strcmp(code_raw, "0") != 0 ||
+        !desk_log_object_keys_allowed(data, strcmp(type, "sys.log.subscribe") == 0 ? subscribe_keys : unsubscribe_keys,
+            strcmp(type, "sys.log.subscribe") == 0 ? sizeof(subscribe_keys) / sizeof(subscribe_keys[0]) : sizeof(unsubscribe_keys) / sizeof(unsubscribe_keys[0])) ||
+        desk_log_get_member(data, "command_id", command_id, sizeof(command_id)) != 1 ||
+        !json_parse_top_level_str(data, "command_id", command_id, sizeof(command_id)) ||
+        !desk_sdk_log_command_id_valid(command_id)) return -1;
+
+    if (!desk_sdk_ws_client_is_authenticated() || !desk_sdk_log_pairing_is_complete())
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "AUTH_REQUIRED", 401);
+    pthread_mutex_lock(&s_log_mutex);
+    if (!s_local_log_enabled) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "LOGGING_DISABLED", 403);
+    }
+
+    char schema[16] = "", stream_id[40] = "", min_level[8] = "WARN", field_raw[512] = "";
+    if (desk_log_get_member(data, "log_schema_version", field_raw, sizeof(field_raw)) != 1 ||
+        !json_parse_top_level_str(data, "log_schema_version", schema, sizeof(schema)) ||
+        strcmp(schema, "1.0.0") != 0) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "UNSUPPORTED_SCHEMA", 400);
+    }
+    if (strcmp(type, "sys.log.subscribe") == 0) {
+        unsigned min_count = desk_log_get_member(data, "min_level", field_raw, sizeof(field_raw));
+        if (min_count > 1 || (min_count == 1 && !json_parse_top_level_str(data, "min_level", min_level, sizeof(min_level)))) {
+            pthread_mutex_unlock(&s_log_mutex);
+            return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
+        }
+        if (strcmp(min_level, "ERROR") != 0 && strcmp(min_level, "WARN") != 0 &&
+            strcmp(min_level, "INFO") != 0 && strcmp(min_level, "DEBUG") != 0) {
+            pthread_mutex_unlock(&s_log_mutex);
+            return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
+        }
+        /* v1 currently has only the camera component. Accept omitted/empty or
+         * exactly ["camera"]; reject every other shape rather than widening. */
+        bool camera_only = false;
+        unsigned component_count = desk_log_get_member(data, "components", field_raw, sizeof(field_raw));
+        if (component_count > 1 || (component_count == 1 && !desk_log_component_filter_valid(field_raw, &camera_only))) {
+                pthread_mutex_unlock(&s_log_mutex);
+                return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
+        }
+        if (s_log_stream_active) {
+            pthread_mutex_unlock(&s_log_mutex);
+            return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "ALREADY_SUBSCRIBED", 409);
+        }
+        generate_dynamic_token(s_log_stream_id, sizeof(s_log_stream_id));
+        if (!s_log_boot_id[0]) generate_dynamic_token(s_log_boot_id, sizeof(s_log_boot_id));
+        s_log_stream_active = true;
+        s_log_camera_only = camera_only;
+        strcpy(s_log_min_level, min_level);
+        s_log_has_pending_record = false;
+        s_log_has_pending_gap = false;
+        desk_watcher_log_source_set_enabled(true);
+        int n = snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.subscribe\",\"command_id\":\"%s\",\"accepted\":true,\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"next_sequence\":%llu,\"min_level\":\"%s\",\"components\":%s}}",
+            command_id, s_log_stream_id, s_log_boot_id,
+            (unsigned long long)desk_watcher_log_source_next_sequence(),
+            s_log_min_level, s_log_camera_only ? "[\"camera\"]" : "[]");
+        if (n < 0 || (size_t)n >= max_out_len) {
+            s_log_stream_active = false;
+            s_log_stream_id[0] = '\0';
+            desk_sdk_log_source_reset_locked();
+        }
+        pthread_mutex_unlock(&s_log_mutex);
+        return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
+    }
+
+    if (desk_log_get_member(data, "stream_id", field_raw, sizeof(field_raw)) != 1 ||
+        !json_parse_top_level_str(data, "stream_id", stream_id, sizeof(stream_id)) ||
+        !s_log_stream_active || strcmp(stream_id, s_log_stream_id) != 0) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_STREAM", 409);
+    }
+    s_log_stream_active = false;
+    s_log_stream_id[0] = '\0';
+    desk_sdk_log_source_reset_locked();
+    int n = snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.unsubscribe\",\"command_id\":\"%s\",\"accepted\":true}}",
+        command_id);
+    pthread_mutex_unlock(&s_log_mutex);
+    return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
+}
+
 int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
 {
     if (!event_type || !payload_json) return -1;
@@ -1574,7 +2253,9 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
         s_outbound_cb(event_buf, strlen(event_buf), s_outbound_user_data);
     }
 
-    if (s_client_fd >= 0) {
+    if (desk_sdk_ws_client_is_connected()) {
+        desk_sdk_ws_client_send_text(event_buf);
+    } else if (s_client_fd >= 0) {
         desk_sdk_socket_send_line(event_buf);
     }
 
@@ -1638,7 +2319,9 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
         s_outbound_cb(formatted, strlen(formatted), s_outbound_user_data);
     }
 
-    if (s_client_fd >= 0) {
+    if (desk_sdk_ws_client_is_connected()) {
+        desk_sdk_ws_client_send_text(formatted);
+    } else if (s_client_fd >= 0) {
         desk_sdk_socket_send_line(formatted);
     }
 
@@ -1704,7 +2387,9 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
         ret = s_outbound_cb(payload_to_send, strlen(payload_to_send), s_outbound_user_data);
     }
 
-    if (s_client_fd >= 0) {
+    if (desk_sdk_ws_client_is_connected()) {
+        desk_sdk_ws_client_send_text(payload_to_send);
+    } else if (s_client_fd >= 0) {
         size_t len = strlen(payload_to_send);
         if (desk_sdk_socket_write_all(s_client_fd, payload_to_send, len) != 0) {
             desk_sdk_socket_client_close();
@@ -1775,8 +2460,9 @@ int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json)
         }
     }
 
-    /* Update table with raw status */
-    desk_sdk_req_table_update(req_id, raw_status);
+    /* Update table with raw status and payload */
+    bool is_payload_succ = (strcmp(raw_status, "succeeded") == 0 || strcmp(raw_status, "completed") == 0 || strcmp(raw_status, "accepted") == 0);
+    desk_sdk_req_table_update_with_payload(req_id, raw_status, is_payload_succ ? s_result_buf : s_error_buf);
 
     /* Normalize status: "completed" -> "succeeded" */
     const char *eff_status = raw_status;
@@ -2127,8 +2813,14 @@ int desk_sdk_pairing_server_poll(int timeout_ms)
              * (interfaces.md 6.4.4 -- no wire message type is defined). */
             if (desk_sdk_bridge_process_pairing_udp(s_pairing_buf, s_pairing_reply, sizeof(s_pairing_reply)) == DESK_SDK_PAIRING_OK &&
                 s_pairing_reply[0] != '\0') {
+                pthread_mutex_lock(&s_pairing_code_mutex);
+                desk_sdk_ws_client_close();
+                inet_ntop(AF_INET, &client_addr.sin_addr, s_pair_host, sizeof(s_pair_host));
+                desk_sdk_ws_client_close();
+                pthread_mutex_unlock(&s_pairing_code_mutex);
                 sendto(s_pairing_udp_fd, s_pairing_reply, strlen(s_pairing_reply), 0,
                        (struct sockaddr *)&client_addr, addr_len);
+                desk_sdk_ws_client_connect_paired();
             }
         }
     }
@@ -2152,10 +2844,12 @@ int desk_sdk_pairing_server_get_port(void)
 
 int desk_firmware_poll(int timeout_ms)
 {
+    desk_sdk_pairing_code_expire_if_needed();
     int half = timeout_ms / 2;
     if (half < 1) half = 1;
     desk_sdk_socket_server_poll(half);
     desk_sdk_pairing_server_poll(half);
+    desk_sdk_ws_client_poll(half);
     return 0;
 }
 

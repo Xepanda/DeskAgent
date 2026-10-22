@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0.0",
+  "request_id": "req-rem-complete-008",
+  "status": "failed",
+  "timestamp": "2026-10-22T00:00:00Z",
+  "error": {
+    "code": "STATE_CONFLICT",
+    "message": "Reminder occurrence exists but is not in a state that allows this transition",
+    "retryable": false,
+    "details": {
+      "reminder_id": "rem-team-checkin",
+      "occurrence_id": "occ-20261021-090000",
+      "current_state": "dismissed",
+      "requested_transition": "complete"
+    }
+  },
+  "execution_duration_ms": 3
+}

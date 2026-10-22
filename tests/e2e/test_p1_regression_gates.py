@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -533,9 +534,11 @@ class OutboundEnvelopeGates(RealChainGateCase):
 
     def test_reminder_delivery_still_works_end_to_end(self) -> None:
         """A due reminder is delivered to the robot channel and the outbox row dispatched."""
+        # Keep the due time within the scheduler's 24-hour catch-up window.
+        due_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
         resp = self.tool_roundtrip(
             "req-gate-reg-due", "reminder.create",
-            {"reminder_id": "rem-gate-due", "title": "Stretch", "due_at": "2026-10-16T08:00:00Z"},
+            {"reminder_id": "rem-gate-due", "title": "Stretch", "due_at": due_at},
         )
         self.assertEqual(resp.get("status"), "succeeded")
 
@@ -619,8 +622,10 @@ class PairingFailClosedGate(unittest.TestCase):
             f"-I{REPO_ROOT}/firmware/components/desk_sdk_bridge/include",
             f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{REPO_ROOT}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{REPO_ROOT}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{REPO_ROOT}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-lpthread", "-o", cls.so_path,
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
@@ -661,9 +666,10 @@ class PairingFailClosedGate(unittest.TestCase):
     def _pair_request(pairing_code: Optional[str]) -> bytes:
         req: dict[str, Any] = {
             "protocol": "watcher_lan_pairing_v1",
-            "request_id": "pair-gate-001",
-            "daemon_instance_id": "sdk-daemon-gate",
+            "request_id": "21a9dbf05ea3443480e62076f79a3b12",
+            "daemon_instance_id": "f730f29e670c49f7a3320c4314eb9805",
             "target_mode": "python_sdk",
+            "websocket_port": 8765,
         }
         if pairing_code is not None:
             req["pairing_code"] = pairing_code

@@ -30,13 +30,26 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Mapping, Optional, Union
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_task_summary(candidate: Any, prompt: Any, fallback: str) -> str:
+    """Normalize a task summary and redact any echoed original prompt."""
+    if isinstance(candidate, dict):
+        candidate = candidate.get("summary") or candidate.get("text") or candidate.get("message")
+    summary = str(candidate or "").strip()
+    prompt_text = str(prompt or "").strip()
+    if prompt_text and prompt_text in summary:
+        summary = summary.replace(prompt_text, "[user request omitted]").strip()
+    return summary or fallback
 
 KNOWN_DECISION_KEYWORDS = {
     "accept", "acceptforsession", "decline", "cancel", "approved", "denied", "abort", "approve", "reject"
@@ -156,7 +169,7 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
         self.codex_bin = codex_bin
         self.on_notification = on_notification
         self._proc: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._req_counter = 0
         self._pending: dict[int, threading.Event] = {}
         self._responses: dict[int, dict[str, Any]] = {}
@@ -301,6 +314,9 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
 
 
 class CodexCompanion:
+    _RECOVERY_RETRY_BASE_SEC = 1.0
+    _RECOVERY_RETRY_MAX_SEC = 30.0
+
     def __init__(
         self,
         allowed_workspaces: Optional[dict[str, str]] = None,
@@ -320,11 +336,16 @@ class CodexCompanion:
         self.codex_bin = codex_bin
         self._transport = transport
         self._initialized = False
+        self._last_recovery_counts = {"reconnected": 0, "reconciled": 0, "pending": 0}
+        self._recovery_retry_deadlines: dict[str, float] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
         self._pending_approvals: dict[str, dict[str, Any]] = {}
         self._thread_to_task: dict[str, str] = {}
         self._turn_to_task: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._initialize_lock = threading.Lock()
+        self._recovery_lock = threading.Lock()
+        self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
 
         if db_path is None:
             if "unittest" in sys.modules and os.environ.get("DESK_AGENT_USE_REAL_CODEX") != "1":
@@ -343,6 +364,25 @@ class CodexCompanion:
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
         self._load_from_db()
+
+    def add_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
+        with self._lock:
+            if cb not in self._event_listeners:
+                self._event_listeners.append(cb)
+
+    @staticmethod
+    def _safe_terminal_summary(task: dict[str, Any], candidate: Any, fallback: str) -> str:
+        """Return terminal text without echoing the user's original prompt."""
+        return _safe_task_summary(candidate, task.get("prompt"), fallback)
+
+    def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> None:
+        with self._lock:
+            listeners = list(self._event_listeners)
+        for cb in listeners:
+            try:
+                cb(event_type, data)
+            except Exception as err:
+                logger.warning("Codex event listener error: %s", err)
 
     def _get_connection(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -366,6 +406,8 @@ class CodexCompanion:
                 cwd TEXT NOT NULL,
                 prompt TEXT,
                 model TEXT,
+                summary TEXT,
+                last_output TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -382,6 +424,12 @@ class CodexCompanion:
             );
             """)
             conn.commit()
+            for col in ("summary", "last_output"):
+                try:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
+            conn.commit()
 
     def _load_from_db(self) -> None:
         with self._lock:
@@ -389,7 +437,7 @@ class CodexCompanion:
             cur = conn.cursor()
 
             # Load tasks
-            cur.execute("SELECT task_id, thread_id, turn_id, status, alias, cwd, prompt, model, created_at, updated_at FROM tasks")
+            cur.execute("SELECT task_id, thread_id, turn_id, status, alias, cwd, prompt, model, summary, last_output, created_at, updated_at FROM tasks")
             for row in cur.fetchall():
                 tid = row["task_id"]
                 th_id = row["thread_id"] or ""
@@ -401,7 +449,9 @@ class CodexCompanion:
                     "thread_id": th_id,
                     "turn_id": tu_id,
                     "prompt": row["prompt"] or "",
-                    "model": row["model"] or "gpt-5-codex",
+                    "model": row["model"] or None,
+                    "summary": row["summary"] or "",
+                    "last_output": row["last_output"] or "",
                     "state": row["status"],
                     "status": row["status"],
                     "created_at": row["created_at"],
@@ -458,8 +508,8 @@ class CodexCompanion:
             conn = self._get_connection()
             conn.execute(
                 """
-                INSERT INTO tasks (task_id, thread_id, turn_id, status, alias, cwd, prompt, model, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (task_id, thread_id, turn_id, status, alias, cwd, prompt, model, summary, last_output, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     thread_id=excluded.thread_id,
                     turn_id=excluded.turn_id,
@@ -468,6 +518,8 @@ class CodexCompanion:
                     cwd=excluded.cwd,
                     prompt=excluded.prompt,
                     model=excluded.model,
+                    summary=excluded.summary,
+                    last_output=excluded.last_output,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -479,6 +531,8 @@ class CodexCompanion:
                     task.get("target_dir", ""),
                     task.get("prompt", ""),
                     task.get("model", ""),
+                    task.get("summary", ""),
+                    task.get("last_output", ""),
                     created_at,
                     now,
                 ),
@@ -563,6 +617,14 @@ class CodexCompanion:
             thread_id = params.get("threadId") or params.get("thread_id")
             turn_id = params.get("turnId") or params.get("turn_id")
             task_id = params.get("task_id") or self._resolve_task_id(thread_id, turn_id)
+            if task_id and task_id in self._tasks:
+                current_task = self._tasks[task_id]
+                if thread_id and not current_task.get("thread_id"):
+                    current_task["thread_id"] = thread_id
+                if turn_id:
+                    current_task["turn_id"] = turn_id
+                    self._turn_to_task[turn_id] = task_id
+                self._persist_task(current_task)
 
             if method in (
                 "approval/request",
@@ -599,17 +661,103 @@ class CodexCompanion:
                 }
                 self._pending_approvals[approval_id] = appr_dict
                 self._persist_approval(appr_dict)
-            elif method in ("turn/progress", "task/progress", "item/updated", "turn/step"):
+            elif method in ("turn/progress", "task/progress", "item/updated", "turn/step", "item/created", "item/completed"):
                 if task_id and task_id in self._tasks:
                     self._tasks[task_id]["progress"] = params.get("progress") or params.get("message") or "in_progress"
                     self._tasks[task_id]["state"] = "running"
                     self._tasks[task_id]["status"] = "running"
+                    item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                    item_type = item.get("type")
+                    item_role = item.get("role") or item.get("author")
+                    is_user_message = item_type == "userMessage" or item_role == "user"
+                    is_assistant_message = (
+                        item_type in ("agentMessage", "assistantMessage")
+                        or item_role in ("assistant", "agent")
+                    )
+                    output_text = None
+                    if not is_user_message and is_assistant_message:
+                        output_text = item.get("text") or item.get("formatted")
+                        if not output_text:
+                            content = item.get("content")
+                            if isinstance(content, str):
+                                output_text = content
+                            elif isinstance(content, list):
+                                text_parts = [
+                                    part.get("text", "")
+                                    for part in content
+                                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                                ]
+                                output_text = "".join(text_parts).strip() or None
+                    if output_text:
+                        self._tasks[task_id]["last_output"] = str(output_text).strip()
                     self._persist_task(self._tasks[task_id])
             elif method in ("turn/completed", "task/completed", "turn/finished"):
                 if task_id and task_id in self._tasks:
-                    self._tasks[task_id]["status"] = "completed"
-                    self._tasks[task_id]["state"] = "completed"
-                    self._persist_task(self._tasks[task_id])
+                    turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                    raw_status = str(turn.get("status") or params.get("status") or "completed").lower()
+                    error_info = params.get("error") or turn.get("error")
+                    if raw_status in ("failed", "error") or error_info is not None:
+                        self._tasks[task_id]["status"] = "failed"
+                        self._tasks[task_id]["state"] = "failed"
+                        self._persist_task(self._tasks[task_id])
+                        summary = params.get("summary") or turn.get("summary")
+                        if not summary:
+                            if isinstance(error_info, dict):
+                                summary = error_info.get("message")
+                            elif error_info:
+                                summary = str(error_info)
+                            else:
+                                summary = f"Task {task_id} failed"
+                        summary = self._safe_terminal_summary(
+                            self._tasks[task_id], summary, f"Task {task_id} failed"
+                        )
+                        self._tasks[task_id]["summary"] = summary
+                        self._tasks[task_id]["last_output"] = summary
+                        self._dispatch_event("codex.failed", {
+                            "task_id": task_id,
+                            "status": "failed",
+                            "summary": summary,
+                        })
+                        self._persist_task(self._tasks[task_id])
+                    elif raw_status in ("interrupted", "cancelled"):
+                        self._tasks[task_id]["status"] = "interrupted"
+                        self._tasks[task_id]["state"] = "interrupted"
+                        summary = self._safe_terminal_summary(
+                            self._tasks[task_id],
+                            params.get("summary") or turn.get("summary"),
+                            f"Task {task_id} interrupted",
+                        )
+                        self._tasks[task_id]["summary"] = summary
+                        self._tasks[task_id]["last_output"] = summary
+                        self._persist_task(self._tasks[task_id])
+                        self._dispatch_event("codex.interrupted", {
+                            "task_id": task_id,
+                            "status": "interrupted",
+                            "summary": summary,
+                        })
+                    else:
+                        assistant_output = (
+                            self._assistant_text_from_items(turn.get("items"))
+                            or self._tasks[task_id].get("last_output")
+                        )
+                        summary = assistant_output or "任务已成功完成"
+                        if isinstance(summary, dict):
+                            summary = summary.get("summary") or summary.get("text") or summary.get("message") or "任务已成功完成"
+                        summary = self._safe_terminal_summary(
+                            self._tasks[task_id],
+                            summary,
+                            self._tasks[task_id].get("last_output") or "任务已成功完成",
+                        )
+                        self._tasks[task_id]["status"] = "completed"
+                        self._tasks[task_id]["state"] = "completed"
+                        self._tasks[task_id]["summary"] = summary
+                        self._tasks[task_id]["last_output"] = assistant_output or ""
+                        self._persist_task(self._tasks[task_id])
+                        self._dispatch_event("codex.turn_completed", {
+                            "task_id": task_id,
+                            "status": "completed",
+                            "summary": summary,
+                        })
 
     def _get_transport(self) -> JsonRpcTransport:
         if self._transport is not None:
@@ -626,21 +774,292 @@ class CodexCompanion:
 
     def initialize(self) -> dict[str, Any]:
         """Performs JSON-RPC initialize handshake with Codex app-server."""
-        with self._lock:
-            if not self._initialized:
-                transport = self._get_transport()
-                resp = transport.send_request(
-                    "initialize",
-                    {
-                        "clientInfo": {"name": "desk-agent-companion", "version": "0.1.0"},
-                        "capabilities": {},
-                    },
-                )
-                if resp is None or (isinstance(resp, dict) and "error" in resp):
-                    raise ConnectionError(f"Codex app-server initialization failed: {resp}")
+        with self._initialize_lock:
+            with self._lock:
+                initialized = self._initialized
+            if initialized:
+                return {"capabilities": {}}
+
+            transport = self._get_transport()
+            resp = transport.send_request(
+                "initialize",
+                {
+                    "clientInfo": {"name": "desk-agent-companion", "version": "0.1.0"},
+                    "capabilities": {},
+                },
+            )
+            if resp is None or (isinstance(resp, dict) and "error" in resp):
+                raise ConnectionError(f"Codex app-server initialization failed: {resp}")
+            with self._lock:
                 self._initialized = True
-                return resp
-            return {"capabilities": {}}
+
+        # Do not hold the state lock across RPCs: thread/resume may emit
+        # notifications before its response, and the transport reader must be
+        # able to correlate those notifications while this request is pending.
+        self._last_recovery_counts = self._recover_pending_tasks()
+        return resp
+
+    def recover_pending_tasks(self) -> dict[str, int]:
+        """Reconnects persisted non-terminal tasks to their app-server threads.
+
+        Resume errors, including active-writer conflicts, leave the original
+        task status untouched and mark recovery pending so callers can retry.
+        """
+        if not self._initialized:
+            self.initialize()
+            return dict(self._last_recovery_counts)
+
+        self._last_recovery_counts = self._recover_pending_tasks()
+        return dict(self._last_recovery_counts)
+
+    def _recover_pending_tasks(self) -> dict[str, int]:
+        counts = {"reconnected": 0, "reconciled": 0, "pending": 0}
+        # Keep legacy persisted ``cancelled`` tasks terminal for compatibility.
+        # New cancellation requests use ``cancelling`` until the server reports
+        # an authoritative interrupted terminal turn.
+        terminal_statuses = {"completed", "failed", "interrupted", "cancelled", "succeeded", "error"}
+        with self._recovery_lock:
+            with self._lock:
+                now = time.monotonic()
+                active_tasks = [
+                    task for task in self._tasks.values()
+                    if str(task.get("status") or task.get("state") or "").lower() not in terminal_statuses
+                ]
+                candidates = [
+                    dict(task)
+                    for task in active_tasks
+                    if task.get("recovery_status") in (None, "pending")
+                    and self._recovery_retry_deadlines.get(task["task_id"], 0.0) <= now
+                ]
+                counts["pending"] = sum(
+                    1 for task in active_tasks
+                    if task.get("recovery_status") == "pending"
+                    and self._recovery_retry_deadlines.get(task["task_id"], 0.0) > now
+                )
+
+            transport = self._get_transport()
+            for task_snapshot in candidates:
+                task_id = task_snapshot["task_id"]
+                thread_id = task_snapshot.get("thread_id")
+                turn_id = task_snapshot.get("turn_id")
+                with self._lock:
+                    task = self._tasks.get(task_id)
+                    if task is None:
+                        continue
+                    task["recovery_status"] = "pending"
+                    task["recovery_attempts"] = int(task.get("recovery_attempts", 0)) + 1
+                    task.pop("recovery_error_kind", None)
+
+                if not thread_id:
+                    self._set_recovery_pending(task_id, "missing_thread_id")
+                    counts["pending"] += 1
+                    continue
+
+                active_writer_snapshot = False
+
+                try:
+                    response = transport.send_request("thread/resume", {
+                        "threadId": thread_id,
+                        "cwd": task_snapshot.get("target_dir") or None,
+                        "excludeTurns": False,
+                    })
+                except Exception as exc:
+                    error_text = str(exc).lower()
+                    error_kind = "active_writer" if "already has an active writer" in error_text else "resume_error"
+                    if error_kind == "active_writer":
+                        response = self._read_thread_snapshot(transport, thread_id)
+                        active_writer_snapshot = response is not None
+                    else:
+                        response = None
+                    if response is None:
+                        self._set_recovery_pending(task_id, error_kind)
+                        counts["pending"] += 1
+                        logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
+                        continue
+
+                if isinstance(response, dict) and isinstance(response.get("error"), dict):
+                    error_text = str(response["error"].get("message") or "").lower()
+                    error_kind = "active_writer" if "already has an active writer" in error_text else "resume_error"
+                    if error_kind == "active_writer":
+                        response = self._read_thread_snapshot(transport, thread_id)
+                        active_writer_snapshot = response is not None
+                    else:
+                        response = None
+                    if response is None:
+                        self._set_recovery_pending(task_id, error_kind)
+                        counts["pending"] += 1
+                        logger.warning("Codex task %s thread recovery remains pending (%s)", task_id, error_kind)
+                        continue
+
+                thread = response.get("thread") if isinstance(response, dict) else None
+                if not isinstance(thread, dict):
+                    self._set_recovery_pending(task_id, "missing_thread")
+                    counts["pending"] += 1
+                    continue
+
+                resumed_thread_id = thread.get("id") or thread_id
+                if resumed_thread_id != thread_id:
+                    self._set_recovery_pending(task_id, "thread_mismatch")
+                    counts["pending"] += 1
+                    continue
+
+                with self._lock:
+                    current = self._tasks.get(task_id)
+                    if current is None:
+                        continue
+                    self._thread_to_task[thread_id] = task_id
+
+                turns = thread.get("turns")
+                if not isinstance(turns, list):
+                    self._set_recovery_pending(task_id, "missing_turns")
+                    counts["pending"] += 1
+                    continue
+
+                matching_turn = next((
+                    turn for turn in turns
+                    if isinstance(turn, dict) and turn_id and turn.get("id") == turn_id
+                ), None)
+                if matching_turn is None and not turn_id and str(task_snapshot.get("status")).lower() == "start_unknown":
+                    # A timed-out turn/start has no returned turn ID. Threads
+                    # are created per Companion task, so their newest turn is
+                    # the authoritative candidate for this task.
+                    matching_turn = next((turn for turn in reversed(turns) if isinstance(turn, dict) and turn.get("id")), None)
+                if matching_turn is None:
+                    self._set_recovery_pending(task_id, "turn_not_found")
+                    counts["pending"] += 1
+                    continue
+
+                resolved_turn_id = str(matching_turn.get("id") or turn_id)
+                with self._lock:
+                    current = self._tasks.get(task_id)
+                    if current is not None and not current.get("turn_id"):
+                        current["turn_id"] = resolved_turn_id
+                        self._persist_task(current)
+                    self._turn_to_task[resolved_turn_id] = task_id
+                turn_status = str(matching_turn.get("status") or "").lower()
+
+                with self._lock:
+                    current = self._tasks.get(task_id)
+                    current_status = str((current or {}).get("status") or "").lower()
+                if current_status in terminal_statuses:
+                    # A notification may arrive before the resume RPC response.
+                    # Keep its authoritative result and avoid duplicate events.
+                    with self._lock:
+                        current = self._tasks.get(task_id)
+                        if current is not None:
+                            self._recovery_retry_deadlines.pop(task_id, None)
+                            current["recovery_status"] = "reconciled"
+                            current.pop("recovery_error_kind", None)
+                            self._persist_task(current)
+                    counts["reconciled"] += 1
+                    continue
+
+                if turn_status == "inprogress":
+                    if active_writer_snapshot:
+                        # thread/read is observational only. It cannot subscribe
+                        # this Companion to the other writer's notifications or
+                        # transfer thread ownership, so keep polling snapshots
+                        # with backoff until an authoritative terminal turn is
+                        # visible (or thread/resume becomes available).
+                        self._set_recovery_pending(task_id, "active_writer")
+                        counts["pending"] += 1
+                        continue
+                    with self._lock:
+                        current = self._tasks.get(task_id)
+                        if current is not None:
+                            self._recovery_retry_deadlines.pop(task_id, None)
+                            current["state"] = "running"
+                            current["status"] = "running"
+                            current["recovery_status"] = "reconnected"
+                            current.pop("recovery_error_kind", None)
+                            self._persist_task(current)
+                    counts["reconnected"] += 1
+                    continue
+
+                if turn_status not in {"completed", "failed", "interrupted"}:
+                    self._set_recovery_pending(task_id, "unknown_turn_status")
+                    counts["pending"] += 1
+                    continue
+
+                terminal_turn = dict(matching_turn)
+                assistant_text = self._assistant_text_from_items(terminal_turn.get("items"))
+                params: dict[str, Any] = {"threadId": thread_id, "turnId": resolved_turn_id, "turn": terminal_turn}
+                if assistant_text:
+                    params["summary"] = assistant_text
+                self._handle_server_notification("turn/completed", params)
+                with self._lock:
+                    current = self._tasks.get(task_id)
+                    if current is not None:
+                        self._recovery_retry_deadlines.pop(task_id, None)
+                        current["recovery_status"] = "reconciled"
+                        current.pop("recovery_error_kind", None)
+                        self._persist_task(current)
+                counts["reconciled"] += 1
+
+        return counts
+
+    @staticmethod
+    def _read_thread_snapshot(transport: JsonRpcTransport, thread_id: str) -> Optional[dict[str, Any]]:
+        """Reads persisted thread state without claiming its active writer lease."""
+        try:
+            response = transport.send_request("thread/read", {"threadId": thread_id, "includeTurns": True})
+        except Exception:
+            return None
+        if not isinstance(response, dict) or isinstance(response.get("error"), dict):
+            return None
+        thread = response.get("thread")
+        if not isinstance(thread, dict) or not isinstance(thread.get("turns"), list):
+            return None
+        return response
+
+    def _set_recovery_pending(self, task_id: str, error_kind: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task["recovery_status"] = "pending"
+            task["recovery_error_kind"] = error_kind
+            attempts = max(1, int(task.get("recovery_attempts", 1)))
+            delay = min(
+                self._RECOVERY_RETRY_BASE_SEC * (2 ** min(attempts - 1, 10)),
+                self._RECOVERY_RETRY_MAX_SEC,
+            )
+            self._recovery_retry_deadlines[task_id] = time.monotonic() + delay
+            # Persist the task's existing status and output without translating
+            # a reconnect problem into a task failure or completion.
+            self._persist_task(task)
+
+    @staticmethod
+    def _assistant_text_from_items(items: Any) -> Optional[str]:
+        if not isinstance(items, list):
+            return None
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            role = item.get("role") or item.get("author")
+            if item_type == "userMessage" or role == "user":
+                continue
+            if not (
+                item_type in ("agentMessage", "assistantMessage")
+                or role in ("assistant", "agent")
+            ):
+                continue
+            text = item.get("text") or item.get("formatted")
+            if not text:
+                content = item.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts = [
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    ]
+                    text = "".join(parts).strip()
+            if text:
+                return str(text).strip()
+        return None
 
     def _ensure_initialized(self) -> None:
         if not self._initialized:
@@ -691,14 +1110,48 @@ class CodexCompanion:
                 if not appr.get("task_id") and appr.get("thread_id") == thread_id:
                     appr["task_id"] = task_id
 
+            # Persist the thread association before turn/start. The app-server
+            # may create a turn and then time out before returning its ID; the
+            # durable thread ID lets startup recovery reconcile that outcome.
+            task_dict = {
+                "task_id": task_id,
+                "workspace_alias": workspace_alias,
+                "target_dir": target_dir,
+                "thread_id": thread_id,
+                "turn_id": "",
+                "prompt": prompt,
+                "model": model,
+                "state": "starting",
+                "status": "starting",
+            }
+            self._tasks[task_id] = task_dict
+            self._persist_task(task_dict)
+
         # 2. Start turn (Codex app-server uses threadId and input array)
-        turn_res = transport.send_request("turn/start", {
+        turn_params = {
             "threadId": thread_id,
             "thread_id": thread_id,
             "input": [{"type": "text", "text": prompt}],
             "prompt": prompt,
-            "model": model or "gpt-5-codex",
-        })
+        }
+        if model is not None:
+            turn_params["model"] = model
+        try:
+            turn_res = transport.send_request("turn/start", turn_params)
+        except Exception:
+            # The request may have reached app-server even when its response
+            # did not. Preserve the task and thread so resume can discover the
+            # actual turn; do not report a false terminal failure.
+            with self._lock:
+                # A progress/terminal notification can beat the timed-out
+                # response. Preserve its authoritative state and turn ID.
+                if task_dict.get("status") == "starting":
+                    task_dict["state"] = "start_unknown"
+                    task_dict["status"] = "start_unknown"
+                    task_dict["recovery_status"] = "pending"
+                    task_dict["recovery_error_kind"] = "turn_start_outcome_unknown"
+                self._persist_task(task_dict)
+            raise
         if "turn" in turn_res and isinstance(turn_res["turn"], dict):
             turn_id = turn_res["turn"].get("id", f"trn_{task_id[:8]}_01")
             state = turn_res["turn"].get("status", "running")
@@ -712,18 +1165,16 @@ class CodexCompanion:
                 if not appr.get("task_id") and (appr.get("turn_id") == turn_id or appr.get("thread_id") == thread_id):
                     appr["task_id"] = task_id
                     self._persist_approval(appr)
-            task_dict = {
-                "task_id": task_id,
-                "workspace_alias": workspace_alias,
-                "target_dir": target_dir,
-                "thread_id": thread_id,
-                "turn_id": turn_id,
-                "prompt": prompt,
-                "model": model or "gpt-5-codex",
-                "state": state,
-                "status": state,
-            }
-            self._tasks[task_id] = task_dict
+            task_dict["turn_id"] = turn_id
+            # Notifications can be delivered synchronously before turn/start
+            # returns. Keep their newer running or terminal state and output;
+            # use the RPC state only while the task is still awaiting its
+            # first notification.
+            if task_dict.get("status") == "starting":
+                task_dict["state"] = state
+                task_dict["status"] = state
+            task_dict.pop("recovery_error_kind", None)
+            task_dict.pop("recovery_status", None)
             self._persist_task(task_dict)
 
         return {
@@ -760,17 +1211,47 @@ class CodexCompanion:
             thread_id = task["thread_id"]
             turn_id = task["turn_id"]
 
+        if not thread_id or not turn_id:
+            self.recover_pending_tasks()
+            with self._lock:
+                task = self._tasks.get(task_id)
+                thread_id = (task or {}).get("thread_id")
+                turn_id = (task or {}).get("turn_id")
+            if not thread_id or not turn_id:
+                raise RuntimeError("Task startup is not reconciled yet; cancellation is unavailable")
+
         transport = self._get_transport()
         params: dict[str, Any] = {"threadId": thread_id, "turnId": turn_id}
         if reason:
             params["reason"] = reason
-        transport.send_request("turn/interrupt", params)
+        try:
+            transport.send_request("turn/interrupt", params)
+        except RuntimeError as exc:
+            # Cancellation can race with a turn that has already reached a
+            # terminal state. Reconcile the authoritative thread state so the
+            # caller receives completed/interrupted instead of a stale RPC
+            # error and a task left marked as running.
+            if "no active turn to interrupt" not in str(exc).lower():
+                raise
+            self.recover_pending_tasks()
+            with self._lock:
+                task = self._tasks.get(task_id)
+                terminal_statuses = {"completed", "failed", "interrupted", "cancelled", "succeeded", "error"}
+                if task is not None and str(task.get("status") or "").lower() in terminal_statuses:
+                    return {
+                        "task_id": task_id,
+                        "turn_id": turn_id,
+                        "status": task["status"],
+                        "summary": task.get("summary") or task.get("last_output") or "",
+                        "reason": reason,
+                    }
+            raise
 
         with self._lock:
-            task["state"] = "cancelled"
-            task["status"] = "cancelled"
+            task["state"] = "cancelling"
+            task["status"] = "cancelling"
             self._persist_task(task)
-        return {"task_id": task_id, "turn_id": turn_id, "status": "cancelled", "reason": reason}
+        return {"task_id": task_id, "turn_id": turn_id, "status": "cancelling", "reason": reason}
 
     def request_approval(
         self,
@@ -881,6 +1362,9 @@ class CodexCompanion:
             if not task:
                 return None
             res = dict(task)
+            res["summary"] = task.get("summary") or task.get("last_output") or ""
+            res["last_output"] = task.get("last_output") or ""
+            res["output"] = task.get("last_output") or task.get("summary") or ""
             res["pending_approvals"] = self.get_pending_approvals(task_id)
             return res
 
@@ -888,13 +1372,260 @@ class CodexCompanion:
 class RemoteCodexCompanionClient:
     """HTTP client connecting Host (on 泰山派 Linux) to Windows Codex Companion."""
 
-    def __init__(self, endpoint_url: str, auth_token: Optional[str] = None, timeout_sec: float = 10.0) -> None:
+    def __init__(
+        self,
+        endpoint_url: str,
+        auth_token: Optional[str] = None,
+        timeout_sec: float = 10.0,
+        poll_interval: float = 1.0,
+        state_file_path: Optional[str] = None,
+    ) -> None:
         self.endpoint_url = endpoint_url.rstrip("/")
         if self.endpoint_url.endswith("/rpc"):
             self.endpoint_url = self.endpoint_url[:-4]
         self.auth_token = auth_token
         self.timeout_sec = timeout_sec
+        self.poll_interval = poll_interval
+        self.state_file_path = state_file_path
         self.workspaces: dict[str, str] = {}
+        self._lock = threading.RLock()
+        self._event_listeners: list[Callable[[str, dict[str, Any]], bool]] = []
+        self._pending_tasks: dict[str, dict[str, Any]] = {}
+        self._stop_event = threading.Event()
+        self._poll_thread: Optional[threading.Thread] = None
+
+        if self.state_file_path:
+            self._load_persisted_tasks()
+
+    def _load_persisted_tasks(self) -> None:
+        if not self.state_file_path:
+            return
+        p = Path(self.state_file_path)
+        if not p.is_file():
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                with self._lock:
+                    self._pending_tasks.update(data)
+                if self._pending_tasks:
+                    logger.info("Restored %d in-flight Codex tasks from %s (polling deferred until listeners registered)", len(self._pending_tasks), p)
+        except Exception as exc:
+            logger.warning("Failed to load persisted remote Codex tasks from %s: %s", p, exc)
+
+    def _save_persisted_tasks(self) -> None:
+        if not self.state_file_path:
+            return
+        p = Path(self.state_file_path)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = p.with_suffix(".tmp")
+            with open(tmp_p, "w", encoding="utf-8") as f:
+                json.dump(self._pending_tasks, f, indent=2)
+            tmp_p.replace(p)
+        except Exception as exc:
+            logger.warning("Failed to save remote Codex tasks to %s: %s", p, exc)
+
+    def start(self) -> None:
+        """Starts background poller if there are pending in-flight tasks and listeners registered."""
+        with self._lock:
+            if self._pending_tasks and self._event_listeners:
+                self._ensure_polling_thread()
+
+    def add_event_listener(self, cb: Callable[[str, dict[str, Any]], bool]) -> None:
+        with self._lock:
+            if cb not in self._event_listeners:
+                self._event_listeners.append(cb)
+            if self._pending_tasks:
+                self._ensure_polling_thread()
+
+    def remove_event_listener(self, cb: Callable[[str, dict[str, Any]], None]) -> None:
+        with self._lock:
+            if cb in self._event_listeners:
+                self._event_listeners.remove(cb)
+
+    def acknowledge_task(self, task_id: str) -> None:
+        """Acknowledges successful delivery of a task notification and removes it from pending list and disk."""
+        with self._lock:
+            if task_id in self._pending_tasks:
+                self._pending_tasks.pop(task_id, None)
+                self._save_persisted_tasks()
+                logger.info("Remote Codex task %s acknowledged and cleared from pending queue", task_id)
+
+    def _dispatch_event(self, event_type: str, data: dict[str, Any]) -> bool:
+        with self._lock:
+            listeners = list(self._event_listeners)
+        if not listeners:
+            return False
+        all_acked = True
+        for cb in listeners:
+            try:
+                res = cb(event_type, data)
+                if res is not True:
+                    all_acked = False
+            except Exception as err:
+                logger.warning("Remote Codex event listener error: %s", err)
+                all_acked = False
+        return all_acked
+
+    def _ensure_polling_thread(self) -> None:
+        with self._lock:
+            if self._poll_thread is None or not self._poll_thread.is_alive():
+                self._stop_event.clear()
+                self._poll_thread = threading.Thread(
+                    target=self._poll_worker,
+                    name="RemoteCodexPoller",
+                    daemon=True,
+                )
+                self._poll_thread.start()
+
+    def _poll_worker(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                task_items = list(self._pending_tasks.items())
+            if not task_items:
+                self._stop_event.wait(self.poll_interval)
+                continue
+
+            for task_id, task_meta in task_items:
+                if self._stop_event.is_set():
+                    break
+
+                existing_notification = task_meta.get("notification")
+                if existing_notification:
+                    event_type = "codex.turn_completed"
+                    if task_meta.get("status") in ("interrupted", "cancelled"):
+                        event_type = "codex.interrupted"
+                    elif task_meta.get("status") in ("failed", "error"):
+                        event_type = "codex.failed"
+                    event_payload = {
+                        key: existing_notification[key]
+                        for key in ("status", "summary", "thread_id", "turn_id", "resolution")
+                        if key in existing_notification
+                    }
+                    event_payload["task_id"] = task_id
+                    summary = event_payload.get("summary")
+                    if event_type == "codex.failed":
+                        fallback = f"Task {task_id} failed"
+                    elif event_type == "codex.interrupted":
+                        fallback = f"Task {task_id} interrupted"
+                    else:
+                        fallback = "任务已成功完成"
+                    summary = _safe_task_summary(summary, task_meta.get("prompt"), fallback)
+                    event_payload["summary"] = summary
+                    with self._lock:
+                        task_meta["notification"] = event_payload
+                        task_meta["summary"] = summary
+                        self._save_persisted_tasks()
+                    acked = self._dispatch_event(event_type, event_payload)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
+                    continue
+
+                try:
+                    res = self.get_task_status(task_id)
+                except Exception as exc:
+                    logger.debug("Failed to poll status for task %s: %s", task_id, exc)
+                    continue
+
+                if not isinstance(res, dict):
+                    continue
+
+                res_dict = res.get("result") if isinstance(res.get("result"), dict) else {}
+                task_status = str(
+                    res_dict.get("status")
+                    or res_dict.get("state")
+                    or res.get("status")
+                    or res.get("state")
+                    or ""
+                ).lower()
+
+                if task_status in ("completed", "succeeded"):
+                    summary = (
+                        res_dict.get("summary")
+                        or res_dict.get("last_output")
+                        or res_dict.get("output")
+                        or res_dict.get("response")
+                        or res.get("summary")
+                        or res.get("last_output")
+                        or res.get("output")
+                        or res.get("response")
+                        or res.get("message")
+                        or "任务已成功完成"
+                    )
+                    summary = _safe_task_summary(summary, task_meta.get("prompt"), "任务已成功完成")
+
+                    event_payload = {
+                        "task_id": task_id,
+                        "status": "completed",
+                        "summary": summary,
+                    }
+                    with self._lock:
+                        self._pending_tasks[task_id]["notification"] = event_payload
+                        self._pending_tasks[task_id]["status"] = "completed"
+                        self._pending_tasks[task_id]["summary"] = summary
+                        self._save_persisted_tasks()
+
+                    acked = self._dispatch_event("codex.turn_completed", event_payload)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
+
+                elif task_status in ("interrupted", "cancelled"):
+                    summary = res_dict.get("summary") or res.get("summary") or f"Task {task_id} interrupted"
+                    summary = _safe_task_summary(summary, task_meta.get("prompt"), f"Task {task_id} interrupted")
+                    event_payload = {
+                        "task_id": task_id,
+                        "status": "interrupted",
+                        "summary": summary,
+                    }
+                    with self._lock:
+                        self._pending_tasks[task_id]["notification"] = event_payload
+                        self._pending_tasks[task_id]["status"] = "interrupted"
+                        self._pending_tasks[task_id]["summary"] = summary
+                        self._save_persisted_tasks()
+
+                    acked = self._dispatch_event("codex.interrupted", event_payload)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
+
+                elif task_status in ("failed", "error"):
+                    err_msg = (
+                        res_dict.get("summary")
+                        or res_dict.get("last_output")
+                        or res_dict.get("output")
+                        or res_dict.get("error")
+                        or res.get("summary")
+                        or res.get("last_output")
+                        or res.get("output")
+                        or res.get("error")
+                        or f"Task {task_id} failed"
+                    )
+                    err_msg = _safe_task_summary(err_msg, task_meta.get("prompt"), f"Task {task_id} failed")
+                    event_payload = {
+                        "task_id": task_id,
+                        "status": "failed",
+                        "summary": err_msg,
+                    }
+                    with self._lock:
+                        self._pending_tasks[task_id]["notification"] = event_payload
+                        self._pending_tasks[task_id]["status"] = "failed"
+                        self._pending_tasks[task_id]["summary"] = err_msg
+                        self._save_persisted_tasks()
+
+                    acked = self._dispatch_event("codex.failed", event_payload)
+                    if acked:
+                        with self._lock:
+                            self._pending_tasks.pop(task_id, None)
+                            self._save_persisted_tasks()
+
+            self._stop_event.wait(self.poll_interval)
 
     def _rpc_call(self, operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
         url = f"{self.endpoint_url}/rpc"
@@ -935,12 +1666,22 @@ class RemoteCodexCompanionClient:
             raise ConnectionError(f"Failed to connect to Windows Companion at {url}: {exc}") from exc
 
     def submit_task(self, task_id: str, workspace_alias: str, prompt: str, model: Optional[str] = None) -> dict[str, Any]:
-        return self._rpc_call("codex.submit_turn", {
+        res = self._rpc_call("codex.submit_turn", {
             "task_id": task_id,
             "workspace_alias": workspace_alias,
             "prompt": prompt,
             "model": model,
         })
+        with self._lock:
+            self._pending_tasks[task_id] = {
+                "task_id": task_id,
+                "prompt": prompt,
+                "workspace_alias": workspace_alias,
+                "model": model,
+            }
+            self._save_persisted_tasks()
+        self._ensure_polling_thread()
+        return res
 
     def get_task_status(self, task_id: str) -> Optional[dict[str, Any]]:
         return self._rpc_call("codex.get_task", {"task_id": task_id})
@@ -969,6 +1710,12 @@ class RemoteCodexCompanionClient:
 
     def cancel_task(self, task_id: str, reason: Optional[str] = None) -> dict[str, Any]:
         return self._rpc_call("codex.cancel", {"task_id": task_id, "reason": reason})
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=1.0)
+
 
 
 # ---------------------------------------------------------------------------

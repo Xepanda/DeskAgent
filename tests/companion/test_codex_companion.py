@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from typing import Any, Mapping, Optional
 from companion.src.codex_companion import CodexCompanion, DefaultMockTransport, JsonRpcTransport
 
@@ -121,7 +122,8 @@ class TestCodexCompanion(unittest.TestCase):
 
         # 4. Cancel task
         cancel_res = companion.cancel_task("tsk-turn-01", reason="User requested interrupt")
-        self.assertEqual(cancel_res["status"], "cancelled")
+        self.assertEqual(cancel_res["status"], "cancelling")
+        self.assertEqual(companion.get_task_status("tsk-turn-01")["status"], "cancelling")
 
         # Verify initialize request structure aligned with codex-cli 0.161.0
         init_call = next(m for m in sent_messages if m["method"] == "initialize")
@@ -135,6 +137,217 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(interrupt_call["params"].get("turnId"), "trn-real-9999")
         self.assertNotIn("thread_id", interrupt_call["params"])
         self.assertNotIn("turn_id", interrupt_call["params"])
+
+    def test_default_model_is_omitted_and_explicit_model_is_preserved(self) -> None:
+        sent_calls: list[dict[str, Any]] = []
+
+        class ModelTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                sent_calls.append({"method": method, "params": dict(params)})
+                if method == "initialize":
+                    return {"capabilities": {}}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": f"thr-{len(sent_calls)}"}
+                if method == "turn/start":
+                    return {"turn_id": f"turn-{len(sent_calls)}", "state": "running"}
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=ModelTransport(),
+            db_path=":memory:",
+        )
+        companion.submit_task("tsk-default-model", "test-project", "hello")
+        companion.submit_task("tsk-explicit-model", "test-project", "hello", model="chosen-model")
+
+        turn_calls = [call["params"] for call in sent_calls if call["method"] == "turn/start"]
+        self.assertEqual(len(turn_calls), 2)
+        self.assertNotIn("model", turn_calls[0])
+        self.assertEqual(turn_calls[1].get("model"), "chosen-model")
+        self.assertIsNone(companion.get_task_status("tsk-default-model")["model"])
+        self.assertEqual(companion.get_task_status("tsk-explicit-model")["model"], "chosen-model")
+
+    def test_user_message_is_not_output_but_agent_message_with_null_role_is(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        user_task = companion.submit_task("tsk-user-item", "test-project", "private user prompt")
+        companion._handle_server_notification(
+            "item/created",
+            {
+                "threadId": user_task["thread_id"],
+                "turnId": user_task["turn_id"],
+                "item": {"type": "userMessage", "content": [{"type": "text", "text": "private user prompt"}]},
+            },
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": user_task["thread_id"], "turnId": user_task["turn_id"], "status": "completed"},
+        )
+        user_status = companion.get_task_status("tsk-user-item")
+        self.assertNotIn("private user prompt", user_status["last_output"])
+        self.assertNotIn("private user prompt", user_status["summary"])
+
+        agent_task = companion.submit_task("tsk-agent-item", "test-project", "another prompt")
+        companion._handle_server_notification(
+            "item/completed",
+            {
+                "threadId": agent_task["thread_id"],
+                "turnId": agent_task["turn_id"],
+                "item": {
+                    "type": "agentMessage",
+                    "role": None,
+                    "content": [{"type": "text", "text": "real assistant result"}],
+                },
+            },
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": agent_task["thread_id"], "turnId": agent_task["turn_id"], "status": "completed"},
+        )
+        agent_status = companion.get_task_status("tsk-agent-item")
+        self.assertEqual(agent_status["last_output"], "real assistant result")
+        self.assertEqual(agent_status["summary"], "real assistant result")
+
+    def test_ambiguous_legacy_message_item_is_not_adopted_as_output(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        task = companion.submit_task("tsk-legacy-message", "test-project", "make a change")
+        companion._handle_server_notification(
+            "item/updated",
+            {"threadId": task["thread_id"], "turnId": task["turn_id"], "item": {"type": "message", "text": "assistant result"}},
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": task["thread_id"], "turnId": task["turn_id"], "status": "completed"},
+        )
+        legacy_status = companion.get_task_status("tsk-legacy-message")
+        self.assertEqual(legacy_status["summary"], "任务已成功完成")
+        self.assertEqual(legacy_status["last_output"], "")
+
+        user_task = companion.submit_task("tsk-legacy-user", "test-project", "private prompt")
+        companion._handle_server_notification(
+            "item/updated",
+            {
+                "threadId": user_task["thread_id"],
+                "turnId": user_task["turn_id"],
+                "item": {"type": "message", "role": "user", "text": "private prompt"},
+            },
+        )
+        companion._handle_server_notification(
+            "turn/completed",
+            {"threadId": user_task["thread_id"], "turnId": user_task["turn_id"], "status": "completed"},
+        )
+        self.assertNotIn("private prompt", companion.get_task_status("tsk-legacy-user")["summary"])
+
+    def test_untyped_terminal_summary_and_output_are_not_adopted_as_result(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        task = companion.submit_task("tsk-untyped-terminal", "test-project", "private prompt")
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": task["thread_id"],
+                "turnId": task["turn_id"],
+                "status": "completed",
+                "summary": "unattributed summary",
+                "output": "unattributed output",
+                "turn": {"status": "completed", "response": "unattributed response"},
+            },
+        )
+        status = companion.get_task_status("tsk-untyped-terminal")
+        self.assertEqual(status["summary"], "任务已成功完成")
+        self.assertEqual(status["last_output"], "")
+
+    def test_failed_turn_is_reported_as_failure_with_server_error(self) -> None:
+        db_path = os.path.join(self.workspace_dir, "failed-task.sqlite3")
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_path,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        companion.add_event_listener(lambda event, data: events.append((event, data)))
+        task = companion.submit_task("tsk-failed-turn", "test-project", "run the task")
+
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": task["thread_id"],
+                "turnId": task["turn_id"],
+                "status": "failed",
+                "error": {"message": "app-server rejected the operation"},
+            },
+        )
+
+        status = companion.get_task_status("tsk-failed-turn")
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["summary"], "app-server rejected the operation")
+        self.assertEqual(events, [("codex.failed", {
+            "task_id": "tsk-failed-turn",
+            "status": "failed",
+            "summary": "app-server rejected the operation",
+        })])
+
+        restored_companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_path,
+        )
+        restored = restored_companion.get_task_status("tsk-failed-turn")
+        self.assertEqual(restored["status"], "failed")
+        self.assertEqual(restored["summary"], "app-server rejected the operation")
+        companion._conn.close()
+        restored_companion._conn.close()
+
+    def test_failed_and_interrupted_events_redact_prompt_echo_and_keep_status_distinct(self) -> None:
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=":memory:",
+        )
+        prompt = "private task instructions"
+        events: list[tuple[str, dict[str, Any]]] = []
+        companion.add_event_listener(lambda event, data: events.append((event, data)))
+
+        failed = companion.submit_task("tsk-redacted-failure", "test-project", prompt)
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": failed["thread_id"],
+                "turnId": failed["turn_id"],
+                "status": "failed",
+                "error": {"message": f"Execution failed while handling: {prompt}"},
+            },
+        )
+
+        interrupted = companion.submit_task("tsk-redacted-interruption", "test-project", prompt)
+        companion._handle_server_notification(
+            "turn/completed",
+            {
+                "threadId": interrupted["thread_id"],
+                "turnId": interrupted["turn_id"],
+                "status": "interrupted",
+                "summary": f"Interrupted: {prompt}",
+            },
+        )
+
+        self.assertEqual([event for event, _ in events], ["codex.failed", "codex.interrupted"])
+        self.assertEqual([data["status"] for _, data in events], ["failed", "interrupted"])
+        self.assertNotIn(prompt, json.dumps(events))
+        self.assertIn("[user request omitted]", events[0][1]["summary"])
+        self.assertIn("[user request omitted]", events[1][1]["summary"])
+        self.assertEqual(companion.get_task_status("tsk-redacted-failure")["status"], "failed")
+        self.assertEqual(companion.get_task_status("tsk-redacted-interruption")["status"], "interrupted")
 
     # -------------------------------------------------------------------------
     # 4. Approval Correlation Lifecycle
@@ -463,7 +676,7 @@ class TestCodexCompanion(unittest.TestCase):
 
             # 5. Cancel task
             cancel_res = client.cancel_task("tsk-rem-01", reason="Testing cancel")
-            self.assertEqual(cancel_res["status"], "cancelled")
+            self.assertEqual(cancel_res["status"], "cancelling")
 
             # 6. Auth failure with invalid token
             bad_client = RemoteCodexCompanionClient(
@@ -476,6 +689,165 @@ class TestCodexCompanion(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_remote_completion_event_excludes_raw_task_status_and_prompt(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9998", poll_interval=0.01)
+        task_id = "tsk-safe-completion"
+        prompt = "private user prompt"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": prompt}
+        client.get_task_status = lambda _task_id: {
+            "result": {
+                "task_id": task_id,
+                "status": "completed",
+                "thread_id": "thread-safe-completion",
+                "turn_id": "turn-safe-completion",
+                "prompt": prompt,
+                "summary": f"assistant response echoed request: {prompt}",
+            }
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def acknowledge_restored_event(event: str, data: dict[str, Any]) -> bool:
+            events.append((event, data))
+            return True
+
+        try:
+            client.add_event_listener(acknowledge_restored_event)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "codex.turn_completed")
+        self.assertEqual(
+            events[0][1]["summary"],
+            "assistant response echoed request: [user request omitted]",
+        )
+        self.assertNotIn("result", events[0][1])
+        self.assertNotIn(prompt, json.dumps(events[0][1]))
+
+    def test_remote_task_is_not_acknowledged_by_listener_without_explicit_true(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9995", poll_interval=0.01)
+        task_id = "tsk-no-device-ack"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": "private prompt"}
+        client.get_task_status = lambda _task_id: {
+            "result": {"task_id": task_id, "status": "completed", "summary": "assistant result"}
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+        stop_after_delivery = threading.Event()
+
+        def observer(event: str, data: dict[str, Any]) -> None:
+            events.append((event, data))
+            stop_after_delivery.set()
+
+        try:
+            client.add_event_listener(observer)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not stop_after_delivery.is_set():
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertIn(task_id, client._pending_tasks)
+
+    def test_remote_task_is_acknowledged_only_when_listener_returns_true(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9994", poll_interval=0.01)
+        task_id = "tsk-device-ack"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": "private prompt"}
+        client.get_task_status = lambda _task_id: {
+            "result": {"task_id": task_id, "status": "completed", "summary": "assistant result"}
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+
+        def accepted(event: str, data: dict[str, Any]) -> bool:
+            events.append((event, data))
+            return True
+
+        try:
+            client.add_event_listener(accepted)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and task_id in client._pending_tasks:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertNotIn(task_id, client._pending_tasks)
+
+    def test_remote_failure_event_uses_persisted_failure_summary(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9997", poll_interval=0.01)
+        task_id = "tsk-safe-failure"
+        prompt = "private user prompt"
+        client._pending_tasks[task_id] = {"task_id": task_id, "prompt": prompt}
+        client.get_task_status = lambda _task_id: {
+            "result": {
+                "task_id": task_id,
+                "status": "failed",
+                "thread_id": "thread-safe-failure",
+                "turn_id": "turn-safe-failure",
+                "prompt": prompt,
+                "summary": "task failed: validation did not pass",
+                "error": {"message": "internal transport detail"},
+            }
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+        try:
+            client.add_event_listener(lambda event, data: events.append((event, data)))
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "codex.failed")
+        self.assertEqual(events[0][1]["summary"], "task failed: validation did not pass")
+        self.assertNotIn("result", events[0][1])
+        self.assertNotIn(prompt, json.dumps(events[0][1]))
+        self.assertNotIn("internal transport detail", json.dumps(events[0][1]))
+
+    def test_restored_remote_notification_drops_legacy_raw_result(self) -> None:
+        from companion.src.codex_companion import RemoteCodexCompanionClient
+
+        client = RemoteCodexCompanionClient("http://127.0.0.1:9996", poll_interval=0.01)
+        task_id = "tsk-restored-safe"
+        prompt = "private recovered prompt"
+        client._pending_tasks[task_id] = {
+            "task_id": task_id,
+            "prompt": prompt,
+            "status": "completed",
+            "notification": {
+                "task_id": task_id,
+                "status": "completed",
+                "summary": "assistant result after restart",
+                "result": {"prompt": prompt, "last_output": "assistant result after restart"},
+            },
+        }
+        events: list[tuple[str, dict[str, Any]]] = []
+        try:
+            client.add_event_listener(lambda event, data: events.append((event, data)))
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "codex.turn_completed")
+        self.assertEqual(events[0][1]["summary"], "assistant result after restart")
+        self.assertNotIn("result", events[0][1])
+        self.assertNotIn(prompt, json.dumps(events[0][1]))
 
     # -------------------------------------------------------------------------
     # 10. Approval Schema Enums Mapping (Command & Patch)
@@ -617,7 +989,7 @@ class TestCodexCompanion(unittest.TestCase):
 
         task_st3 = comp3.get_task_status("tsk-persist-100")
         self.assertIsNotNone(task_st3)
-        self.assertEqual(task_st3["status"], "cancelled")
+        self.assertEqual(task_st3["status"], "cancelling")
 
         pending3 = comp3.get_pending_approvals("tsk-persist-100")
         self.assertEqual(len(pending3), 0)
@@ -665,8 +1037,531 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual(params["reason"], "Timed out")
         self.assertNotIn("thread_id", params)
         self.assertNotIn("turn_id", params)
-
         companion.close()
+
+    def test_cancel_reconciles_server_terminal_state_when_turn_is_no_longer_active(self) -> None:
+        """A completion/cancel race should return the app-server's terminal state."""
+        class NoActiveTurnTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"capabilities": {}}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": "thr-no-active-01"}
+                if method == "turn/start":
+                    return {"turn_id": "trn-no-active-01", "state": "running"}
+                if method == "turn/interrupt":
+                    raise RuntimeError("Codex JSON-RPC error: no active turn to interrupt")
+                if method == "thread/resume":
+                    return {"thread": {"id": params["threadId"], "turns": [{
+                        "id": "trn-no-active-01",
+                        "status": "interrupted",
+                        "items": [],
+                    }]}}
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=NoActiveTurnTransport(),
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        companion.add_event_listener(lambda event, data: events.append((event, data)))
+        companion.submit_task("tsk-no-active-01", "test-project", "private prompt")
+
+        result = companion.cancel_task("tsk-no-active-01", reason="User requested stop")
+
+        status = companion.get_task_status("tsk-no-active-01")
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(status["status"], "interrupted")
+        self.assertNotIn("private prompt", status["summary"])
+        self.assertEqual([event for event, _ in events], ["codex.interrupted"])
+        companion.close()
+
+    def test_initialize_resumes_persisted_running_thread_and_restores_turn_correlation(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-running.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-resume-running", "test-project", "run a task")
+        original.close()
+
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        class ResumeTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                calls.append((method, dict(params)))
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": "inProgress", "items": [],
+                    }]}}
+                return {}
+
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=ResumeTransport(),
+            db_path=db_file,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        resumed.add_event_listener(lambda event, data: events.append((event, data)))
+        resumed.initialize()
+
+        self.assertEqual([method for method, _ in calls], ["initialize", "thread/resume"])
+        resume_params = calls[1][1]
+        self.assertEqual(resume_params["threadId"], task["thread_id"])
+        self.assertEqual(resume_params["cwd"], self.workspace_dir)
+        self.assertFalse(resume_params["excludeTurns"])
+        self.assertEqual(resumed._turn_to_task[task["turn_id"]], "tsk-resume-running")
+        self.assertEqual(resumed.get_task_status("tsk-resume-running")["status"], "running")
+        self.assertEqual(resumed.get_task_status("tsk-resume-running")["recovery_status"], "reconnected")
+
+        resumed._handle_server_notification(
+            "turn/completed",
+            {"threadId": task["thread_id"], "turn": {"id": task["turn_id"], "status": "completed"}},
+        )
+        self.assertEqual(resumed.get_task_status("tsk-resume-running")["status"], "completed")
+        self.assertEqual([event for event, _ in events], ["codex.turn_completed"])
+        resumed.close()
+
+    def test_turn_start_timeout_persists_thread_and_recovers_actual_turn(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "turn-start-timeout.db")
+
+        class DelayedTurnStartTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": "thr-start-timeout"}
+                if method == "turn/start":
+                    raise TimeoutError("app-server timed out waiting for turn/start")
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DelayedTurnStartTransport(),
+            db_path=db_file,
+        )
+        with self.assertRaises(TimeoutError):
+            companion.submit_task("tsk-start-timeout", "test-project", "private prompt")
+
+        status = companion.get_task_status("tsk-start-timeout")
+        self.assertIsNotNone(status)
+        self.assertEqual(status["thread_id"], "thr-start-timeout")
+        self.assertEqual(status["status"], "start_unknown")
+        self.assertEqual(status["summary"], "")
+        self.assertEqual(status["last_output"], "")
+        companion.close()
+
+        class ResumeTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    return {"thread": {"id": params["threadId"], "turns": [{
+                        "id": "trn-created-despite-timeout",
+                        "status": "inProgress",
+                        "items": [],
+                    }]}}
+                if method == "turn/interrupt":
+                    if params["turnId"] != "trn-created-despite-timeout":
+                        raise AssertionError("recovery did not restore the actual turn ID")
+                    return {"interrupted": True}
+                return {}
+
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=ResumeTransport(),
+            db_path=db_file,
+        )
+        resumed.initialize()
+        recovered = resumed.get_task_status("tsk-start-timeout")
+        self.assertEqual(recovered["turn_id"], "trn-created-despite-timeout")
+        self.assertEqual(recovered["status"], "running")
+        self.assertEqual(recovered["recovery_status"], "reconnected")
+        self.assertEqual(resumed.cancel_task("tsk-start-timeout")["status"], "cancelling")
+        resumed.close()
+
+    def test_turn_start_response_does_not_overwrite_synchronous_terminal_notification(self) -> None:
+        companion: CodexCompanion
+
+        class NotificationBeforeTurnStartResponseTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method in ("thread/create", "thread/start"):
+                    return {"thread_id": "thr-notification-race"}
+                if method == "turn/start":
+                    companion._handle_server_notification("turn/completed", {
+                        "threadId": params["threadId"],
+                        "turnId": "trn-notification-race",
+                        "turn": {
+                            "status": "completed",
+                            "items": [{"type": "agentMessage", "text": "assistant completed result"}],
+                        },
+                    })
+                    return {"turn_id": "trn-notification-race", "state": "inProgress"}
+                return {}
+
+        companion = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=NotificationBeforeTurnStartResponseTransport(),
+            db_path=":memory:",
+        )
+        result = companion.submit_task("tsk-notification-race", "test-project", "private prompt")
+        status = companion.get_task_status("tsk-notification-race")
+        self.assertEqual(result["turn_id"], "trn-notification-race")
+        self.assertEqual(status["turn_id"], "trn-notification-race")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["summary"], "assistant completed result")
+        self.assertEqual(status["last_output"], "assistant completed result")
+        self.assertNotIn("private prompt", status["summary"])
+        companion.close()
+
+    def test_resume_reconciles_schema_terminal_turns_without_using_user_items_as_output(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-terminal.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        tasks = {
+            key: original.submit_task(key, "test-project", "private prompt")
+            for key in ("tsk-resume-completed", "tsk-resume-failed", "tsk-resume-interrupted")
+        }
+        cancel_result = original.cancel_task("tsk-resume-interrupted", reason="user requested stop")
+        self.assertEqual(cancel_result["status"], "cancelling")
+        self.assertEqual(original.get_task_status("tsk-resume-interrupted")["status"], "cancelling")
+        original.close()
+
+        statuses = {
+            tasks["tsk-resume-completed"]["thread_id"]: ("completed", [
+                {"type": "userMessage", "text": "private prompt"},
+                {"type": "agentMessage", "text": "assistant result after restart"},
+            ]),
+            tasks["tsk-resume-failed"]["thread_id"]: ("failed", []),
+            tasks["tsk-resume-interrupted"]["thread_id"]: ("interrupted", []),
+        }
+
+        class ResumeTerminalTransport(JsonRpcTransport):
+            companion: Optional[CodexCompanion] = None
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    status, items = statuses[params["threadId"]]
+                    task = next(value for value in tasks.values() if value["thread_id"] == params["threadId"])
+                    if status == "completed":
+                        items.append({"type": "message", "text": "ambiguous non-assistant text"})
+                    if status == "completed" and self.companion is not None:
+                        self.companion._handle_server_notification("turn/completed", {
+                            "threadId": params["threadId"],
+                            "turn": {"id": task["turn_id"], "status": status, "items": items},
+                        })
+                    return {"thread": {"id": params["threadId"], "turns": [{
+                        "id": task["turn_id"], "status": status, "items": items,
+                        "error": {"message": "server error"} if status == "failed" else None,
+                    }]}}
+                return {}
+
+        terminal_transport = ResumeTerminalTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=terminal_transport,
+            db_path=db_file,
+        )
+        terminal_transport.companion = resumed
+        events: list[tuple[str, dict[str, Any]]] = []
+        resumed.add_event_listener(lambda event, data: events.append((event, data)))
+        resumed.initialize()
+
+        self.assertEqual(resumed.get_task_status("tsk-resume-completed")["status"], "completed")
+        self.assertEqual(resumed.get_task_status("tsk-resume-completed")["summary"], "assistant result after restart")
+        self.assertNotIn("private prompt", json.dumps(events))
+        self.assertEqual(sum(event == "codex.turn_completed" for event, _ in events), 1)
+        self.assertEqual(resumed.get_task_status("tsk-resume-failed")["status"], "failed")
+        self.assertEqual(resumed.get_task_status("tsk-resume-interrupted")["status"], "interrupted")
+        self.assertEqual([event for event, _ in events], [
+            "codex.turn_completed", "codex.failed", "codex.interrupted",
+        ])
+        resumed.close()
+
+    def test_nonterminal_thread_is_resumed_after_each_companion_restart(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-twice.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-resume-twice", "test-project", "run a task")
+        original.close()
+
+        resume_calls = 0
+
+        class ResumeTwiceTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                nonlocal resume_calls
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    resume_calls += 1
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": "inProgress", "items": [],
+                    }]}}
+                return {}
+
+        for _ in range(2):
+            companion = CodexCompanion(
+                allowed_workspaces=self.workspaces,
+                transport=ResumeTwiceTransport(),
+                db_path=db_file,
+            )
+            companion.initialize()
+            self.assertEqual(companion.get_task_status("tsk-resume-twice")["status"], "running")
+            self.assertEqual(companion.get_task_status("tsk-resume-twice")["recovery_status"], "reconnected")
+            companion.close()
+        self.assertEqual(resume_calls, 2)
+
+    def test_active_writer_resume_conflict_stays_pending_and_can_be_retried(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-active-writer.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-active-writer", "test-project", "run a task")
+        original.close()
+
+        class ResumeTransport(JsonRpcTransport):
+            attempts = 0
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    self.attempts += 1
+                    if self.attempts == 1:
+                        raise RuntimeError("Codex JSON-RPC error: {'code': -32600, 'message': 'thread already has an active writer'}")
+                    if self.attempts == 2:
+                        return {"error": {"code": -32600, "message": "thread already has an active writer"}}
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": "inProgress", "items": [],
+                    }]}}
+                return {}
+
+        transport = ResumeTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        self.addCleanup(resumed.close)
+        clock = [100.0]
+        clock_patcher = patch("companion.src.codex_companion.time.monotonic", side_effect=lambda: clock[0])
+        clock_patcher.start()
+        self.addCleanup(clock_patcher.stop)
+        resumed.initialize()
+
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "pending")
+        self.assertEqual(status["recovery_error_kind"], "active_writer")
+        self.assertFalse(status["summary"])
+        self.assertEqual(resumed.get_pending_approvals("tsk-active-writer"), [])
+
+        recovered = resumed.recover_pending_tasks()
+        self.assertEqual(recovered, {"reconnected": 0, "reconciled": 0, "pending": 1})
+        self.assertEqual(transport.attempts, 1)
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "pending")
+        self.assertEqual(status["recovery_error_kind"], "active_writer")
+
+        clock[0] += 2.0
+        recovered = resumed.recover_pending_tasks()
+        self.assertEqual(recovered, {"reconnected": 0, "reconciled": 0, "pending": 1})
+        self.assertEqual(transport.attempts, 2)
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "pending")
+        self.assertEqual(status["recovery_error_kind"], "active_writer")
+
+        clock[0] += 3.0
+        recovered = resumed.recover_pending_tasks()
+        self.assertEqual(recovered, {"reconnected": 1, "reconciled": 0, "pending": 0})
+        status = resumed.get_task_status("tsk-active-writer")
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["recovery_status"], "reconnected")
+        self.assertNotIn("recovery_error_kind", status)
+        self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 0, "pending": 0})
+        self.assertEqual(transport.attempts, 3)
+        resumed.close()
+
+    def test_active_writer_backoff_preserves_task_and_reconciles_terminal_assistant_result(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-active-writer-backoff.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        prompt = "private recovery prompt"
+        task = original.submit_task("tsk-active-writer-backoff", "test-project", prompt)
+        original.close()
+
+        class BackoffResumeTransport(JsonRpcTransport):
+            resume_calls = 0
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    self.resume_calls += 1
+                    if self.resume_calls == 1:
+                        raise RuntimeError("Codex JSON-RPC error: {'code': -32600, 'message': 'thread already has an active writer'}")
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"],
+                        "status": "completed",
+                        "items": [
+                            {"type": "userMessage", "text": prompt},
+                            {"type": "agentMessage", "text": "Recovered assistant result"},
+                        ],
+                    }]}}
+                return {}
+
+        transport = BackoffResumeTransport()
+        clock = [1000.0]
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        with patch("companion.src.codex_companion.time.monotonic", side_effect=lambda: clock[0]):
+            resumed.initialize()
+            state = resumed.get_task_status("tsk-active-writer-backoff")
+            self.assertEqual(state["status"], "running")
+            self.assertEqual(state["recovery_status"], "pending")
+            self.assertEqual(state["recovery_error_kind"], "active_writer")
+            self.assertEqual(state["thread_id"], task["thread_id"])
+            self.assertEqual(state["turn_id"], task["turn_id"])
+            self.assertEqual(state["prompt"], prompt)
+            self.assertEqual(transport.resume_calls, 1)
+
+            # Immediate retries remain pending and do not hammer the busy server.
+            self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 0, "pending": 1})
+            self.assertEqual(transport.resume_calls, 1)
+
+            # The retry becomes eligible after the short initial backoff.
+            clock[0] += 2.0
+            self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 1, "pending": 0})
+
+        final = resumed.get_task_status("tsk-active-writer-backoff")
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["summary"], "Recovered assistant result")
+        self.assertNotIn(prompt, final["summary"])
+        self.assertEqual(transport.resume_calls, 2)
+        resumed.close()
+
+    def test_active_writer_uses_read_only_snapshot_until_terminal_then_recovers_after_restart(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-active-writer-snapshot.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        task = original.submit_task("tsk-active-writer-snapshot", "test-project", "private prompt")
+        original.close()
+
+        class SnapshotTransport(JsonRpcTransport):
+            snapshot_calls = 0
+            methods: list[str] = []
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                self.methods.append(method)
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    return {"error": {"code": -32600, "message": "thread already has an active writer"}}
+                if method == "thread/read":
+                    self.snapshot_calls += 1
+                    status = "inProgress" if self.snapshot_calls == 1 else "completed"
+                    items = [] if status == "inProgress" else [
+                        {"type": "userMessage", "text": "private prompt"},
+                        {"type": "agentMessage", "text": "assistant result recovered from snapshot"},
+                    ]
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"], "status": status, "items": items,
+                    }]}}
+                return {}
+
+        transport = SnapshotTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        self.addCleanup(resumed.close)
+        clock = [2000.0]
+        with patch("companion.src.codex_companion.time.monotonic", side_effect=lambda: clock[0]):
+            resumed.initialize()
+            first = resumed.get_task_status("tsk-active-writer-snapshot")
+            self.assertEqual(first["status"], "running")
+            self.assertEqual(first["recovery_status"], "pending")
+            self.assertEqual(first["recovery_error_kind"], "active_writer")
+            self.assertEqual(transport.methods, ["initialize", "thread/resume", "thread/read"])
+
+            # An active snapshot is not ownership or event-stream recovery.
+            self.assertEqual(resumed._thread_to_task.get(task["thread_id"]), "tsk-active-writer-snapshot")
+            self.assertEqual(resumed._turn_to_task.get(task["turn_id"]), "tsk-active-writer-snapshot")
+            self.assertEqual(resumed.get_task_status("tsk-active-writer-snapshot")["recovery_status"], "pending")
+
+            clock[0] += 2.0
+            self.assertEqual(resumed.recover_pending_tasks(), {"reconnected": 0, "reconciled": 1, "pending": 0})
+
+        final = resumed.get_task_status("tsk-active-writer-snapshot")
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["summary"], "assistant result recovered from snapshot")
+        self.assertNotIn("private prompt", final["summary"])
+        self.assertEqual(transport.snapshot_calls, 2)
+        self.assertNotIn("turn/start", transport.methods)
+        self.assertNotIn("turn/append", transport.methods)
+        resumed.close()
+
+    def test_legacy_cancelled_task_is_not_resumed(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "legacy-cancelled.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        original.submit_task("tsk-legacy-cancelled", "test-project", "already cancelled")
+        with original._lock:
+            task = original._tasks["tsk-legacy-cancelled"]
+            task["status"] = task["state"] = "cancelled"
+            original._persist_task(task)
+        original.close()
+
+        class NoResumeTransport(JsonRpcTransport):
+            resume_calls = 0
+
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    self.resume_calls += 1
+                return {}
+
+        transport = NoResumeTransport()
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=transport,
+            db_path=db_file,
+        )
+        resumed.initialize()
+        self.assertEqual(transport.resume_calls, 0)
+        self.assertEqual(resumed.get_task_status("tsk-legacy-cancelled")["status"], "cancelled")
+        resumed.close()
 
 
 if __name__ == "__main__":

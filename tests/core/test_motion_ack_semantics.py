@@ -486,7 +486,12 @@ class RobotAdapterCorrelationTestCase(unittest.TestCase):
             t2 = threading.Thread(target=call, args=(2,))
             t1.start()
             t2.start()
-            time.sleep(0.03)  # let both waiters enter the fallback loop
+            wait_deadline = time.time() + 1.0
+            while time.time() < wait_deadline:
+                if "req-coal-1" in adapter._awaiting_ids and "req-coal-2" in adapter._awaiting_ids:
+                    break
+                time.sleep(0.005)
+            time.sleep(0.02)  # let both waiters enter the fallback loop
             coalesced = "".join(
                 json.dumps({
                     "type": "sys.ack",

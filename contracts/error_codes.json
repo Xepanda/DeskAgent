@@ -38,6 +38,12 @@
       "retryable": false,
       "description": "The specified entity_id, task_id, reminder_id, or approval_id does not exist."
     },
+    "STATE_CONFLICT": {
+      "code": "STATE_CONFLICT",
+      "category": "CLIENT_ERROR",
+      "retryable": false,
+      "description": "The referenced resource or occurrence exists, but its current lifecycle state does not allow the requested transition. Do not retry unchanged; query current state and issue a new request only after the state or user intent changes."
+    },
     "OPERATION_TIMEOUT": {
       "code": "OPERATION_TIMEOUT",
       "category": "TRANSIENT_ERROR",

@@ -130,11 +130,16 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             "-fPIC",
             "-O2",
             "-Wall",
+            "-DDESK_SDK_TESTING",
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"-I{repo_root}/firmware/components/desk_hardware/include",
+            f"-I{repo_root}/firmware/components/desk_tclaw/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
+            f"{repo_root}/tests/sdk_contract/pairing_ui_test_stubs.c",
             "-o",
             cls.so_path,
         ]
@@ -267,6 +272,18 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_sdk_bridge_is_pairing_code_configured.restype = ctypes.c_bool
         cls.lib.desk_sdk_bridge_is_pairing_code_configured.argtypes = []
 
+        cls.lib.desk_sdk_test_pairing_ui_reset_counters.restype = None
+        cls.lib.desk_sdk_test_pairing_ui_reset_counters.argtypes = []
+        for counter_name in (
+            "desk_sdk_test_pairing_consumed_notifications",
+            "desk_sdk_test_sdk_reset_notifications",
+            "desk_sdk_test_pairing_consumed_reentry_checks",
+            "desk_sdk_test_sdk_reset_reentry_checks",
+        ):
+            counter = getattr(cls.lib, counter_name)
+            counter.restype = ctypes.c_uint
+            counter.argtypes = []
+
         cls.lib.desk_hardware_register_driver_ops.restype = ctypes.c_int
         cls.lib.desk_hardware_register_driver_ops.argtypes = [ctypes.POINTER(DeskBoardDriverOps)]
 
@@ -345,9 +362,16 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     def setUp(self) -> None:
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock.argtypes = [ctypes.c_uint64]
+        set_clock.restype = None
+        set_clock(1_000)
+        self.lib.desk_firmware_poll.argtypes = [ctypes.c_int]
+        self.lib.desk_firmware_poll.restype = ctypes.c_int
         self.lib.desk_hardware_init()
         self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
+        self.lib.desk_sdk_test_pairing_ui_reset_counters()
 
     def tearDown(self) -> None:
         self.lib.desk_hardware_register_driver_ops(None)
@@ -481,9 +505,11 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         data = resp.get("data", {})
         self.assertEqual(data.get("role"), "device")
         caps = data.get("capabilities", [])
-        expected_caps = ["inputs", "motion", "camera", "audio.stream", "expression.audio_follow.v1", "mcp_tools"]
+        expected_caps = ["inputs", "motion", "camera", "expression.audio_follow.v1", "mcp_tools"]
         for cap in expected_caps:
             self.assertIn(cap, caps, f"Missing expected capability: {cap}")
+        self.assertNotIn("audio.stream", caps)
+        self.assertNotIn("audio_stream", caps)
 
     def test_motion_move_with_custom_angles(self) -> None:
         """Verifies motion command parses JSON arguments and sets hardware angles."""
@@ -1096,8 +1122,8 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(len(rsp["session_token"]), 64)
         self.assertTrue(all(c in "0123456789abcdef" for c in rsp["session_token"]))
 
-    def test_hardware_hello_handshake_with_audio_negotiation(self) -> None:
-        """Verifies sys.client.hello with role=hardware negotiates Opus audio uplink per contract."""
+    def test_hardware_hello_handshake_omits_unimplemented_audio_negotiation(self) -> None:
+        """Hardware hello omits Opus uplink until its media path exists."""
         hardware_hello = json.dumps({
             "type": "sys.client.hello",
             "code": 0,
@@ -1120,10 +1146,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(rsp["code"], 0)
         self.assertEqual(rsp["data"]["role"], "hardware")
         self.assertEqual(rsp["data"]["session_state"], "connected")
-        audio_up = rsp["data"]["negotiated"]["audio_uplink"]
-        self.assertEqual(audio_up["codec"], "opus")
-        self.assertEqual(audio_up["sample_rate"], 16000)
-        self.assertEqual(audio_up["channels"], 1)
+        self.assertNotIn("audio_uplink", rsp["data"].get("negotiated", {}))
 
     def test_media_frame_pack_and_unpack(self) -> None:
         """Verifies packaging complete WSPK binary media frames with Little-Endian headers."""
@@ -1231,7 +1254,10 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         pair_req = json.dumps({
             "type": "pair.request",
             "protocol": "watcher_lan_pairing_v1",
-            "client_id": "test_py_sdk_runner",
+            "request_id": "0123456789abcdef0123456789abcdef",
+            "daemon_instance_id": "abcdef0123456789abcdef0123456789",
+            "target_mode": "python_sdk",
+            "websocket_port": 37020,
             "pairing_code": "123456",
             "timestamp": 1792000000,
         }).encode("utf-8")
@@ -1273,7 +1299,10 @@ class TestSdkBridgeProtocol(unittest.TestCase):
                 json.dumps({
                     "type": "pair.request",
                     "protocol": "watcher_lan_pairing_v1",
-                    "client_id": "test_py_sdk_runner",
+                    "request_id": "1123456789abcdef0123456789abcdef",
+                    "daemon_instance_id": "abcdef0123456789abcdef0123456789",
+                    "target_mode": "python_sdk",
+                    "websocket_port": 37020,
                     "pairing_code": "123456",
                 }).encode("utf-8"),
                 ("127.0.0.1", udp_port),
@@ -1955,15 +1984,15 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             ("motion.move", "sys.ack", {"type": "ctrl.motion.move",
                                         "data": {"pan_deg": 30.0, "tilt_deg": 120.0, "duration_ms": 200}}),
             ("motion.stop", "sys.ack", {"type": "ctrl.motion.stop", "data": {"emergency": True}}),
-            ("motion.action.play", "sys.ack", {"type": "ctrl.motion.action.play", "data": {}}),
+            ("motion.action.play", "sys.nack", {"type": "ctrl.motion.action.play", "data": {}}),
             ("camera.acquire", "sys.ack", {"type": "ctrl.camera.acquire",
                                            "data": {"client_id": "corr-client", "lease_duration_ms": 2000}}),
+            ("camera.capture", "sys.ack", {"type": "ctrl.camera.capture", "data": {}}),
             ("camera.release", "sys.ack", {"type": "ctrl.camera.release",
                                            "data": {"client_id": "corr-client"}}),
-            ("camera.capture", "sys.ack", {"type": "ctrl.camera.capture", "data": {}}),
-            ("microphone.open", "sys.ack", {"type": "ctrl.microphone.open",
+            ("microphone.open", "sys.nack", {"type": "ctrl.microphone.open",
                                             "data": {"sample_rate_hz": 16000}}),
-            ("microphone.close", "sys.ack", {"type": "ctrl.microphone.close", "data": {}}),
+            ("microphone.close", "sys.nack", {"type": "ctrl.microphone.close", "data": {}}),
             ("expression.play", "sys.ack", {"type": "ctrl.expression.play",
                                             "data": {"preset": "idle", "text": "correlate"}}),
             ("expression.audio_follow", "sys.ack", {"type": "ctrl.expression.audio_follow",
@@ -1980,6 +2009,19 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             resp = self._process_cmd(payload)
             self.assertEqual(resp.get("type"), expected_type, f"{name}: unexpected response type")
             self.assertEqual(resp.get("request_id"), req_id, f"{name}: request_id was not echoed")
+
+    def test_unimplemented_motion_action_is_not_accepted(self) -> None:
+        """Do not mint a fake SDK job for an action engine that is not wired."""
+        response = self._process_cmd({
+            "type": "ctrl.motion.action.play",
+            "request_id": "req-action-not-implemented",
+            "data": {"action_id": "wave"},
+        })
+        self.assertEqual(response.get("type"), "sys.nack")
+        self.assertEqual(response.get("code"), 501)
+        self.assertEqual(response.get("request_id"), "req-action-not-implemented")
+        self.assertEqual(response.get("error", {}).get("code"), "UNSUPPORTED_OPERATION")
+        self.assertNotIn("job_id", response.get("data", {}))
 
     def test_hello_auth_failure_nack_echoes_request_id(self) -> None:
         """The 401 nack must correlate to its request_id like any other response."""
@@ -2010,6 +2052,24 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("code"), 409)
         self.assertEqual(resp.get("error", {}).get("code"), "RESOURCE_BUSY")
         self.assertEqual(resp.get("request_id"), "req-busy-correlate")
+
+    def test_camera_capture_without_active_lease_rejected_with_403(self) -> None:
+        """interfaces.md / arbitration: ctrl.camera.capture must be rejected with 403 NO_ACTIVE_LEASE when no lease is held."""
+        # Ensure any lease is released first
+        self._process_cmd({
+            "type": "ctrl.camera.release",
+            "request_id": "req-ensure-rel",
+            "data": {"client_id": "test-client-1"},
+        })
+        resp = self._process_cmd({
+            "type": "ctrl.camera.capture",
+            "request_id": "req-cap-nolease-01",
+            "data": {},
+        })
+        self.assertEqual(resp.get("type"), "sys.nack")
+        self.assertEqual(resp.get("code"), 403)
+        self.assertEqual(resp.get("error", {}).get("code"), "NO_ACTIVE_LEASE")
+        self.assertEqual(resp.get("request_id"), "req-cap-nolease-01")
 
     # ------------------------------------------------------------------
     # WP3 -- TCP stream framing
@@ -2161,6 +2221,134 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertEqual(reply, "")
 
+    def test_pairing_code_window_closes_after_five_failures_and_is_consumed_on_success(self) -> None:
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        for _ in range(5):
+            rc, reply = self._process_pairing(self._official_pair_request("123456"))
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(reply, "")
+            if _ < 4:
+                self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        # A sixth request cannot use the old code after the window locks.
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+        # A1 can explicitly open a fresh ephemeral window with the existing setter.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(reply)["type"], "pair.accept")
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_pairing_ui_notified_once_after_successful_consume_and_after_unlock(self) -> None:
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(reply)["type"], "pair.accept")
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_reentry_checks(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_notifications(), 0)
+
+    def test_pairing_ui_notified_once_after_five_failure_lockout_and_after_unlock(self) -> None:
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        for _ in range(5):
+            rc, reply = self._process_pairing(self._official_pair_request("123456"))
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(reply, "")
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_reentry_checks(), 1)
+
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+
+    def test_pairing_ui_notified_once_when_ttl_expires_via_query_or_poll(self) -> None:
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock.argtypes = [ctypes.c_uint64]
+        set_clock.restype = None
+
+        set_clock(10_000)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        set_clock(10_000 + 5 * 60 * 1_000)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_reentry_checks(), 1)
+        self.lib.desk_firmware_poll(0)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+
+        self.lib.desk_sdk_test_pairing_ui_reset_counters()
+        set_clock(20_000)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        set_clock(20_000 + 5 * 60 * 1_000)
+        self.lib.desk_firmware_poll(0)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_reentry_checks(), 1)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+
+        self.lib.desk_sdk_test_pairing_ui_reset_counters()
+        set_clock(30_000)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        set_clock(30_000 + 5 * 60 * 1_000)
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_reentry_checks(), 1)
+
+    def test_sdk_session_reset_notified_once_only_when_pairing_state_exists(self) -> None:
+        self.lib.desk_sdk_bridge_reset()
+        self.lib.desk_sdk_bridge_reset()
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_notifications(), 0)
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        self.lib.desk_sdk_bridge_reset()
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_notifications(), 1)
+
+        self.lib.desk_sdk_test_pairing_ui_reset_counters()
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock(40_000)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        rc, reply = self._process_pairing(self._official_pair_request("654321"))
+        self.assertEqual(rc, 0)
+        self.lib.desk_sdk_bridge_reset()
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_notifications(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_reentry_checks(), 1)
+        self.lib.desk_sdk_bridge_reset()
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_notifications(), 1)
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_reentry_checks(), 1)
+        self.lib.desk_sdk_bridge_reset()
+        self.assertEqual(self.lib.desk_sdk_test_sdk_reset_notifications(), 1)
+
+    def test_setter_null_clear_does_not_emit_consumed_notification(self) -> None:
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertEqual(self.lib.desk_sdk_test_pairing_consumed_notifications(), 0)
+
+    def test_concurrent_pair_requests_consume_code_exactly_once(self) -> None:
+        import concurrent.futures
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        request = self._official_pair_request("123456")
+
+        def pair_once() -> tuple[int, str]:
+            return self._process_pairing(request)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _index: pair_once(), range(8)))
+
+        successes = [(rc, reply) for rc, reply in results if rc == 0]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(json.loads(successes[0][1])["type"], "pair.accept")
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
     def test_pairing_rejected_on_missing_code(self) -> None:
         """A pair.request without a pairing_code must be rejected."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
@@ -2185,8 +2373,61 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         rc_ok, reply_ok = self._process_pairing(self._official_pair_request("123456"))
         self.assertEqual(rc_ok, 0)
         self.assertEqual(json.loads(reply_ok)["type"], "pair.accept")
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
 
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_pairing_code_expires_after_five_minutes_of_monotonic_time(self) -> None:
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock.argtypes = [ctypes.c_uint64]
+        set_clock.restype = None
+        set_clock(1_000)
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        set_clock(1_000 + 5 * 60 * 1_000 - 1)
+        self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        set_clock(1_000 + 5 * 60 * 1_000)
+        self.lib.desk_firmware_poll(0)
+        # The periodic production poll must zero the expired RAM window even
+        # if monotonic time is subsequently moved backwards in this test.
+        set_clock(1_001)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(reply, "")
+
+    def test_pairing_code_clear_api_and_bridge_init_clear_ram_window(self) -> None:
+        clear_code = self.lib.desk_sdk_bridge_clear_pairing_code
+        clear_code.argtypes = []
+        clear_code.restype = None
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        clear_code()
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        self.lib.desk_sdk_bridge_reset()
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_init(), 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+    def test_pairing_code_is_consumed_after_success(self) -> None:
+        set_clock = self.lib.desk_sdk_test_set_monotonic_ms
+        set_clock.argtypes = [ctypes.c_uint64]
+        set_clock.restype = None
+        set_clock(50_000)
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(reply)["type"], "pair.accept")
         self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
         rc, reply = self._process_pairing(self._official_pair_request("123456"))
         self.assertNotEqual(rc, 0)
@@ -2203,8 +2444,8 @@ class TestSdkBridgeProtocol(unittest.TestCase):
                     self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(bad), -1)
                 self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured())
 
-    def test_pairing_logs_are_redacted(self) -> None:
-        """pairing_code and session_token must never appear in clear text in logs."""
+    def test_pairing_logs_contain_only_reason_and_request_id(self) -> None:
+        """Pairing diagnostics include reason/request id and never credentials."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
 
         with capture_c_stdout() as tmp:
@@ -2213,12 +2454,14 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             token = json.loads(reply)["session_token"]
 
         logged = read_captured(tmp)
-        self.assertIn("[redacted", logged, "expected a redacted diagnostic log line")
-        self.assertNotIn("123456", logged, "pairing_code must never be logged in clear text")
+        self.assertIn("reason=validated", logged)
+        self.assertIn("request_id=21a9dbf05ea3443480e62076f79a3b12", logged)
+        self.assertNotIn("123456", logged, "pairing_code must never be logged")
         self.assertNotIn(token, logged, "session_token must never be logged in clear text")
+        self.assertNotIn("session_token", logged)
 
-    def test_pairing_rejection_logs_are_redacted(self) -> None:
-        """Rejection diagnostics must redact the supplied pairing code."""
+    def test_pairing_rejection_logs_contain_only_reason_and_request_id(self) -> None:
+        """Rejection diagnostics contain only a reason and request id."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
 
         with capture_c_stdout() as tmp:
@@ -2227,8 +2470,12 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             self.assertEqual(reply, "")
 
         logged = read_captured(tmp)
+        self.assertIn("reason=code_mismatch", logged)
+        self.assertIn("request_id=21a9dbf05ea3443480e62076f79a3b12", logged)
         self.assertNotIn("123456", logged, "supplied pairing_code must never be logged")
         self.assertNotIn("654321", logged, "provisioned pairing_code must never be logged")
+        self.assertNotIn("pairing_code", logged)
+        self.assertNotIn("token", logged)
 
     # ------------------------------------------------------------------
     # R9 -- set_pairing_token() sets credentials only, never the paired state

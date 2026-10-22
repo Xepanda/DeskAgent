@@ -5,6 +5,13 @@
 
 #include "desk_tclaw_bridge.h"
 #include "desk_hardware.h"
+#ifdef ESP_PLATFORM
+#include "ai_agent.h"
+#else
+/* Host builds have no Tuya component; keep the cloud API weak for contract tests. */
+typedef enum { AT_LONG_KEY_TALK = 7, AT_KEY_TALK = 8 } AI_ALERT_TYPE_E;
+extern int ai_agent_cloud_alert(AI_ALERT_TYPE_E type) __attribute__((weak));
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -110,6 +117,177 @@ static char s_tuya_device_id[64] = "";
 static char s_tuya_token[128] = "";
 static char s_last_tool_result[1024] = "";
 
+typedef enum {
+    WATCHER_UI_PAGE_HOME = 0,
+    WATCHER_UI_PAGE_AUDIO,
+    WATCHER_UI_PAGE_CONNECTION,
+    WATCHER_UI_PAGE_DEVICE,
+    WATCHER_UI_PAGE_COUNT
+} watcher_ui_page_t;
+
+static watcher_ui_page_t s_ui_focus = WATCHER_UI_PAGE_HOME;
+static bool s_ui_overlay_active = false;
+static bool s_ui_page_open = false;
+static bool s_pairing_ui_active = false;
+static char s_pairing_ui_code[7] = {0};
+static char s_ui_home_preset[32] = "idle";
+static char s_ui_home_status[64] = "Ready";
+
+static const char *watcher_ui_page_name(watcher_ui_page_t page)
+{
+    switch (page) {
+    case WATCHER_UI_PAGE_HOME: return "HOME";
+    case WATCHER_UI_PAGE_AUDIO: return "AUDIO";
+    case WATCHER_UI_PAGE_CONNECTION: return "CONNECTION";
+    case WATCHER_UI_PAGE_DEVICE: return "DEVICE";
+    default: return "HOME";
+    }
+}
+
+static int watcher_ui_render(void)
+{
+    char status[64] = "";
+    if (s_pairing_ui_active) {
+        snprintf(status, sizeof(status), "PAIR %s", s_pairing_ui_code);
+        return desk_hardware_display_set_expression(s_ui_home_preset, status);
+    }
+    if (!s_ui_overlay_active) return DESK_HW_OK;
+    if (!s_ui_page_open) {
+        snprintf(status, sizeof(status), "MENU %s", watcher_ui_page_name(s_ui_focus));
+    } else {
+        switch (s_ui_focus) {
+        case WATCHER_UI_PAGE_HOME:
+            snprintf(status, sizeof(status), "HOME %.16s", s_ui_home_status);
+            break;
+        case WATCHER_UI_PAGE_AUDIO: {
+            desk_hardware_audio_status_t audio = {0};
+            if (desk_hardware_audio_get_status(&audio) != DESK_HW_OK) {
+                snprintf(status, sizeof(status), "AUDIO UNAVAILABLE");
+            } else {
+                snprintf(status, sizeof(status), "MIC %s F%lu E%lu",
+                         audio.running ? "RUN" : "READY",
+                         (unsigned long)audio.frames, (unsigned long)audio.errors);
+            }
+            break;
+        }
+        case WATCHER_UI_PAGE_CONNECTION:
+            switch (desk_tclaw_get_state()) {
+            case TCLAW_STATE_LISTENING: snprintf(status, sizeof(status), "TCLAW SHIM LISTENING"); break;
+            case TCLAW_STATE_THINKING: snprintf(status, sizeof(status), "TCLAW SHIM THINKING"); break;
+            case TCLAW_STATE_SPEAKING: snprintf(status, sizeof(status), "TCLAW SHIM SPEAKING"); break;
+            case TCLAW_STATE_TOOL_CALLING: snprintf(status, sizeof(status), "TCLAW SHIM TOOL CALL"); break;
+            case TCLAW_STATE_IDLE:
+            default: snprintf(status, sizeof(status), "TCLAW SHIM IDLE"); break;
+            }
+            break;
+        case WATCHER_UI_PAGE_DEVICE:
+            snprintf(status, sizeof(status), "WATCHER S3 412X412");
+            break;
+        default:
+            snprintf(status, sizeof(status), "PAGE UNAVAILABLE");
+            break;
+        }
+    }
+    return desk_hardware_display_set_expression(s_ui_home_preset, status);
+}
+
+int desk_tclaw_pairing_ui_set_code(const char *code)
+{
+    if (!code || strlen(code) != 6) return DESK_HW_ERR_INVALID_ARG;
+    for (size_t i = 0; i < 6; ++i) {
+        if (code[i] < '0' || code[i] > '9') return DESK_HW_ERR_INVALID_ARG;
+    }
+    memcpy(s_pairing_ui_code, code, sizeof(s_pairing_ui_code));
+    s_pairing_ui_active = true;
+    return watcher_ui_render();
+}
+
+void desk_tclaw_pairing_ui_clear(void)
+{
+    memset(s_pairing_ui_code, 0, sizeof(s_pairing_ui_code));
+    s_pairing_ui_active = false;
+    if (s_ui_overlay_active) {
+        (void)watcher_ui_render();
+    } else {
+        (void)desk_hardware_display_set_expression(s_ui_home_preset, s_ui_home_status);
+    }
+}
+
+void desk_tclaw_pairing_ui_on_pairing_consumed(void)
+{
+    desk_tclaw_pairing_ui_clear();
+}
+
+void desk_tclaw_pairing_ui_on_sdk_session_reset(void)
+{
+    desk_tclaw_pairing_ui_clear();
+}
+
+static int desk_tclaw_update_screen(const char *preset, const char *status)
+{
+    const char *safe_preset = preset ? preset : "idle";
+    const char *safe_status = status ? status : "";
+    if (s_ui_overlay_active || s_pairing_ui_active) {
+        snprintf(s_ui_home_preset, sizeof(s_ui_home_preset), "%s", safe_preset);
+        snprintf(s_ui_home_status, sizeof(s_ui_home_status), "%s", safe_status);
+        return watcher_ui_render();
+    }
+    int rc = desk_hardware_display_set_expression(safe_preset, safe_status);
+    if (rc != DESK_HW_OK) return rc;
+    snprintf(s_ui_home_preset, sizeof(s_ui_home_preset), "%s", safe_preset);
+    snprintf(s_ui_home_status, sizeof(s_ui_home_status), "%s", safe_status);
+    return rc;
+}
+
+static void watcher_ui_input_event(desk_touch_target_t target,
+                                   desk_touch_action_t action,
+                                   void *user_data)
+{
+    (void)user_data;
+    if (target == DESK_TOUCH_TARGET_ROLLER) {
+        if (action == DESK_TOUCH_ACTION_SCROLL_UP || action == DESK_TOUCH_ACTION_SCROLL_DOWN) {
+            s_ui_overlay_active = true;
+            if (action == DESK_TOUCH_ACTION_SCROLL_UP) {
+                s_ui_focus = (watcher_ui_page_t)((s_ui_focus + 1) % WATCHER_UI_PAGE_COUNT);
+            } else {
+                s_ui_focus = (watcher_ui_page_t)((s_ui_focus + WATCHER_UI_PAGE_COUNT - 1) % WATCHER_UI_PAGE_COUNT);
+            }
+            s_ui_page_open = false;
+            (void)watcher_ui_render();
+        } else if (action == DESK_TOUCH_ACTION_SHORT_PRESS || action == DESK_TOUCH_ACTION_LONG_PRESS) {
+#ifdef ESP_PLATFORM
+            AI_ALERT_TYPE_E alert = action == DESK_TOUCH_ACTION_SHORT_PRESS ? AT_KEY_TALK : AT_LONG_KEY_TALK;
+            int rc = ai_agent_cloud_alert(alert);
+#else
+            int rc = ai_agent_cloud_alert
+                         ? ai_agent_cloud_alert(action == DESK_TOUCH_ACTION_SHORT_PRESS ? AT_KEY_TALK : AT_LONG_KEY_TALK)
+                         : DESK_HW_ERR_UNAVAILABLE;
+#endif
+            if (rc != 0) printf("[TCLAW_UI] Tuya talk alert failed rc=%d action=%d\n", rc, action);
+        }
+        return;
+    }
+
+    if (target == DESK_TOUCH_TARGET_SCREENTOUCH) {
+        if (action == DESK_TOUCH_ACTION_SHORT_PRESS) {
+            s_ui_overlay_active = true;
+            s_ui_page_open = true;
+            (void)watcher_ui_render();
+        } else if (action == DESK_TOUCH_ACTION_SCROLL_DOWN && s_ui_overlay_active) {
+            s_ui_overlay_active = false;
+            s_ui_page_open = false;
+            s_ui_focus = WATCHER_UI_PAGE_HOME;
+            if (s_pairing_ui_active) (void)watcher_ui_render();
+            else (void)desk_hardware_display_set_expression(s_ui_home_preset, s_ui_home_status);
+        }
+    }
+}
+
+static int desk_tclaw_update_ui_screen(const char *preset, const char *status)
+{
+    return desk_tclaw_update_screen(preset, status);
+}
+
 /* --------------------------------------------------------------------------
  * TClaw Dialogue Lifecycle
  * -------------------------------------------------------------------------- */
@@ -128,14 +306,28 @@ int desk_tclaw_init(void)
     s_last_tool_result[0] = '\0';
     s_tuya_session_id[0] = '\0';
     s_tuya_conn_state = TUYA_CLOUD_DISCONNECTED;
+    s_ui_focus = WATCHER_UI_PAGE_HOME;
+    s_ui_overlay_active = false;
+    s_ui_page_open = false;
+    memset(s_ui_home_preset, 0, sizeof(s_ui_home_preset));
+    snprintf(s_ui_home_preset, sizeof(s_ui_home_preset), "idle");
+    memset(s_ui_home_status, 0, sizeof(s_ui_home_status));
+    snprintf(s_ui_home_status, sizeof(s_ui_home_status), "Ready");
+    desk_tclaw_pairing_ui_clear();
 
-    desk_hardware_set_screen_expression("idle", "Ready");
+    desk_hardware_register_input_cb(watcher_ui_input_event, NULL);
+    desk_tclaw_update_ui_screen("idle", "Ready");
     return 0;
 }
 
 void desk_tclaw_reset(void)
 {
     s_initialized = false;
+    desk_hardware_register_input_cb(NULL, NULL);
+    s_ui_focus = WATCHER_UI_PAGE_HOME;
+    s_ui_overlay_active = false;
+    s_ui_page_open = false;
+    desk_tclaw_pairing_ui_clear();
     s_state = TCLAW_STATE_IDLE;
     s_turn_count = 0;
     s_last_response[0] = '\0';
@@ -233,7 +425,7 @@ int desk_tclaw_start_speaking(const char *speech_text)
     strncpy(s_last_response, speech_text, sizeof(s_last_response) - 1);
     s_last_response[sizeof(s_last_response) - 1] = '\0';
 
-    desk_hardware_set_screen_expression("speaking", s_last_response);
+    desk_tclaw_update_ui_screen("speaking", s_last_response);
 
     /* Stream speech tokens to registered listener if active */
     if (s_speech_stream_cb) {
@@ -261,7 +453,7 @@ int desk_tclaw_interrupt(void)
     s_state = TCLAW_STATE_IDLE;
     s_current_pending_tool[0] = '\0';
     s_pending_request_id[0] = '\0';
-    desk_hardware_set_screen_expression("idle", "Ready");
+    desk_tclaw_update_ui_screen("idle", "Ready");
     return 0;
 }
 
@@ -427,7 +619,7 @@ int desk_tclaw_execute_tool(const char *request_id,
         desk_json_parse_str(args, "preset", preset, sizeof(preset));
         desk_json_parse_str(args, "status_text", status_text, sizeof(status_text));
 
-        int exp_rc = desk_hardware_set_screen_expression(preset, status_text);
+        int exp_rc = desk_tclaw_update_ui_screen(preset, status_text);
         if (exp_rc == DESK_HW_OK) {
             status = "succeeded";
             snprintf(result_buf, sizeof(result_buf),
@@ -510,7 +702,7 @@ int desk_tclaw_trigger_tool_call(const char *request_id, const char *operation, 
     s_pending_request_id[sizeof(s_pending_request_id) - 1] = '\0';
     s_pending_tool_start_ms = desk_tclaw_get_time_ms();
 
-    desk_hardware_set_screen_expression("thinking", "Calling external tool...");
+    desk_tclaw_update_ui_screen("thinking", "Calling external tool...");
 
     if (s_tool_dispatcher) {
         time_t now = time(NULL);
@@ -699,7 +891,7 @@ int desk_tclaw_tuya_session_start(const char *session_id)
     }
 
     s_state = TCLAW_STATE_LISTENING;
-    desk_hardware_set_screen_expression("listening", "Tuya Cloud Voice Active");
+    desk_tclaw_update_ui_screen("listening", "Tuya Cloud Voice Active");
     return 0;
 }
 
@@ -722,7 +914,7 @@ int desk_tclaw_tuya_session_feed_audio(const uint8_t *pcm_data, size_t len)
 
     if (s_state == TCLAW_STATE_IDLE) {
         s_state = TCLAW_STATE_LISTENING;
-        desk_hardware_set_screen_expression("listening", "Listening...");
+        desk_tclaw_update_ui_screen("listening", "Listening...");
     }
 
     return 0;
@@ -739,7 +931,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
                 s_tuya_session_id[sizeof(s_tuya_session_id) - 1] = '\0';
             }
             s_state = TCLAW_STATE_LISTENING;
-            desk_hardware_set_screen_expression("listening", "Tuya Cloud Listening");
+            desk_tclaw_update_ui_screen("listening", "Tuya Cloud Listening");
             break;
 
         case TUYA_DIALOGUE_EVT_STREAM_TOKEN:
@@ -756,7 +948,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
                 if (cur_len + strlen(event->token) < sizeof(s_last_response) - 1) {
                     strcat(s_last_response, event->token);
                 }
-                desk_hardware_set_screen_expression("speaking", s_last_response);
+                desk_tclaw_update_ui_screen("speaking", s_last_response);
 
                 if (s_speech_stream_cb) {
                     s_speech_stream_cb(event->token, event->is_final_token, s_stream_user_data);
@@ -766,7 +958,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
 
         case TUYA_DIALOGUE_EVT_TOOL_CALL:
             s_state = TCLAW_STATE_TOOL_CALLING;
-            desk_hardware_set_screen_expression("thinking", "Calling tool...");
+            desk_tclaw_update_ui_screen("thinking", "Calling tool...");
             if (event->tool_name) {
                 strncpy(s_current_pending_tool, event->tool_name, sizeof(s_current_pending_tool) - 1);
                 s_current_pending_tool[sizeof(s_current_pending_tool) - 1] = '\0';
@@ -799,7 +991,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
             s_state = TCLAW_STATE_IDLE;
             s_current_pending_tool[0] = '\0';
             s_pending_request_id[0] = '\0';
-            desk_hardware_set_screen_expression("idle", "Ready");
+            desk_tclaw_update_ui_screen("idle", "Ready");
             break;
 
         case TUYA_DIALOGUE_EVT_ERROR:
@@ -807,7 +999,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
             desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
             desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
             s_state = TCLAW_STATE_IDLE;
-            desk_hardware_set_screen_expression("idle", event->error_msg ? event->error_msg : "Error");
+            desk_tclaw_update_ui_screen("idle", event->error_msg ? event->error_msg : "Error");
             break;
 
         default:
@@ -850,19 +1042,19 @@ int desk_tclaw_tuya_session_stop(void)
     if (s_tuya_conn_state == TUYA_CLOUD_STREAMING) {
         s_tuya_conn_state = TUYA_CLOUD_CONNECTED;
     }
-    desk_hardware_set_screen_expression("idle", "Ready");
+    desk_tclaw_update_ui_screen("idle", "Ready");
     return 0;
 }
 
 int desk_tclaw_on_tuya_netcfg_started(void)
 {
-    return desk_hardware_set_screen_expression("thinking", "BLE Netcfg");
+    return desk_tclaw_update_ui_screen("thinking", "BLE Netcfg");
 }
 
 int desk_tclaw_on_tuya_mqtt_connected(void)
 {
     s_tuya_conn_state = TUYA_CLOUD_CONNECTED;
-    int rc = desk_hardware_set_screen_expression("happy", "Online");
+    int rc = desk_tclaw_update_ui_screen("happy", "Online");
 
     /* Play brief connection chime / audio tone (800Hz PCM, 50ms) */
     static const int16_t s_connect_chime[64] = {
@@ -887,7 +1079,7 @@ int desk_tclaw_on_tuya_mqtt_disconnected(void)
     if (s_tuya_session_id[0] != '\0') {
         desk_tclaw_tuya_session_stop();
     }
-    return desk_hardware_set_screen_expression("idle", "Cloud Offline");
+    return desk_tclaw_update_ui_screen("idle", "Cloud Offline");
 }
 
 int desk_tclaw_inject_text(const char *user_prompt)
@@ -899,10 +1091,10 @@ int desk_tclaw_inject_text(const char *user_prompt)
     }
 
     s_state = TCLAW_STATE_LISTENING;
-    desk_hardware_set_screen_expression("listening", user_prompt);
+    desk_tclaw_update_ui_screen("listening", user_prompt);
 
     s_state = TCLAW_STATE_THINKING;
-    desk_hardware_set_screen_expression("thinking", "Thinking...");
+    desk_tclaw_update_ui_screen("thinking", "Thinking...");
 
     /* Detect intent for tool dispatching through Tuya dialogue engine */
     char req_id[64];

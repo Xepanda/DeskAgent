@@ -72,6 +72,7 @@
 
 #define WATCHER_PCA_TIMEOUT_TICKS    pdMS_TO_TICKS(50)
 #define WATCHER_LCD_RAIL_SETTLE_MS   50
+#define WATCHER_SYSTEM_RAIL_SETTLE_MS 100
 
 static bool s_i2c_ready;
 static bool s_spi_owned;
@@ -270,25 +271,42 @@ static esp_err_t watcher_expander_prepare_lcd(void)
              WATCHER_EXPANDER_ADDR, input1, input0);
 
     /* Seeed BSP assigns system rail to PCA bit 10 and LCD rail to bit 9.
-     * Do not turn on the global system rail or disturb any other supply. */
-    if ((config1 & WATCHER_SYSTEM_PORT_MASK) != 0 ||
-        (output1 & WATCHER_SYSTEM_PORT_MASK) == 0) {
-        ESP_LOGW(TAG, "LCD unavailable: PCA9535 system rail bit 10 is not already output-high");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const uint8_t lcd_output = (uint8_t)(output1 | WATCHER_LCD_POWER_PORT_MASK);
-    if (lcd_output != output1) {
-        err = watcher_pca_write(WATCHER_PCA_REG_OUTPUT1, lcd_output);
+     * Raise only the system rail first; preserve every unrelated output and
+     * direction bit. Set the output latch before changing its direction. */
+    const uint8_t system_output = (uint8_t)(output1 | WATCHER_SYSTEM_PORT_MASK);
+    if (system_output != output1) {
+        err = watcher_pca_write(WATCHER_PCA_REG_OUTPUT1, system_output);
         if (err != ESP_OK) return err;
     }
-    const uint8_t lcd_config = (uint8_t)(config1 & (uint8_t)~WATCHER_LCD_POWER_PORT_MASK);
-    if (lcd_config != config1) {
-        err = watcher_pca_write(WATCHER_PCA_REG_CONFIG1, lcd_config);
+    const uint8_t system_config = (uint8_t)(config1 & (uint8_t)~WATCHER_SYSTEM_PORT_MASK);
+    if (system_config != config1) {
+        err = watcher_pca_write(WATCHER_PCA_REG_CONFIG1, system_config);
         if (err != ESP_OK) return err;
     }
 
     uint8_t verify_output, verify_config;
+    if ((err = watcher_pca_read(3, &verify_output)) != ESP_OK ||
+        (err = watcher_pca_read(7, &verify_config)) != ESP_OK) {
+        return err;
+    }
+    if ((verify_output & WATCHER_SYSTEM_PORT_MASK) == 0 ||
+        (verify_config & WATCHER_SYSTEM_PORT_MASK) != 0) {
+        ESP_LOGE(TAG, "PCA9535 system rail bit 10 failed output-high verification");
+        return ESP_ERR_INVALID_STATE;
+    }
+    vTaskDelay(pdMS_TO_TICKS(WATCHER_SYSTEM_RAIL_SETTLE_MS));
+
+    const uint8_t lcd_output = (uint8_t)(verify_output | WATCHER_LCD_POWER_PORT_MASK);
+    if (lcd_output != verify_output) {
+        err = watcher_pca_write(WATCHER_PCA_REG_OUTPUT1, lcd_output);
+        if (err != ESP_OK) return err;
+    }
+    const uint8_t lcd_config = (uint8_t)(verify_config & (uint8_t)~WATCHER_LCD_POWER_PORT_MASK);
+    if (lcd_config != verify_config) {
+        err = watcher_pca_write(WATCHER_PCA_REG_CONFIG1, lcd_config);
+        if (err != ESP_OK) return err;
+    }
+
     if ((err = watcher_pca_read(3, &verify_output)) != ESP_OK ||
         (err = watcher_pca_read(7, &verify_config)) != ESP_OK) {
         return err;

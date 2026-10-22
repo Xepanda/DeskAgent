@@ -28,6 +28,9 @@ int desk_watcher_motion_wire_encode(const uint8_t *raw, size_t raw_len, uint8_t 
 int desk_watcher_motion_wire_decode(const uint8_t *wire, size_t wire_len, uint8_t *raw, size_t raw_len, size_t *out_len);
 size_t desk_watcher_motion_pack_move(float pan, float tilt, uint32_t duration_ms, uint32_t seq, uint8_t *out_buf);
 size_t desk_watcher_motion_pack_stop(bool emergency, uint32_t seq, uint8_t *out_buf);
+int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
+                                  uint32_t expected_seq, uint8_t expected_msg_id,
+                                  uint8_t *out_nack_code, bool *out_is_nack);
 
 #ifdef __cplusplus
 }

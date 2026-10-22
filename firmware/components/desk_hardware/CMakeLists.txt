@@ -7,6 +7,7 @@ idf_component_register(
         "src/desk_watcher_audio.c"
         "src/desk_watcher_motion.c"
         "src/desk_watcher_camera.c"
+        "src/desk_watcher_log_source.c"
         "src/desk_watcher_input.c"
     INCLUDE_DIRS
         "include"

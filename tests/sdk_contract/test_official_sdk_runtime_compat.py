@@ -14,18 +14,26 @@ Directly imports official SDK modules from the locked external repository to ver
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import socket
+import threading
+import time
+import types
 import unittest
+from pathlib import Path
 
 # Import official WatcheRobot SDK from the locked path
-OFFICIAL_SDK_PATH = "/home/maidang/.gemini/antigravity-cli/brain/cb82573a-ba9b-42ea-a6be-405983e79f69/scratch/watcherobot_python_sdk/src"
-if OFFICIAL_SDK_PATH not in sys.path and os.path.isdir(OFFICIAL_SDK_PATH):
-    sys.path.insert(0, OFFICIAL_SDK_PATH)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_OFFICIAL_SDK_SRC = REPO_ROOT / ".target_logging/sdk-acceptance/vendor/WatcheRobot_python_sdk/src"
+OFFICIAL_SDK_PATH = Path(os.environ.get("WATCHEROBOT_SDK_SRC", str(DEFAULT_OFFICIAL_SDK_SRC)))
+if OFFICIAL_SDK_PATH.is_dir() and str(OFFICIAL_SDK_PATH) not in sys.path:
+    sys.path.insert(0, str(OFFICIAL_SDK_PATH))
 
 try:
     from watcherobot.protocol import (
@@ -41,8 +49,10 @@ try:
         PairAccept,
         PairRequest,
         encode_udp_message,
+        parse_hardware_hello,
         parse_udp_message,
     )
+    import websockets
     HAVE_WATCHEROBOT = True
 except ImportError:
     HAVE_WATCHEROBOT = False
@@ -57,6 +67,21 @@ DESK_ARBITER_ERR_BUSY = 1
 OUTBOUND_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 
 
+def _jpeg_dimensions(payload: bytes) -> tuple[int, int]:
+    """Read dimensions from a baseline JPEG SOF0 segment without Pillow."""
+    if not payload.startswith(b"\xff\xd8") or not payload.endswith(b"\xff\xd9"):
+        raise ValueError("payload is not a complete JPEG")
+    sof = payload.find(b"\xff\xc0")
+    if sof < 0 or sof + 9 > len(payload):
+        raise ValueError("JPEG does not contain a complete baseline SOF0 segment")
+    segment_length = int.from_bytes(payload[sof + 2 : sof + 4], "big")
+    if segment_length < 7 or sof + 2 + segment_length > len(payload):
+        raise ValueError("JPEG SOF0 segment has an invalid length")
+    height = int.from_bytes(payload[sof + 5 : sof + 7], "big")
+    width = int.from_bytes(payload[sof + 7 : sof + 9], "big")
+    return width, height
+
+
 @unittest.skipUnless(HAVE_WATCHEROBOT, "Official watcherobot python sdk not installed in environment")
 class TestOfficialSdkRuntimeCompat(unittest.TestCase):
     @classmethod
@@ -65,6 +90,62 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.so_path = os.path.join(cls.temp_dir.name, "libdesk_sdk_bridge_compat.so")
         repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+        # The production pairing path learns the Runtime's host from the source
+        # address of the UDP request. This narrow test seam fills only that
+        # already-validated address/port after process_pairing_udp(); the C
+        # RFC6455 client, official Runtime listener and all wire traffic below
+        # remain the production implementations.
+        shim_path = os.path.join(cls.temp_dir.name, "sdk_runtime_loopback_shim.c")
+        with open(shim_path, "w", encoding="utf-8") as shim:
+            shim.write(
+                f'#include "{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c"\n'
+                f'#include "{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c"\n'
+                'int desk_sdk_test_set_pairing_target(const char *host, unsigned short port) {\n'
+                '  if (!host || !port || !s_paired || strlen(host) >= sizeof(s_pair_host)) return -1;\n'
+                '  strcpy(s_pair_host, host); s_pair_websocket_port = port; return 0;\n'
+                '}\n'
+                'const char *desk_sdk_test_last_ack(void) { return (const char *)s_ws_ack; }\n'
+                'const char *desk_sdk_test_http_response(void) { return s_ws_http_response; }\n'
+                'int desk_sdk_test_ws_state(void) { return (int)s_ws_state; }\n'
+                'void desk_sdk_test_seed_ws_auth_latch(void) { s_ws_ready = true; s_ws_authenticated = true; }\n'
+                'void desk_sdk_test_prepare_log_pair(void) { s_paired = true; '
+                'strcpy(s_pair_request_id, "31a9dbf05ea3443480e62076f79a3b12"); '
+                'strcpy(s_pair_daemon_instance_id, "e730f29e670c49f7a3320c4314eb9805"); '
+                'strcpy(s_active_pairing_token, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); '
+                'strcpy(s_pair_target_mode, "python_sdk"); strcpy(s_pair_host, "127.0.0.1"); '
+                's_pair_websocket_port = 8765; }\n'
+                'void desk_sdk_test_set_legacy_connected(void) { s_client_connected = true; }\n'
+                'uint32_t desk_sdk_test_ws_generation(void) { return ws_lifecycle_generation(); }\n'
+                'int desk_sdk_test_commit_hello_ack(uint32_t generation) { '
+                'return ws_commit_hardware_hello_ack(generation) ? 1 : 0; }\n'
+                'int desk_sdk_test_preflight(void) { char host[64], hello[512]; uint16_t port = 0; '
+                'return desk_sdk_bridge_get_pairing_target(host, sizeof(host), &port) == 0 && '
+                'desk_sdk_bridge_build_hardware_hello(hello, sizeof(hello)) > 0 ? 1 : 0; }\n'
+                'void desk_sdk_test_attach_writer_fd(int fd) { '
+                'pthread_mutex_lock(&s_ws_lifecycle_mutex); s_ws_fd = fd; '
+                's_ws_ready = true; s_ws_authenticated = true; s_ws_state = DESK_SDK_WS_CONNECTED; '
+                'pthread_mutex_unlock(&s_ws_lifecycle_mutex); }\n'
+                'uint32_t desk_sdk_test_advance_ws_generation(void) { '
+                'pthread_mutex_lock(&s_ws_lifecycle_mutex); ++s_ws_generation; '
+                'uint32_t generation = s_ws_generation; pthread_mutex_unlock(&s_ws_lifecycle_mutex); '
+                'return generation; }\n'
+                'void desk_sdk_test_disconnect_ws_generation(uint32_t generation) { '
+                'ws_disconnect_generation_and_schedule(generation); }\n'
+                'int desk_sdk_test_deadline_write(int fd, const uint8_t *payload, size_t len, unsigned deadline_ms) { '
+                'int old_fd = s_ws_fd; s_ws_fd = fd; int rc = ws_send_frame_deadline(0x1, payload, len, deadline_ms); '
+                's_ws_fd = old_fd; return rc; }\n'
+                'int desk_sdk_test_binary_deadline_write(int fd, const uint8_t *payload, size_t len, unsigned deadline_ms) { '
+                'int old_fd = s_ws_fd; s_ws_fd = fd; int rc = ws_send_frame_deadline(0x2, payload, len, deadline_ms); '
+                's_ws_fd = old_fd; return rc; }\n'
+                'int desk_sdk_test_outbound_queue_is_zero(void) { int clean = 1; '
+                'pthread_mutex_lock(&s_ws_writer_mutex); '
+                'for (size_t i = 0; i < sizeof(s_ws_control_queue); ++i) if (((const uint8_t *)s_ws_control_queue)[i]) clean = 0; '
+                'for (size_t i = 0; i < sizeof(s_ws_writer_current); ++i) if (((const uint8_t *)&s_ws_writer_current)[i]) clean = 0; '
+                'pthread_mutex_unlock(&s_ws_writer_mutex); return clean; }\n'
+                'void desk_sdk_test_pause_writer_without_thread(void) { s_ws_writer_started = true; }\n'
+                'void desk_sdk_test_resume_writer(void) { s_ws_writer_started = false; }\n'
+            )
+
         # Compile C shared library
         cmd = [
             "gcc",
@@ -72,13 +153,16 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             "-fPIC",
             "-O2",
             "-Wall",
+            "-DDESK_SDK_OPENSSL_TESTING",
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
-            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
+            shim_path,
+            "-lcrypto",
             "-o",
             cls.so_path,
         ]
@@ -119,12 +203,57 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.lib.desk_sdk_bridge_init.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_init.argtypes = []
 
+        cls.lib.desk_sdk_ws_client_is_connected.restype = ctypes.c_bool
+        cls.lib.desk_sdk_ws_client_is_connected.argtypes = []
+        cls.lib.desk_sdk_ws_client_is_authenticated.restype = ctypes.c_bool
+        cls.lib.desk_sdk_ws_client_is_authenticated.argtypes = []
+        cls.lib.desk_sdk_test_seed_ws_auth_latch.restype = None
+        cls.lib.desk_sdk_test_seed_ws_auth_latch.argtypes = []
+        cls.lib.desk_sdk_test_set_legacy_connected.restype = None
+        cls.lib.desk_sdk_test_set_legacy_connected.argtypes = []
+        cls.lib.desk_sdk_test_ws_generation.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_test_ws_generation.argtypes = []
+        cls.lib.desk_sdk_test_commit_hello_ack.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_commit_hello_ack.argtypes = [ctypes.c_uint32]
+        cls.lib.desk_sdk_ws_client_send_text.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_send_text.argtypes = [ctypes.c_char_p]
+        cls.lib.desk_sdk_ws_client_connect_paired.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_connect_paired.argtypes = []
+        cls.lib.desk_sdk_ws_client_poll.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_poll.argtypes = [ctypes.c_int]
+
         cls.lib.desk_sdk_bridge_process_command.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_process_command.argtypes = [
             ctypes.c_char_p,
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
+        cls.lib.desk_sdk_bridge_process_ws_command.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_process_ws_command.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+        cls.lib.desk_sdk_bridge_set_local_log_enabled.restype = None
+        cls.lib.desk_sdk_bridge_set_local_log_enabled.argtypes = [ctypes.c_bool]
+        cls.lib.desk_watcher_log_source_publish_camera_capture_empty.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_camera_capture_empty.argtypes = []
+        cls.lib.desk_sdk_bridge_log_next_text.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_log_next_text.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        cls.lib.desk_sdk_test_deadline_write.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_deadline_write.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint]
+        cls.lib.desk_sdk_test_binary_deadline_write.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_binary_deadline_write.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint]
+        cls.lib.desk_sdk_test_outbound_queue_is_zero.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_outbound_queue_is_zero.argtypes = []
+        cls.lib.desk_sdk_test_pause_writer_without_thread.restype = None
+        cls.lib.desk_sdk_test_pause_writer_without_thread.argtypes = []
+        cls.lib.desk_sdk_test_resume_writer.restype = None
+        cls.lib.desk_sdk_test_resume_writer.argtypes = []
+        cls.lib.desk_sdk_test_attach_writer_fd.restype = None
+        cls.lib.desk_sdk_test_attach_writer_fd.argtypes = [ctypes.c_int]
+        cls.lib.desk_sdk_test_advance_ws_generation.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_test_advance_ws_generation.argtypes = []
+        cls.lib.desk_sdk_test_disconnect_ws_generation.restype = None
+        cls.lib.desk_sdk_test_disconnect_ws_generation.argtypes = [ctypes.c_uint32]
+        cls.lib.desk_sdk_test_prepare_log_pair.restype = None
+        cls.lib.desk_sdk_test_prepare_log_pair.argtypes = []
 
         cls.lib.desk_sdk_bridge_process_pairing_udp.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_process_pairing_udp.argtypes = [
@@ -132,6 +261,9 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
+
+        cls.lib.desk_sdk_bridge_build_hardware_hello.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_build_hardware_hello.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
 
         cls.lib.desk_sdk_bridge_set_pairing_code.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_set_pairing_code.argtypes = [ctypes.c_char_p]
@@ -151,6 +283,22 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
+        cls.lib.desk_sdk_test_set_pairing_target.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_set_pairing_target.argtypes = [ctypes.c_char_p, ctypes.c_ushort]
+        cls.lib.desk_sdk_ws_client_connect_paired.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_connect_paired.argtypes = []
+        cls.lib.desk_sdk_ws_client_poll.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_poll.argtypes = [ctypes.c_int]
+        cls.lib.desk_sdk_test_last_ack.restype = ctypes.c_char_p
+        cls.lib.desk_sdk_test_last_ack.argtypes = []
+        cls.lib.desk_sdk_test_http_response.restype = ctypes.c_char_p
+        cls.lib.desk_sdk_test_http_response.argtypes = []
+        cls.lib.desk_sdk_test_ws_state.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_ws_state.argtypes = []
+        cls.lib.desk_sdk_test_preflight.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_preflight.argtypes = []
+        cls.lib.desk_sdk_bridge_send_event.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_send_event.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -159,11 +307,468 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
     def setUp(self) -> None:
         self.lib.desk_hardware_init()
         self.lib.desk_tclaw_init()
+        self.lib.desk_sdk_bridge_reset()
         self.lib.desk_sdk_bridge_init()
         # The device-side expected pairing code must be provisioned explicitly;
         # without it pairing is fail-closed (interfaces.md 6.4 / CR-001).
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
         self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+    def test_websocket_client_starts_offline_and_refuses_unpaired_send(self) -> None:
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.assertNotEqual(self.lib.desk_sdk_ws_client_send_text(b'{"type":"sys.ping"}'), 0)
+
+    def test_authenticated_latch_is_websocket_scoped_and_invalidated_by_lifecycle_changes(self) -> None:
+        """Test-only latch seeding covers lifecycle invalidators; legacy TCP is never auth."""
+        # Legacy TCP may report connected, but it cannot establish a paired WS latch.
+        self.lib.desk_sdk_test_set_legacy_connected()
+        self.assertTrue(self.lib.desk_sdk_bridge_is_connected())
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        # A changed token closes the old transport and clears its latch.
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_token(b"a" * 64), 0)
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        # Changing auth policy also invalidates a prior connection latch.
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_set_auth_required(True)
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.lib.desk_sdk_bridge_set_auth_required(False)
+
+        # A successful new pair replaces pairing metadata only after invalidation.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        request = PairRequest(
+            request_id="31a9dbf05ea3443480e62076f79a3b12",
+            daemon_instance_id="e730f29e670c49f7a3320c4314eb9805",
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+        )
+        response = ctypes.create_string_buffer(1024)
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(
+            self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(request), response, len(response)),
+            0,
+        )
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        # Explicit reset clears the latch independently of the stored pairing state.
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_reset()
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_init()
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+    def test_stale_inflight_hello_ack_cannot_restore_latch_after_invalidation(self) -> None:
+        """A connection generation change rejects an ACK completion from the old attempt."""
+        in_flight_generation = self.lib.desk_sdk_test_ws_generation()
+        self.lib.desk_sdk_ws_client_close()
+        self.assertEqual(
+            self.lib.desk_sdk_test_commit_hello_ack(in_flight_generation), 0
+        )
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+    def test_cr009_ws_subscription_gate_duplicate_cancel_and_reconnect(self) -> None:
+        def dispatch(message: dict) -> dict:
+            out = ctypes.create_string_buffer(1024)
+            rc = self.lib.desk_sdk_bridge_process_ws_command(
+                json.dumps(message).encode(), out, len(out)
+            )
+            self.assertEqual(rc, 0)
+            return json.loads(out.value)
+
+        sub = lambda cid: {"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": cid, "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}}
+        self.lib.desk_sdk_test_set_legacy_connected()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        denied = dispatch(sub("00000000000000000000000000000001"))
+        self.assertEqual((denied["type"], denied["data"]["error"]), ("sys.nack", "AUTH_REQUIRED"))
+
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        first_id = "00000000000000000000000000000002"
+        first = dispatch(sub(first_id))
+        self.assertEqual((first["type"], first["data"]["command_id"]), ("sys.ack", first_id))
+        original_stream = first["data"]["stream_id"]
+        first_sequence = first["data"]["next_sequence"]
+        duplicate_id = "00000000000000000000000000000003"
+        duplicate = dispatch(sub(duplicate_id))
+        self.assertEqual((duplicate["type"], duplicate["data"]["error"]), ("sys.nack", "ALREADY_SUBSCRIBED"))
+        self.assertEqual(duplicate["data"]["command_id"], duplicate_id)
+
+        invalid = sub("00000000000000000000000000000004")
+        invalid["data"]["components"] = ["camera", "raw"]
+        self.assertEqual(dispatch(invalid)["data"]["error"], "INVALID_FILTER")
+        raw = sub("00000000000000000000000000000005")
+        raw["data"]["components"] = ["camera\nsecret diagnostic text"]
+        self.assertEqual(dispatch(raw)["data"]["error"], "INVALID_FILTER")
+
+        cancel = {"type": "sys.log.unsubscribe", "code": 0, "data": {
+            "command_id": "00000000000000000000000000000006", "log_schema_version": "1.0.0", "stream_id": original_stream}}
+        self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+        self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+        self.assertEqual(dispatch(cancel)["data"]["command_id"], cancel["data"]["command_id"])
+        stale = ctypes.create_string_buffer(768)
+        self.assertEqual(self.lib.desk_sdk_bridge_log_next_text(stale, len(stale)), 0)
+        again = dispatch(sub("00000000000000000000000000000007"))
+        self.assertEqual(again["type"], "sys.ack")
+        self.assertNotEqual(again["data"]["stream_id"], original_stream)
+        self.assertEqual(again["data"]["next_sequence"], first_sequence + 2)
+
+        self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+        self.lib.desk_sdk_ws_client_close()
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        resumed = dispatch(sub("00000000000000000000000000000010"))
+        self.assertEqual(resumed["data"]["next_sequence"], first_sequence + 3)
+        self.assertEqual(self.lib.desk_sdk_bridge_log_next_text(stale, len(stale)), 0)
+        self.lib.desk_sdk_ws_client_close()
+        denied_reconnect = dispatch(sub("00000000000000000000000000000008"))
+        self.assertEqual(denied_reconnect["data"]["error"], "AUTH_REQUIRED")
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(dispatch(sub("00000000000000000000000000000009"))["type"], "sys.ack")
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    def test_cr009_event_and_queue_full_gap_are_serialized_in_sequence_order(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        subscribe = {"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": "00000000000000000000000000000031",
+            "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}}
+        out = ctypes.create_string_buffer(1024)
+        self.assertEqual(self.lib.desk_sdk_bridge_process_ws_command(
+            json.dumps(subscribe).encode(), out, len(out)), 0)
+        ack = json.loads(out.value)
+        first_sequence = ack["data"]["next_sequence"]
+
+        for _ in range(18):
+            self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+        messages = []
+        for _ in range(17):
+            frame = ctypes.create_string_buffer(768)
+            n = self.lib.desk_sdk_bridge_log_next_text(frame, len(frame))
+            self.assertGreater(n, 0)
+            messages.append(json.loads(frame.value))
+        events = [m for m in messages if m["type"] == "sys.log.event"]
+        gaps = [m for m in messages if m["type"] == "sys.log.gap"]
+        self.assertEqual([m["data"]["sequence"] for m in events],
+                         list(range(first_sequence, first_sequence + 16)))
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["data"], {
+            "log_schema_version": "1.0.0", "stream_id": ack["data"]["stream_id"],
+            "boot_id": ack["data"]["boot_id"], "first_dropped_sequence": first_sequence + 16,
+            "last_dropped_sequence": first_sequence + 17, "dropped_count": 2, "reason": "QUEUE_FULL"})
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    def test_cr009_deadline_writer_times_out_on_a_full_socket(self) -> None:
+        sender, receiver = socket.socketpair()
+        try:
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+            sender.setblocking(False)
+            while True:
+                try:
+                    sender.send(b"x" * 4096)
+                except BlockingIOError:
+                    break
+            payload = ctypes.create_string_buffer(b"deadline")
+            start = time.monotonic()
+            rc = self.lib.desk_sdk_test_deadline_write(sender.fileno(), payload, 8, 150)
+            elapsed = time.monotonic() - start
+            self.assertNotEqual(rc, 0)
+            self.assertGreaterEqual(elapsed, 0.12)
+            self.assertLess(elapsed, 0.5)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_deadline_writer_reassembles_short_writes(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        receiver.settimeout(0.5)
+        payload = bytes(range(256)) * 32
+        result: dict[str, int] = {}
+        def write() -> None:
+            result["rc"] = self.lib.desk_sdk_test_deadline_write(
+                sender.fileno(), ctypes.create_string_buffer(payload), len(payload), 250)
+        writer = threading.Thread(target=write)
+        writer.start()
+        wire = bytearray()
+        try:
+            while writer.is_alive() or len(wire) < len(payload) + 8:
+                try:
+                    chunk = receiver.recv(256)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                wire.extend(chunk)
+                time.sleep(0.0005)
+            writer.join(timeout=1)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(result.get("rc"), 0)
+            self.assertEqual(wire[0], 0x81)
+            self.assertEqual(wire[1] & 0x7F, 126)
+            self.assertEqual(int.from_bytes(wire[2:4], "big"), len(payload))
+            mask = wire[4:8]
+            decoded = bytes(byte ^ mask[index % 4] for index, byte in enumerate(wire[8:]))
+            self.assertEqual(decoded, payload)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_deadline_caps_total_time_with_slow_progressing_peer(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        sender.setblocking(False)
+        payload = bytes(range(256)) * 32
+        result: dict[str, int] = {}
+        stop_reader = threading.Event()
+
+        def write() -> None:
+            result["rc"] = self.lib.desk_sdk_test_deadline_write(
+                sender.fileno(), ctypes.create_string_buffer(payload), len(payload), 120)
+
+        def read_slowly() -> None:
+            receiver.settimeout(0.02)
+            while not stop_reader.is_set():
+                try:
+                    receiver.recv(64)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                time.sleep(0.003)
+
+        reader = threading.Thread(target=read_slowly)
+        reader.start()
+        start = time.monotonic()
+        writer = threading.Thread(target=write)
+        writer.start()
+        try:
+            writer.join(timeout=0.5)
+            elapsed = time.monotonic() - start
+            self.assertFalse(writer.is_alive(), "bounded send exceeded test watchdog")
+            self.assertNotEqual(result.get("rc"), 0)
+            self.assertGreaterEqual(elapsed, 0.09)
+            self.assertLess(elapsed, 0.35)
+        finally:
+            stop_reader.set()
+            sender.close()
+            receiver.close()
+            reader.join(timeout=0.2)
+
+    def test_cr009_binary_frame_over_8k_survives_short_writes(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        receiver.settimeout(0.5)
+        payload = bytes(range(256)) * 64
+        result: dict[str, int] = {}
+        def write() -> None:
+            result["rc"] = self.lib.desk_sdk_test_binary_deadline_write(
+                sender.fileno(), ctypes.create_string_buffer(payload), len(payload), 250)
+        writer = threading.Thread(target=write)
+        writer.start()
+        wire = bytearray()
+        try:
+            while writer.is_alive() or len(wire) < len(payload) + 8:
+                try:
+                    chunk = receiver.recv(512)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                wire.extend(chunk)
+                time.sleep(0.0002)
+            writer.join(timeout=1)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(result.get("rc"), 0)
+            self.assertEqual(wire[0], 0x82)
+            self.assertEqual(wire[1] & 0x7F, 126)
+            self.assertEqual(int.from_bytes(wire[2:4], "big"), len(payload))
+            mask = wire[4:8]
+            decoded = bytes(byte ^ mask[index % 4] for index, byte in enumerate(wire[8:]))
+            self.assertEqual(decoded, payload)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_full_control_queue_fails_closed_without_blocking(self) -> None:
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_test_pause_writer_without_thread()
+        start = time.monotonic()
+        results = [self.lib.desk_sdk_ws_client_send_text(b'{"type":"sys.ping"}') for _ in range(4)]
+        elapsed = time.monotonic() - start
+        self.assertEqual(results[:3], [0, 0, 0])
+        self.assertNotEqual(results[3], 0)
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(self.lib.desk_sdk_test_outbound_queue_is_zero(), 1)
+        self.lib.desk_sdk_test_resume_writer()
+
+    def test_cr009_live_writer_timeout_closes_connection_and_clears_queue(self) -> None:
+        sender, receiver = socket.socketpair()
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        sender.setblocking(False)
+        try:
+            while True:
+                try:
+                    sender.send(b"x" * 4096)
+                except BlockingIOError:
+                    break
+            writer_fd = os.dup(sender.fileno())
+            self.lib.desk_sdk_test_attach_writer_fd(writer_fd)
+            start = time.monotonic()
+            self.assertEqual(self.lib.desk_sdk_ws_client_send_text(b'{"type":"sys.ack"}'), 0)
+            deadline = start + 0.8
+            while self.lib.desk_sdk_ws_client_is_connected() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            elapsed = time.monotonic() - start
+            self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+            self.assertGreaterEqual(elapsed, 0.18)
+            self.assertLess(elapsed, 0.8)
+            self.assertEqual(self.lib.desk_sdk_test_outbound_queue_is_zero(), 1)
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_cr009_stale_writer_failure_cannot_close_new_generation(self) -> None:
+        sender, receiver = socket.socketpair()
+        try:
+            self.lib.desk_sdk_test_attach_writer_fd(os.dup(sender.fileno()))
+            old_generation = self.lib.desk_sdk_test_ws_generation()
+            self.lib.desk_sdk_test_advance_ws_generation()
+            self.lib.desk_sdk_test_disconnect_ws_generation(old_generation)
+            self.assertTrue(self.lib.desk_sdk_ws_client_is_connected())
+        finally:
+            self.lib.desk_sdk_ws_client_close()
+            sender.close()
+            receiver.close()
+
+    def test_cr009_command_is_dispatched_from_live_websocket_receive_loop(self) -> None:
+        async def exercise() -> dict:
+            received: dict = {}
+            received_event: dict = {}
+            async def handler(websocket) -> None:
+                hello = json.loads(await websocket.recv())
+                self.assertEqual(hello["type"], "sys.client.hello")
+                await websocket.send(json.dumps({"type": "sys.ack", "code": 0,
+                    "data": {"type": "sys.client.hello"}}, separators=(",", ":")))
+                await websocket.send(json.dumps({"type": "sys.log.subscribe", "code": 0,
+                    "data": {"command_id": "11111111111111111111111111111111",
+                             "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}},
+                    separators=(",", ":")))
+                received.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+                received_event.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                self.lib.desk_sdk_test_prepare_log_pair()
+                self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port), 0)
+                self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 1000), 0)
+                self.lib.desk_watcher_log_source_publish_camera_capture_empty()
+                await asyncio.sleep(0.05)
+                self.lib.desk_sdk_ws_client_close()
+                self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+            return {"ack": received, "event": received_event}
+
+        response = asyncio.run(exercise())
+        self.assertEqual(response["ack"]["type"], "sys.ack")
+        self.assertEqual(response["ack"]["data"]["type"], "sys.log.subscribe")
+        self.assertEqual(response["ack"]["data"]["command_id"], "11111111111111111111111111111111")
+        self.assertTrue(response["ack"]["data"]["accepted"])
+        self.assertEqual(response["event"]["type"], "sys.log.event")
+        self.assertEqual(response["event"]["data"]["event_id"], "CAMERA_CAPTURE_EMPTY")
+        self.assertEqual(response["event"]["data"]["sequence"], response["ack"]["data"]["next_sequence"])
+
+    def test_cr009_rejects_malformed_or_ambiguous_json_filters(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        cid = "22222222222222222222222222222222"
+        base = ('{"type":"sys.log.subscribe","code":0,"data":{"command_id":"' + cid +
+                '","log_schema_version":"1.0.0","min_level":"WARN","components":[]}}')
+
+        def dispatch_raw(raw: str) -> tuple[int, dict | None]:
+            out = ctypes.create_string_buffer(1024)
+            rc = self.lib.desk_sdk_bridge_process_ws_command(raw.encode(), out, len(out))
+            return rc, json.loads(out.value) if rc == 0 and out.value else None
+
+        malformed = [
+            base[:-1] + 'garbage',
+            base[:-2],
+            base.replace('"components":[]', '"components":["camera"]garbage'),
+            base.replace(',"components":[]', ',"meta":{"components":["camera"]}'),
+            base.replace(',"components":[]', ',"note":"escaped \\\"components\\\": [\\\"camera\\\"]"'),
+            base[:-1] + ',"data":{"command_id":"' + cid + '","log_schema_version":"1.0.0"}}',
+            base[:-1] + ',"data":{"unexpected":true}}',
+        ]
+        for raw in malformed:
+            with self.subTest(raw=raw):
+                rc, response = dispatch_raw(raw)
+                self.assertTrue(rc != 0 or (response and response["type"] == "sys.nack"))
+
+        invalid_but_well_formed = [
+            base.replace('"components":[]', '"components":[],"components":["camera"]'),
+            base.replace('"min_level":"WARN"', '"min_level":"WARN","min_level":"ERROR"'),
+            base.replace('"log_schema_version":"1.0.0"', '"log_schema_version":"1.0.0","log_schema_version":"1.0.0"'),
+            base.replace('"min_level":"WARN"', '"min_level":"WARN-extra"'),
+            base.replace('"log_schema_version":"1.0.0"', '"log_schema_version":"2.0"'),
+            base.replace('"components":[]', '"components":[],"unexpected":true'),
+        ]
+        for raw in invalid_but_well_formed:
+            with self.subTest(raw=raw):
+                rc, response = dispatch_raw(raw)
+                self.assertTrue(rc != 0 or (response and response["type"] == "sys.nack"))
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    def test_failed_hardware_hello_ack_does_not_set_authenticated_latch(self) -> None:
+        """A NACK/failed handshake never establishes the per-WebSocket latch."""
+        async def reject_hello(websocket) -> None:
+            await websocket.recv()
+            await websocket.send(json.dumps({
+                "type": "sys.nack",
+                "code": 401,
+                "data": {"type": "sys.client.hello", "error": "rejected"},
+            }))
+
+        async def exercise_rejection() -> None:
+            async with websockets.serve(reject_hello, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                request = PairRequest(
+                    request_id="41a9dbf05ea3443480e62076f79a3b12",
+                    daemon_instance_id="f730f29e670c49f7a3320c4314eb9805",
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=port,
+                )
+                response = ctypes.create_string_buffer(1024)
+                self.assertEqual(
+                    self.lib.desk_sdk_bridge_process_pairing_udp(
+                        encode_udp_message(request), response, len(response)
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port),
+                    0,
+                )
+                connect_rc = await asyncio.to_thread(
+                    self.lib.desk_sdk_ws_client_connect_paired
+                )
+                self.assertNotEqual(connect_rc, 0)
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+
+        asyncio.run(exercise_rejection())
 
     def _exec_command(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")
@@ -188,6 +793,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         out_buf = ctypes.create_string_buffer(1024)
         rc = self.lib.desk_sdk_bridge_process_pairing_udp(wire_bytes, out_buf, 1024)
         self.assertEqual(rc, 0)
+        self.assertFalse(self.lib.desk_sdk_bridge_is_pairing_code_configured(),
+                         "a successful PairAccept must consume the ephemeral code window")
 
         # 3. Parse reply using official SDK parse_udp_message parser
         reply_raw = out_buf.value
@@ -200,6 +807,236 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(parsed_msg.target_mode, "python_sdk")
         self.assertEqual(len(parsed_msg.session_token), 64)
         self.assertTrue(all(c in "0123456789abcdef" for c in parsed_msg.session_token))
+
+        hello_buf = ctypes.create_string_buffer(512)
+        hello_len = self.lib.desk_sdk_bridge_build_hardware_hello(hello_buf, len(hello_buf))
+        self.assertGreater(hello_len, 0)
+        hello = parse_hardware_hello(hello_buf.value)
+        self.assertEqual(hello.pair_request_id, parsed_msg.request_id)
+        self.assertEqual(hello.daemon_instance_id, parsed_msg.daemon_instance_id)
+        self.assertEqual(hello.session_token, parsed_msg.session_token)
+        self.assertEqual(hello.mode, parsed_msg.target_mode)
+
+    def test_generated_pairing_and_hello_are_accepted_by_official_runtime_server(self) -> None:
+        """Exercise C bridge pairing output against the pinned Runtime's real loopback WS server."""
+        # Importing the SDK's connections package eagerly imports its unrelated
+        # application process monitor (psutil). This test exercises only the
+        # official pairing authority and WebSocket listener, so keep that
+        # optional monitor dependency out of this focused harness when absent.
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+
+        request_id = "21a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "f730f29e670c49f7a3320c4314eb9805"
+        request = PairRequest(
+            request_id=request_id,
+            daemon_instance_id=daemon_id,
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+        )
+        pair_reply = ctypes.create_string_buffer(1024)
+        rc = self.lib.desk_sdk_bridge_process_pairing_udp(
+            encode_udp_message(request), pair_reply, len(pair_reply)
+        )
+        self.assertEqual(rc, 0)
+        pair_accept = parse_udp_message(pair_reply.value)
+        self.assertIsInstance(pair_accept, PairAccept)
+
+        hello_buf = ctypes.create_string_buffer(512)
+        self.assertGreater(
+            self.lib.desk_sdk_bridge_build_hardware_hello(hello_buf, len(hello_buf)), 0
+        )
+        hello_wire = hello_buf.value.decode("utf-8")
+        parse_hardware_hello(hello_wire)
+
+        pairing = DevicePairingSession(
+            daemon_instance_id=daemon_id,
+            request_id_factory=lambda: request_id,
+        )
+        pairing.start_pairing(
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+            now=0.0,
+        )
+        pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=1.0)
+
+        async def exercise_runtime() -> dict:
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=2.0)
+
+            server = ExternalWebSocketServer(
+                host="127.0.0.1",
+                port=0,
+                hardware_hello_authorizer=authorize,
+            )
+            await server.start()
+            try:
+                async with websockets.connect(server.url) as ws:
+                    await ws.send(hello_wire)
+                    return json.loads(await ws.recv())
+            finally:
+                await server.stop()
+
+        ack = asyncio.run(exercise_runtime())
+        self.assertEqual(ack["type"], "sys.ack")
+        self.assertEqual(ack["code"], 0)
+        self.assertEqual(ack["data"]["type"], "sys.client.hello")
+        self.assertEqual(ack["data"]["role"], "hardware")
+        self.assertEqual(pairing.snapshot()["state"], "connected")
+
+    def test_c_firmware_client_runtime_commands_results_events_media_and_reconnect(self) -> None:
+        """Connect the production C WebSocket client to the pinned Runtime and exchange real frames."""
+        import time
+
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+
+        request_id = "21a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "f730f29e670c49f7a3320c4314eb9805"
+        pairing = DevicePairingSession(
+            daemon_instance_id=daemon_id,
+            request_id_factory=lambda: request_id,
+        )
+
+        async def exercise_runtime() -> None:
+            clock = {"now": 1.0}
+
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=clock["now"])
+                clock["now"] += 1.0
+
+            async def disconnected(_peer_ip: str) -> None:
+                pairing.device_disconnected(now=clock["now"])
+                clock["now"] += 1.0
+
+            server = ExternalWebSocketServer(
+                host="127.0.0.1",
+                port=0,
+                hardware_hello_authorizer=authorize,
+                device_disconnect_listener=disconnected,
+            )
+            await server.start()
+            poll_stop = asyncio.Event()
+
+            async def poll_c_client() -> None:
+                while not poll_stop.is_set():
+                    await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 50)
+
+            poll_task = asyncio.create_task(poll_c_client())
+            try:
+                request = PairRequest(
+                    request_id=request_id,
+                    daemon_instance_id=daemon_id,
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=server.bound_port,
+                )
+                pair_reply = ctypes.create_string_buffer(1024)
+                rc = self.lib.desk_sdk_bridge_process_pairing_udp(
+                    encode_udp_message(request), pair_reply, len(pair_reply)
+                )
+                self.assertEqual(rc, 0)
+                pair_accept = parse_udp_message(pair_reply.value)
+                pairing.start_pairing(
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=server.bound_port,
+                    now=0.0,
+                )
+                pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=0.5)
+                self.assertEqual(
+                    self.lib.desk_sdk_test_set_pairing_target(
+                        b"127.0.0.1", server.bound_port
+                    ),
+                    0,
+                )
+                self.assertEqual(self.lib.desk_sdk_test_preflight(), 1)
+                connect_rc = await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired)
+                self.assertEqual(connect_rc, 0,
+                                 f"state={self.lib.desk_sdk_test_ws_state()}, "
+                                 f"http={self.lib.desk_sdk_test_http_response().decode('utf-8', 'replace')!r}, "
+                                 f"ack={self.lib.desk_sdk_test_last_ack().decode('utf-8', 'replace')!r}")
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_connected())
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                # The current implementation only observes the existing protocol ACK;
+                # this does not cryptographically authenticate the Runtime peer.
+
+                async with websockets.connect(server.url) as desktop:
+                    await desktop.send(json.dumps({
+                        "type": "sys.client.hello", "code": 0,
+                        "data": {"role": "desktop", "version": "1.0"},
+                    }))
+                    desktop_hello = json.loads(await desktop.recv())
+                    self.assertEqual(desktop_hello["type"], "sys.ack")
+
+                    await desktop.send(json.dumps({
+                        "type": "ctrl.motion.set_target", "code": 0,
+                        "request_id": "runtime-motion-01",
+                        "data": {"pan_deg": 111, "tilt_deg": 99,
+                                 "command_id": "runtime-motion-01"},
+                    }))
+                    result = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual((result["type"], result["code"]), ("sys.ack", 0))
+                    self.assertEqual(result["request_id"], "runtime-motion-01")
+                    self.assertEqual(result["data"]["status"], "accepted")
+                    self.assertIs(result["data"]["state_confirmed"], False)
+
+                    await desktop.send(json.dumps({
+                        "type": "runtime.unsupported.operation", "code": 0, "data": {},
+                    }))
+                    nack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(nack["type"], "sys.nack")
+                    self.assertNotEqual(nack["code"], 0)
+
+                    self.assertEqual(self.lib.desk_sdk_bridge_send_event(
+                        b"resource.motion.completed",
+                        b'{"command_id":"runtime-motion-01","status":"succeeded"}',
+                    ), 0)
+                    event = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(event["type"], "resource.motion.completed")
+                    self.assertEqual(event["payload"]["command_id"], "runtime-motion-01")
+
+                    jpeg = (Path(__file__).parent / "fixtures" / "interop_4x3.jpg").read_bytes()
+                    payload = ctypes.create_string_buffer(jpeg)
+                    self.assertEqual(self.lib.desk_sdk_bridge_send_media_frame(
+                        FRAME_IMAGE, 0, 0x1234, 7, payload, len(jpeg)
+                    ), 0)
+                    media = parse_wspk(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual((media.frame_type, media.stream_id, media.sequence),
+                                     (FRAME_IMAGE, 0x1234, 7))
+                    self.assertEqual(media.payload, jpeg)
+                    self.assertEqual(_jpeg_dimensions(media.payload), (4, 3))
+
+                # Force the official Runtime to close sessions, then let the
+                # C client's bounded retry path reconnect with the same token.
+                await server.registry.close_all(code=1012, reason="interop reconnect check")
+                deadline = time.monotonic() + 8.0
+                reconnected = False
+                while time.monotonic() < deadline:
+                    if self.lib.desk_sdk_ws_client_is_connected() and pairing.snapshot()["state"] == "connected":
+                        reconnected = True
+                        break
+                    await asyncio.sleep(0.1)
+                self.assertTrue(reconnected, "C client did not reconnect to official Runtime")
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.lib.desk_sdk_ws_client_close()
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+            finally:
+                poll_stop.set()
+                await poll_task
+                await server.stop()
+
+        asyncio.run(exercise_runtime())
 
     def test_official_udp_pairing_rejected_when_unprovisioned(self) -> None:
         """Fail-closed: an unprovisioned device must not answer with pair.accept."""
@@ -217,7 +1054,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         out_buf = ctypes.create_string_buffer(1024)
         rc = self.lib.desk_sdk_bridge_process_pairing_udp(wire_bytes, out_buf, 1024)
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 1)  # DESK_SDK_PAIRING_REJECTED
         self.assertEqual(out_buf.value, b"", "no pairing response may be emitted")
 
     def test_official_udp_pairing_rejected_on_wrong_code(self) -> None:
@@ -233,11 +1070,11 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         )
         out_buf = ctypes.create_string_buffer(1024)
         rc = self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(official_pair_req), out_buf, 1024)
-        self.assertNotEqual(rc, 0)
+        self.assertEqual(rc, 1)  # DESK_SDK_PAIRING_REJECTED
         self.assertEqual(out_buf.value, b"")
 
-    def test_official_hardware_hello_with_token(self) -> None:
-        """Verifies sys.client.hello with role=hardware carrying session_token succeeds and returns negotiated parameters."""
+    def test_official_hardware_hello_does_not_negotiate_unimplemented_audio(self) -> None:
+        """Hardware hello must not claim Opus uplink without its media path."""
         # Pair first to establish token
         out_buf = ctypes.create_string_buffer(1024)
         req_json = json.dumps({
@@ -272,8 +1109,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(resp["code"], 0)
         self.assertEqual(resp["data"]["role"], "hardware")
         self.assertEqual(resp["data"]["session_state"], "connected")
-        self.assertEqual(resp["data"]["negotiated"]["audio_uplink"]["codec"], "opus")
-        self.assertEqual(resp["data"]["negotiated"]["audio_uplink"]["sample_rate"], 16000)
+        self.assertNotIn("audio_uplink", resp["data"].get("negotiated", {}))
 
     def test_official_desktop_hello_and_ready_get(self) -> None:
         """Verifies official Desktop hello and sys.sdk.ready.get capability negotiation."""
@@ -287,7 +1123,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertIn("inputs", caps)
         self.assertIn("motion", caps)
         self.assertIn("camera", caps)
-        self.assertIn("audio.stream", caps)
+        self.assertNotIn("audio.stream", caps)
+        self.assertNotIn("audio_stream", caps)
         self.assertIn("expression.audio_follow.v1", caps)
 
         # sys.sdk.ready.get returns identical capabilities
@@ -329,6 +1166,18 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
     def test_official_camera_capture_and_wspk_stream(self) -> None:
         """Verifies ctrl.camera.capture returns positive session_id and emits official WSPK image frame."""
+        # The device requires an explicit camera lease before capture. Use the
+        # same client identity for acquire/release, matching the SDK lifecycle.
+        lease_resp = self._exec_command({
+            "type": "ctrl.camera.acquire",
+            "client_id": "sdk-client",
+            "lease_duration_ms": 10000,
+            "data": {"command_id": "cmd-cam-acquire-01"},
+        })
+        self.assertEqual(lease_resp["type"], "sys.ack", lease_resp)
+        self.assertEqual(lease_resp["code"], 0, lease_resp)
+        self.assertTrue(lease_resp["data"]["accepted"], lease_resp)
+
         # 1. Inject a sample JPEG into the camera HAL
         test_jpeg = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00OFFICIAL_SDK_CAMERA_FRAME\xFF\xD9"
         self.lib.desk_hardware_camera_inject_frame(test_jpeg, len(test_jpeg), 12345)
@@ -345,54 +1194,72 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         self.lib.desk_sdk_bridge_register_outbound(on_outbound, None)
 
-        # 3. Send ctrl.camera.capture
-        resp = self._exec_command({
-            "type": "ctrl.camera.capture",
-            "code": 0,
-            "data": {
-                "width": 0,
-                "height": 0,
-                "quality": 0,
-                "command_id": "cmd-cam-capture-01",
-            },
-        })
-        self.assertEqual(resp["type"], "sys.ack")
-        self.assertEqual(resp["code"], 0)
-        session_id = resp["data"].get("session_id")
-        self.assertIsInstance(session_id, int)
-        self.assertGreater(session_id, 0)
+        try:
+            # 3. Send ctrl.camera.capture under the acquired lease.
+            resp = self._exec_command({
+                "type": "ctrl.camera.capture",
+                "code": 0,
+                "data": {
+                    "width": 0,
+                    "height": 0,
+                    "quality": 0,
+                    "command_id": "cmd-cam-capture-01",
+                },
+            })
+            self.assertEqual(resp["type"], "sys.ack", resp)
+            self.assertEqual(resp["code"], 0, resp)
+            session_id = resp["data"].get("session_id")
+            self.assertIsInstance(session_id, int)
+            self.assertGreater(session_id, 0)
 
-        # 4. Verify WSPK binary frame was dispatched and unpacks using official parse_wspk
-        self.assertEqual(len(intercepted_frames), 1)
-        wspk_pkt = intercepted_frames[0]
-        parsed_binary = parse_wspk(wspk_pkt)
+            # 4. Verify WSPK binary frame was dispatched and unpacks using official parse_wspk.
+            self.assertEqual(len(intercepted_frames), 1)
+            wspk_pkt = intercepted_frames[0]
+            parsed_binary = parse_wspk(wspk_pkt)
 
-        self.assertEqual(parsed_binary.frame_type, FRAME_IMAGE)
-        self.assertEqual(parsed_binary.stream_id, session_id)
-        self.assertEqual(parsed_binary.payload, test_jpeg)
+            self.assertEqual(parsed_binary.frame_type, FRAME_IMAGE)
+            self.assertEqual(parsed_binary.stream_id, session_id)
+            self.assertEqual(parsed_binary.payload, test_jpeg)
+        finally:
+            release_resp = self._exec_command({
+                "type": "ctrl.camera.release",
+                "client_id": "sdk-client",
+                "data": {"command_id": "cmd-cam-release-01"},
+            })
+            self.assertEqual(release_resp["type"], "sys.ack", release_resp)
+            self.assertEqual(release_resp["code"], 0, release_resp)
+            self.assertTrue(release_resp["data"]["accepted"], release_resp)
 
-    def test_official_microphone_lifecycle(self) -> None:
-        """Verifies ctrl.microphone.open returns session_id and close cleans up."""
-        # Open microphone
+    def test_official_microphone_open_is_explicitly_unsupported(self) -> None:
+        """Microphone control must not claim success without Opus WSPK uplink."""
         resp_open = self._exec_command({
             "type": "ctrl.microphone.open",
             "code": 0,
             "data": {"sample_rate_hz": 16000, "command_id": "cmd-mic-open-01"},
         })
-        self.assertEqual(resp_open["type"], "sys.ack")
-        self.assertEqual(resp_open["code"], 0)
-        session_id = resp_open["data"].get("session_id")
-        self.assertIsInstance(session_id, int)
-        self.assertGreater(session_id, 0)
+        self.assertEqual(resp_open["type"], "sys.nack")
+        self.assertEqual(resp_open["error"]["code"], "UNSUPPORTED_OPERATION")
 
-        # Close microphone
-        resp_close = self._exec_command({
+    def test_audio_playback_commands_are_explicitly_unsupported(self) -> None:
+        """PCM playback begin/stop must not silently accept a missing media path."""
+        for msg_type in ("ctrl.audio.stream.begin", "ctrl.audio.stop"):
+            with self.subTest(msg_type=msg_type):
+                response = self._exec_command({
+                    "type": msg_type,
+                    "code": 0,
+                    "data": {"stream_id": 1, "total_bytes": 320},
+                })
+                self.assertEqual(response["type"], "sys.nack")
+                self.assertEqual(response["error"]["code"], "UNSUPPORTED_OPERATION")
+
+    def test_official_microphone_close_is_explicitly_unsupported(self) -> None:
+        response = self._exec_command({
             "type": "ctrl.microphone.close",
             "code": 0,
-            "data": {"session_id": session_id, "command_id": "cmd-mic-close-01"},
+            "data": {"session_id": 1, "command_id": "cmd-mic-close-01"},
         })
-        self.assertEqual(resp_close["type"], "sys.ack")
-        self.assertEqual(resp_close["data"]["status"], "accepted")
+        self.assertEqual(response["type"], "sys.nack")
+        self.assertEqual(response["error"]["code"], "UNSUPPORTED_OPERATION")
 
     def test_official_expression_audio_follow(self) -> None:
         """Verifies ctrl.expression.audio_follow toggling."""

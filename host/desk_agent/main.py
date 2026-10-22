@@ -7,6 +7,7 @@ Codex Companion Router, Camera Leased Viewer, and Envelope RPC Dispatcher.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -22,13 +23,27 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, ResponseStatus
 from host.desk_agent.core.router import Router
+from host.desk_agent.core.managed_sdk_listener import ManagedSdkMessageListener
+from host.desk_agent.core.managed_sdk_lifecycle import ManagedSdkLifecycleObservers
 from host.desk_agent.services.life_service import LifeService
+from host.desk_agent.services.network_log_consumer import NetworkLogConsumer
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
-from host.desk_agent.camera.camera_service import CameraViewerService
+from host.desk_agent.camera.camera_service import (
+    CameraStreamCapacityError,
+    CameraStreamFrameUnavailable,
+    CameraStreamLeaseError,
+    CameraViewerService,
+)
 from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
+from host.desk_agent.connectors.robot.official_camera_adapter import (
+    MAX_WSPK_FRAME_BYTES,
+    OfficialRobotCameraAdapter,
+)
+from host.desk_agent.connectors.robot.managed_codex_feedback_adapter import ManagedCodexFeedbackAdapter
 from companion.src.codex_companion import CodexCompanion
 
 logging.basicConfig(
@@ -38,84 +53,7 @@ logging.basicConfig(
 logger = logging.getLogger("DeskAgentHost")
 
 
-class RemoteCodexCompanionClient:
-    """HTTP client connecting Host (on 泰山派 Linux) to Windows Codex Companion."""
-
-    def __init__(self, endpoint_url: str, auth_token: Optional[str] = None, timeout_sec: float = 10.0) -> None:
-        self.endpoint_url = endpoint_url.rstrip("/")
-        if self.endpoint_url.endswith("/rpc"):
-            self.endpoint_url = self.endpoint_url[:-4]
-        self.auth_token = auth_token
-        self.timeout_sec = timeout_sec
-        self.workspaces: dict[str, str] = {}
-
-    def _rpc_call(self, operation: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        url = f"{self.endpoint_url}/rpc"
-        payload = {
-            "schema_version": "1.0.0",
-            "request_id": f"req-rem-codex-{uuid.uuid4().hex[:8]}",
-            "operation": operation,
-            "arguments": dict(arguments),
-            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=int(self.timeout_sec))).isoformat().replace("+00:00", "Z"),
-        }
-        headers = {"Content-Type": "application/json"}
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-            headers["X-Companion-Token"] = self.auth_token
-
-        req = urllib.request.Request(
-            url=url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if data.get("status") == "succeeded" or data.get("success") is True:
-                    return data.get("result", {})
-                err = data.get("error", {})
-                if isinstance(err, dict):
-                    err_msg = err.get("message", "Unknown error")
-                    err_code = err.get("code", "ERROR")
-                else:
-                    err_msg = str(err)
-                    err_code = "ERROR"
-                raise RuntimeError(f"Windows Companion error ({err_code}): {err_msg}")
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                raise PermissionError("Authentication failed with Windows Companion") from exc
-            raise ConnectionError(f"HTTP error connecting to Windows Companion at {url}: {exc}") from exc
-        except Exception as exc:
-            raise ConnectionError(f"Failed to connect to Windows Companion at {url}: {exc}") from exc
-
-    def submit_task(self, task_id: str, workspace_alias: str, prompt: str, model: Optional[str] = None) -> dict[str, Any]:
-        return self._rpc_call("codex.submit_turn", {
-            "task_id": task_id,
-            "workspace_alias": workspace_alias,
-            "prompt": prompt,
-            "model": model,
-        })
-
-    def get_task_status(self, task_id: str) -> Optional[dict[str, Any]]:
-        return self._rpc_call("codex.get_task", {"task_id": task_id})
-
-    def respond_approval(self, approval_id: str, task_id: str, decision: str, reason: Optional[str] = None) -> dict[str, Any]:
-        return self._rpc_call("codex.decide_approval", {
-            "approval_id": approval_id,
-            "task_id": task_id,
-            "decision": decision,
-            "reason": reason,
-        })
-
-    def get_pending_approvals(self, task_id: Optional[str] = None) -> list[dict[str, Any]]:
-        args = {"task_id": task_id} if task_id else {}
-        res = self._rpc_call("codex.get_pending_approvals", args)
-        return res.get("approvals", [])
-
-    def list_workspaces(self) -> list[str]:
-        res = self._rpc_call("codex.list_workspaces", {})
-        return res.get("workspaces", [])
+from companion.src.codex_companion import RemoteCodexCompanionClient
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -123,7 +61,9 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 class DeskAgentHostApp:
-    def __init__(self, config_path: Optional[str] = None) -> None:
+    def __init__(self, config_path: Optional[str] = None, *, managed_sdk_session: bool = False) -> None:
+        self.managed_sdk_session = bool(managed_sdk_session)
+        self.managed_codex_feedback_adapter: Optional[ManagedCodexFeedbackAdapter] = None
         self.config = self._load_config(config_path)
         self.start_time = time.time()
 
@@ -143,22 +83,38 @@ class DeskAgentHostApp:
         cam_cfg = self.config.get("camera", {})
         self.camera_service = CameraViewerService(
             default_lease_ms=cam_cfg.get("default_lease_ms", 10000),
-            auto_start_pipeline=True,
+            auto_start_pipeline=cam_cfg.get("auto_start_pipeline", False),
+            allow_synthetic=cam_cfg.get("allow_synthetic", False),
         )
+        network_log_cfg = self.config.get("network_logs", {})
+        self.network_log_consumer = NetworkLogConsumer(
+            enabled=bool(network_log_cfg.get("enabled", False))
+        )
+        self._managed_network_log_listener: Optional[ManagedSdkMessageListener] = None
+        # CR-009 authorization/subscription is not implemented by this lifecycle hook.
+        self._network_log_authorized = False
+        self.official_camera_adapter: Optional[OfficialRobotCameraAdapter] = None
 
         codex_cfg = self.config.get("codex", {})
         companion_url = codex_cfg.get("companion_url") or self.config.get("codex_companion", {}).get("endpoint")
         if companion_url:
             logger.info("Configured remote Windows Codex Companion at %s", companion_url)
+            state_file = str(db_path.parent / "remote_codex_tasks.json")
             self.companion = RemoteCodexCompanionClient(
                 endpoint_url=companion_url,
                 auth_token=codex_cfg.get("auth_token") or self.config.get("auth_token"),
+                state_file_path=state_file,
             )
         else:
             self.companion = CodexCompanion(
                 allowed_workspaces=codex_cfg.get("workspaces"),
                 codex_bin=codex_cfg.get("codex_bin", "codex"),
             )
+
+        if hasattr(self.companion, "add_event_listener"):
+            self.companion.add_event_listener(self._on_codex_event)
+            if hasattr(self.companion, "start"):
+                self.companion.start()
 
         # Router Setup
         self.router = Router()
@@ -172,7 +128,7 @@ class DeskAgentHostApp:
         # Robot Hardware Link / SDK Bridge Adapter
         robot_cfg = self.config.get("robot", {})
         self.robot_adapter: Optional[RobotAdapter] = None
-        if robot_cfg.get("enabled", True):
+        if robot_cfg.get("enabled", True) and not managed_sdk_session:
             self.robot_adapter = RobotAdapter(
                 host=robot_cfg.get("host", "127.0.0.1"),
                 tcp_port=robot_cfg.get("tcp_port", 37020),
@@ -184,6 +140,7 @@ class DeskAgentHostApp:
             self.register_robot_hardware_client(self.robot_adapter)
             self.register_announcement_channel(self.robot_adapter.send_announcement)
             self.robot_adapter.register_tool_request_handler(self._on_robot_tool_request)
+            self.robot_adapter.register_camera_frame_callback(self.camera_service.ingest_robot_frame)
             self.robot_adapter.start()
 
         # HA State Subscription
@@ -219,6 +176,80 @@ class DeskAgentHostApp:
             target=self._delivery_loop, name="desk-outbox-delivery", daemon=True
         )
         self._delivery_thread.start()
+
+    def _on_codex_event(self, event_type: str, data: dict[str, Any]) -> bool:
+        state_by_event = {
+            "codex.completed": "completed",
+            "codex.failed": "failed",
+            "codex.error": "failed",
+            "codex.interrupted": "interrupted",
+            "codex.cancelled": "interrupted",
+        }
+        if event_type == "codex.turn_completed":
+            resolution = data.get("resolution") or data.get("status") or "completed"
+        else:
+            resolution = state_by_event.get(event_type)
+        if resolution not in ("completed", "failed", "interrupted"):
+            return True
+
+        task_id = data.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            logger.warning("Ignoring Codex terminal event without task_id")
+            return False
+        turn_id = data.get("turn_id")
+        if not isinstance(turn_id, str):
+            turn_id = ""
+        topic = f"codex.{resolution}"
+        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        payload = {"task_id": task_id, "resolution": resolution, "summary": summary}
+        if turn_id:
+            payload["turn_id"] = turn_id
+
+        # Stable outbox identity prevents repeated Companion notifications from
+        # creating duplicate device prompts while preserving any pending retry.
+        identity = f"{task_id}\0{turn_id or resolution}"
+        outbox_id = self.life_service.enqueue_outbox_once(
+            topic, payload, idempotency_key=identity
+        )
+
+        if self.managed_sdk_session:
+            logger.info("Codex terminal event queued for managed SDK delivery (outbox=%s)", outbox_id)
+            return False
+
+        # Try immediate delivery if robot is currently online
+        delivered = False
+        if self.robot_adapter and getattr(self.robot_adapter, "is_connected", False):
+            try:
+                legacy_announcement = self._legacy_codex_announcement(topic, payload)
+                delivered = bool(self.robot_adapter.send_announcement(topic, legacy_announcement))
+                if delivered:
+                    if hasattr(self.companion, "acknowledge_task"):
+                        self.companion.acknowledge_task(task_id)
+                    self.life_service.mark_outbox_dispatched(outbox_id)
+                    logger.info("Codex announcement for task %s delivered immediately to robot", task_id)
+            except Exception as e:
+                logger.warning("Failed immediate dispatch of Codex announcement: %s", e)
+
+        if delivered:
+            return True
+        else:
+            logger.info("Robot not connected or announcement not confirmed for task %s; outbox %s queued for delivery retry", task_id, outbox_id)
+            return False
+
+    @staticmethod
+    def _legacy_codex_announcement(topic: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        resolution = payload.get("resolution")
+        title, prefix, sound = {
+            "completed": ("Codex 任务完成", "Codex任务已完成：", "notify"),
+            "failed": ("Codex 任务失败", "Codex任务执行失败：", "alert"),
+            "interrupted": ("Codex 任务中断", "Codex任务已中断：", "alert"),
+        }.get(str(resolution), ("Codex 任务状态", "Codex任务状态：", "notify"))
+        return {
+            "title": title,
+            "text": f"{prefix}{payload.get('summary', '')}",
+            "sound": sound,
+            "task_id": payload.get("task_id", ""),
+        }
 
     def register_announcement_channel(self, channel: Callable[[str, dict[str, Any]], bool]) -> None:
         """Registers external robot audio / TTS speaker delivery channel."""
@@ -305,6 +336,8 @@ class DeskAgentHostApp:
                     payload = item.get("payload", {})
 
                     if topic == "reminder.alert":
+                        if not self.life_service.claim_reminder_alert(outbox_id):
+                            continue
                         title = payload.get("title", "Reminder")
                         rem_id = payload.get("reminder_id", "")
                         occ_id = payload.get("occurrence_id", "")
@@ -317,6 +350,60 @@ class DeskAgentHostApp:
                             backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
                             self.life_service.record_outbox_failure(
                                 outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
+                            )
+                    elif topic in ("codex.completed", "codex.failed", "codex.interrupted"):
+                        if self.managed_codex_feedback_adapter is not None:
+                            try:
+                                result = self.managed_codex_feedback_adapter.send_terminal(topic, payload)
+                                if result.get("accepted") is True:
+                                    task_id = payload.get("task_id")
+                                    if task_id and hasattr(self.companion, "acknowledge_task"):
+                                        self.companion.acknowledge_task(task_id)
+                                    self.life_service.mark_outbox_dispatched(outbox_id)
+                                    logger.info(
+                                        "Codex terminal command accepted by device (outbox=%s); audio completion is unconfirmed",
+                                        outbox_id,
+                                    )
+                                else:
+                                    raise RuntimeError("managed SDK feedback did not return accepted status")
+                            except Exception as exc:
+                                backoff = min(60, 2 ** (item.get("retry_count", 0) + 1))
+                                self.life_service.record_outbox_failure(
+                                    outbox_id,
+                                    f"Managed SDK terminal delivery failed: {exc}",
+                                    backoff_seconds=backoff,
+                                    keep_pending=True,
+                                )
+                        elif self.robot_adapter and getattr(self.robot_adapter, "is_connected", False):
+                            try:
+                                delivered = bool(
+                                    self.robot_adapter.send_announcement(
+                                        topic, self._legacy_codex_announcement(topic, payload)
+                                    )
+                                )
+                                if delivered:
+                                    task_id = payload.get("task_id")
+                                    if task_id and hasattr(self.companion, "acknowledge_task"):
+                                        self.companion.acknowledge_task(task_id)
+                                    self.life_service.mark_outbox_dispatched(outbox_id)
+                                    logger.info("Outbox Codex announcement %s (%s) delivered to robot", outbox_id, topic)
+                                else:
+                                    backoff = min(60, 2 ** (item.get("retry_count", 0) + 1))
+                                    self.life_service.record_outbox_failure(
+                                        outbox_id, "Robot announcement channel rejected or busy", backoff_seconds=backoff
+                                    )
+                            except Exception as exc:
+                                backoff = min(60, 2 ** (item.get("retry_count", 0) + 1))
+                                self.life_service.record_outbox_failure(
+                                    outbox_id, f"Robot delivery exception: {exc}", backoff_seconds=backoff
+                                )
+                        else:
+                            backoff = min(30, 2 ** (item.get("retry_count", 0) + 1))
+                            self.life_service.record_outbox_failure(
+                                outbox_id,
+                                "Managed SDK session is not ready" if self.managed_sdk_session else "Robot is disconnected",
+                                backoff_seconds=backoff,
+                                keep_pending=self.managed_sdk_session,
                             )
                     else:
                         self.life_service.mark_outbox_dispatched(outbox_id)
@@ -354,11 +441,26 @@ class DeskAgentHostApp:
             self._scheduler_thread.join(timeout=2.0)
         if hasattr(self, "_delivery_thread") and self._delivery_thread.is_alive():
             self._delivery_thread.join(timeout=2.0)
+        if self.official_camera_adapter:
+            self.official_camera_adapter.close()
+        if self._managed_network_log_listener is not None:
+            try:
+                self._managed_network_log_listener.remove(self._on_managed_sdk_message)
+            except Exception as exc:
+                logger.warning("Managed SDK message listener cleanup failed (%s)", type(exc).__name__)
+            self._managed_network_log_listener = None
+        if getattr(self, "network_log_consumer", None) is not None:
+            self.network_log_consumer.close()
         if getattr(self, "robot_adapter", None):
             self.robot_adapter.stop()
         if getattr(self, "_ha_sub_stop", None):
             try:
                 self._ha_sub_stop()
+            except Exception:
+                pass
+        if getattr(self, "companion", None) and hasattr(self.companion, "close"):
+            try:
+                self.companion.close()
             except Exception:
                 pass
         self.camera_service.stop_capture()
@@ -453,15 +555,27 @@ class DeskAgentHostApp:
 
     def _handle_reminder_create(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
-        res = self.life_service.create_reminder(
-            reminder_id=args.get("reminder_id", req.request_id),
-            title=args["title"],
-            due_at=args["due_at"],
-            timezone_str=args.get("timezone", "Asia/Shanghai"),
-            repeat_rule=args.get("repeat_rule"),
-            priority=args.get("priority", "normal"),
-        )
-        return ResponseEnvelope.create_success(req.request_id, res)
+        title = args.get("title") or args.get("text") or "Reminder"
+        due_at = args.get("due_at") or args.get("due_time")
+        if not due_at:
+            now = datetime.now(timezone.utc)
+            due_at = (now + timedelta(minutes=10)).isoformat()
+        try:
+            res = self.life_service.create_reminder(
+                reminder_id=args.get("reminder_id", req.request_id),
+                title=title,
+                due_at=due_at,
+                timezone_str=args.get("timezone", "Asia/Shanghai"),
+                repeat_rule=args.get("repeat_rule"),
+                priority=args.get("priority", "normal"),
+            )
+            return ResponseEnvelope.create_success(req.request_id, res)
+        except Exception as e:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="EXECUTION_FAILED",
+                message=str(e),
+            )
 
     def _handle_reminder_list(self, req: RequestEnvelope) -> ResponseEnvelope:
         status_filter = req.arguments.get("status")
@@ -474,7 +588,7 @@ class DeskAgentHostApp:
             reminder_id=args["reminder_id"],
             title=args.get("title"),
             due_at=args.get("due_at"),
-            status=args.get("status"),
+            repeat_rule=args.get("repeat_rule"),
         )
         return ResponseEnvelope.create_success(req.request_id, res)
 
@@ -489,22 +603,48 @@ class DeskAgentHostApp:
 
     def _handle_reminder_snooze(self, req: RequestEnvelope) -> ResponseEnvelope:
         snooze_min = req.arguments.get("snooze_minutes", 10)
-        item = self.life_service.snooze_reminder(req.arguments["reminder_id"], snooze_min)
+        item = self.life_service.snooze_reminder(
+            req.arguments["reminder_id"], snooze_min, req.arguments.get("occurrence_id")
+        )
         return ResponseEnvelope.create_success(req.request_id, item)
 
     def _handle_reminder_stop_ringing(self, req: RequestEnvelope) -> ResponseEnvelope:
-        item = self.life_service.stop_ringing(req.arguments["occurrence_id"])
+        try:
+            item = self.life_service.stop_ringing(req.arguments["occurrence_id"])
+        except KeyError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                "RESOURCE_NOT_FOUND",
+                str(exc),
+                retryable=False,
+            )
+        except ValueError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                "STATE_CONFLICT",
+                str(exc),
+                retryable=False,
+            )
         return ResponseEnvelope.create_success(req.request_id, item)
 
     def _handle_note_create(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
-        res = self.life_service.create_note(
-            note_id=args.get("note_id", req.request_id),
-            title=args.get("title", "Untitled"),
-            content=args["content"],
-            tags=args.get("tags"),
-        )
-        return ResponseEnvelope.create_success(req.request_id, res)
+        title = args.get("title", "Untitled")
+        content = args.get("content") or args.get("note") or title
+        try:
+            res = self.life_service.create_note(
+                note_id=args.get("note_id", req.request_id),
+                title=title,
+                content=content,
+                tags=args.get("tags"),
+            )
+            return ResponseEnvelope.create_success(req.request_id, res)
+        except Exception as e:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="EXECUTION_FAILED",
+                message=str(e),
+            )
 
     def _handle_note_list(self, req: RequestEnvelope) -> ResponseEnvelope:
         tag_filter = req.arguments.get("tag")
@@ -578,16 +718,110 @@ class DeskAgentHostApp:
                 message=f"Camera lease is currently held by '{res.get('current_owner')}'",
                 details=res,
             )
+        if self.official_camera_adapter is not None:
+            device_result = self.official_camera_adapter.acquire(
+                client_id, res.get("lease_duration_ms", 10000), target_fps=float(target_fps or res.get("target_fps", 2.0))
+            )
+            if not device_result.get("granted"):
+                self.camera_service.release_lease(client_id)
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code=device_result.get("reason", "DEVICE_ERROR"),
+                    message="Official SDK camera lease was not granted",
+                    details=device_result,
+                )
+        elif self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+            try:
+                ack = self._robot_client.send_command({
+                    "type": "ctrl.camera.acquire",
+                    "client_id": client_id,
+                    "lease_duration_ms": res.get("lease_duration_ms", 10000),
+                }, timeout=1.0)
+                if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
+                    logger.warning("Robot rejected camera acquire: %s. Rolling back host lease.", ack)
+                    self.camera_service.release_lease(client_id)
+                    err_info = ack.get("error", {}) if isinstance(ack, dict) else {}
+                    return ResponseEnvelope.create_error(
+                        req.request_id,
+                        code=err_info.get("code", "RESOURCE_BUSY"),
+                        message=err_info.get("message", "Robot rejected camera acquire"),
+                        details=ack if isinstance(ack, dict) else {},
+                    )
+                self._robot_client.send_command({
+                    "type": "ctrl.camera.capture",
+                }, timeout=1.0)
+            except Exception as e:
+                logger.warning("Failed to dispatch camera acquire/capture to robot: %s. Rolling back lease.", e)
+                self.camera_service.release_lease(client_id)
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code="DEVICE_ERROR",
+                    message=f"Failed to communicate with robot camera: {e}",
+                )
         return ResponseEnvelope.create_success(req.request_id, res)
 
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")
         released = self.camera_service.release_lease(client_id)
+        if released and self.official_camera_adapter is None and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+            try:
+                self._robot_client.send_command({
+                    "type": "ctrl.camera.release",
+                    "client_id": client_id,
+                }, timeout=1.0)
+            except Exception as e:
+                logger.debug("Failed to dispatch camera release to robot: %s", e)
         return ResponseEnvelope.create_success(req.request_id, {"released": released})
 
     def register_robot_hardware_client(self, client: Any) -> None:
         """Registers the connected robot hardware / SDK bridge client."""
         self._robot_client = client
+
+    def register_official_sdk_camera_session(
+        self,
+        robot: Any,
+        *,
+        command_sender: Callable[[str, dict[str, Any], Optional[float]], dict[str, Any]],
+        on_disconnect: Optional[Callable[[Callable[[], None]], None]] = None,
+    ) -> OfficialRobotCameraAdapter:
+        """Attach an existing managed-SDK session; this method never starts a Runtime or connection."""
+        previous_teardown = self.camera_service.on_lease_released
+        adapter = OfficialRobotCameraAdapter(
+            robot,
+            send_command=command_sender,
+            ingest_frame=self.camera_service.ingest_robot_frame,
+            clear_frame=self.camera_service.invalidate_owner_on_upstream_disconnect,
+        )
+        self.official_camera_adapter = adapter
+
+        def release_device_lease(owner: str, reason: str) -> None:
+            if previous_teardown:
+                previous_teardown(owner, reason)
+            adapter.release(owner)
+
+        self.camera_service.on_lease_released = release_device_lease
+        if on_disconnect is not None:
+            on_disconnect(adapter.on_sdk_disconnect)
+        return adapter
+
+    def register_managed_sdk_codex_feedback_session(
+        self,
+        *,
+        command_sender: Callable[[str, dict[str, Any], Optional[float]], dict[str, Any]],
+    ) -> ManagedCodexFeedbackAdapter:
+        """Attach Codex feedback to the existing managed SDK transport without opening a connection."""
+        adapter = ManagedCodexFeedbackAdapter(command_sender)
+        self.managed_codex_feedback_adapter = adapter
+        return adapter
+
+    def register_managed_sdk_network_log_session(self, context: object) -> None:
+        """Route parsed Device JSON to the bounded consumer, fail closed absent CR-009 auth."""
+        listener = ManagedSdkMessageListener(context)
+        listener.add(self._on_managed_sdk_message)
+        self._managed_network_log_listener = listener
+
+    def _on_managed_sdk_message(self, message: dict[str, Any]) -> None:
+        self.network_log_consumer.ingest(message, authorized=self._network_log_authorized)
 
     def has_robot_hardware_connected(self) -> bool:
         """Checks if physical robot hardware link is actively connected."""
@@ -796,6 +1030,14 @@ def make_request_handler(app: DeskAgentHostApp):
                             return True
             return False
 
+        def _check_stream_auth(self) -> bool:
+            """Camera streams accept configured credentials only as a Bearer header."""
+            auth_token = app.config.get("auth_token")
+            if not isinstance(auth_token, str) or not auth_token:
+                return False
+            auth_hdr = self.headers.get("Authorization", "")
+            return auth_hdr.startswith("Bearer ") and auth_hdr[7:].strip() == auth_token
+
         def do_GET(self) -> None:
             if self.path in ("/", "/index.html"):
                 if index_html_path.exists():
@@ -825,8 +1067,24 @@ def make_request_handler(app: DeskAgentHostApp):
                 or self.path.startswith("/snapshot.jpg?")
                 or self.path.startswith("/api/camera/snapshot")
                 or self.path.startswith("/api/camera/frame")
+                or self.path == "/api/camera/stream"
+                or self.path.startswith("/api/camera/stream?")
             ):
-                if not self._check_auth():
+                is_stream_request = (
+                    self.path == "/api/camera/stream"
+                    or self.path.startswith("/api/camera/stream?")
+                )
+                if is_stream_request and "token" in parse_qs(
+                    urlsplit(self.path).query, keep_blank_values=True
+                ):
+                    request_parts = self.requestline.split(" ", 2)
+                    if len(request_parts) == 3:
+                        self.requestline = (
+                            f"{request_parts[0]} {urlsplit(request_parts[1]).path}"
+                            f"?token=[REDACTED] {request_parts[2]}"
+                        )
+                is_authorized = self._check_stream_auth() if is_stream_request else self._check_auth()
+                if not is_authorized:
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -849,37 +1107,279 @@ def make_request_handler(app: DeskAgentHostApp):
                     or self.path.startswith("/api/camera/snapshot")
                 )
 
+                is_stream_path = (
+                    self.path == "/api/camera/stream"
+                    or self.path.startswith("/api/camera/stream?")
+                )
+
+                if is_stream_path:
+                    query_values = parse_qs(
+                        urlsplit(self.path).query, keep_blank_values=True
+                    ).get("client_id", [])
+                    if len(query_values) != 1 or not query_values[0].strip():
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"INVALID_CLIENT_ID"}')
+                        return
+                    client_id = query_values[0].strip()
+
+                    stream = None
+                    stream_admitted = False
+                    stream_ready = False
+                    try:
+                        stream = iter(app.camera_service.iter_mjpeg(client_id))
+                        stream_admitted = True
+                        first_part = next(stream)
+                        stream_ready = True
+                    except CameraStreamCapacityError as exc:
+                        self.send_response(429)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": exc.code}).encode())
+                        return
+                    except CameraStreamLeaseError as exc:
+                        self.send_response(403)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": exc.code}).encode())
+                        return
+                    except CameraStreamFrameUnavailable as exc:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "error": "CAMERA_FRAME_UNAVAILABLE",
+                            "reason": exc.code,
+                        }).encode())
+                        return
+                    except StopIteration:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"CAMERA_FRAME_UNAVAILABLE"}')
+                        return
+                    except Exception:
+                        logger.exception("Camera stream could not start")
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"CAMERA_STREAM_UNAVAILABLE"}')
+                        return
+                    finally:
+                        # Failed first-frame attempts free only the subscriber slot;
+                        # lease ownership is managed by the explicit lease API.
+                        if not stream_ready and stream_admitted:
+                            if stream is not None:
+                                stream.close()
+
+                    try:
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type",
+                            "multipart/x-mixed-replace; boundary=deskagent-frame",
+                        )
+                        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                        self.send_header("Pragma", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(first_part)
+                        self.wfile.flush()
+                        while True:
+                            try:
+                                part = next(stream)
+                            except StopIteration:
+                                break
+                            self.wfile.write(part)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        logger.debug("Camera stream client disconnected: %s", client_id)
+                    finally:
+                        if stream is not None:
+                            stream.close()
+                    return
+
                 if is_snapshot_path:
-                    frame_info = app.camera_service.get_snapshot(client_id=client_id)
+                    ephemeral_lease_acquired = False
+                    if app.camera_service.is_lease_valid():
+                        if not client_id or app.camera_service._active_lease_owner != client_id:
+                            self.send_response(403)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                            return
+                        effective_client = client_id
+                    else:
+                        effective_client = client_id or "snapshot-viewer"
+                        acq = app.camera_service.acquire_lease(effective_client, lease_ms=5000)
+                        if not acq.get("granted"):
+                            self.send_response(403)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                            return
+                        ephemeral_lease_acquired = True
+                        if app.official_camera_adapter is not None:
+                            device_acq = app.official_camera_adapter.acquire(effective_client, 5000, target_fps=10.0)
+                            if not device_acq.get("granted"):
+                                app.camera_service.release_lease(effective_client)
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": device_acq.get("reason", "DEVICE_UNAVAILABLE")}).encode())
+                                return
+                        elif app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                            try:
+                                ack = app._robot_client.send_command({
+                                    "type": "ctrl.camera.acquire",
+                                    "client_id": effective_client,
+                                    "lease_duration_ms": 5000,
+                                }, timeout=1.0)
+                                if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
+                                    logger.warning("Robot rejected snapshot camera acquire: %s", ack)
+                                    app.camera_service.release_lease(effective_client)
+                                    self.send_response(403)
+                                    self.send_header("Content-Type", "application/json")
+                                    self.end_headers()
+                                    self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                                    return
+                            except Exception as exc:
+                                logger.warning("Snapshot acquire dispatch error: %s", exc)
+                                app.camera_service.release_lease(effective_client)
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "DEVICE_UNAVAILABLE"}).encode())
+                                return
+
+                    try:
+                        initial_seq = getattr(app.camera_service, "_frame_seq", 0)
+                        if app.official_camera_adapter is not None:
+                            frame_info = None
+                            deadline = time.time() + 1.2
+                            while time.time() < deadline:
+                                candidate = app.camera_service.get_latest_frame(effective_client)
+                                if candidate is not None and candidate.get("frame_seq", 0) > initial_seq:
+                                    frame_info = candidate
+                                    break
+                                time.sleep(0.02)
+                            if frame_info is None:
+                                self.send_response(504)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "CAPTURE_TIMEOUT"}).encode())
+                                return
+                        elif app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                            try:
+                                cap_ack = app._robot_client.send_command({"type": "ctrl.camera.capture"}, timeout=1.0)
+                                if not isinstance(cap_ack, dict) or cap_ack.get("type") != "sys.ack" or cap_ack.get("code") != 0:
+                                    logger.warning("Robot rejected snapshot camera capture: %s", cap_ack)
+                                    self.send_response(503)
+                                    self.send_header("Content-Type", "application/json")
+                                    self.end_headers()
+                                    self.wfile.write(json.dumps({"error": "CAPTURE_FAILED"}).encode())
+                                    return
+                            except Exception as e:
+                                logger.warning("Snapshot capture dispatch error: %s", e)
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "CAPTURE_FAILED"}).encode())
+                                return
+
+                            frame_info = None
+                            deadline = time.time() + 1.2
+                            while time.time() < deadline:
+                                candidate = app.camera_service.get_latest_frame(effective_client)
+                                if candidate is not None and candidate.get("frame_seq", 0) > initial_seq:
+                                    frame_info = candidate
+                                    break
+                                time.sleep(0.02)
+
+                            if frame_info is None:
+                                logger.warning("Timed out waiting for fresh robot frame (initial_seq=%d)", initial_seq)
+                                self.send_response(504)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": "CAPTURE_TIMEOUT"}).encode())
+                                return
+                        else:
+                            frame_info = None
+                            deadline = time.time() + 1.2
+                            while time.time() < deadline:
+                                candidate = app.camera_service.get_latest_frame(effective_client)
+                                if candidate is not None:
+                                    frame_info = candidate
+                                    break
+                                time.sleep(0.02)
+
+                            if frame_info is None:
+                                frame_info = app.camera_service.get_latest_frame(effective_client)
+
+                        if not frame_info:
+                            self.send_response(404)
+                            self.end_headers()
+                            return
+
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                        self.send_header("Pragma", "no-cache")
+                        self.send_header("Expires", "0")
+                        self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
+                        self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
+                        self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
+                        self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
+                        self.end_headers()
+                        self.wfile.write(frame_info["jpeg_data"])
+                    finally:
+                        if ephemeral_lease_acquired:
+                            app.camera_service.release_lease(effective_client)
+                            if app.official_camera_adapter is None and app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                                try:
+                                    app._robot_client.send_command({
+                                        "type": "ctrl.camera.release",
+                                        "client_id": effective_client,
+                                    }, timeout=0.5)
+                                except Exception:
+                                    pass
                 else:
                     # /api/camera/frame strictly enforces existing lease ownership
                     effective_id = client_id or "web-client"
+                    lease_valid = app.camera_service.is_lease_valid()
+                    if not lease_valid:
+                        self.send_response(403)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "NO_ACTIVE_LEASE"}).encode())
+                        return
+
+                    if app.camera_service._active_lease_owner != effective_id:
+                        self.send_response(403)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
+                        return
+
                     frame_info = app.camera_service.get_latest_frame(effective_id)
+                    if not frame_info:
+                        self.send_response(503)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "CAMERA_FRAME_UNAVAILABLE"}).encode())
+                        return
 
-                if not frame_info:
-                    is_busy = (
-                        app.camera_service.is_lease_valid()
-                        and client_id is not None
-                        and app.camera_service._active_lease_owner != client_id
-                    )
-                    err_code = "RESOURCE_BUSY" if is_busy else "NO_ACTIVE_LEASE"
-                    self.send_response(403)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Expires", "0")
+                    self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
+                    self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
+                    self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
+                    self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"error": err_code}).encode())
-                    return
-
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-                self.send_header("Pragma", "no-cache")
-                self.send_header("Expires", "0")
-                self.send_header("X-Frame-Seq", str(frame_info["frame_seq"]))
-                self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
-                self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
-                self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
-                self.end_headers()
-                self.wfile.write(frame_info["jpeg_data"])
+                    self.wfile.write(frame_info["jpeg_data"])
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -917,6 +1417,92 @@ def make_request_handler(app: DeskAgentHostApp):
     return DeskAgentHTTPHandler
 
 
+def _serve_host(app: DeskAgentHostApp, host: str, port: int, *, shutdown_check: Optional[Callable[[], bool]] = None) -> None:
+    handler_cls = make_request_handler(app)
+    httpd = ThreadedHTTPServer((host, port), handler_cls)
+
+    def handle_signal(sig, frame):
+        logger.info("Received signal %s, shutting down...", sig)
+        httpd.shutdown()
+
+    if shutdown_check is None:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    logger.info("Desk Agent Host Daemon running on http://%s:%d", host, port)
+    try:
+        if shutdown_check is None:
+            httpd.serve_forever()
+        else:
+            thread = threading.Thread(target=httpd.serve_forever, name="desk-agent-http", daemon=True)
+            thread.start()
+            while thread.is_alive() and not shutdown_check():
+                thread.join(timeout=0.25)
+            if thread.is_alive():
+                httpd.shutdown()
+            thread.join(timeout=2.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.close()
+        httpd.server_close()
+        logger.info("Host daemon terminated cleanly.")
+
+
+async def _run_managed_application(config_path: Optional[str], host: str, port: int) -> None:
+    """Run the Host inside the one Runtime-authorized SDK managed Application session."""
+    from watcherobot.application import ApplicationContext
+
+    context = ApplicationContext.from_environment()
+    async with context:
+        app = DeskAgentHostApp(config_path=config_path, managed_sdk_session=True)
+        lifecycle: Optional[ManagedSdkLifecycleObservers] = None
+        host_loop_started = False
+        try:
+            # Pinned SDK currently keeps the command transport private on ApplicationContext.
+            # This is a version-bound compatibility point: send_command itself is public on
+            # DaemonApplicationTransport, but ApplicationContext exposes no transport property.
+            transport = context._transport
+            sdk_binary = getattr(transport, "_binary_callback", None)
+            if not callable(sdk_binary):
+                raise RuntimeError("pinned SDK transport has no binary callback")
+            lifecycle = ManagedSdkLifecycleObservers(transport)
+
+            def bounded_sdk_binary(frame: Any) -> None:
+                payload = getattr(frame, "payload", None)
+                if not isinstance(payload, bytes) or len(payload) + 16 > MAX_WSPK_FRAME_BYTES:
+                    logger.warning("Dropped malformed or oversized official SDK WSPK frame")
+                    return
+                sdk_binary(frame)
+
+            # The pinned Runtime uses max_size=None. Bound the parsed WSPK payload
+            # before the SDK can queue or assemble it, while retaining its handler.
+            transport._binary_callback = bounded_sdk_binary
+
+            app.register_official_sdk_camera_session(
+                context.robot,
+                command_sender=transport.send_command,
+                on_disconnect=lifecycle.add,
+            )
+            app.register_managed_sdk_network_log_session(context)
+            lifecycle.add(app.network_log_consumer.on_disconnect)
+            app.register_managed_sdk_codex_feedback_session(command_sender=transport.send_command)
+            host_loop_started = True
+            await asyncio.to_thread(
+                _serve_host,
+                app,
+                host,
+                port,
+                shutdown_check=lambda: context.shutdown_requested,
+            )
+        finally:
+            try:
+                if lifecycle is not None:
+                    lifecycle.close()
+            finally:
+                if not host_loop_started:
+                    app.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Desk Agent R1 Host Daemon")
     parser.add_argument("--config", "-c", type=str, help="Path to config.json")
@@ -935,31 +1521,22 @@ def main() -> None:
             print(json.dumps({"status": "invalid", "error": str(exc)}), file=sys.stderr)
             sys.exit(1)
 
+    config_loader = DeskAgentHostApp.__new__(DeskAgentHostApp)
+    launch_config = config_loader._load_config(args.config)
+    port = args.port or launch_config.get("server", {}).get("port", 8088)
+    host = args.host or launch_config.get("server", {}).get("host", "127.0.0.1")
+    managed_env_names = (
+        "WATCHER_APP_ID",
+        "WATCHER_APP_RUN_CREDENTIAL",
+        "WATCHER_APP_DESKTOP_WS_URL",
+        "WATCHER_APP_DEVICE_WS_URL",
+    )
+    managed_environment_present = any(os.environ.get(name, "").strip() for name in managed_env_names)
+    if managed_environment_present:
+        asyncio.run(_run_managed_application(args.config, host, port))
+        return
     app = DeskAgentHostApp(config_path=args.config)
-    port = args.port or app.config.get("server", {}).get("port", 8088)
-    host = args.host or app.config.get("server", {}).get("host", "127.0.0.1")
-
-    handler_cls = make_request_handler(app)
-    httpd = ThreadedHTTPServer((host, port), handler_cls)
-
-    def handle_signal(sig, frame):
-        logger.info("Received signal %s, shutting down...", sig)
-        app.close()
-        httpd.shutdown()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    logger.info("Desk Agent Host Daemon running on http://%s:%d", host, port)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        app.close()
-        httpd.server_close()
-        logger.info("Host daemon terminated cleanly.")
+    _serve_host(app, host, port)
 
 
 if __name__ == "__main__":

@@ -194,6 +194,7 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
+            f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c",
             "-lpthread",
             "-o",
             cls.so_path,
@@ -394,9 +395,10 @@ class TestG1OfficialSdkAndTuyaInterop(unittest.TestCase):
         udp_client.settimeout(2.0)
         pair_req = {
             "protocol": "watcher_lan_pairing_v1",
-            "request_id": "pair-g1-001",
-            "daemon_instance_id": "sdk-daemon-g1",
+            "request_id": "91d4a5cf34ae4d469a8ec9761b52f084",
+            "daemon_instance_id": "e47a83a66f814139a2ba32b784ca190f",
             "target_mode": "python_sdk",
+            "websocket_port": 8765,
             # interfaces.md 6.4: the official pairing contract requires a
             # 6-digit pairing_code; without it the device stays fail-closed.
             "pairing_code": "123456",

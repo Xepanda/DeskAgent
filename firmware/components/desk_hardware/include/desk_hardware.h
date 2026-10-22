@@ -73,7 +73,7 @@ typedef struct {
     int (*audio_play_pcm)(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
     int (*motion_move)(float pan_deg, float tilt_deg, uint32_t duration_ms);
     int (*motion_stop)(bool emergency);
-    int (*camera_capture)(uint8_t *out_buf, size_t max_len, size_t *out_len);
+    int (*camera_capture)(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
     int (*display_expression)(const char *preset_name, const char *status_text);
     int (*deinit)(void);
 } desk_board_driver_ops_t;
@@ -94,10 +94,19 @@ const desk_board_driver_ops_t *desk_hardware_get_driver_ops(void);
 int desk_hardware_init(void);
 
 /* Audio API */
+typedef struct {
+    bool ready;
+    bool running;
+    uint32_t frames;
+    uint32_t errors;
+    uint32_t peak;
+} desk_hardware_audio_status_t;
+
 int desk_hardware_audio_record_start(uint32_t sample_rate_hz);
 int desk_hardware_audio_record_read(int16_t *pcm_buf, size_t samples, size_t *read_samples);
 int desk_hardware_audio_record_stop(void);
 int desk_hardware_audio_record_inject(const int16_t *pcm_buf, size_t samples);
+int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status);
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
 int desk_hardware_audio_play_stop(void);
 

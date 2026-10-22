@@ -3,7 +3,7 @@ Comprehensive verification test suite for all P1 gap closures:
 1. Codex remote companion client and request ID response mapping.
 2. Outbox delivery worker consuming reminder alerts with announcement audio dispatch and retries.
 3. Home Assistant state reconciliation, whitelist enforcement, and change subscriptions.
-4. Camera dynamic FrameCapturePipeline and gimbal coordinate overlay.
+4. Camera FrameCapturePipeline refuses to synthesize frames without a hardware source.
 """
 
 from __future__ import annotations
@@ -103,29 +103,31 @@ class TestP1GapsVerification(unittest.TestCase):
         db_path = os.path.join(temp_dir.name, "life_test.db")
         life = LifeService(db_path=db_path)
 
-        outbox_id = life.enqueue_outbox(
-            event_type="reminder.alert",
-            payload={"reminder_id": "rem-p1-test", "title": "Stand up and stretch"},
-        )
-        self.assertTrue(outbox_id.startswith("outbox-"))
+        try:
+            outbox_id = life.enqueue_outbox(
+                event_type="reminder.alert",
+                payload={"reminder_id": "rem-p1-test", "title": "Stand up and stretch"},
+            )
+            self.assertTrue(outbox_id.startswith("outbox-"))
 
-        # Verify message is pending
-        pending = life.get_pending_outbox()
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["outbox_id"], outbox_id)
+            # Verify message is pending
+            pending = life.get_pending_outbox()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["outbox_id"], outbox_id)
 
-        # Mark failure and retry
-        life.record_outbox_failure(outbox_id, "Audio device busy", max_retries=3)
-        pending = life.get_pending_outbox()
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["retry_count"], 1)
+            # Mark failure and retry
+            life.record_outbox_failure(outbox_id, "Audio device busy", max_retries=3)
+            pending = life.get_pending_outbox()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["retry_count"], 1)
 
-        # Mark delivered / dispatched
-        life.mark_outbox_dispatched(outbox_id)
-        pending = life.get_pending_outbox()
-        self.assertEqual(len(pending), 0)
-
-        temp_dir.cleanup()
+            # Mark delivered / dispatched
+            life.mark_outbox_dispatched(outbox_id)
+            pending = life.get_pending_outbox()
+            self.assertEqual(len(pending), 0)
+        finally:
+            life.close()
+            temp_dir.cleanup()
 
     def test_ha_whitelist_and_state_reconciliation(self) -> None:
         """Verifies HA connector entity allowlist rejection, state reconciliation, and subscriber."""
@@ -162,25 +164,20 @@ class TestP1GapsVerification(unittest.TestCase):
         lamp_events = [e for e in observed_events if e[0] == "light.desk_lamp"]
         self.assertTrue(len(lamp_events) > 0)
 
-    def test_camera_capture_pipeline_dynamic_frames(self) -> None:
-        """Verifies FrameCapturePipeline generates valid dynamic JPEG frames with pan/tilt overlays."""
-        pipeline = FrameCapturePipeline(fps=20.0)
+    def test_camera_capture_pipeline_does_not_synthesize_frames_without_source(self) -> None:
+        """No attached capture source means no frame, even if synthetic output is requested."""
+        pipeline = FrameCapturePipeline(fps=20.0, allow_synthetic=True)
         captured = []
 
-        def on_frame(data: bytes) -> None:
-            captured.append(data)
+        def on_frame(data: bytes, is_hardware: bool = False) -> None:
+            captured.append((data, is_hardware))
 
         pipeline.start(on_frame)
         pipeline.update_coordinates(120.0, 115.0)
         time.sleep(0.15)
         pipeline.stop()
 
-        self.assertGreaterEqual(len(captured), 1, "Pipeline must emit dynamic frames")
-        first_frame = captured[0]
-        # JPEG SOI marker (0xFF, 0xD8) and EOI marker (0xFF, 0xD9)
-        self.assertEqual(first_frame[:2], b"\xff\xd8")
-        self.assertEqual(first_frame[-2:], b"\xff\xd9")
-        self.assertIn(b"DeskAgent", first_frame)
+        self.assertEqual(captured, [], "Pipeline must not emit placeholder or synthetic camera frames")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <sys/time.h>
 #include <time.h>
+#include <math.h>
 
 #ifdef ESP_PLATFORM
 #include "driver/uart.h"
@@ -18,6 +19,7 @@
 
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_board.h"
+#include "desk_watcher_audio.h"
 #endif
 
 /* --- Motion & STM32 Link State --- */
@@ -41,6 +43,7 @@ typedef enum {
 
 static volatile mcu_tx_state_t s_pending_state = MCU_TX_IDLE;
 static volatile uint32_t s_pending_seq = 0;
+static volatile uint8_t s_pending_msg_id = 0;
 static volatile uint8_t s_pending_err_code = 0;
 
 static uint32_t s_mcu_ack_timeout_ms = MCU_ACK_TIMEOUT_MS;
@@ -528,6 +531,7 @@ static int mcu_execute_transaction(const uint8_t *frame_data, size_t frame_len, 
     }
 
     s_pending_seq = expected_seq;
+    s_pending_msg_id = frame_data[4];
     s_pending_state = MCU_TX_WAITING_ACK;
     s_pending_err_code = 0;
 
@@ -644,15 +648,16 @@ static int default_driver_motion_stop(bool emergency)
     return mcu_execute_transaction(s_last_mcu_frame, s_last_mcu_frame_len, seq);
 }
 
-static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len)
+static int default_driver_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
 {
+    (void)timeout_ms;
 #ifdef ESP_PLATFORM
     /* On ESP-IDF with Himax HX6538 SPI2 / PTL sensor */
     (void)out_buf; (void)max_len; (void)out_len;
 #else
     (void)out_buf; (void)max_len; (void)out_len;
 #endif
-    return -1;
+    return DESK_HW_ERR_UNAVAILABLE;
 }
 
 static int default_driver_display_expression(const char *preset_name, const char *status_text)
@@ -837,7 +842,7 @@ int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len)
     if (data[2] != MCU_FRAME_PROTO_VERSION) return -2;
 
     uint16_t payload_len = (uint16_t)(data[10] | ((uint16_t)data[11] << 8));
-    if (len < (size_t)(12 + payload_len + 2)) return -3;
+    if (len != (size_t)(12 + payload_len + 2)) return -3;
 
     /* Verify CRC16 */
     uint16_t expected_crc = mcu_crc16_calc(data, 12 + payload_len);
@@ -856,55 +861,35 @@ int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len)
     uint8_t msg_id = data[4];
     uint8_t flags = data[5];
 
-    if (msg_class != MCU_FRAME_CLASS_MOTION) {
-        return DESK_HW_OK;
-    }
+    if (msg_class != MCU_FRAME_CLASS_MOTION) return DESK_HW_ERR_IO;
+    if (s_pending_state != MCU_TX_WAITING_ACK || s_pending_seq != seq) return DESK_HW_ERR_BUSY;
 
     /* Check for NACK */
-    if (msg_id == MCU_MOTION_MSG_NACK || (flags & MCU_FRAME_FLAG_NACK_RESP)) {
-        s_mcu_nack_count++;
-        uint8_t err_code = (payload_len >= 1) ? data[12] : 0;
-        if (s_pending_state == MCU_TX_WAITING_ACK && s_pending_seq == seq) {
-            s_pending_err_code = err_code;
-            s_pending_state = MCU_TX_NACKED;
+    if (msg_id == MCU_MOTION_MSG_NACK || flags == MCU_FRAME_FLAG_NACK_RESP) {
+        if (msg_id != MCU_MOTION_MSG_NACK || flags != MCU_FRAME_FLAG_NACK_RESP ||
+            payload_len != 2 || data[12] == 0) {
+            return DESK_HW_ERR_IO;
         }
+        s_mcu_nack_count++;
+        s_pending_err_code = data[12];
+        s_pending_state = MCU_TX_NACKED;
         return DESK_HW_ERR_IO;
     }
 
     /* Check for ACK */
-    if (msg_id == MCU_MOTION_MSG_ACK || (flags & MCU_FRAME_FLAG_ACK_RESP)) {
+    if (flags == MCU_FRAME_FLAG_ACK_RESP && payload_len == 4 &&
+        (msg_id == MCU_MOTION_MSG_ACK || msg_id == s_pending_msg_id)) {
         s_mcu_ack_count++;
-        if (payload_len >= 6) {
-            int16_t pan_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
-            int16_t tilt_x10 = (int16_t)(data[16] | ((uint16_t)data[17] << 8));
-            if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
-                s_current_pan = pan_x10 / 10.0f;
-                s_current_tilt = tilt_x10 / 10.0f;
-            }
-        } else if (payload_len >= 4) {
-            int16_t pan_x10 = (int16_t)(data[12] | ((uint16_t)data[13] << 8));
-            int16_t tilt_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
-            if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
-                s_current_pan = pan_x10 / 10.0f;
-                s_current_tilt = tilt_x10 / 10.0f;
-            }
-        }
-        if (s_pending_state == MCU_TX_WAITING_ACK && s_pending_seq == seq) {
-            s_pending_state = MCU_TX_ACKED;
-        }
-        return DESK_HW_OK;
-    }
-
-    /* Generic motion frame fallback */
-    if (payload_len >= 4) {
         int16_t pan_x10 = (int16_t)(data[12] | ((uint16_t)data[13] << 8));
         int16_t tilt_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
         if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
             s_current_pan = pan_x10 / 10.0f;
             s_current_tilt = tilt_x10 / 10.0f;
         }
+        s_pending_state = MCU_TX_ACKED;
+        return DESK_HW_OK;
     }
-    return DESK_HW_OK;
+    return DESK_HW_ERR_IO;
 }
 
 /* Audio API */
@@ -986,6 +971,20 @@ int desk_hardware_audio_record_stop(void)
     return 0;
 }
 
+int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status)
+{
+    if (!out_status) return DESK_HW_ERR_INVALID_ARG;
+    memset(out_status, 0, sizeof(*out_status));
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    desk_watcher_audio_status(&out_status->ready, &out_status->running,
+                              &out_status->frames, &out_status->errors,
+                              &out_status->peak);
+    return out_status->ready ? DESK_HW_OK : DESK_HW_ERR_UNAVAILABLE;
+#else
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
 int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void *user_data)
 {
     s_audio_play_cb = cb;
@@ -1027,6 +1026,7 @@ int desk_hardware_audio_play_stop(void)
 /* Motion / Gimbal API */
 int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms)
 {
+    if (!isfinite(pan_deg) || !isfinite(tilt_deg)) return DESK_HW_ERR_INVALID_ARG;
 #ifdef ESP_PLATFORM
     if (!s_board_driver_ops || !s_board_driver_ops->motion_move) return DESK_HW_ERR_UNAVAILABLE;
 #endif
@@ -1144,16 +1144,30 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
 {
     if (out_len) *out_len = 0;
     if (!out_buf || !out_len) return DESK_HW_ERR_INVALID_ARG;
-    (void)timeout_ms;
+#ifndef ESP_PLATFORM
+    /* Host simulator frames are the capture source for L2 tests. The default
+     * host driver intentionally reports unavailable, so consume an injected
+     * frame before asking that stub. ESP production never accepts injection. */
+    if (s_cam_frame_len > 0) {
+        if (max_len < s_cam_frame_len) return DESK_HW_ERR_INVALID_ARG;
+        memcpy(out_buf, s_cam_frame_buf, s_cam_frame_len);
+        *out_len = s_cam_frame_len;
+        return DESK_HW_OK;
+    }
+#endif
 
     /* First attempt capturing live frame from registered hardware driver */
     if (s_board_driver_ops && s_board_driver_ops->camera_capture) {
         size_t drv_len = 0;
-        int drv_ret = s_board_driver_ops->camera_capture(out_buf, max_len, &drv_len);
+        int drv_ret = s_board_driver_ops->camera_capture(out_buf, max_len, &drv_len, timeout_ms);
         if (drv_ret == 0 && drv_len > 0) {
             *out_len = drv_len;
             return DESK_HW_OK;
         }
+        if (drv_ret != DESK_HW_OK) {
+            return drv_ret;
+        }
+        return DESK_HW_ERR_IO;
     }
 
 #ifdef ESP_PLATFORM

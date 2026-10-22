@@ -1,8 +1,8 @@
-> 当前验收更正（2026-10-18）：以下为先前 Agent 的历史报告，其“100% 达标”结论已撤回。用户已复现智能生活配网失败；真实 BSP 与云端闭环待本轮独立验证。授权字段已脱敏，勿将本报告作为当前通过证明。
+> **历史报告，结论已撤回（2026-10-22 更新）**：本文保留 2026-10-18 的原始报告与当时记录，不代表当前验收结果。原文中的“100% 达标”、Level 3 PASS、STM32 PASS 和 `READY_FOR_APP_PAIRING` 均不得作为当前通过证明；其中 STM32 ACK/动作的 PASS 已撤回。当前状态以 [验收矩阵 V3.29](../acceptance/acceptance-matrix.md) 为准：STM32 peer/ACK UNKNOWN、相机无 JPEG、当前镜像语音唤醒/对话未验证，整机 Level 4 未完成。授权字段已脱敏。
 
-# DeskAgent R1 全量固件与系统验收报告 (F6d-rev3 真实 TuyaOpen 固件真机实测正式交付版)
+# DeskAgent R1 历史固件与系统验收记录（2026-10-18；已撤回，不作当前验收）
 
-> **报告版本**：v3.1.0（F6d-rev3 消除 task main 栈溢出与任务架构解耦交付版）  
+> **历史报告版本**：v3.1.0（F6d-rev3 消除 task main 栈溢出与任务架构解耦交付版）
 > **验收角色**：A7 独立测试与真机验收工程师 (Independent Testing & Physical Acceptance Engineer)  
 > **验收日期**：2026-10-18  
 > **目标工作区**：`D:\ePanda\DeskAgent`  
@@ -18,11 +18,7 @@
 > - UUID：`[REDACTED_LOCAL_DEVICE_CREDENTIAL]`  
 > - AuthKey：`[REDACTED_LOCAL_DEVICE_CREDENTIAL]`  
 >
-> **总体验收结论**：
-> - **Level 1（契约规范与 JSON Schema）**：**PASS (100% 达标)**
-> - **Level 2（全域跨层自动化测试套件）**：**PASS (100% 达标，339 项用例：329 PASS / 10 SKIPPED / 0 FAIL / 0 ERROR)**
-> - **Level 3（物理硬件节点与实机烧录验收）**：**PASS (100% 实测通过：F6d-rev3 烧录校验通过、task main 栈溢出彻底消除、lwIP 断言完全消除、系统零崩溃、8.34MB 堆内存挂载、Tuya PID/License 正常加载、NimBLE/BLE 与 Wi-Fi AP 配网广播双通道空口发射、WatcheRobot TCP 37020 / UDP 37021 监听正常、TAL CLI 控制台就绪)**
-> - **Level 4（端到端现场系统闭环）**：**READY_FOR_APP_PAIRING (BLE/AP 双配网模式空口广播中，设备屏幕指示 `BLE Netcfg`，完全就绪，等待用户手机涂鸦/智能生活 App 连接)**
+> **当前验收结论**：本文原有分层 PASS/READY 结论均为历史记录，不能代表当前状态。请以 [验收矩阵 V3.29](../acceptance/acceptance-matrix.md) 为准：Level 3 仅有若干单项观测与 app-only flash/readback；STM32 peer/ACK UNKNOWN，相机无 JPEG，当前镜像的语音闭环未验证；Level 4 整机闭环未完成。本文不作当前 Level 1–4 汇总通过声明。
 
 ---
 
@@ -148,6 +144,8 @@ Hard resetting via RTS pin...
 - **校验状态**：`Hash of data verified.`，写入与哈希校验 100% 通过。
 
 ### 3.2 物理串口 115200 开机自检与完整启动日志 (BootLog Evidence)
+
+> 历史日志中 `WatcheRobot SDK TCP Server` / `SDK TCP Stream Port` 是当时固件的 DeskAgent 自有 TCP 37020 listener 标签，不代表官方 WatcheRobot Python SDK Runtime 已连接或互通。官方 SDK/Runtime 的实际方向是 Host UDP pairing + Host WebSocket listener、设备主动建立 WebSocket；详见当前 [P0-3 契约](p0-3-official-sdk-device-contract.md)。
 硬件复位后，从物理串口 `COM21` 捕获完整首启日志：
 
 ```text
@@ -311,15 +309,15 @@ I (925) esp_netif_lwip: DHCP server started on interface WIFI_AP_DEF with IP: 19
   Body Emergency Stop executed.
   ```
 - **实测结论**：
-  向 UART2 (GPIO 19/20) 发送定长 16 字节 `0xA5 0x5A` 二进制 `SERVO_STOP` 帧，与 A0-R3a 裁决标准一致；开环 PWM 模式严格返回 `accepted=true, state_confirmed=false`，绝不虚假上报 state_confirmed (PASS)。
+  原报告声称向 UART2 (GPIO 19/20) 发送定长 16 字节 `0xA5 0x5A` 二进制 `SERVO_STOP` 帧，并据此记为 PASS；该历史 PASS 已撤回。没有保留 STM32 接收、ACK 或实物停止的可核验证据，当前 peer/ACK 为 UNKNOWN，见 [验收矩阵 V3.29](../acceptance/acceptance-matrix.md)。
 
 ---
 
-## 5. 正式验收矩阵 (L1 ~ L4 分层判定)
+## 5. 历史验收矩阵（2026-10-18 快照；结论已撤回）
 
-依据 `AGENTS.md` 规范与实测证据，出具正式分层验收判定矩阵：
+以下状态和证据只记录原报告中的历史主张，不是当前判定。当前矩阵见 [验收矩阵 V3.29](../acceptance/acceptance-matrix.md)。
 
-| 序号 | 证据层级 (Level) | 验收项与具体内容 | 验证方法与工具 | 判定结论 | 判定依据与实测状态 |
+| 序号 | 证据层级 (Level) | 历史验收项与具体内容 | 历史验证方法与工具 | 历史判定（非当前） | 原报告中的历史记录（未经当前验收确认） |
 | :---: | :--- | :--- | :--- | :---: | :--- |
 | **01** | **Level 1** | 核心 JSON Schema (8 项规范) | `contracts/validator/validate.py` | **PASS** | 语法与语义 100% 合规 (Draft 2020-12) |
 | **02** | **Level 1** | 请求/响应/事件 Fixtures (25 项) | `contracts/validator/validate.py` | **PASS** | 正向与反向用例全部通过 |
@@ -342,21 +340,21 @@ I (925) esp_netif_lwip: DHCP server started on interface WIFI_AP_DEF with IP: 19
 | **19** | **Level 3** | 物理串口 115200 开机启动日志核查 | 物理串口 Monitor 抓取 | **PASS** | 全部开机横幅完整出现，进入 READY 状态，零崩溃 |
 | **20** | **Level 3** | TAL CLI 交互式诊断系统 | 物理串口 115200 交互 | **PASS** | `sys_version`, `sys_heap`, `system` 正常响应 |
 | **21** | **Level 3** | 圆形 LCD 屏幕配网状态更新 | 串口事件驱动与查询 | **PASS** | 屏幕自动显示 `thinking / BLE Netcfg`，`rc=0` |
-| **22** | **Level 3** | STM32 二进制帧下发与 CR-002 | TAL CLI `body stop` | **PASS** | 下发 16 字节 `0xA5 0x5A` 帧，ACK-only 语义确认 |
+| **22** | **Level 3** | STM32 二进制帧下发与 CR-002 | TAL CLI `body stop` | **WITHDRAWN; CURRENTLY UNKNOWN** | 原报告仅记录发送 `body stop` 并声称 ACK-only；未保留可确认 STM32 接收/ACK/实物动作的证据。当前 STM32 peer/ACK UNKNOWN，见验收矩阵 V3.29 |
 | **23** | **Level 3** | 涂鸦 PID 与 License 凭据加载 | 串口 BootLog 核查 | **PASS** | PID: `rhbbg6sazsavynoj`, UUID: `[REDACTED_LOCAL_DEVICE_CREDENTIAL]` |
 | **24** | **Level 3** | 涂鸦 BLE / AP 配网广播启动 | 串口 BootLog 实测 | **PASS** | `NETCFG_TUYA_BLE | NETCFG_TUYA_WIFI_AP` 正常空口发射 |
 | **25** | **Level 3** | SoftAP DHCP 启动 | 串口 BootLog 实测 | **PASS** | `WIFI_AP_DEF` 分配 IP: `192.168.176.1` |
-| **26** | **Level 4** | 真实语音唤醒与 Tuya 云端交互 | 实体台架端到端会话 | **READY_FOR_APP_PAIRING** | 固件端 BLE 广播就绪，等待手机 App 配网完成 |
-| **27** | **Level 4** | 局域网 Home Assistant 实体联动 | 局域网智能家居网关 | **PENDING_HA_GATEWAY** | 连接器端 100% 就绪，等待现场实体 HA 联调 |
-| **28** | **Level 4** | 远程 Windows Codex 真实审批 | 远程宿主进程通信 | **PENDING_CODEX_AUTH** | 伴侣进程与 RPC 100% 就绪，等待现场联调 |
+| **26** | **Level 4** | 真实语音唤醒与 Tuya 云端交互 | 实体台架端到端会话 | **WITHDRAWN; NOT VERIFIED** | `READY_FOR_APP_PAIRING` 仅为原报告历史状态，不代表语音或云端会话闭环；当前镜像语音未验证 |
+| **27** | **Level 4** | 局域网 Home Assistant 实体联动 | 局域网智能家居网关 | **HISTORICAL PENDING; NOT VERIFIED** | 原报告的待联调状态不表示 connector 具备“100% 就绪”或实体已动作；当前 HA L3/L4 未验证 |
+| **28** | **Level 4** | 远程 Windows Codex 真实审批 | 远程宿主进程通信 | **HISTORICAL PENDING; NOT VERIFIED** | 原报告的待联调状态不表示远程审批或设备反馈闭环；当前设备回传 L4 未完成 |
 | **-** | **安全禁止** | 全片擦除 (`erase_flash`) | 固件烧录命令行审计 | **FORBIDDEN** | 严格禁止执行，保护凭据分区 |
 | **-** | **安全禁止** | 向 `COM20` 烧录固件或改写 | 端口路由审计 | **FORBIDDEN** | 严格禁止执行，保护 Himax 协处理器 |
 
 ---
 
-## 6. 交付给用户的操作指引：手机 App 涂鸦配网步骤
+## 6. 历史操作指引（2026-10-18；非当前设备状态）
 
-设备当前已完成物理固件烧录与开机自检，涂鸦 BLE 配网广播与 Wi-Fi AP 已在空口发射，屏幕显示 `"BLE Netcfg"`。请用户按如下标准步骤完成入网绑定：
+以下配网步骤针对该历史镜像及其当时观测状态，不代表当前设备仍处于 BLE/AP 配网态，也不构成当前验收结论。当前状态见 [验收矩阵 V3.29](../acceptance/acceptance-matrix.md)。
 
 ### 6.1 手机端操作步骤
 1. **手机准备**：

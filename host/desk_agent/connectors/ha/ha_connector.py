@@ -5,7 +5,7 @@ Implements real Home Assistant REST API interactions and WebSocket real-time eve
 1. Enforces strict domain, entity, and service allowlists and denylists.
 2. Interacts with Home Assistant via standard REST endpoints (/api/states, /api/services).
 3. Connects to Home Assistant WebSocket API (/api/websocket) for real-time state change streaming.
-4. Separates service acceptance (`accepted`) from observed physical state confirmation (`state_confirmed`).
+4. Separates HA service acceptance from observed entity-state changes and target-state confirmation.
 5. Reconciles state snapshots upon startup, WebSocket reconnect, and periodic polling.
 6. Rate limiting and error classification (401/403 PermissionError, 404 LookupError, 429/5xx ConnectionError).
 7. Supports transport injection and explicit mock mode for test isolation without polluting production.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -61,7 +62,39 @@ DEFAULT_DENIED_SERVICES = frozenset({
     "homeassistant.check_config",
 })
 
+# Safe, explicit controls available when a deployment does not provide its
+# own service list. Read-only domains intentionally have no default services.
+DEFAULT_ALLOWED_SERVICES = frozenset({
+    "light.turn_on", "light.turn_off", "light.toggle",
+    "switch.turn_on", "switch.turn_off", "switch.toggle",
+    "cover.open_cover", "cover.close_cover", "cover.stop_cover", "cover.set_cover_position",
+    "climate.set_temperature", "climate.set_hvac_mode",
+    "fan.turn_on", "fan.turn_off", "fan.toggle", "fan.set_percentage",
+    "media_player.turn_on", "media_player.turn_off", "media_player.media_play",
+    "media_player.media_pause", "media_player.media_stop", "media_player.volume_set",
+    "scene.turn_on",
+    "input_boolean.turn_on", "input_boolean.turn_off", "input_boolean.toggle",
+})
+
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+MAX_STATE_CONFIRMATION_TIMEOUT_MS = 30_000
+
+
+def _normalize_confirmation_timeout_ms(value: Any) -> float:
+    """Validate and cap caller-supplied synchronous state confirmation waits."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError("wait_for_state.timeout_ms must be a finite, non-negative number")
+    return min(float(value), float(MAX_STATE_CONFIRMATION_TIMEOUT_MS))
+
+
+def _state_snapshot_changed(before: Optional[Mapping[str, Any]], after: Optional[Mapping[str, Any]]) -> Optional[bool]:
+    """Compare HA-reported state and attributes; this does not establish physical device action."""
+    if before is None or after is None:
+        return None
+    return (
+        before.get("state") != after.get("state")
+        or before.get("attributes", {}) != after.get("attributes", {})
+    )
 
 KNOWN_ATTRIBUTE_KEYS = frozenset({
     "brightness",
@@ -148,7 +181,9 @@ class HAConnector:
 
         self.allowed_entities: Optional[set[str]] = set(allowed_entities) if allowed_entities is not None else None
         self.denied_entities: set[str] = set(denied_entities) if denied_entities is not None else set()
-        self.allowed_services: Optional[set[str]] = set(allowed_services) if allowed_services is not None else None
+        self.allowed_services: set[str] = (
+            set(allowed_services) if allowed_services is not None else set(DEFAULT_ALLOWED_SERVICES)
+        )
         self.denied_services: set[str] = set(denied_services) if denied_services is not None else set()
         self.timeout_sec = max(0.5, timeout_sec)
         self._transport = transport
@@ -201,7 +236,10 @@ class HAConnector:
         if not isinstance(entity_id, str) or not ENTITY_ID_REGEX.match(entity_id):
             return False
         domain = entity_id.split(".", 1)[0]
-        return domain in self.allowed_domains
+        # These domains are hard safety exclusions. A deployment allowlist may
+        # narrow ordinary domains, but must not re-enable locks, alarms,
+        # cameras, or update entities through configuration.
+        return domain not in DEFAULT_DENIED_DOMAINS and domain in self.allowed_domains
 
     def is_entity_allowed(self, entity_id: str) -> bool:
         """Enforces domain-level allowlist, entity-level allowlist, and entity-level denylist."""
@@ -218,11 +256,9 @@ class HAConnector:
         full_svc = f"{domain}.{action}"
         if full_svc in self.denied_services or action in self.denied_services:
             return False
-        if full_svc in DEFAULT_DENIED_SERVICES and not (self.allowed_services and full_svc in self.allowed_services):
+        if full_svc in DEFAULT_DENIED_SERVICES:
             return False
-        if self.allowed_services is None:
-            return True
-        return full_svc in self.allowed_services or action in self.allowed_services
+        return full_svc in self.allowed_services
 
     def reconcile_states(self) -> dict[str, Any]:
         """
@@ -231,14 +267,28 @@ class HAConnector:
         """
         current_list = self.get_all_states()
         changes: list[dict[str, Any]] = []
+        current_ids: set[str] = set()
         for item in current_list:
             eid = item["entity_id"]
+            current_ids.add(eid)
             new_st = item.get("state")
             old_item = self._cached_states.get(eid)
             old_st = old_item.get("state") if old_item else None
             if old_st != new_st:
                 changes.append({"entity_id": eid, "old_state": old_st, "new_state": new_st})
             self._cached_states[eid] = item
+
+        # HA can remove an entity without returning a replacement state in
+        # /api/states. Drop it from the authoritative cache and report the
+        # transition as old -> None so polling subscribers converge too.
+        for eid in tuple(self._cached_states):
+            if eid not in current_ids:
+                old_item = self._cached_states.pop(eid)
+                changes.append({
+                    "entity_id": eid,
+                    "old_state": old_item.get("state"),
+                    "new_state": None,
+                })
 
         return {"total_entities": len(current_list), "reconciled_changes": changes}
 
@@ -305,7 +355,13 @@ class HAConnector:
                     try:
                         res = self.reconcile_states()
                         for chg in res["reconciled_changes"]:
-                            callback(chg["entity_id"], chg["old_state"], chg["new_state"])
+                            try:
+                                callback(chg["entity_id"], chg["old_state"], chg["new_state"])
+                            except Exception as callback_err:
+                                # A consumer failure must not suppress other changes from
+                                # this snapshot. Reconciliation updates the cache first,
+                                # so skipped callbacks would otherwise be lost forever.
+                                logger.exception("HA state subscriber callback failed: %s", callback_err)
                     except Exception as err:
                         logger.debug("State subscriber polling note: %s", err)
                 stop_evt.wait(interval_sec)
@@ -354,7 +410,7 @@ class HAConnector:
                         backoff = min(backoff * 2.0, 16.0)
                         continue
                 elif msg.get("type") != "auth_ok":
-                    logger.warning("Unexpected first WebSocket message: %s", msg)
+                    raise ConnectionError("Home Assistant WebSocket did not begin with an authentication message")
 
                 # 2. Subscribe to state_changed events
                 sub_id = self._next_interaction_id()
@@ -366,8 +422,12 @@ class HAConnector:
                 conn.send(json.dumps(sub_msg))
                 sub_ack_raw = conn.recv(timeout=self.timeout_sec)
                 sub_ack = json.loads(sub_ack_raw)
-                if not sub_ack.get("success", False) and sub_ack.get("id") == sub_id:
-                    logger.warning("HA state_changed subscription not accepted: %s", sub_ack)
+                if (
+                    sub_ack.get("type") != "result"
+                    or sub_ack.get("id") != sub_id
+                    or sub_ack.get("success") is not True
+                ):
+                    raise ConnectionError("Home Assistant did not acknowledge the state_changed subscription")
 
                 self._ws_connected.set()
                 backoff = 1.0
@@ -375,7 +435,19 @@ class HAConnector:
 
                 # Reconcile authoritative states upon connection/reconnection
                 try:
-                    self.reconcile_states()
+                    report = self.reconcile_states()
+                    # The polling fallback pauses as soon as the WebSocket is
+                    # authenticated. Surface transitions observed by this
+                    # reconnect snapshot so a short outage cannot silently
+                    # consume a state change between poll intervals.
+                    with self._subscribers_lock:
+                        active_subs = list(self._subscribers)
+                    for change in report["reconciled_changes"]:
+                        for cb in active_subs:
+                            try:
+                                cb(change["entity_id"], change["old_state"], change["new_state"])
+                            except Exception as cb_err:
+                                logger.exception("Error in HA reconnect state subscriber: %s", cb_err)
                 except Exception as rec_err:
                     logger.debug("Reconciliation on WS connect: %s", rec_err)
 
@@ -404,6 +476,8 @@ class HAConnector:
 
                                 if isinstance(new_obj, dict):
                                     self._cached_states[entity_id] = new_obj
+                                else:
+                                    self._cached_states.pop(entity_id, None)
 
                                 with self._state_condition:
                                     self._state_condition.notify_all()
@@ -515,6 +589,10 @@ class HAConnector:
         Retrieves current state snapshot of an entity from Home Assistant.
         Strictly enforces domain and entity allowlists and denylists.
         """
+        return self._get_state(entity_id, timeout=None)
+
+    def _get_state(self, entity_id: str, timeout: Optional[float]) -> dict[str, Any]:
+        """Fetch state with an optional request timeout for bounded confirmation waits."""
         if not self.is_entity_allowed(entity_id):
             raise PermissionError(f"Entity '{entity_id}' is outside allowed domain/entity scope")
 
@@ -530,7 +608,7 @@ class HAConnector:
             }
 
         path = f"/api/states/{entity_id}"
-        state_data = self._http_request("GET", path)
+        state_data = self._http_request("GET", path, timeout=timeout)
         if not isinstance(state_data, dict):
             raise ConnectionError(f"Invalid state payload returned for {entity_id}: {state_data}")
 
@@ -597,7 +675,11 @@ class HAConnector:
         """
         Executes a service call on Home Assistant and verifies observed state.
 
-        - Separates accepted service call (`accepted`) from observed state (`state_confirmed`).
+        - `accepted` means HA returned success for the service request.
+        - `state_confirmed` means the requested state currently matches HA's observed entity snapshot.
+        - `state_changed` reports whether that snapshot differs from a best-effort pre-call snapshot.
+        - `physical_action_confirmed` is always None because this connector only observes HA state,
+          not independent physical feedback.
         - Polls entity state up to `timeout_ms` when `wait_for_state` is provided,
           leveraging real-time WebSocket state notification for instant confirmation when available.
         - Verifies both target state and target attributes (explicit or inferred from parameters).
@@ -610,10 +692,18 @@ class HAConnector:
         if not self.is_service_allowed(domain, action):
             raise PermissionError(f"Service '{domain}.{action}' is outside allowed service scope")
 
+        # Validate this before issuing the service request, so malformed wait
+        # parameters can never trigger an action and caller waits stay bounded.
+        timeout_ms = None
+        if wait_for_state is not None:
+            timeout_ms = _normalize_confirmation_timeout_ms(wait_for_state.get("timeout_ms", 2000))
+
         service_path = f"/api/services/{domain}/{action}"
 
         body: dict[str, Any] = {"entity_id": entity_id}
         if parameters:
+            if "entity_id" in parameters and parameters["entity_id"] != entity_id:
+                raise ValueError("parameters.entity_id cannot differ from the allowlisted target entity")
             body.update(parameters)
 
         # Resolve target state and attributes confirmation requirements
@@ -628,13 +718,28 @@ class HAConnector:
                 if filtered:
                     expected_attributes = filtered
 
+        before_state: Optional[dict[str, Any]] = None
+        if wait_for_state is not None:
+            try:
+                baseline_timeout = min(self.timeout_sec, max(0.001, timeout_ms / 1000.0))
+                before = self._get_state(entity_id, timeout=baseline_timeout)
+                before_state = dict(before)
+                if isinstance(before.get("attributes"), dict):
+                    before_state["attributes"] = dict(before["attributes"])
+            except Exception as err:
+                # A pre-call read is observational only; it must not block an otherwise
+                # permitted HA service request when the state endpoint is temporarily down.
+                logger.debug("Pre-service state check note for %s: %s", entity_id, err)
+
         # Handle mock mode or unconfigured daemon test
         if self.mock_mode or (self._is_default_unconfigured and "unittest" in sys.modules):
             target_state = "on" if "turn_on" in action else "off" if "turn_off" in action else "active"
             if expected_state is not None:
                 target_state = expected_state
 
-            current = self.get_state(entity_id)
+            current = dict(self.get_state(entity_id))
+            if isinstance(current.get("attributes"), dict):
+                current["attributes"] = dict(current["attributes"])
             current["state"] = target_state
             if parameters:
                 current.setdefault("attributes", {}).update(parameters)
@@ -650,6 +755,8 @@ class HAConnector:
                 "accepted": True,
                 "observed_state": current["state"],
                 "state_confirmed": state_confirmed,
+                "state_changed": _state_snapshot_changed(before_state, current) if wait_for_state is not None else None,
+                "physical_action_confirmed": None,
             }
 
         # 1. Trigger service call (First Stage: Acceptance)
@@ -659,15 +766,17 @@ class HAConnector:
         # 2. State verification (Second Stage: Confirmation)
         observed_state: Optional[str] = None
         state_confirmed = False
+        state_changed: Optional[bool] = None
 
         if wait_for_state is not None and (expected_state is not None or expected_attributes):
-            timeout_ms = wait_for_state.get("timeout_ms", 2000)
-            deadline = time.time() + (timeout_ms / 1000.0)
+            deadline = time.monotonic() + (timeout_ms / 1000.0)
 
             # Check initial state immediately
             try:
-                current_st = self.get_state(entity_id)
+                remaining = max(0.001, deadline - time.monotonic())
+                current_st = self._get_state(entity_id, timeout=min(self.timeout_sec, remaining))
                 observed_state = current_st.get("state")
+                state_changed = _state_snapshot_changed(before_state, current_st)
                 if self._is_state_confirmed(current_st, expected_state, expected_attributes):
                     return {
                         "entity_id": entity_id,
@@ -675,14 +784,16 @@ class HAConnector:
                         "accepted": accepted,
                         "observed_state": observed_state,
                         "state_confirmed": True,
+                        "state_changed": state_changed,
+                        "physical_action_confirmed": None,
                     }
             except Exception as err:
                 logger.debug("Initial state check note: %s", err)
 
             # Poll with interval or wake up immediately on WebSocket state condition
             poll_interval = 0.05
-            while time.time() < deadline:
-                remaining = deadline - time.time()
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
 
@@ -690,8 +801,10 @@ class HAConnector:
                     self._state_condition.wait(timeout=min(poll_interval, remaining))
 
                 try:
-                    current_st = self.get_state(entity_id)
+                    remaining = max(0.001, deadline - time.monotonic())
+                    current_st = self._get_state(entity_id, timeout=min(self.timeout_sec, remaining))
                     observed_state = current_st.get("state")
+                    state_changed = _state_snapshot_changed(before_state, current_st)
                     if self._is_state_confirmed(current_st, expected_state, expected_attributes):
                         state_confirmed = True
                         break
@@ -702,6 +815,7 @@ class HAConnector:
             try:
                 current_st = self.get_state(entity_id)
                 observed_state = current_st.get("state")
+                state_changed = _state_snapshot_changed(before_state, current_st)
             except Exception:
                 observed_state = None
             state_confirmed = False
@@ -712,6 +826,8 @@ class HAConnector:
             "accepted": accepted,
             "observed_state": observed_state,
             "state_confirmed": state_confirmed,
+            "state_changed": state_changed,
+            "physical_action_confirmed": None,
         }
 
     def execute_service(

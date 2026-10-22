@@ -4,7 +4,7 @@
  *
  * Implements standard WatcheRobot device protocol endpoints:
  * - sys.client.hello / sys.ack handshake and capabilities negotiation
- * - WSPK binary framing for audio/image streams
+ * - WSPK binary framing for image media (SDK audio transport is not advertised)
  * - Inputs event notifications (backtouch, screentouch, roller)
  * - Motion & Camera commands with strict resource arbitration
  * - Bidirectional RequestEnvelope / ResponseEnvelope tool routing
@@ -29,8 +29,6 @@ extern "C" {
 #define DESK_SDK_CAP_INPUTS        "inputs"
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
-#define DESK_SDK_CAP_AUDIO_STREAM  "audio.stream"
-#define DESK_SDK_CAP_AUDIO_STREAM_ALT "audio_stream"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
 #define DESK_SDK_CAP_EXPRESSION_ALT "expression"
 #define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"
@@ -69,6 +67,7 @@ typedef enum {
  * framing (<4sBBHII) is unaffected.
  */
 #define DESK_SDK_MAX_FRAME_LEN 8192
+#define DESK_WSPK_MAX_FRAME_SIZE (DESK_WSPK_MAX_PAYLOAD_SIZE + DESK_WSPK_HEADER_SIZE)
 
 /**
  * @brief Return codes for desk_sdk_bridge_process_pairing_udp().
@@ -84,11 +83,12 @@ typedef enum {
 #define DESK_SDK_PAIRING_OK        0
 #define DESK_SDK_PAIRING_REJECTED  1
 #define DESK_SDK_PAIRING_ERR_ARG  (-1)
+#define DESK_SDK_PAIRING_MAX_FAILED_ATTEMPTS 5
 
 #pragma pack(push, 1)
 typedef struct {
     char magic[4];          /* "WSPK" */
-    uint8_t frame_type;     /* 1: Audio, 2: Camera JPEG, 3: Data */
+    uint8_t frame_type;     /* 1: Audio, 2: Video, 3: Image/JPEG, 4: Data */
     uint8_t flags;          /* Flags, e.g. 0x01: EOS, 0x02: Keyframe */
     uint16_t stream_id;     /* Stream ID (Little-Endian per official SDK) */
     uint32_t sequence;      /* Packet sequence (Little-Endian) */
@@ -125,6 +125,22 @@ int desk_sdk_bridge_register_outbound(desk_sdk_outbound_send_cb_t cb, void *user
  * @brief Register callback to receive external tool response envelopes from Python app.
  */
 int desk_sdk_bridge_register_tool_response_cb(desk_sdk_tool_response_cb_t cb, void *user_data);
+
+/**
+ * @brief Wait for a tool response for a given request_id up to timeout_ms.
+ * 
+ * @param request_id Request ID to wait for
+ * @param timeout_ms Maximum time to wait in milliseconds
+ * @param out_status Buffer to receive final status string ("succeeded", "failed", etc.)
+ * @param status_max_len Size of out_status buffer
+ * @param out_result Buffer to receive result JSON or error description
+ * @param result_max_len Size of out_result buffer
+ * @return 0 on success, -1 on timeout or error
+ */
+int desk_sdk_bridge_wait_tool_response(const char *request_id,
+                                       uint32_t timeout_ms,
+                                       char *out_status, size_t status_max_len,
+                                       char *out_result, size_t result_max_len);
 
 /**
  * @brief Pack WSPK binary header (16-byte Little Endian <4sBBHII).
@@ -172,6 +188,10 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
  *
  * The request's `pairing_code` is validated (6 digits, exact match) against the
  * device-side expected code provisioned via desk_sdk_bridge_set_pairing_code().
+ * The provisioned code is RAM-only and expires after five minutes of monotonic
+ * time. Five malformed or mismatching attempts close it, and a successful
+ * PairAccept consumes it. Bridge initialization/reset and explicit cancellation
+ * clear the code; it is never persisted or logged.
  * Fail-closed: when no expected code is configured, or the code is malformed or
  * mismatching, DESK_SDK_PAIRING_REJECTED is returned and udp_out is NOT written
  * (no `pair.accept`, no `session_token`, no `s_paired`). See interfaces.md 6.4.
@@ -185,20 +205,69 @@ int desk_sdk_bridge_process_pairing_udp(const char *udp_in, char *udp_out, size_
  * @brief Provision the device-side expected pairing code (6 decimal digits).
  *
  * This is the ONLY authoritative source for the expected code; no production
- * pairing code is ever hardcoded. The code is never logged (redacted per the
- * official redact_sensitive_fields rule). Passing NULL (or an empty string)
- * clears the configuration, which makes pairing fail-closed again.
+ * pairing code is ever hardcoded. The code remains in RAM for at most five
+ * minutes of monotonic time and is never logged. A successful pairing consumes
+ * it. Passing NULL (or an empty string) clears the configuration.
  *
  * @param code 6-digit code matching ^[0-9]{6}$, or NULL/"" to clear.
  * @return 0 on success, -1 if `code` is non-NULL and not exactly 6 digits.
  */
 int desk_sdk_bridge_set_pairing_code(const char *code);
 
+/** @brief Explicitly cancel the active pairing window and erase its RAM code. */
+void desk_sdk_bridge_clear_pairing_code(void);
+
 /**
  * @brief Report whether an expected pairing code has been provisioned.
  * @return true if pairing can succeed, false if pairing is fail-closed.
  */
 bool desk_sdk_bridge_is_pairing_code_configured(void);
+
+/**
+ * @brief Build the strict official HardwareHello for the latest accepted pairing.
+ *
+ * This binds the first WebSocket application frame to the pairing request and
+ * token. The caller must send it as the first text frame on a WebSocket client
+ * connection to the source host and websocket_port from that same request.
+ * Returns -1 when no valid pairing session is available.
+ */
+int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len);
+
+/** @brief Return the host and WebSocket port from the last accepted request. */
+int desk_sdk_bridge_get_pairing_target(char *host, size_t host_len,
+                                       uint16_t *port);
+
+/* RFC6455 device client used by the firmware poll loop. */
+typedef enum {
+    DESK_SDK_WS_OFFLINE = 0,
+    DESK_SDK_WS_CONNECTING,
+    DESK_SDK_WS_HANDSHAKE,
+    DESK_SDK_WS_HELLO_SENT,
+    DESK_SDK_WS_CONNECTED
+} desk_sdk_ws_state_t;
+int desk_sdk_ws_client_connect_paired(void);
+int desk_sdk_ws_client_poll(int timeout_ms);
+int desk_sdk_ws_client_send_text(const char *text);
+int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len);
+bool desk_sdk_ws_client_is_connected(void);
+/**
+ * @brief Return whether this current WebSocket observed a successful
+ *        HardwareHello protocol ACK.
+ *
+ * This reports protocol-level ACK observation only; the current plaintext
+ * WebSocket transport does not cryptographically authenticate the Runtime.
+ */
+bool desk_sdk_ws_client_is_authenticated(void);
+desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void);
+void desk_sdk_ws_client_close(void);
+
+/* Device-local opt-in for the CR-009 structured diagnostic stream. Disabled
+ * by default; this is not wired to a product setting until A0/A1 provide it. */
+void desk_sdk_bridge_set_local_log_enabled(bool enabled);
+/* Internal transport lifecycle seam; clears the current log stream lease. */
+void desk_sdk_bridge_log_session_closed(void);
+/* Internal A2 writer seam: returns one serialized v1 event/gap, or 0 if idle. */
+int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len);
 
 /**
  * @brief Parse top-level string field from JSON payload.
@@ -223,10 +292,12 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
  * - ctrl.motion.move / ctrl.motion.stop -> sys.ack with CR-002 ACK-only semantics
  *   (status="accepted", accepted=true, state_confirmed=false)
  * - ctrl.camera.acquire / ctrl.camera.release / ctrl.camera.capture
- * - ctrl.microphone.open / ctrl.microphone.close
+ * - SDK audio transport controls currently return UNSUPPORTED_OPERATION
  * - ctrl.expression.play / ctrl.expression.set / ctrl.expression.audio_follow
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
+/* WebSocket-only dispatch. Never use this entry point for the legacy TCP server. */
+int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len);
 #define desk_sdk_bridge_process_line desk_sdk_bridge_process_command
 
 /**

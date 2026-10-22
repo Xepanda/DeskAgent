@@ -1,6 +1,6 @@
 """
 Contract tests for Watcher embedded hardware drivers:
-1. STM32 Coprocessor COBS framing (mcu_link wire contract) and strict ACK validation.
+1. STM32 frame packing and standalone legacy COBS utility helpers.
 2. Himax PTL camera 7-byte Base Header, 16-byte Media Header, CRC32, and multi-packet assembly.
 """
 
@@ -102,6 +102,12 @@ class TestWatcherHardwareContract(unittest.TestCase):
         ]
         cls.lib.desk_watcher_motion_pack_stop.restype = ctypes.c_size_t
 
+        cls.lib.desk_watcher_motion_parse_ack.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint8,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_bool)
+        ]
+        cls.lib.desk_watcher_motion_parse_ack.restype = ctypes.c_int
+
         # Camera functions
         cls.lib.desk_watcher_camera_parse_ptl_header.argtypes = [
             ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
@@ -116,8 +122,33 @@ class TestWatcherHardwareContract(unittest.TestCase):
         ]
         cls.lib.desk_watcher_camera_validate_frame.restype = ctypes.c_int
 
+        class CameraControlState(ctypes.Structure):
+            _fields_ = [
+                ("result", ctypes.c_uint32),
+                ("generation", ctypes.c_uint32),
+                ("mode", ctypes.c_uint32),
+                ("model", ctypes.c_uint32),
+                ("debug", ctypes.c_uint32),
+                ("error", ctypes.c_uint32),
+            ]
+
+        class CameraResync(ctypes.Structure):
+            _fields_ = [("bytes", ctypes.c_uint8 * 7), ("used", ctypes.c_size_t)]
+
+        cls.CameraControlState = CameraControlState
+        cls.CameraResync = CameraResync
+        cls.lib.desk_watcher_camera_parse_control_state.argtypes = [
+            ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(CameraControlState)
+        ]
+        cls.lib.desk_watcher_camera_parse_control_state.restype = ctypes.c_int
+        cls.lib.desk_watcher_camera_resync_push.argtypes = [
+            ctypes.POINTER(CameraResync), ctypes.c_uint8, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32)
+        ]
+        cls.lib.desk_watcher_camera_resync_push.restype = ctypes.c_bool
+
     def test_cobs_roundtrip_vectors(self) -> None:
-        """Verifies standard COBS encoding and decoding round-trip."""
+        """Verifies legacy utility helpers; the STM32 UART transaction does not use COBS."""
         test_cases = [
             b"Hello World",
             b"\x00",
@@ -150,7 +181,7 @@ class TestWatcherHardwareContract(unittest.TestCase):
             self.assertEqual(bytes(decoded[:dec_len.value]), data)
 
     def test_wire_framing_delimiter(self) -> None:
-        """Verifies that wire framing appends 0x00 delimiter and decodes accurately."""
+        """Verifies retained legacy framing helpers, not the ratified UART wire format."""
         payload = b"\xa5\x5a\x01\x02\x01\x01\x05\x00\x00\x00\x09\x00\x03\xb0\x04\x4c\x04\xc2\x01\x00\x01"
         crc = python_crc16_ccitt(payload)
         raw_frame = payload + struct.pack("<H", crc)
@@ -210,6 +241,83 @@ class TestWatcherHardwareContract(unittest.TestCase):
         pkt_stop_crc = struct.unpack("<H", raw_stop[14:16])[0]
         self.assertEqual(calc_stop_crc, pkt_stop_crc)
 
+    def test_native_binary_ack_parser(self) -> None:
+        """UART ACKs are raw fixed-length frames, not COBS-delimited frames."""
+        payload = bytes([0xA5, 0x5A, 1, 2, 0, 2]) + struct.pack("<IH", 0x12345678, 4)
+        payload += struct.pack("<hh", 900, 1200)
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0xFF)
+        is_nack = ctypes.c_bool(False)
+
+        self.assertEqual(len(raw), 18)
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345678, 1,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack)),
+            0,
+        )
+        self.assertFalse(is_nack.value)
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 0x12345679, 1,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack)),
+            -5,
+        )
+
+        bad = (ctypes.c_uint8 * len(raw))(*raw)
+        bad[-1] ^= 0x01
+        self.assertEqual(
+            self.lib.desk_watcher_motion_parse_ack(bad, len(raw), 0x12345678, 1,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack)),
+            -4,
+        )
+
+    def test_native_binary_ack_requires_expected_command_and_valid_shape(self) -> None:
+        payload = bytes([0xA5, 0x5A, 1, 2, 1, 2]) + struct.pack("<IH", 7, 4)
+        payload += struct.pack("<hh", 900, 1200)
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0)
+        is_nack = ctypes.c_bool(False)
+        parse = self.lib.desk_watcher_motion_parse_ack
+
+        # Echoed MOVE ACK is valid only for the matching pending command.
+        self.assertEqual(parse(frame, len(raw), 7, 1, ctypes.byref(nack), ctypes.byref(is_nack)), 0)
+        self.assertEqual(parse(frame, len(raw), 7, 2, ctypes.byref(nack), ctypes.byref(is_nack)), -5)
+
+        # An ACK frame with an unexpected flag bit or malformed payload is ignored.
+        malformed_payload = bytes([0xA5, 0x5A, 1, 2, 1, 3]) + struct.pack("<IH", 7, 4)
+        malformed_payload += struct.pack("<hh", 900, 1200)
+        malformed = (ctypes.c_uint8 * (len(malformed_payload) + 2))(
+            *(malformed_payload + struct.pack("<H", python_crc16_ccitt(malformed_payload)))
+        )
+        self.assertEqual(parse(malformed, len(malformed), 7, 1,
+                               ctypes.byref(nack), ctypes.byref(is_nack)), -5)
+
+    def test_zero_code_nack_is_rejected(self) -> None:
+        payload = bytes([0xA5, 0x5A, 1, 2, 0xFF, 4]) + struct.pack("<IH", 9, 2)
+        payload += bytes([0, 0])
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0xFF)
+        is_nack = ctypes.c_bool(False)
+        rc = self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 9, 2,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack))
+        self.assertEqual(rc, -4)
+        self.assertFalse(is_nack.value)
+        self.assertEqual(nack.value, 0)
+
+    def test_nack_requires_exact_flags(self) -> None:
+        payload = bytes([0xA5, 0x5A, 1, 2, 0xFF, 0x05]) + struct.pack("<IH", 9, 2)
+        payload += bytes([1, 0])
+        raw = payload + struct.pack("<H", python_crc16_ccitt(payload))
+        frame = (ctypes.c_uint8 * len(raw))(*raw)
+        nack = ctypes.c_uint8(0)
+        is_nack = ctypes.c_bool(False)
+        rc = self.lib.desk_watcher_motion_parse_ack(frame, len(raw), 9, 2,
+                                                   ctypes.byref(nack), ctypes.byref(is_nack))
+        self.assertEqual(rc, -4)
+        self.assertFalse(is_nack.value)
+
     def test_camera_ptl_header_parsing(self) -> None:
         """Verifies Himax PTL 7-byte Base Header parsing and negative rejection."""
         # Valid header: 0xC0 0x5A, media_type=0x01, body_size=1024 (LE)
@@ -241,6 +349,40 @@ class TestWatcherHardwareContract(unittest.TestCase):
             (ctypes.c_uint8 * 7)(*bad_size), 7, ctypes.byref(body_size)
         )
         self.assertEqual(rc_sz, -4)
+
+    def test_camera_control_status_requires_matching_request_id_and_valid_fields(self) -> None:
+        state = self.CameraControlState()
+        self.assertEqual(
+            self.lib.desk_watcher_camera_parse_control_state(
+                b"WV1 STATE 17 0 42 0 0 0 0", 17, ctypes.byref(state)
+            ),
+            0,
+        )
+        self.assertEqual((state.generation, state.mode, state.model, state.error), (42, 0, 0, 0))
+        self.assertNotEqual(
+            self.lib.desk_watcher_camera_parse_control_state(
+                b"WV1 STATE 18 0 42 0 0 0 0", 17, ctypes.byref(state)
+            ),
+            0,
+        )
+        self.assertNotEqual(
+            self.lib.desk_watcher_camera_parse_control_state(
+                b"WV1 STATE 17 0 42 9 0 0 0", 17, ctypes.byref(state)
+            ),
+            0,
+        )
+
+    def test_camera_ptl_resync_finds_header_across_byte_boundaries(self) -> None:
+        scanner = self.CameraResync()
+        body_size = ctypes.c_uint32(0)
+        header = b"\xC0\x5A\x01" + struct.pack("<I", 1024)
+        found = False
+        for byte in b"noise" + header:
+            found = self.lib.desk_watcher_camera_resync_push(
+                ctypes.byref(scanner), byte, 128 * 1024, ctypes.byref(body_size)
+            )
+        self.assertTrue(found)
+        self.assertEqual(body_size.value, 1024)
 
     def test_camera_ptl_frame_assembly_and_crc32(self) -> None:
         """Verifies complete PTL Media Header validation, CRC32, and JPEG extraction."""
