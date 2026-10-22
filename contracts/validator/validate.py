@@ -202,6 +202,33 @@ def test_error_catalog() -> None:
     print(f"  [OK] Error catalog verified: {len(errors)} stable error codes")
 
 
+def test_ha_contract_semantics(raw_schemas: dict[str, Any]) -> None:
+    """Pin the HA schema to the connector's documented optional/default semantics."""
+    schema = raw_schemas["domain_ha.json"]["definitions"]
+    args_validator = Draft202012Validator(schema["ha_execute_args"])
+    result_validator = Draft202012Validator(schema["ha_execute_result"])
+
+    base = {"entity_id": "light.desk", "action": "turn_on"}
+    args_validator.validate(base)
+    args_validator.validate({**base, "wait_for_state": {}})
+    args_validator.validate({**base, "wait_for_state": {"expected_attributes": {"brightness": 200}}})
+    args_validator.validate({**base, "wait_for_state": {"timeout_ms": 0}})
+    args_validator.validate({**base, "wait_for_state": {"timeout_ms": 1250.5}})
+    args_validator.validate({**base, "wait_for_state": {"timeout_ms": 30000}})
+
+    for invalid_timeout in (-0.1, 30000.1, True, "2000"):
+        instance = {**base, "wait_for_state": {"timeout_ms": invalid_timeout}}
+        assert list(args_validator.iter_errors(instance)), f"Invalid timeout accepted: {invalid_timeout!r}"
+    assert list(args_validator.iter_errors({**base, "wait_for_state": {"unknown": True}}))
+
+    result_validator.validate({
+        "entity_id": "light.desk", "action": "turn_on", "accepted": True,
+        "observed_state": "on", "state_confirmed": True, "state_changed": True,
+        "physical_action_confirmed": None,
+    })
+    print("  [OK] HA contract semantics verified: optional criteria, timeout bounds/default shape, and truthful result fields")
+
+
 def test_idempotency_and_sequence_rules() -> None:
     requests_dir = FIXTURES_DIR / "requests"
     seen_ids: set[str] = set()
@@ -236,6 +263,9 @@ def main() -> int:
 
     print("\n6. Verifying Error Catalog...")
     test_error_catalog()
+
+    print("\n6a. Verifying HA Connector Contract Semantics...")
+    test_ha_contract_semantics(raw_schemas)
 
     print("\n7. Verifying Idempotency and Sequence Constraints...")
     test_idempotency_and_sequence_rules()

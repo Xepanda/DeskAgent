@@ -8,7 +8,9 @@
     "action": "turn_on",
     "accepted": true,
     "observed_state": "on",
-    "state_confirmed": true
+    "state_confirmed": true,
+    "state_changed": true,
+    "physical_action_confirmed": null
   },
   "execution_duration_ms": 2040
 }
