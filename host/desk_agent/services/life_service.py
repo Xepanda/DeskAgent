@@ -114,6 +114,12 @@ def _normalize_utc_iso(value: str) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _is_valid_local_time(dt: datetime, target_tz: tzinfo) -> bool:
+    """Return false when a local wall time falls inside a timezone transition gap."""
+    round_trip = dt.astimezone(timezone.utc).astimezone(target_tz)
+    return round_trip.replace(tzinfo=None) == dt.replace(tzinfo=None)
+
+
 def compute_next_occurrence(
     current_iso: str,
     repeat_rule: str,
@@ -191,6 +197,22 @@ def compute_next_occurrence(
             next_dt = local_dt + timedelta(days=1)
     else:
         return None
+
+    # A recurring wall-clock time can land in the spring-forward gap (for
+    # example, 02:30 in New York). ZoneInfo assigns that nonexistent time an
+    # offset, which would move the reminder to 03:30 and permanently drift its
+    # local time. Skip the nonexistent calendar slot while retaining the
+    # original wall-clock time for the next valid recurrence.
+    if rule == "daily" or rrule_frequency == "daily":
+        stride_days = rrule_interval
+    elif rule == "weekly" or rrule_frequency == "weekly":
+        stride_days = 7 * rrule_interval
+    else:
+        stride_days = 0
+    for _ in range(366):
+        if not stride_days or _is_valid_local_time(next_dt, target_tz):
+            break
+        next_dt += timedelta(days=stride_days)
 
     return next_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 

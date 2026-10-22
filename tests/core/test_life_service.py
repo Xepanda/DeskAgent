@@ -1005,6 +1005,16 @@ os._exit(0)
         # 01:30 EST on Nov 2, which is still 06:30Z.
         self.assertEqual(next_daily, "2026-11-02T06:30:00Z")
 
+    def test_daily_occurrence_skips_nonexistent_spring_forward_wall_time(self) -> None:
+        """A 02:30 daily reminder resumes at 02:30 after the DST gap, without drifting."""
+        next_daily = compute_next_occurrence(
+            "2026-03-07T07:30:00Z", "daily", tz_name="America/New_York"
+        )
+
+        # New York has no 02:30 on Mar 8, 2026. Skip that nonexistent slot so
+        # the stored UTC occurrence still maps to 02:30 local on the next day.
+        self.assertEqual(next_daily, "2026-03-09T06:30:00Z")
+
     # -------------------------------------------------------------------------
     # 13. LifeService Close & Context Manager
     # -------------------------------------------------------------------------
