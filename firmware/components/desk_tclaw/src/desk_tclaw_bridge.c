@@ -98,6 +98,7 @@ static const char *desk_camera_capture_error_name(int rc)
     case DESK_WATCHER_CAMERA_ERR_SPI: return "SPI transport failed";
     case DESK_WATCHER_CAMERA_ERR_EMPTY: return "camera FIFO remained empty until deadline";
     case DESK_WATCHER_CAMERA_ERR_CONTROL: return "HX6538 control command failed";
+    case DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL: return "JPEG output buffer too small";
     default: return "camera capture failed";
     }
 }

@@ -281,6 +281,18 @@ int main(void) {
         self.assertIn("SYNC retry read failed: PCA9535 INPUT0 rc=%d", retry_sync)
         self.assertIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO);", retry_sync)
 
+    def test_camera_output_buffer_too_small_has_camera_specific_error_mapping(self):
+        header = CAMERA_H.read_text(encoding="utf-8")
+        camera = CAMERA_C.read_text(encoding="utf-8")
+        tclaw = TCLAW_BRIDGE_C.read_text(encoding="utf-8")
+
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL = -27", header)
+        capture = camera.split("int desk_watcher_camera_capture(", 1)[1]
+        small_buffer = capture.split("if (jpeg_sz > max_len)", 1)[1].split("memcpy(out_buf", 1)[0]
+        self.assertIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL);", small_buffer)
+        names = tclaw.split("static const char *desk_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        self.assertIn('case DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL: return "JPEG output buffer too small";', names)
+
     def test_empty_headers_retry_until_capture_deadline_and_allow_later_valid_header(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]

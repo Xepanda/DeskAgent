@@ -743,7 +743,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     if (jpeg_sz > max_len) {
         ESP_LOGE(TAG, "JPEG output buffer too small: jpeg_size=%u max_len=%u",
                  (unsigned)jpeg_sz, (unsigned)max_len);
-        return camera_capture_release(DESK_HW_ERR_INVALID_ARG);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL);
     }
 
     memcpy(out_buf, jpeg_ptr, jpeg_sz);
