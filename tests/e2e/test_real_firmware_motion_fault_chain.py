@@ -152,6 +152,7 @@ class RealFirmwareMotionFaultChain(unittest.TestCase):
             f"-I{REPO_ROOT}/firmware/components/desk_sdk_bridge/include",
             f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_notification.c",
             f"{REPO_ROOT}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{REPO_ROOT}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{REPO_ROOT}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
