@@ -325,7 +325,11 @@ static int camera_read_resynchronized_header(uint8_t header[HX_PTL_BASE_HEADER_S
             .rx_buffer = chunk, .flags = SPI_TRANS_CS_KEEP_ACTIVE,
         };
         esp_err_t err = spi_device_transmit(s_spi_dev, &trans);
-        if (err != ESP_OK) return -1;
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "SPI PTL resynchronization scan failed: %s (%d)",
+                     esp_err_to_name(err), (int)err);
+            return DESK_WATCHER_CAMERA_ERR_SPI;
+        }
         for (size_t i = 0; i < sizeof(chunk); ++i) {
             if (desk_watcher_camera_resync_push(&s_ptl_scanner, chunk[i],
                                                 WATCHER_HX_PTL_BODY_CAPACITY, body_size)) {
@@ -337,7 +341,9 @@ static int camera_read_resynchronized_header(uint8_t header[HX_PTL_BASE_HEADER_S
             }
         }
     }
-    return -1;
+    /* No valid PTL header within the bounded resynchronization window is a
+     * protocol framing failure. Transport failures return SPI above. */
+    return DESK_WATCHER_CAMERA_ERR_PROTOCOL;
 }
 #endif
 
@@ -597,7 +603,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             spi_transaction_t close_trans = {.length = 8, .rxlength = 8, .rx_buffer = &dummy, .flags = 0};
             (void)spi_device_transmit(s_spi_dev, &close_trans);
             camera_capture_release_bus();
-            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL);
+            return camera_capture_release(scan_rc);
         }
         s_ptl_resynchronizing = false;
     } else {

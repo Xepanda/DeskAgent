@@ -176,6 +176,17 @@ int main(void) {
         ):
             self.assertIn(diagnostic, source)
 
+    def test_resynchronization_preserves_spi_transport_error(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        scan = source.split("static int camera_read_resynchronized_header(", 1)[1].split("\n}", 1)[0]
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        scan_failure = capture.split("if (scan_rc != 0)", 1)[1].split("s_ptl_resynchronizing = false", 1)[0]
+        self.assertIn("SPI PTL resynchronization scan failed", scan)
+        self.assertIn("return DESK_WATCHER_CAMERA_ERR_SPI;", scan)
+        self.assertIn("return DESK_WATCHER_CAMERA_ERR_PROTOCOL;", scan)
+        self.assertIn("return camera_capture_release(scan_rc);", scan_failure)
+        self.assertNotIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL);", scan_failure)
+
     def test_zero_ptl_header_has_distinct_empty_error_and_spi_failures_keep_stage(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
