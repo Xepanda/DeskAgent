@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -48,6 +49,7 @@ static void desk_sdk_format_iso8601(time_t t, char *out_buf, size_t buf_len)
 
 static bool s_client_connected = false;
 static uint32_t s_event_seq = 0;
+static atomic_uint_least32_t s_roller_input_send_failures = ATOMIC_VAR_INIT(0);
 static desk_sdk_outbound_send_cb_t s_outbound_cb = NULL;
 static void *s_outbound_user_data = NULL;
 static desk_sdk_tool_response_cb_t s_tool_response_cb = NULL;
@@ -182,6 +184,52 @@ static bool desk_sdk_monotonic_now_ms(uint64_t *now_ms)
     return true;
 }
 #endif
+
+#ifdef DESK_SDK_TESTING
+typedef int (*desk_sdk_test_roller_input_send_hook_t)(desk_sdk_roller_delta_t delta,
+                                                       int64_t timestamp_ms);
+static desk_sdk_test_roller_input_send_hook_t s_test_roller_input_send_hook;
+
+void desk_sdk_test_set_roller_input_send_hook(desk_sdk_test_roller_input_send_hook_t hook)
+{
+    s_test_roller_input_send_hook = hook;
+}
+#endif
+
+static void desk_sdk_roller_input_observer(desk_roller_delta_t delta, void *user_data)
+{
+    (void)user_data;
+    desk_sdk_roller_delta_t sdk_delta;
+    if (delta == DESK_ROLLER_DELTA_UP) {
+        sdk_delta = DESK_SDK_ROLLER_DELTA_POSITIVE;
+    } else if (delta == DESK_ROLLER_DELTA_DOWN) {
+        sdk_delta = DESK_SDK_ROLLER_DELTA_NEGATIVE;
+    } else {
+        atomic_fetch_add(&s_roller_input_send_failures, 1);
+        return;
+    }
+
+    uint64_t monotonic_ms = 0;
+    if (!desk_sdk_monotonic_now_ms(&monotonic_ms) || monotonic_ms > INT64_MAX) {
+        atomic_fetch_add(&s_roller_input_send_failures, 1);
+        return;
+    }
+
+#ifdef DESK_SDK_TESTING
+    int rc = s_test_roller_input_send_hook
+        ? s_test_roller_input_send_hook(sdk_delta, (int64_t)monotonic_ms)
+        : desk_sdk_bridge_send_roller_input(sdk_delta, (int64_t)monotonic_ms);
+#else
+    int rc = desk_sdk_bridge_send_roller_input(sdk_delta, (int64_t)monotonic_ms);
+#endif
+    if (rc != DESK_SDK_ROLLER_OK)
+        atomic_fetch_add(&s_roller_input_send_failures, 1);
+}
+
+uint32_t desk_sdk_bridge_get_roller_input_failure_count(void)
+{
+    return atomic_load(&s_roller_input_send_failures);
+}
 
 static bool desk_sdk_is_lower_hex_32(const char *s)
 {
@@ -1113,6 +1161,7 @@ int desk_sdk_bridge_init(void)
     desk_sdk_bridge_set_local_log_enabled(false);
     s_client_connected = false;
     s_event_seq = 0;
+    atomic_store(&s_roller_input_send_failures, 0);
     s_outbound_cb = NULL;
     s_outbound_user_data = NULL;
     s_tool_response_cb = NULL;
@@ -1128,6 +1177,10 @@ int desk_sdk_bridge_init(void)
     desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
     desk_sdk_ws_client_close();
+    if (desk_hardware_register_roller_delta_cb(desk_sdk_roller_input_observer, NULL) != DESK_HW_OK) {
+        printf("[SDK-INPUT] roller observer registration failed\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -2603,9 +2656,9 @@ int desk_sdk_bridge_send_roller_input(desk_sdk_roller_delta_t delta,
     int rc = desk_sdk_bridge_format_roller_input(delta, timestamp_ms,
                                                   event_json, sizeof(event_json));
     if (rc != DESK_SDK_ROLLER_OK) return rc;
-    if (!desk_sdk_ws_client_is_connected())
-        return DESK_SDK_ROLLER_ERR_NOT_CONNECTED;
-    return desk_sdk_ws_client_send_text(event_json) == 0
+    int send_rc = desk_sdk_ws_client_send_text_nonblocking(event_json);
+    if (send_rc == -1) return DESK_SDK_ROLLER_ERR_NOT_CONNECTED;
+    return send_rc == 0
         ? DESK_SDK_ROLLER_OK
         : DESK_SDK_ROLLER_ERR_SEND;
 }

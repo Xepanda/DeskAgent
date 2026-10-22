@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 # Mirror of DESK_SDK_MAX_FRAME_LEN in desk_sdk_bridge.h (interfaces.md 6.3.2).
@@ -218,6 +219,28 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         ]
         cls.lib.desk_sdk_bridge_send_roller_input.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_send_roller_input.argtypes = [ctypes.c_int, ctypes.c_int64]
+        cls.lib.desk_sdk_bridge_get_roller_input_failure_count.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_bridge_get_roller_input_failure_count.argtypes = []
+        cls.lib.desk_sdk_test_set_roller_input_send_hook.restype = None
+        cls.lib.desk_sdk_test_set_roller_input_send_hook.argtypes = [
+            ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int64)
+        ]
+        cls.lib.desk_sdk_test_ws_seed_ready.restype = None
+        cls.lib.desk_sdk_test_ws_seed_ready.argtypes = []
+        cls.lib.desk_sdk_test_ws_lock_control_queue.restype = None
+        cls.lib.desk_sdk_test_ws_lock_control_queue.argtypes = []
+        cls.lib.desk_sdk_test_ws_unlock_control_queue.restype = None
+        cls.lib.desk_sdk_test_ws_unlock_control_queue.argtypes = []
+        cls.lib.desk_sdk_test_ws_fill_control_queue.restype = None
+        cls.lib.desk_sdk_test_ws_fill_control_queue.argtypes = []
+        cls.lib.desk_sdk_test_ws_clear_control_queue.restype = None
+        cls.lib.desk_sdk_test_ws_clear_control_queue.argtypes = []
+        cls.lib.desk_sdk_test_ws_reset.restype = None
+        cls.lib.desk_sdk_test_ws_reset.argtypes = []
+        cls.lib.desk_hardware_feed_roller_delta.restype = ctypes.c_int
+        cls.lib.desk_hardware_feed_roller_delta.argtypes = [ctypes.c_int]
+        cls.lib.desk_hardware_feed_touch_event.restype = ctypes.c_int
+        cls.lib.desk_hardware_feed_touch_event.argtypes = [ctypes.c_int, ctypes.c_int]
 
         cls.lib.desk_wspk_pack_header.restype = ctypes.c_int
         cls.lib.desk_wspk_pack_header.argtypes = [
@@ -1104,6 +1127,89 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             {"source": "screen_touch", "action": "tap", "delta": 1, "timestamp_ms": 1},
         ):
             self.assertIsNone(parse_input_event(bad_data))
+
+    def test_roller_observer_maps_direction_time_and_preserves_local_ui(self) -> None:
+        """Bridge init registers the observer; buttons stay local and failures count."""
+        sent: list[tuple[int, int]] = []
+        local_events: list[tuple[int, int]] = []
+        send_cb_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int64)
+
+        @send_cb_type
+        def sender(delta, timestamp_ms):
+            sent.append((delta, timestamp_ms))
+            return 0
+
+        touch_cb_type = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+
+        @touch_cb_type
+        def local_touch(target, action, _user_data):
+            local_events.append((target, action))
+
+        self.addCleanup(lambda: self.lib.desk_sdk_test_set_roller_input_send_hook(
+            ctypes.cast(None, send_cb_type)))
+        self.addCleanup(lambda: self.lib.desk_hardware_register_input_cb(
+            ctypes.cast(None, touch_cb_type), None))
+
+        self.lib.desk_sdk_test_set_roller_input_send_hook(sender)
+        self.lib.desk_hardware_register_input_cb.argtypes = [touch_cb_type, ctypes.c_void_p]
+        self.lib.desk_hardware_register_input_cb.restype = ctypes.c_int
+        self.assertEqual(self.lib.desk_hardware_register_input_cb(local_touch, None), 0)
+
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(1), 0)
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(-1), 0)
+        self.assertEqual(sent, [(1, 1000), (-1, 1000)])
+        self.assertEqual(local_events, [(2, 2), (2, 3)])
+        self.assertEqual(self.lib.desk_sdk_bridge_get_roller_input_failure_count(), 0)
+
+        self.lib.desk_hardware_feed_touch_event(2, 0)
+        self.lib.desk_hardware_feed_touch_event(2, 1)
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(local_events[-2:], [(2, 0), (2, 1)])
+
+        @send_cb_type
+        def failed_sender(delta, timestamp_ms):
+            return -4
+
+        self.lib.desk_sdk_test_set_roller_input_send_hook(failed_sender)
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(1), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_get_roller_input_failure_count(), 1)
+        self.assertEqual(local_events[-1], (2, 2))
+
+    def test_roller_observer_drops_fast_when_websocket_queue_busy_or_full(self) -> None:
+        """Not-ready, busy and full sends count as drops without waiting or UI loss."""
+        send_cb_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int64)
+        self.lib.desk_sdk_test_set_roller_input_send_hook(ctypes.cast(None, send_cb_type))
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+        local_events: list[tuple[int, int]] = []
+        touch_cb_type = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+
+        @touch_cb_type
+        def local_touch(target, action, _user_data):
+            local_events.append((target, action))
+
+        self.lib.desk_hardware_register_input_cb(local_touch, None)
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(1), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_get_roller_input_failure_count(), 1)
+        self.assertEqual(local_events[-1], (2, 2))
+
+        self.lib.desk_sdk_test_ws_seed_ready()
+        self.lib.desk_sdk_test_ws_lock_control_queue()
+        start = time.monotonic()
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(1), 0)
+        busy_elapsed = time.monotonic() - start
+        self.lib.desk_sdk_test_ws_unlock_control_queue()
+        self.assertLess(busy_elapsed, 0.1)
+        self.assertEqual(self.lib.desk_sdk_bridge_get_roller_input_failure_count(), 2)
+        self.assertEqual(local_events[-1], (2, 2))
+
+        self.lib.desk_sdk_test_ws_fill_control_queue()
+        start = time.monotonic()
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(-1), 0)
+        full_elapsed = time.monotonic() - start
+        self.lib.desk_sdk_test_ws_clear_control_queue()
+        self.assertLess(full_elapsed, 0.1)
+        self.assertEqual(self.lib.desk_sdk_bridge_get_roller_input_failure_count(), 3)
+        self.assertEqual(local_events[-1], (2, 3))
 
     def test_wspk_native_c_pack_and_unpack(self) -> None:
         """Verifies native C WSPK header serialization and deserialization."""

@@ -266,6 +266,44 @@ static int ws_enqueue_frame(uint8_t opcode, const uint8_t *payload, size_t len)
     return 0;
 }
 
+/* Roller input is delivered synchronously from the hardware input worker.
+ * This path never starts the writer and never waits on lifecycle/queue locks.
+ * The connection path prepares the writer before marking the session ready. */
+static int ws_enqueue_frame_nonblocking(uint8_t opcode,
+                                        const uint8_t *payload,
+                                        size_t len)
+{
+    if (!payload || len > WS_CONTROL_FRAME_MAX) return -1;
+    if (pthread_mutex_trylock(&s_ws_lifecycle_mutex) != 0) return -2;
+    bool ready = s_ws_ready;
+    uint32_t generation = s_ws_generation;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    if (!ready) return -1;
+
+    if (pthread_mutex_trylock(&s_ws_writer_mutex) != 0) return -2;
+    if (!s_ws_writer_started) {
+        pthread_mutex_unlock(&s_ws_writer_mutex);
+        return -3;
+    }
+    if (s_ws_control_count == WS_CONTROL_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&s_ws_writer_mutex);
+        return -4;
+    }
+
+    size_t tail = (s_ws_control_head + s_ws_control_count) % WS_CONTROL_QUEUE_CAPACITY;
+    s_ws_control_queue[tail].opcode = opcode;
+    s_ws_control_queue[tail].generation = generation;
+    s_ws_control_queue[tail].close_after_send = opcode == 0x8;
+    s_ws_control_queue[tail].len = len;
+    memcpy(s_ws_control_queue[tail].payload, payload, len);
+    ++s_ws_control_count;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+    /* The writer polls on its 20ms timed-wait interval; this is a nominal
+     * queue-observation interval, with additional scheduler latency possible.
+     * Avoid condition-variable work in the synchronous hardware callback. */
+    return 0;
+}
+
 static void ws_clear_outbound_queue(void)
 {
     pthread_mutex_lock(&s_ws_writer_mutex);
@@ -606,6 +644,12 @@ int desk_sdk_ws_client_send_text(const char *text)
     return ws_enqueue_frame(0x1, (const uint8_t *)text, strlen(text));
 }
 
+int desk_sdk_ws_client_send_text_nonblocking(const char *text)
+{
+    if (!text) return -1;
+    return ws_enqueue_frame_nonblocking(0x1, (const uint8_t *)text, strlen(text));
+}
+
 int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len)
 {
     if (!s_ws_ready || (!data && len)) return -1;
@@ -679,6 +723,7 @@ int desk_sdk_ws_client_connect_paired(void)
     if (ws_read_frame(3000, &opcode, s_ws_ack, sizeof(s_ws_ack)-1, &ack_len) != 0 || opcode != 0x1) goto fail;
     s_ws_ack[ack_len] = 0;
     if (!strstr((char *)s_ws_ack, "\"type\":\"sys.ack\"") || !strstr((char *)s_ws_ack, "\"sys.client.hello\"") || !strstr((char *)s_ws_ack, "\"code\":0")) goto fail;
+    if (ws_writer_start() != 0) goto fail;
     /* Commit only if no close/credential/policy/identity invalidation happened
      * while this connection was in flight. This remains protocol ACK evidence,
      * not cryptographic Runtime peer authentication. */
@@ -729,3 +774,49 @@ int desk_sdk_ws_client_poll(int timeout_ms)
         return desk_sdk_ws_client_send_text(s_ws_response);
     return 0;
 }
+
+#ifdef DESK_SDK_TESTING
+void desk_sdk_test_ws_seed_ready(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    ++s_ws_generation;
+    s_ws_ready = true;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_writer_started = true;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_lock_control_queue(void)
+{
+    pthread_mutex_lock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_unlock_control_queue(void)
+{
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_fill_control_queue(void)
+{
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_control_count = WS_CONTROL_QUEUE_CAPACITY;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_clear_control_queue(void)
+{
+    ws_clear_outbound_queue();
+}
+
+void desk_sdk_test_ws_reset(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    s_ws_ready = false;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_writer_started = false;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+    ws_clear_outbound_queue();
+}
+#endif

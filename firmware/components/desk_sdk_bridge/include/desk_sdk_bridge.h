@@ -259,6 +259,8 @@ typedef enum {
 int desk_sdk_ws_client_connect_paired(void);
 int desk_sdk_ws_client_poll(int timeout_ms);
 int desk_sdk_ws_client_send_text(const char *text);
+/** Best-effort control-queue enqueue for input observer context; fail-fast. */
+int desk_sdk_ws_client_send_text_nonblocking(const char *text);
 int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len);
 bool desk_sdk_ws_client_is_connected(void);
 /**
@@ -348,6 +350,9 @@ int desk_sdk_bridge_format_roller_input(desk_sdk_roller_delta_t delta,
  */
 int desk_sdk_bridge_send_roller_input(desk_sdk_roller_delta_t delta,
                                       int64_t timestamp_ms);
+
+/** @brief Number of roller observer events dropped by the SDK bridge. */
+uint32_t desk_sdk_bridge_get_roller_input_failure_count(void);
 
 /**
  * @brief Forward external tool request from TClaw to Python Application.
