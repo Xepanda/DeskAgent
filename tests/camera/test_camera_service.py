@@ -152,6 +152,60 @@ class TestCameraService(unittest.TestCase):
         self.assertIsNone(cam.get_latest_frame("viewer"), "A stale frame must not be returned or masked as a usable image")
         cam.release_lease("viewer")
 
+    def test_repeated_source_jpeg_does_not_refresh_stale_frame(self) -> None:
+        source_calls = 0
+        source_called_twice = threading.Event()
+
+        def stale_source():
+            nonlocal source_calls
+            source_calls += 1
+            if source_calls >= 2:
+                source_called_twice.set()
+            return TEST_JPEG
+
+        cam = CameraViewerService(stale_threshold_ms=50, auto_start_pipeline=True)
+        cam.set_hardware_frame_source(stale_source)
+        cam.acquire_lease("viewer", lease_ms=1000, target_fps=30)
+        try:
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and cam.get_latest_frame("viewer") is None:
+                time.sleep(0.005)
+            first = cam.get_latest_frame("viewer")
+            self.assertIsNotNone(first)
+            self.assertTrue(source_called_twice.wait(0.5))
+            time.sleep(0.06)
+            self.assertIsNone(
+                cam.get_latest_frame("viewer"),
+                "re-reading byte-identical source data must not renew the frame freshness timestamp",
+            )
+        finally:
+            cam.release_lease("viewer")
+            cam.stop_capture()
+
+    def test_capture_timeout_does_not_refresh_last_frame(self) -> None:
+        source_calls = 0
+
+        def timeout_after_first_frame():
+            nonlocal source_calls
+            source_calls += 1
+            return TEST_JPEG if source_calls == 1 else None
+
+        cam = CameraViewerService(stale_threshold_ms=50, auto_start_pipeline=True)
+        cam.set_hardware_frame_source(timeout_after_first_frame)
+        cam.acquire_lease("viewer", lease_ms=1000, target_fps=30)
+        try:
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and cam.get_latest_frame("viewer") is None:
+                time.sleep(0.005)
+            self.assertIsNotNone(cam.get_latest_frame("viewer"))
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and cam.get_latest_frame("viewer") is not None:
+                time.sleep(0.005)
+            self.assertIsNone(cam.get_latest_frame("viewer"))
+        finally:
+            cam.release_lease("viewer")
+            cam.stop_capture()
+
     def test_frame_fractionally_over_freshness_limit_is_rejected(self) -> None:
         cam = CameraViewerService(stale_threshold_ms=2000)
         cam.acquire_lease("viewer", lease_ms=10000)

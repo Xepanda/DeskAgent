@@ -95,11 +95,13 @@ class FrameCapturePipeline:
         self._current_tilt = 120.0
         self._consumer: Optional[Callable[[bytes, bool], None]] = None
         self._frame_source: Optional[Callable[[], Optional[bytes]]] = None
+        self._last_source_frame: Optional[bytes] = None
 
     def set_frame_source(self, source: Optional[Callable[[], Optional[bytes]]]) -> None:
         """Sets external hardware frame capture callback (e.g. V4L2 device or robot frame stream)."""
         with self._lock:
             self._frame_source = source
+            self._last_source_frame = None
 
     def start(self, consumer: Callable[[bytes, bool], None]) -> None:
         with self._lock:
@@ -159,6 +161,16 @@ class FrameCapturePipeline:
                         frame = self._frame_source()
                         if frame:
                             is_hw = True
+                            # The callback contract carries bytes only, with no
+                            # capture timestamp or frame sequence. Repeated
+                            # byte-identical data therefore cannot prove that
+                            # a new physical exposure occurred; keep its
+                            # original freshness deadline instead of
+                            # re-publishing it as a new frame.
+                            if frame == self._last_source_frame:
+                                frame = None
+                            else:
+                                self._last_source_frame = frame
                     except Exception as src_err:
                         logger.debug("Hardware frame source error: %s", src_err)
 
