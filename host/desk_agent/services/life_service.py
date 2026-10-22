@@ -1236,6 +1236,40 @@ class LifeService:
             conn.commit()
             return cursor.rowcount == 1
 
+    def record_terminal_reminder_alert_failure(self, outbox_id: str) -> bool:
+        """Mark only a claimed, still-ringing reminder alert terminally failed.
+
+        Classified non-retryable transport NACKs must not be rescheduled. The
+        transition is intentionally limited to reminder.alert rows currently
+        in dispatching state and leaves reminder/occurrence lifecycle intact.
+        """
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM outbox "
+                "WHERE outbox_id = ? AND event_type = 'reminder.alert' AND state = 'dispatching'",
+                (outbox_id,),
+            ).fetchone()
+            if not row:
+                return False
+            try:
+                occurrence_id = json.loads(row["payload_json"]).get("occurrence_id")
+            except (TypeError, json.JSONDecodeError):
+                return False
+            if not isinstance(occurrence_id, str) or not occurrence_id:
+                return False
+            occurrence = conn.execute(
+                "SELECT state FROM occurrences WHERE occurrence_id = ?", (occurrence_id,)
+            ).fetchone()
+            if not occurrence or occurrence["state"] != "ringing":
+                return False
+            cursor = conn.execute(
+                "UPDATE outbox SET state = 'failed', retry_count = retry_count + 1, next_retry_at = NULL "
+                "WHERE outbox_id = ? AND event_type = 'reminder.alert' AND state = 'dispatching'",
+                (outbox_id,),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
     def record_outbox_failure(
         self,
         outbox_id: str,

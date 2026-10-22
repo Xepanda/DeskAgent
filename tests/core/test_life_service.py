@@ -241,6 +241,34 @@ class TestLifeService(unittest.TestCase):
         self.service = LifeService(self.db_path)
         self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
 
+    def test_terminal_alert_failure_requires_claimed_ringing_reminder_and_preserves_lifecycle(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-terminal-outbox")
+        with self.service._get_connection() as conn:
+            outbox_id = conn.execute(
+                "SELECT outbox_id FROM outbox WHERE event_type = 'reminder.alert' "
+                "AND json_extract(payload_json, '$.occurrence_id') = ?",
+                (occurrence_id,),
+            ).fetchone()["outbox_id"]
+
+        self.assertFalse(self.service.record_terminal_reminder_alert_failure(outbox_id))
+        self.assertTrue(self.service.claim_reminder_alert(outbox_id))
+        self.assertTrue(self.service.record_terminal_reminder_alert_failure(outbox_id))
+        self.assertFalse(self.service.record_terminal_reminder_alert_failure(outbox_id))
+        with self.service._get_connection() as conn:
+            row = conn.execute(
+                "SELECT state, retry_count, next_retry_at, dispatched_at FROM outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["retry_count"], 1)
+        self.assertIsNone(row["next_retry_at"])
+        self.assertIsNone(row["dispatched_at"])
+        self.assertEqual(self.service.get_all_occurrences("rem-terminal-outbox")[0]["state"], "ringing")
+        self.assertEqual(self.service.get_reminder("rem-terminal-outbox")["status"], "ringing")
+
+        other_id = self.service.enqueue_outbox("codex.failed", {"task_id": "unrelated"})
+        self.assertFalse(self.service.record_terminal_reminder_alert_failure(other_id))
+
     def test_unconfirmed_claimed_alert_is_retried_after_service_restart(self) -> None:
         occurrence_id = self._create_pending_reminder_alert("rem-claimed-restart")
         with self.service._get_connection() as conn:

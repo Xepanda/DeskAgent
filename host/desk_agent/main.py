@@ -32,7 +32,10 @@ from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, Respo
 from host.desk_agent.core.router import Router
 from host.desk_agent.core.managed_sdk_listener import ManagedSdkMessageListener
 from host.desk_agent.core.managed_sdk_lifecycle import ManagedSdkLifecycleObservers
-from host.desk_agent.core.managed_notification import ManagedNotificationAdapter
+from host.desk_agent.core.managed_notification import (
+    ManagedNotificationAdapter,
+    ManagedNotificationNackError,
+)
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.services.network_log_consumer import NetworkLogConsumer
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
@@ -448,6 +451,28 @@ class DeskAgentHostApp:
                                     outbox_id,
                                     result.get("delivery_state", "unknown"),
                                 )
+                            except ManagedNotificationNackError as exc:
+                                if exc.retryable:
+                                    backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                                    self.life_service.record_outbox_failure(
+                                        outbox_id,
+                                        f"Managed notification NACK: {exc.error}",
+                                        backoff_seconds=backoff,
+                                        keep_pending=True,
+                                    )
+                                    logger.warning(
+                                        "Managed reminder %s received retryable NACK %s; kept pending",
+                                        outbox_id,
+                                        exc.error,
+                                    )
+                                else:
+                                    terminal = self.life_service.record_terminal_reminder_alert_failure(outbox_id)
+                                    logger.warning(
+                                        "Managed reminder %s received terminal NACK %s (outbox_failed=%s)",
+                                        outbox_id,
+                                        exc.error,
+                                        terminal,
+                                    )
                             except Exception as exc:
                                 backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
                                 self.life_service.record_outbox_failure(
