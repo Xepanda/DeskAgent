@@ -91,6 +91,22 @@ def _resolve_timezone(tz_name: Optional[str]) -> timezone | zoneinfo.ZoneInfo:
         return timezone.utc
 
 
+def _validate_timezone_name(tz_name: str) -> str:
+    """Reject unknown reminder zones instead of silently scheduling in UTC."""
+    cleaned = tz_name.strip()
+    if not cleaned:
+        raise ValueError("timezone must be a non-empty IANA timezone name")
+    try:
+        zoneinfo.ZoneInfo(cleaned)
+    except Exception as exc:
+        if cleaned.lower() not in {
+            "america/new_york", "us/eastern", "est5edt",
+            "asia/shanghai", "asia/chongqing", "prc", "utc", "gmt",
+        }:
+            raise ValueError(f"Unknown timezone: {cleaned}") from exc
+    return cleaned
+
+
 def _normalize_utc_iso(value: str) -> str:
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if dt.tzinfo is None:
@@ -121,12 +137,26 @@ def compute_next_occurrence(
     local_dt = dt.astimezone(target_tz)
     rule = repeat_rule.strip().lower()
 
+    rrule_frequency: Optional[str] = None
+    rrule_interval = 1
+    if rule.startswith("freq="):
+        try:
+            rrule_parts = dict(part.split("=", 1) for part in rule.split(";"))
+            if set(rrule_parts) - {"freq", "interval"}:
+                return None
+            rrule_frequency = rrule_parts["freq"]
+            rrule_interval = int(rrule_parts.get("interval", "1"))
+            if rrule_interval <= 0:
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
+
     # Hourly and interval schedules describe elapsed time. Adding a timedelta
     # directly to a ZoneInfo local datetime can skip/repeat an hour at DST
     # transitions, so advance these rules on the UTC timeline instead.
     elapsed_minutes: Optional[int] = None
-    if rule in ("hourly", "freq=hourly"):
-        elapsed_minutes = 60
+    if rule == "hourly" or rrule_frequency == "hourly":
+        elapsed_minutes = 60 * rrule_interval
     elif rule.startswith("interval:"):
         try:
             elapsed_minutes = int(rule.split(":", 1)[1])
@@ -145,10 +175,10 @@ def compute_next_occurrence(
         next_utc = dt.astimezone(timezone.utc) + timedelta(minutes=elapsed_minutes)
         return next_utc.isoformat().replace("+00:00", "Z")
 
-    if rule in ("daily", "freq=daily"):
-        next_dt = local_dt + timedelta(days=1)
-    elif rule in ("weekly", "freq=weekly"):
-        next_dt = local_dt + timedelta(days=7)
+    if rule == "daily" or rrule_frequency == "daily":
+        next_dt = local_dt + timedelta(days=rrule_interval)
+    elif rule == "weekly" or rrule_frequency == "weekly":
+        next_dt = local_dt + timedelta(days=7 * rrule_interval)
     elif rule == "weekdays":
         weekday = local_dt.weekday()
         if weekday < 4:  # Mon-Thu -> next day
@@ -340,6 +370,7 @@ class LifeService:
         priority: str = "normal",
     ) -> dict[str, Any]:
         due_at = _normalize_utc_iso(due_at)
+        timezone_str = _validate_timezone_name(timezone_str)
         now_str = self._now_utc_str()
         occ_id = f"occ-{reminder_id}-0"
         with self._lock, self._get_connection() as conn:

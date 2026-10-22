@@ -19,7 +19,7 @@ import gc
 from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from host.desk_agent.services.life_service import LifeService
+from host.desk_agent.services.life_service import LifeService, compute_next_occurrence
 
 
 class TestLifeService(unittest.TestCase):
@@ -85,6 +85,17 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(self.service.get_reminder("rem-offset-time")["due_at"], "2026-10-15T01:00:00Z")
         self.assertEqual(self.service.get_due_occurrences("2026-10-15T00:59:00Z"), [])
         self.assertEqual(len(self.service.get_due_occurrences("2026-10-15T01:01:00Z")), 1)
+
+    def test_reminder_creation_rejects_unknown_timezone(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown timezone"):
+            self.service.create_reminder(
+                reminder_id="rem-invalid-timezone",
+                title="Invalid timezone",
+                due_at="2035-01-01T09:00:00Z",
+                timezone_str="Mars/Olympus_Mons",
+            )
+
+        self.assertIsNone(self.service.get_reminder("rem-invalid-timezone"))
 
     # -------------------------------------------------------------------------
     # 2. Occurrence Scheduling & Due Triggering
@@ -754,6 +765,17 @@ class TestLifeService(unittest.TestCase):
             "2026-11-01T05:30:00Z", "hourly", tz_name="America/New_York"
         )
         self.assertEqual(next_hourly_fold, "2026-11-01T06:30:00Z")
+
+    def test_compute_next_occurrence_supports_contract_rrule_intervals(self) -> None:
+        daily = compute_next_occurrence(
+            "2026-10-15T08:00:00Z", "FREQ=DAILY;INTERVAL=2", tz_name="Asia/Shanghai"
+        )
+        weekly = compute_next_occurrence(
+            "2026-10-15T08:00:00Z", "FREQ=WEEKLY;INTERVAL=2", tz_name="Asia/Shanghai"
+        )
+
+        self.assertEqual(daily, "2026-10-17T08:00:00Z")
+        self.assertEqual(weekly, "2026-10-29T08:00:00Z")
 
     def test_new_york_fallback_preserves_second_fold_wall_time(self) -> None:
         """The bundled Windows fallback must distinguish the repeated 01:30 after DST ends."""

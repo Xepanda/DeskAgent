@@ -567,7 +567,7 @@ class DeskAgentHostApp:
             reminder_id=args["reminder_id"],
             title=args.get("title"),
             due_at=args.get("due_at"),
-            status=args.get("status"),
+            repeat_rule=args.get("repeat_rule"),
         )
         return ResponseEnvelope.create_success(req.request_id, res)
 

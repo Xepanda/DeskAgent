@@ -120,6 +120,33 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data["status"], "succeeded")
             self.assertTrue(len(data["result"]["items"]) >= 1)
 
+    def test_reminder_update_routes_repeat_rule_through_service(self) -> None:
+        reminder_id = "rem-daemon-update-repeat"
+        self.app.life_service.create_reminder(
+            reminder_id=reminder_id,
+            title="Initial reminder",
+            due_at="2035-01-01T09:00:00Z",
+            timezone_str="Asia/Shanghai",
+        )
+        req = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-daemon-update-repeat",
+            operation="reminder.update",
+            arguments={
+                "reminder_id": reminder_id,
+                "title": "Updated reminder",
+                "repeat_rule": "FREQ=DAILY;INTERVAL=1",
+            },
+            expires_at="2035-01-01T00:00:00Z",
+        )
+
+        response = self.app.router.dispatch(req)
+
+        self.assertEqual(response.status.value, "succeeded")
+        stored = self.app.life_service.get_reminder(reminder_id)
+        self.assertEqual(stored["title"], "Updated reminder")
+        self.assertEqual(stored["repeat_rule"], "FREQ=DAILY;INTERVAL=1")
+
     def test_reminder_snooze_route_passes_occurrence_id(self) -> None:
         reminder_id = "rem-daemon-snooze-occurrence"
         self.app.life_service.create_reminder(
