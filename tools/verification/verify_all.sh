@@ -53,7 +53,7 @@ if [[ -n "${CMAKE_BIN:-}" ]]; then
   fi
 else
   if ! CMAKE_BIN="$(command -v cmake)"; then
-    step_fail "A native CMake executable is required for the standalone host check. In WSL, provide a Linux CMake path with CMAKE_BIN; a Windows cmake.exe cannot run inside WSL."
+    step_fail "CMake is missing for this shell; install CMake or set CMAKE_BIN to a native executable. In WSL, provide a Linux CMake path with CMAKE_BIN; a Windows cmake.exe cannot run inside WSL."
   fi
 fi
 
@@ -116,7 +116,7 @@ step_pass "Driver failure/timeout never fake success; ACK correlation, TCP frami
 # ------------------------------------------------------------------------------
 echo ""
 echo "--- Step 6: Edge Deployment Pre-Flight Checks (deploy/edge/) ---"
-bash deploy/edge/verify_edge.sh || step_fail "Edge deployment verification failed"
+sed 's/\r$//' deploy/edge/verify_edge.sh | bash || step_fail "Edge deployment verification failed"
 step_pass "TaishanPi edge environment pre-flight checks passed (directories, permissions, toolchain, Python modules)"
 
 # ------------------------------------------------------------------------------
