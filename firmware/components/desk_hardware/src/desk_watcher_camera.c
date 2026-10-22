@@ -654,7 +654,11 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         bool retry_sync = false;
         while (esp_timer_get_time() < camera_capture_deadline_us) {
             bool active = false;
-            if (camera_sync_is_active(&active) != DESK_HW_OK) return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO);
+            int retry_sync_rc = camera_sync_is_active(&active);
+            if (retry_sync_rc != DESK_HW_OK) {
+                ESP_LOGE(TAG, "SYNC retry read failed: PCA9535 INPUT0 rc=%d", retry_sync_rc);
+                return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO);
+            }
             if (active) { retry_sync = true; break; }
             vTaskDelay(pdMS_TO_TICKS(1));
         }

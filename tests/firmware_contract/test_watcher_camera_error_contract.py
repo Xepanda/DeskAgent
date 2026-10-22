@@ -271,6 +271,16 @@ int main(void) {
         self.assertIn("base_header[0]", empty_poll)
         self.assertIn("sync read rc=%d", empty_poll)
 
+    def test_sync_i2c_failure_during_empty_header_retry_is_logged(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        retry_sync = capture.split("while (esp_timer_get_time() < camera_capture_deadline_us)", 2)[2]
+        retry_sync = retry_sync.split("if (!retry_sync)", 1)[0]
+
+        self.assertIn("int retry_sync_rc = camera_sync_is_active(&active);", retry_sync)
+        self.assertIn("SYNC retry read failed: PCA9535 INPUT0 rc=%d", retry_sync)
+        self.assertIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO);", retry_sync)
+
     def test_empty_headers_retry_until_capture_deadline_and_allow_later_valid_header(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
