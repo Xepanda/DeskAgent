@@ -363,5 +363,31 @@ class TestCliEntryPointEnforcesSameRule(unittest.TestCase):
             self.assertIn("exit $LASTEXITCODE", script, f"{name} must exit non-zero on refusal")
 
 
+class TestWindowsCompanionAutostartRecovery(unittest.TestCase):
+    """Static contract for bounded, failure-only Scheduled Task recovery."""
+
+    def setUp(self) -> None:
+        with open(os.path.join(REPO_ROOT, "deploy", "windows", "register-autostart.ps1"), "r", encoding="utf-8") as f:
+            self.script = f.read()
+
+    def test_companion_task_uses_bounded_restart_policy(self) -> None:
+        self.assertRegex(self.script, r"(?is)New-ScheduledTaskSettingsSet[\s\S]*?-RestartCount\s+\$?\w+")
+        self.assertRegex(self.script, r"(?is)New-ScheduledTaskSettingsSet[\s\S]*?-RestartInterval\s+")
+        self.assertRegex(self.script, r"(?is)\$restartCount\s*=\s*[1-9]\d*")
+        self.assertRegex(self.script, r"(?is)\$restartInterval\s*=\s*New-TimeSpan\s+-Minutes\s+[1-9]\d*")
+
+    def test_registered_companion_task_policy_is_read_back_and_checked(self) -> None:
+        self.assertRegex(self.script, r"(?is)Register-ScheduledTask.*?Get-ScheduledTask")
+        self.assertIn("Settings.RestartCount", self.script)
+        self.assertIn("Settings.RestartInterval", self.script)
+        self.assertRegex(self.script, r"(?is)if\s*\([^)]*RestartCount[^)]*\).*?throw")
+
+    def test_companion_failure_does_not_claim_registry_run_has_recovery(self) -> None:
+        companion_region = self.script.split("# 4. Optionally register Host service", 1)[0]
+        self.assertNotIn("Falling back to Registry Run Key", companion_region)
+        self.assertNotIn("Registered '$companionTaskName' via Registry Run Key", companion_region)
+        self.assertRegex(companion_region, r"(?is)catch\s*\{[^}]*throw")
+
+
 if __name__ == "__main__":
     unittest.main()
