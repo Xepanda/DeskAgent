@@ -250,8 +250,22 @@ int desk_sdk_ws_client_poll(int timeout_ms);
 int desk_sdk_ws_client_send_text(const char *text);
 int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len);
 bool desk_sdk_ws_client_is_connected(void);
+/**
+ * @brief Return whether this current WebSocket observed a successful
+ *        HardwareHello protocol ACK.
+ *
+ * This reports protocol-level ACK observation only; the current plaintext
+ * WebSocket transport does not cryptographically authenticate the Runtime.
+ */
+bool desk_sdk_ws_client_is_authenticated(void);
 desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void);
 void desk_sdk_ws_client_close(void);
+
+/* Device-local opt-in for the CR-009 structured diagnostic stream. Disabled
+ * by default; this is not wired to a product setting until A0/A1 provide it. */
+void desk_sdk_bridge_set_local_log_enabled(bool enabled);
+/* Internal transport lifecycle seam; clears the current log stream lease. */
+void desk_sdk_bridge_log_session_closed(void);
 
 /**
  * @brief Parse top-level string field from JSON payload.
@@ -280,6 +294,8 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
  * - ctrl.expression.play / ctrl.expression.set / ctrl.expression.audio_follow
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
+/* WebSocket-only dispatch. Never use this entry point for the legacy TCP server. */
+int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len);
 #define desk_sdk_bridge_process_line desk_sdk_bridge_process_command
 
 /**

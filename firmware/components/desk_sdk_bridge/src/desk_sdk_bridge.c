@@ -69,6 +69,37 @@ static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
 static bool desk_sdk_is_lower_hex_64(const char *s);
 
+/* CR-009 L2: protocol state only. A1 still owns the bounded source queue and
+ * must call a future narrow event-consumer seam; no raw logger is forwarded. */
+static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool s_local_log_enabled = false;
+static bool s_log_stream_active = false;
+static bool s_log_camera_only = false;
+static char s_log_stream_id[33] = "";
+static char s_log_min_level[8] = "WARN";
+static uint32_t s_log_sequence = 0;
+static char s_log_boot_id[33] = "";
+
+void desk_sdk_bridge_set_local_log_enabled(bool enabled)
+{
+    pthread_mutex_lock(&s_log_mutex);
+    s_local_log_enabled = enabled;
+    if (!enabled) {
+        s_log_stream_active = false;
+        s_log_stream_id[0] = '\0';
+    }
+    pthread_mutex_unlock(&s_log_mutex);
+}
+
+void desk_sdk_bridge_log_session_closed(void)
+{
+    pthread_mutex_lock(&s_log_mutex);
+    s_log_stream_active = false;
+    s_log_camera_only = false;
+    s_log_stream_id[0] = '\0';
+    pthread_mutex_unlock(&s_log_mutex);
+}
+
 #define DESK_SDK_PAIRING_CODE_TTL_MS (5ULL * 60ULL * 1000ULL)
 
 #ifdef DESK_SDK_TESTING
@@ -308,7 +339,9 @@ int desk_sdk_bridge_set_pairing_token(const char *token)
     if (!token) {
         /* No value supplied: mint a fresh credential (always 64 lowercase hex). */
         pthread_mutex_lock(&s_pairing_code_mutex);
+        desk_sdk_ws_client_close();
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
+        desk_sdk_ws_client_close();
         pthread_mutex_unlock(&s_pairing_code_mutex);
         return 0;
     }
@@ -321,11 +354,20 @@ int desk_sdk_bridge_set_pairing_token(const char *token)
     }
 
     pthread_mutex_lock(&s_pairing_code_mutex);
+    bool token_changed = strcmp(s_active_pairing_token, token) != 0;
+    if (token_changed) {
+        /* A changed credential invalidates the current socket's handshake. */
+        desk_sdk_ws_client_close();
+    }
     memcpy(s_active_pairing_token, token, sizeof(s_active_pairing_token));
     /* R9 (interfaces.md 6.6): this provisioning entry point sets credential
      * material ONLY. `s_paired` means "a client has successfully completed a
      * pairing handshake" and may only be set by the validated pairing path in
      * desk_sdk_bridge_process_pairing_udp() (interfaces.md 6.4). */
+    if (token_changed) {
+        /* Invalidate any connect that began while the token was replaced. */
+        desk_sdk_ws_client_close();
+    }
     pthread_mutex_unlock(&s_pairing_code_mutex);
     return 0;
 }
@@ -345,7 +387,17 @@ int desk_sdk_bridge_get_pairing_token(char *token, size_t max_len)
 
 void desk_sdk_bridge_set_auth_required(bool required)
 {
+    bool policy_changed = s_auth_required != required;
+    if (policy_changed) {
+        /* Changing the handshake policy invalidates any prior session latch. */
+        desk_sdk_ws_client_close();
+    }
     s_auth_required = required;
+    if (policy_changed) {
+        /* Invalidate connects that crossed the policy update before they can
+         * commit their previous handshake result. */
+        desk_sdk_ws_client_close();
+    }
 }
 
 /* Socket Server State */
@@ -986,6 +1038,11 @@ bool desk_sdk_bridge_is_heartbeat_alive(uint32_t timeout_sec)
 int desk_sdk_bridge_init(void)
 {
     desk_sdk_ws_client_close();
+    desk_sdk_bridge_set_local_log_enabled(false);
+    pthread_mutex_lock(&s_log_mutex);
+    s_log_sequence = 0;
+    s_log_boot_id[0] = '\0';
+    pthread_mutex_unlock(&s_log_mutex);
     s_client_connected = false;
     s_event_seq = 0;
     s_outbound_cb = NULL;
@@ -999,14 +1056,21 @@ int desk_sdk_bridge_init(void)
     pthread_mutex_lock(&s_pairing_code_mutex);
     desk_sdk_pairing_code_clear_locked();
     pthread_mutex_unlock(&s_pairing_code_mutex);
+    desk_sdk_ws_client_close();
     desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
+    desk_sdk_ws_client_close();
     return 0;
 }
 
 void desk_sdk_bridge_reset(void)
 {
     desk_sdk_ws_client_close();
+    desk_sdk_bridge_set_local_log_enabled(false);
+    pthread_mutex_lock(&s_log_mutex);
+    s_log_sequence = 0;
+    s_log_boot_id[0] = '\0';
+    pthread_mutex_unlock(&s_log_mutex);
     s_client_connected = false;
     s_event_seq = 0;
     pthread_mutex_lock(&s_pairing_code_mutex);
@@ -1020,6 +1084,7 @@ void desk_sdk_bridge_reset(void)
     desk_sdk_pairing_code_clear_locked();
     pthread_mutex_unlock(&s_pairing_code_mutex);
     s_auth_required = false;
+    desk_sdk_ws_client_close();
     s_last_heartbeat_time = 0;
     desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
@@ -1275,12 +1340,16 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
         return DESK_SDK_PAIRING_REJECTED;
     }
 
+    /* A new accepted pairing replaces the identity/target bound to the old
+     * socket, so tear it down before mutating those fields. */
+    desk_sdk_ws_client_close();
     s_paired = true;
     memcpy(s_pair_request_id, req_id, sizeof(s_pair_request_id));
     memcpy(s_pair_daemon_instance_id, daemon_id, sizeof(s_pair_daemon_instance_id));
     snprintf(s_pair_target_mode, sizeof(s_pair_target_mode), "%s", target_mode);
     s_pair_websocket_port = (uint16_t)websocket_port;
     desk_sdk_pairing_code_clear_locked();
+    desk_sdk_ws_client_close();
     printf("[SDK-PAIR] pair.accept issued: reason=validated request_id=%s\n", req_id);
 
     return DESK_SDK_PAIRING_OK;
@@ -1756,6 +1825,311 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                  rid);
         return 0;
     }
+}
+
+static bool desk_sdk_log_pairing_is_complete(void)
+{
+    bool complete;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    complete = s_paired && desk_sdk_is_lower_hex_32(s_pair_request_id) &&
+               desk_sdk_is_lower_hex_32(s_pair_daemon_instance_id) &&
+               desk_sdk_is_lower_hex_64(s_active_pairing_token) &&
+               (strcmp(s_pair_target_mode, "python_sdk") == 0 ||
+                strcmp(s_pair_target_mode, "desktop_link") == 0) &&
+               s_pair_host[0] != '\0' && s_pair_websocket_port != 0;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return complete;
+}
+
+static int desk_sdk_log_nack(char *out, size_t cap, const char *type,
+                             const char *command_id, const char *error, int code)
+{
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.nack\",\"code\":%d,\"data\":{\"type\":\"%s\",\"command_id\":\"%s\",\"error\":\"%s\"}}",
+        code, type, command_id, error);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static bool desk_sdk_log_command_id_valid(const char *id)
+{
+    if (!id || strlen(id) != 32) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return false;
+    }
+    return true;
+}
+
+typedef struct { const char *p; unsigned depth; } desk_log_json_parser_t;
+
+static void desk_log_json_ws(desk_log_json_parser_t *p)
+{
+    while (*p->p == ' ' || *p->p == '\t' || *p->p == '\r' || *p->p == '\n') ++p->p;
+}
+
+static bool desk_log_json_string(desk_log_json_parser_t *p, const char **begin, const char **end)
+{
+    if (*p->p != '"') return false;
+    const char *start = p->p++;
+    while (*p->p) {
+        unsigned char c = (unsigned char)*p->p++;
+        if (c == '"') { if (begin) *begin = start; if (end) *end = p->p; return true; }
+        if (c < 0x20) return false;
+        if (c == '\\') {
+            c = (unsigned char)*p->p++;
+            if (c == 'u') {
+                for (int i = 0; i < 4; ++i) {
+                    char h = *p->p++;
+                    if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) return false;
+                }
+            } else if (c != '"' && c != '\\' && c != '/' && c != 'b' && c != 'f' && c != 'n' && c != 'r' && c != 't') return false;
+        }
+    }
+    return false;
+}
+
+static bool desk_log_json_value(desk_log_json_parser_t *p)
+{
+    desk_log_json_ws(p);
+    if (++p->depth > 16) return false;
+    bool ok = false;
+    if (*p->p == '"') ok = desk_log_json_string(p, NULL, NULL);
+    else if (*p->p == '{') {
+        ++p->p; desk_log_json_ws(p);
+        if (*p->p == '}') { ++p->p; ok = true; }
+        else {
+            ok = true;
+            for (;;) {
+                if (!desk_log_json_string(p, NULL, NULL)) { ok = false; break; }
+                desk_log_json_ws(p);
+                if (*p->p++ != ':') { ok = false; break; }
+                if (!desk_log_json_value(p)) { ok = false; break; }
+                desk_log_json_ws(p);
+                if (*p->p == '}') { ++p->p; break; }
+                if (*p->p++ != ',') { ok = false; break; }
+                desk_log_json_ws(p);
+            }
+        }
+    } else if (*p->p == '[') {
+        ++p->p; desk_log_json_ws(p);
+        if (*p->p == ']') { ++p->p; ok = true; }
+        else {
+            ok = true;
+            for (;;) {
+                if (!desk_log_json_value(p)) { ok = false; break; }
+                desk_log_json_ws(p);
+                if (*p->p == ']') { ++p->p; break; }
+                if (*p->p++ != ',') { ok = false; break; }
+                desk_log_json_ws(p);
+            }
+        }
+    } else if (*p->p == 't' && strncmp(p->p, "true", 4) == 0) { p->p += 4; ok = true; }
+    else if (*p->p == 'f' && strncmp(p->p, "false", 5) == 0) { p->p += 5; ok = true; }
+    else if (*p->p == 'n' && strncmp(p->p, "null", 4) == 0) { p->p += 4; ok = true; }
+    else {
+        const char *n = p->p;
+        if (*n == '-') ++n;
+        if (*n == '0') ++n;
+        else if (*n >= '1' && *n <= '9') { do { ++n; } while (*n >= '0' && *n <= '9'); }
+        else n = p->p;
+        if (n != p->p) {
+            if (*n == '.') { ++n; if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9'); }
+            if (n != p->p && (*n == 'e' || *n == 'E')) {
+                ++n; if (*n == '+' || *n == '-') ++n;
+                if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9');
+            }
+            if (n != p->p) { p->p = n; ok = true; }
+        }
+    }
+    --p->depth;
+    return ok;
+}
+
+static bool desk_log_json_valid(const char *json)
+{
+    if (!json) return false;
+    desk_log_json_parser_t p = { .p = json, .depth = 0 };
+    if (!desk_log_json_value(&p)) return false;
+    desk_log_json_ws(&p);
+    return *p.p == '\0';
+}
+
+static bool desk_log_plain_key(const char *start, const char *end, const char *key)
+{
+    size_t len = strlen(key);
+    return (size_t)(end - start) == len + 2 && start[0] == '"' &&
+           memcmp(start + 1, key, len) == 0 && end[-1] == '"';
+}
+
+static unsigned desk_log_get_member(const char *object, const char *name, char *out, size_t cap)
+{
+    if (!object || !out || cap == 0) return 0;
+    out[0] = '\0';
+    desk_log_json_parser_t p = { .p = object, .depth = 0 };
+    desk_log_json_ws(&p);
+    if (*p.p++ != '{') return 0;
+    desk_log_json_ws(&p);
+    unsigned matches = 0;
+    if (*p.p == '}') return 0;
+    for (;;) {
+        const char *ks, *ke;
+        if (!desk_log_json_string(&p, &ks, &ke)) return 0;
+        desk_log_json_ws(&p);
+        if (*p.p++ != ':') return 0;
+        desk_log_json_ws(&p);
+        const char *vs = p.p;
+        if (!desk_log_json_value(&p)) return 0;
+        const char *ve = p.p;
+        if (desk_log_plain_key(ks, ke, name)) {
+            ++matches;
+            size_t n = (size_t)(ve - vs);
+            if (n >= cap) return 0;
+            memcpy(out, vs, n); out[n] = '\0';
+        }
+        desk_log_json_ws(&p);
+        if (*p.p == '}') break;
+        if (*p.p++ != ',') return 0;
+        desk_log_json_ws(&p);
+    }
+    return matches;
+}
+
+static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed, size_t allowed_count)
+{
+    desk_log_json_parser_t p = { .p = object, .depth = 0 };
+    bool seen[8] = { false };
+    if (allowed_count > sizeof(seen) / sizeof(seen[0])) return false;
+    desk_log_json_ws(&p);
+    if (*p.p++ != '{') return false;
+    desk_log_json_ws(&p);
+    if (*p.p == '}') return true;
+    for (;;) {
+        const char *ks, *ke;
+        if (!desk_log_json_string(&p, &ks, &ke)) return false;
+        size_t matched = allowed_count;
+        for (size_t i = 0; i < allowed_count; ++i) {
+            if (desk_log_plain_key(ks, ke, allowed[i])) { matched = i; break; }
+        }
+        if (matched == allowed_count || seen[matched]) return false;
+        seen[matched] = true;
+        desk_log_json_ws(&p);
+        if (*p.p++ != ':') return false;
+        if (!desk_log_json_value(&p)) return false;
+        desk_log_json_ws(&p);
+        if (*p.p == '}') return true;
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+}
+
+static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
+{
+    desk_log_json_parser_t p = { .p = raw, .depth = 0 };
+    desk_log_json_ws(&p);
+    if (*p.p++ != '[') return false;
+    desk_log_json_ws(&p);
+    if (*p.p == ']') { ++p.p; desk_log_json_ws(&p); *camera_only = false; return *p.p == '\0'; }
+    const char *start, *end;
+    if (!desk_log_json_string(&p, &start, &end) || !desk_log_plain_key(start, end, "camera")) return false;
+    desk_log_json_ws(&p);
+    if (*p.p++ != ']') return false;
+    desk_log_json_ws(&p);
+    *camera_only = true;
+    return *p.p == '\0';
+}
+
+/* This is deliberately called only by the WebSocket receive loop. The legacy
+ * TCP line server continues to use desk_sdk_bridge_process_command(). */
+int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len)
+{
+    char type_raw[96] = "", data[512] = "", code_raw[16] = "";
+    if (!json_in || strnlen(json_in, DESK_SDK_MAX_FRAME_LEN + 1U) > DESK_SDK_MAX_FRAME_LEN ||
+        !desk_log_json_valid(json_in)) return -1;
+    if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1 ||
+        !desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;
+    char type[64] = "";
+    if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "sys.log.subscribe") != 0 && strcmp(type, "sys.log.unsubscribe") != 0)
+        return desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
+    static const char *const root_keys[] = { "type", "code", "data" };
+    static const char *const subscribe_keys[] = { "command_id", "log_schema_version", "min_level", "components" };
+    static const char *const unsubscribe_keys[] = { "command_id", "log_schema_version", "stream_id" };
+    char command_id[65] = "";
+    if (!out_buf || max_out_len < 128 ||
+        (strcmp(type_raw, "\"sys.log.subscribe\"") != 0 &&
+         strcmp(type_raw, "\"sys.log.unsubscribe\"") != 0) ||
+        !desk_log_object_keys_allowed(json_in, root_keys, sizeof(root_keys) / sizeof(root_keys[0])) ||
+        desk_log_get_member(json_in, "data", data, sizeof(data)) != 1 ||
+        desk_log_get_member(json_in, "code", code_raw, sizeof(code_raw)) != 1 || strcmp(code_raw, "0") != 0 ||
+        !desk_log_object_keys_allowed(data, strcmp(type, "sys.log.subscribe") == 0 ? subscribe_keys : unsubscribe_keys,
+            strcmp(type, "sys.log.subscribe") == 0 ? sizeof(subscribe_keys) / sizeof(subscribe_keys[0]) : sizeof(unsubscribe_keys) / sizeof(unsubscribe_keys[0])) ||
+        desk_log_get_member(data, "command_id", command_id, sizeof(command_id)) != 1 ||
+        !json_parse_top_level_str(data, "command_id", command_id, sizeof(command_id)) ||
+        !desk_sdk_log_command_id_valid(command_id)) return -1;
+
+    if (!desk_sdk_ws_client_is_authenticated() || !desk_sdk_log_pairing_is_complete())
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "AUTH_REQUIRED", 401);
+    pthread_mutex_lock(&s_log_mutex);
+    if (!s_local_log_enabled) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "LOGGING_DISABLED", 403);
+    }
+
+    char schema[16] = "", stream_id[40] = "", min_level[8] = "WARN", field_raw[512] = "";
+    if (desk_log_get_member(data, "log_schema_version", field_raw, sizeof(field_raw)) != 1 ||
+        !json_parse_top_level_str(data, "log_schema_version", schema, sizeof(schema)) ||
+        strcmp(schema, "1.0.0") != 0) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "UNSUPPORTED_SCHEMA", 400);
+    }
+    if (strcmp(type, "sys.log.subscribe") == 0) {
+        unsigned min_count = desk_log_get_member(data, "min_level", field_raw, sizeof(field_raw));
+        if (min_count > 1 || (min_count == 1 && !json_parse_top_level_str(data, "min_level", min_level, sizeof(min_level)))) {
+            pthread_mutex_unlock(&s_log_mutex);
+            return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
+        }
+        if (strcmp(min_level, "ERROR") != 0 && strcmp(min_level, "WARN") != 0 &&
+            strcmp(min_level, "INFO") != 0 && strcmp(min_level, "DEBUG") != 0) {
+            pthread_mutex_unlock(&s_log_mutex);
+            return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
+        }
+        /* v1 currently has only the camera component. Accept omitted/empty or
+         * exactly ["camera"]; reject every other shape rather than widening. */
+        bool camera_only = false;
+        unsigned component_count = desk_log_get_member(data, "components", field_raw, sizeof(field_raw));
+        if (component_count > 1 || (component_count == 1 && !desk_log_component_filter_valid(field_raw, &camera_only))) {
+                pthread_mutex_unlock(&s_log_mutex);
+                return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
+        }
+        if (s_log_stream_active) {
+            pthread_mutex_unlock(&s_log_mutex);
+            return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "ALREADY_SUBSCRIBED", 409);
+        }
+        generate_dynamic_token(s_log_stream_id, sizeof(s_log_stream_id));
+        if (!s_log_boot_id[0]) generate_dynamic_token(s_log_boot_id, sizeof(s_log_boot_id));
+        s_log_stream_active = true;
+        s_log_camera_only = camera_only;
+        strcpy(s_log_min_level, min_level);
+        int n = snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.subscribe\",\"command_id\":\"%s\",\"accepted\":true,\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"next_sequence\":%u,\"min_level\":\"%s\",\"components\":%s}}",
+            command_id, s_log_stream_id, s_log_boot_id, s_log_sequence + 1U,
+            s_log_min_level, s_log_camera_only ? "[\"camera\"]" : "[]");
+        pthread_mutex_unlock(&s_log_mutex);
+        return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
+    }
+
+    if (desk_log_get_member(data, "stream_id", field_raw, sizeof(field_raw)) != 1 ||
+        !json_parse_top_level_str(data, "stream_id", stream_id, sizeof(stream_id)) ||
+        !s_log_stream_active || strcmp(stream_id, s_log_stream_id) != 0) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_STREAM", 409);
+    }
+    s_log_stream_active = false;
+    s_log_stream_id[0] = '\0';
+    int n = snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.unsubscribe\",\"command_id\":\"%s\",\"accepted\":true}}",
+        command_id);
+    pthread_mutex_unlock(&s_log_mutex);
+    return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
 }
 
 int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
@@ -2347,7 +2721,11 @@ int desk_sdk_pairing_server_poll(int timeout_ms)
              * (interfaces.md 6.4.4 -- no wire message type is defined). */
             if (desk_sdk_bridge_process_pairing_udp(s_pairing_buf, s_pairing_reply, sizeof(s_pairing_reply)) == DESK_SDK_PAIRING_OK &&
                 s_pairing_reply[0] != '\0') {
+                pthread_mutex_lock(&s_pairing_code_mutex);
+                desk_sdk_ws_client_close();
                 inet_ntop(AF_INET, &client_addr.sin_addr, s_pair_host, sizeof(s_pair_host));
+                desk_sdk_ws_client_close();
+                pthread_mutex_unlock(&s_pairing_code_mutex);
                 sendto(s_pairing_udp_fd, s_pairing_reply, strlen(s_pairing_reply), 0,
                        (struct sockaddr *)&client_addr, addr_len);
                 desk_sdk_ws_client_connect_paired();

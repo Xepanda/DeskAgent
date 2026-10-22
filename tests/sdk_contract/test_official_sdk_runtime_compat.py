@@ -104,6 +104,17 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'const char *desk_sdk_test_last_ack(void) { return (const char *)s_ws_ack; }\n'
                 'const char *desk_sdk_test_http_response(void) { return s_ws_http_response; }\n'
                 'int desk_sdk_test_ws_state(void) { return (int)s_ws_state; }\n'
+                'void desk_sdk_test_seed_ws_auth_latch(void) { s_ws_ready = true; s_ws_authenticated = true; }\n'
+                'void desk_sdk_test_prepare_log_pair(void) { s_paired = true; '
+                'strcpy(s_pair_request_id, "31a9dbf05ea3443480e62076f79a3b12"); '
+                'strcpy(s_pair_daemon_instance_id, "e730f29e670c49f7a3320c4314eb9805"); '
+                'strcpy(s_active_pairing_token, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); '
+                'strcpy(s_pair_target_mode, "python_sdk"); strcpy(s_pair_host, "127.0.0.1"); '
+                's_pair_websocket_port = 8765; }\n'
+                'void desk_sdk_test_set_legacy_connected(void) { s_client_connected = true; }\n'
+                'uint32_t desk_sdk_test_ws_generation(void) { return ws_lifecycle_generation(); }\n'
+                'int desk_sdk_test_commit_hello_ack(uint32_t generation) { '
+                'return ws_commit_hardware_hello_ack(generation) ? 1 : 0; }\n'
                 'int desk_sdk_test_preflight(void) { char host[64], hello[512]; uint16_t port = 0; '
                 'return desk_sdk_bridge_get_pairing_target(host, sizeof(host), &port) == 0 && '
                 'desk_sdk_bridge_build_hardware_hello(hello, sizeof(hello)) > 0 ? 1 : 0; }\n'
@@ -167,8 +178,22 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         cls.lib.desk_sdk_ws_client_is_connected.restype = ctypes.c_bool
         cls.lib.desk_sdk_ws_client_is_connected.argtypes = []
+        cls.lib.desk_sdk_ws_client_is_authenticated.restype = ctypes.c_bool
+        cls.lib.desk_sdk_ws_client_is_authenticated.argtypes = []
+        cls.lib.desk_sdk_test_seed_ws_auth_latch.restype = None
+        cls.lib.desk_sdk_test_seed_ws_auth_latch.argtypes = []
+        cls.lib.desk_sdk_test_set_legacy_connected.restype = None
+        cls.lib.desk_sdk_test_set_legacy_connected.argtypes = []
+        cls.lib.desk_sdk_test_ws_generation.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_test_ws_generation.argtypes = []
+        cls.lib.desk_sdk_test_commit_hello_ack.restype = ctypes.c_int
+        cls.lib.desk_sdk_test_commit_hello_ack.argtypes = [ctypes.c_uint32]
         cls.lib.desk_sdk_ws_client_send_text.restype = ctypes.c_int
         cls.lib.desk_sdk_ws_client_send_text.argtypes = [ctypes.c_char_p]
+        cls.lib.desk_sdk_ws_client_connect_paired.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_connect_paired.argtypes = []
+        cls.lib.desk_sdk_ws_client_poll.restype = ctypes.c_int
+        cls.lib.desk_sdk_ws_client_poll.argtypes = [ctypes.c_int]
 
         cls.lib.desk_sdk_bridge_process_command.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_process_command.argtypes = [
@@ -176,6 +201,12 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             ctypes.c_char_p,
             ctypes.c_size_t,
         ]
+        cls.lib.desk_sdk_bridge_process_ws_command.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_process_ws_command.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+        cls.lib.desk_sdk_bridge_set_local_log_enabled.restype = None
+        cls.lib.desk_sdk_bridge_set_local_log_enabled.argtypes = [ctypes.c_bool]
+        cls.lib.desk_sdk_test_prepare_log_pair.restype = None
+        cls.lib.desk_sdk_test_prepare_log_pair.argtypes = []
 
         cls.lib.desk_sdk_bridge_process_pairing_udp.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_process_pairing_udp.argtypes = [
@@ -238,7 +269,225 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
     def test_websocket_client_starts_offline_and_refuses_unpaired_send(self) -> None:
         self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
         self.assertNotEqual(self.lib.desk_sdk_ws_client_send_text(b'{"type":"sys.ping"}'), 0)
+
+    def test_authenticated_latch_is_websocket_scoped_and_invalidated_by_lifecycle_changes(self) -> None:
+        """Test-only latch seeding covers lifecycle invalidators; legacy TCP is never auth."""
+        # Legacy TCP may report connected, but it cannot establish a paired WS latch.
+        self.lib.desk_sdk_test_set_legacy_connected()
+        self.assertTrue(self.lib.desk_sdk_bridge_is_connected())
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        # A changed token closes the old transport and clears its latch.
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_token(b"a" * 64), 0)
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        # Changing auth policy also invalidates a prior connection latch.
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_set_auth_required(True)
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        self.lib.desk_sdk_bridge_set_auth_required(False)
+
+        # A successful new pair replaces pairing metadata only after invalidation.
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        request = PairRequest(
+            request_id="31a9dbf05ea3443480e62076f79a3b12",
+            daemon_instance_id="e730f29e670c49f7a3320c4314eb9805",
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+        )
+        response = ctypes.create_string_buffer(1024)
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(
+            self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(request), response, len(response)),
+            0,
+        )
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        # Explicit reset clears the latch independently of the stored pairing state.
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_reset()
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_init()
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+    def test_stale_inflight_hello_ack_cannot_restore_latch_after_invalidation(self) -> None:
+        """A connection generation change rejects an ACK completion from the old attempt."""
+        in_flight_generation = self.lib.desk_sdk_test_ws_generation()
+        self.lib.desk_sdk_ws_client_close()
+        self.assertEqual(
+            self.lib.desk_sdk_test_commit_hello_ack(in_flight_generation), 0
+        )
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+
+    def test_cr009_ws_subscription_gate_duplicate_cancel_and_reconnect(self) -> None:
+        def dispatch(message: dict) -> dict:
+            out = ctypes.create_string_buffer(1024)
+            rc = self.lib.desk_sdk_bridge_process_ws_command(
+                json.dumps(message).encode(), out, len(out)
+            )
+            self.assertEqual(rc, 0)
+            return json.loads(out.value)
+
+        sub = lambda cid: {"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": cid, "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}}
+        self.lib.desk_sdk_test_set_legacy_connected()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        denied = dispatch(sub("00000000000000000000000000000001"))
+        self.assertEqual((denied["type"], denied["data"]["error"]), ("sys.nack", "AUTH_REQUIRED"))
+
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        first_id = "00000000000000000000000000000002"
+        first = dispatch(sub(first_id))
+        self.assertEqual((first["type"], first["data"]["command_id"]), ("sys.ack", first_id))
+        original_stream = first["data"]["stream_id"]
+        duplicate_id = "00000000000000000000000000000003"
+        duplicate = dispatch(sub(duplicate_id))
+        self.assertEqual((duplicate["type"], duplicate["data"]["error"]), ("sys.nack", "ALREADY_SUBSCRIBED"))
+        self.assertEqual(duplicate["data"]["command_id"], duplicate_id)
+
+        invalid = sub("00000000000000000000000000000004")
+        invalid["data"]["components"] = ["camera", "raw"]
+        self.assertEqual(dispatch(invalid)["data"]["error"], "INVALID_FILTER")
+        raw = sub("00000000000000000000000000000005")
+        raw["data"]["components"] = ["camera\nsecret diagnostic text"]
+        self.assertEqual(dispatch(raw)["data"]["error"], "INVALID_FILTER")
+
+        cancel = {"type": "sys.log.unsubscribe", "code": 0, "data": {
+            "command_id": "00000000000000000000000000000006", "log_schema_version": "1.0.0", "stream_id": original_stream}}
+        self.assertEqual(dispatch(cancel)["data"]["command_id"], cancel["data"]["command_id"])
+        again = dispatch(sub("00000000000000000000000000000007"))
+        self.assertEqual(again["type"], "sys.ack")
+        self.assertNotEqual(again["data"]["stream_id"], original_stream)
+
+        self.lib.desk_sdk_ws_client_close()
+        self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+        denied_reconnect = dispatch(sub("00000000000000000000000000000008"))
+        self.assertEqual(denied_reconnect["data"]["error"], "AUTH_REQUIRED")
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(dispatch(sub("00000000000000000000000000000009"))["type"], "sys.ack")
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    def test_cr009_command_is_dispatched_from_live_websocket_receive_loop(self) -> None:
+        async def exercise() -> dict:
+            received: dict = {}
+            async def handler(websocket) -> None:
+                hello = json.loads(await websocket.recv())
+                self.assertEqual(hello["type"], "sys.client.hello")
+                await websocket.send(json.dumps({"type": "sys.ack", "code": 0,
+                    "data": {"type": "sys.client.hello"}}, separators=(",", ":")))
+                await websocket.send(json.dumps({"type": "sys.log.subscribe", "code": 0,
+                    "data": {"command_id": "11111111111111111111111111111111",
+                             "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}},
+                    separators=(",", ":")))
+                received.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                self.lib.desk_sdk_test_prepare_log_pair()
+                self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port), 0)
+                self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 1000), 0)
+                await asyncio.sleep(0)
+                self.lib.desk_sdk_ws_client_close()
+                self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+            return received
+
+        response = asyncio.run(exercise())
+        self.assertEqual(response["type"], "sys.ack")
+        self.assertEqual(response["data"]["type"], "sys.log.subscribe")
+        self.assertEqual(response["data"]["command_id"], "11111111111111111111111111111111")
+        self.assertTrue(response["data"]["accepted"])
+
+    def test_cr009_rejects_malformed_or_ambiguous_json_filters(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        cid = "22222222222222222222222222222222"
+        base = ('{"type":"sys.log.subscribe","code":0,"data":{"command_id":"' + cid +
+                '","log_schema_version":"1.0.0","min_level":"WARN","components":[]}}')
+
+        def dispatch_raw(raw: str) -> tuple[int, dict | None]:
+            out = ctypes.create_string_buffer(1024)
+            rc = self.lib.desk_sdk_bridge_process_ws_command(raw.encode(), out, len(out))
+            return rc, json.loads(out.value) if rc == 0 and out.value else None
+
+        malformed = [
+            base[:-1] + 'garbage',
+            base[:-2],
+            base.replace('"components":[]', '"components":["camera"]garbage'),
+            base.replace(',"components":[]', ',"meta":{"components":["camera"]}'),
+            base.replace(',"components":[]', ',"note":"escaped \\\"components\\\": [\\\"camera\\\"]"'),
+            base[:-1] + ',"data":{"command_id":"' + cid + '","log_schema_version":"1.0.0"}}',
+            base[:-1] + ',"data":{"unexpected":true}}',
+        ]
+        for raw in malformed:
+            with self.subTest(raw=raw):
+                rc, response = dispatch_raw(raw)
+                self.assertTrue(rc != 0 or (response and response["type"] == "sys.nack"))
+
+        invalid_but_well_formed = [
+            base.replace('"components":[]', '"components":[],"components":["camera"]'),
+            base.replace('"min_level":"WARN"', '"min_level":"WARN","min_level":"ERROR"'),
+            base.replace('"log_schema_version":"1.0.0"', '"log_schema_version":"1.0.0","log_schema_version":"1.0.0"'),
+            base.replace('"min_level":"WARN"', '"min_level":"WARN-extra"'),
+            base.replace('"log_schema_version":"1.0.0"', '"log_schema_version":"2.0"'),
+            base.replace('"components":[]', '"components":[],"unexpected":true'),
+        ]
+        for raw in invalid_but_well_formed:
+            with self.subTest(raw=raw):
+                rc, response = dispatch_raw(raw)
+                self.assertTrue(rc != 0 or (response and response["type"] == "sys.nack"))
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    def test_failed_hardware_hello_ack_does_not_set_authenticated_latch(self) -> None:
+        """A NACK/failed handshake never establishes the per-WebSocket latch."""
+        async def reject_hello(websocket) -> None:
+            await websocket.recv()
+            await websocket.send(json.dumps({
+                "type": "sys.nack",
+                "code": 401,
+                "data": {"type": "sys.client.hello", "error": "rejected"},
+            }))
+
+        async def exercise_rejection() -> None:
+            async with websockets.serve(reject_hello, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                request = PairRequest(
+                    request_id="41a9dbf05ea3443480e62076f79a3b12",
+                    daemon_instance_id="f730f29e670c49f7a3320c4314eb9805",
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=port,
+                )
+                response = ctypes.create_string_buffer(1024)
+                self.assertEqual(
+                    self.lib.desk_sdk_bridge_process_pairing_udp(
+                        encode_udp_message(request), response, len(response)
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port),
+                    0,
+                )
+                connect_rc = await asyncio.to_thread(
+                    self.lib.desk_sdk_ws_client_connect_paired
+                )
+                self.assertNotEqual(connect_rc, 0)
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+
+        asyncio.run(exercise_rejection())
 
     def _exec_command(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")
@@ -437,6 +686,9 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                                  f"http={self.lib.desk_sdk_test_http_response().decode('utf-8', 'replace')!r}, "
                                  f"ack={self.lib.desk_sdk_test_last_ack().decode('utf-8', 'replace')!r}")
                 self.assertTrue(self.lib.desk_sdk_ws_client_is_connected())
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                # The current implementation only observes the existing protocol ACK;
+                # this does not cryptographically authenticate the Runtime peer.
 
                 async with websockets.connect(server.url) as desktop:
                     await desktop.send(json.dumps({
@@ -495,6 +747,9 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                         break
                     await asyncio.sleep(0.1)
                 self.assertTrue(reconnected, "C client did not reconnect to official Runtime")
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.lib.desk_sdk_ws_client_close()
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
             finally:
                 poll_stop.set()
                 await poll_task

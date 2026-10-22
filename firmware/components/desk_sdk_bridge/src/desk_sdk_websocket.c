@@ -12,6 +12,7 @@
 #include <strings.h>
 #include <time.h>
 #include <sys/time.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -46,6 +47,13 @@
 
 static int s_ws_fd = -1;
 static bool s_ws_ready = false;
+/* A successful HardwareHello ACK observed on this socket, not cryptographic
+ * peer authentication (the current transport is plaintext WebSocket). */
+static bool s_ws_authenticated = false;
+/* Serializes only the ACK latch and its generation. It is never held while
+ * taking the pairing mutex or doing network I/O. */
+static pthread_mutex_t s_ws_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t s_ws_generation = 0;
 static desk_sdk_ws_state_t s_ws_state = DESK_SDK_WS_OFFLINE;
 #ifndef ESP_PLATFORM
 static uint32_t s_mask_counter = 0;
@@ -104,10 +112,37 @@ static void ws_schedule_reconnect(void)
 
 static void ws_transport_close(void)
 {
-    if (s_ws_fd >= 0) { close(s_ws_fd); s_ws_fd = -1; }
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    ++s_ws_generation;
     s_ws_ready = false;
+    s_ws_authenticated = false;
+    if (s_ws_fd >= 0) { close(s_ws_fd); s_ws_fd = -1; }
     s_ws_state = DESK_SDK_WS_OFFLINE;
     s_ws_rx_len = 0;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    desk_sdk_bridge_log_session_closed();
+}
+
+static uint32_t ws_lifecycle_generation(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    uint32_t generation = s_ws_generation;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return generation;
+}
+
+static bool ws_commit_hardware_hello_ack(uint32_t generation)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool current = generation == s_ws_generation;
+    if (current) {
+        /* This records protocol ACK observation, not cryptographic peer auth. */
+        s_ws_authenticated = true;
+        s_ws_ready = true;
+        s_ws_state = DESK_SDK_WS_CONNECTED;
+    }
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return current;
 }
 
 static void ws_disconnect_and_schedule(void)
@@ -232,7 +267,20 @@ void desk_sdk_ws_client_close(void)
     s_ws_retry_at = 0;
 }
 
-bool desk_sdk_ws_client_is_connected(void) { return s_ws_ready; }
+bool desk_sdk_ws_client_is_connected(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool ready = s_ws_ready;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return ready;
+}
+bool desk_sdk_ws_client_is_authenticated(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool authenticated = s_ws_ready && s_ws_authenticated;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return authenticated;
+}
 desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void) { return s_ws_state; }
 
 int desk_sdk_ws_client_send_text(const char *text)
@@ -256,6 +304,7 @@ int desk_sdk_ws_client_connect_paired(void)
     uint8_t key_raw[16];
     uint16_t port;
     ws_transport_close();
+    uint32_t connect_generation = ws_lifecycle_generation();
     if (!s_reconnect_attempt) {
         s_reconnect_failures = 0;
         s_ws_retry_at = 0;
@@ -306,7 +355,10 @@ int desk_sdk_ws_client_connect_paired(void)
     if (ws_read_frame(3000, &opcode, s_ws_ack, sizeof(s_ws_ack)-1, &ack_len) != 0 || opcode != 0x1) goto fail;
     s_ws_ack[ack_len] = 0;
     if (!strstr((char *)s_ws_ack, "\"type\":\"sys.ack\"") || !strstr((char *)s_ws_ack, "\"sys.client.hello\"") || !strstr((char *)s_ws_ack, "\"code\":0")) goto fail;
-    s_ws_ready = true; s_ws_state = DESK_SDK_WS_CONNECTED;
+    /* Commit only if no close/credential/policy/identity invalidation happened
+     * while this connection was in flight. This remains protocol ACK evidence,
+     * not cryptographic Runtime peer authentication. */
+    if (!ws_commit_hardware_hello_ack(connect_generation)) goto fail;
     s_reconnect_failures = 0;
     s_ws_retry_at = 0;
     return 0;
@@ -344,11 +396,12 @@ int desk_sdk_ws_client_poll(int timeout_ms)
         return 0;
     }
     if (op != 0x1) { ws_disconnect_and_schedule(); return -1; }
+    if (memchr(payload, '\0', len) != NULL) { ws_disconnect_and_schedule(); return -1; }
     payload[len] = 0;
     char message_type[64] = "";
     if (json_parse_top_level_str((const char *)payload, "type", message_type, sizeof(message_type)) &&
         strcmp(message_type, "sys.client.hello") == 0) { ws_disconnect_and_schedule(); return -1; }
-    if (desk_sdk_bridge_process_command((const char *)payload, s_ws_response, sizeof(s_ws_response)) == 0)
+    if (desk_sdk_bridge_process_ws_command((const char *)payload, s_ws_response, sizeof(s_ws_response)) == 0)
         return desk_sdk_ws_client_send_text(s_ws_response);
     return 0;
 }
