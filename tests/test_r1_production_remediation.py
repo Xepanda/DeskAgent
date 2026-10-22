@@ -356,7 +356,11 @@ class TestCodexTurnStatusAndPersistence(unittest.TestCase):
         # 3. Successful turn
         comp._handle_server_notification("turn/completed", {
             "task_id": "task-ok-01",
-            "turn": {"id": "turn-3", "status": "completed", "summary": "Build succeeded"},
+            "turn": {
+                "id": "turn-3",
+                "status": "completed",
+                "items": [{"type": "agentMessage", "text": "Build succeeded"}],
+            },
         })
         self.assertEqual(events[2][0], "codex.turn_completed")
         self.assertEqual(events[2][1]["status"], "completed")
@@ -485,7 +489,7 @@ class TestP2RemainingRemediations(unittest.TestCase):
         # 1. Assistant produces text via item/updated
         comp._handle_server_notification("item/updated", {
             "task_id": "task-out-01",
-            "item": {"type": "message", "text": "已在第 10 行增加判空检查并修复 NPE"},
+            "item": {"type": "agentMessage", "text": "已在第 10 行增加判空检查并修复 NPE"},
         })
         comp._handle_server_notification("turn/completed", {
             "task_id": "task-out-01",
@@ -631,7 +635,6 @@ class TestP2RemainingRemediations(unittest.TestCase):
 
                 rem_client = RemoteCodexCompanionClient("http://127.0.0.1:9997", state_file_path=state_p)
                 app.companion = rem_client
-                rem_client.add_event_listener(app._on_codex_event)
 
                 # 1. When task completes on remote while robot is disconnected
                 def mock_rpc(op, args):
@@ -639,7 +642,10 @@ class TestP2RemainingRemediations(unittest.TestCase):
                         return {"status": "succeeded", "result": {"task_id": "tsk-retry-01", "status": "completed", "output": "Finished correctly"}}
                     return {"status": "succeeded", "result": {}}
 
+                # Install the mock before registering a listener, which starts the poller.
+                # Otherwise its first poll can escape to the real HTTP endpoint.
                 with patch.object(rem_client, "_rpc_call", side_effect=mock_rpc):
+                    rem_client.add_event_listener(app._on_codex_event)
                     # Give poller time to see task completed
                     deadline = time.time() + 2.5
                     while time.time() < deadline:
@@ -701,7 +707,7 @@ class TestP2RemainingRemediations(unittest.TestCase):
             }
             comp._handle_server_notification("item/updated", {
                 "task_id": "task-persist-out",
-                "item": {"type": "message", "text": "已在第45行增加空指针防护代码"},
+                "item": {"type": "agentMessage", "text": "已在第45行增加空指针防护代码"},
             })
             comp._handle_server_notification("turn/completed", {
                 "task_id": "task-persist-out",
@@ -712,6 +718,7 @@ class TestP2RemainingRemediations(unittest.TestCase):
             # 2. Simulate server restart: reopen CodexCompanion with the same SQLite db
             comp_reloaded = CodexCompanion(db_path=db_file)
             status_data = comp_reloaded.get_task_status("task-persist-out")
+            comp_reloaded.close()  # Release SQLite before assertions can abort the test.
             self.assertIsNotNone(status_data)
             self.assertEqual(status_data["summary"], "已在第45行增加空指针防护代码")
             self.assertEqual(status_data["last_output"], "已在第45行增加空指针防护代码")
@@ -739,7 +746,6 @@ class TestP2RemainingRemediations(unittest.TestCase):
             self.assertNotEqual(events[0][1]["summary"], "任务已成功完成")
 
             remote_client.close()
-            comp_reloaded.close()
 
 if __name__ == "__main__":
     unittest.main()
