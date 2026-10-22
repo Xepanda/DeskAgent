@@ -44,6 +44,29 @@ class Robot:
 
 
 class OfficialRobotCameraAdapterTests(unittest.TestCase):
+    def test_capture_cadence_is_capped_to_host_mjpeg_rate_on_acquire_and_renewal(self) -> None:
+        camera = Camera()
+        camera.release.clear()
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda *_a, **_k: {"type": "sys.ack", "code": 0},
+            ingest_frame=lambda _frame: None,
+        )
+        try:
+            self.assertTrue(adapter.acquire("viewer-a", 5000, target_fps=20)["granted"])
+            self.assertEqual(adapter._interval, 0.5, "capture cadence must not exceed Host's 2 FPS MJPEG output cap")
+
+            # Lower consumer rates remain effective when the same lease is renewed.
+            self.assertTrue(adapter.acquire("viewer-a", 5000, target_fps=1)["granted"])
+            self.assertEqual(adapter._interval, 1.0)
+
+            # Renewing with a faster request must restore the consumer cap, not the raw request.
+            self.assertTrue(adapter.acquire("viewer-a", 5000, target_fps=30)["granted"])
+            self.assertEqual(adapter._interval, 0.5)
+        finally:
+            camera.release.set()
+            adapter.close()
+
     def test_sdk_disconnect_invalidates_camera_lease_without_release_command(self) -> None:
         camera = Camera()
         camera.release.clear()

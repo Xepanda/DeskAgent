@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_JPEG_BYTES = 64 * 1024
 MAX_WSPK_FRAME_BYTES = 131088  # 16-byte header + 128 KiB payload
+MAX_HOST_MJPEG_FPS = 2.0
 
 
 class OfficialRobotCameraAdapter:
@@ -83,7 +84,7 @@ class OfficialRobotCameraAdapter:
                     return {"granted": False, "reason": self._error_code(ack), "device_ack": ack}
                 self._lease_ms = lease_ms
                 self._lease_deadline = time.monotonic() + lease_ms / 1000
-                self._interval = 1.0 / target_fps
+                self._interval = 1.0 / min(target_fps, MAX_HOST_MJPEG_FPS)
                 return {"granted": True, "client_id": client_id, "lease_duration_ms": lease_ms}
 
             ack = self._send_command(
@@ -98,7 +99,7 @@ class OfficialRobotCameraAdapter:
             self._owner = client_id
             self._lease_ms = lease_ms
             self._lease_deadline = time.monotonic() + lease_ms / 1000
-            self._interval = 1.0 / target_fps
+            self._interval = 1.0 / min(target_fps, MAX_HOST_MJPEG_FPS)
             stop_event = threading.Event()
             self._stop_event = stop_event
             self._thread = threading.Thread(
