@@ -47,6 +47,33 @@ class TestCodexCompanion(unittest.TestCase):
                 prompt="git status",
             )
 
+    def test_subprocess_transport_uses_utf8_for_app_server_jsonl(self) -> None:
+        from companion.src.codex_companion import SubprocessJsonRpcTransport
+
+        class ProcessStub:
+            stdin = None
+            stdout = None
+            stderr = None
+
+            def poll(self) -> int:
+                return 0
+
+            def terminate(self) -> None:
+                pass
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def kill(self) -> None:
+                pass
+
+        transport = SubprocessJsonRpcTransport(codex_bin="codex")
+        with patch("companion.src.codex_companion.shutil.which", return_value="codex.exe"), \
+             patch("companion.src.codex_companion.subprocess.Popen", return_value=ProcessStub()) as popen:
+            transport._ensure_proc()
+            self.assertEqual(popen.call_args.kwargs.get("encoding"), "utf-8")
+        transport.close()
+
     # -------------------------------------------------------------------------
     # 2. Workspace Alias & Security Protection
     # -------------------------------------------------------------------------
