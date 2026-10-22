@@ -2,7 +2,7 @@
 
 - **提出方：** A0 架构与协议
 - **范围：** A2 WSPK / 官方 Runtime / A3 Host SDK 接入 / A6 相机服务的数据交付边界
-- **状态：** **Lead/A0 已批准接口边界；A3 官方 SDK camera adapter 与 managed Application 接线已有 L2 源码/测试证据；L3/L4 未通过**。本仓 Host adapter 已实现 camera lease 转发、SDK capture 结果校验/投递、单 capture 在途及断连清理；本轮 WSL 15 项定向测试通过。测试使用 fake transport/fixture JPEG，不证明真实 Runtime 部署或目标相机出图。
+- **状态：** **Lead/A0 已批准接口边界；A3 官方 SDK camera adapter 与 managed Application 接线已有 L2 源码/测试证据；L3/L4 未通过**。commit `21d5505` 将 managed SDK capture cadence 上限限制为 2 FPS，与 `CameraViewerService.iter_mjpeg()` 当前上限一致；低于 2 FPS 的请求仍按请求 cadence 执行。本轮 combined WSL camera tests **53/53 passed**，属于源码/fixture L2；设备负载、真实实时帧和 Runtime 部署未验证。
 - **不在范围：** 修改 WSPK wire format、修改官方 SDK、改变相机硬件驱动或宣布实机 JPEG 已通过
 - **关联：** `contracts/camera_frame_delivery.md`、CR-002、`docs/implementation/p0-3-official-sdk-device-contract.md`
 
@@ -37,7 +37,7 @@ A3 adapter 复用本仓已定义的命令及 pinned SDK `send_command()` / `came
 
 1. Host `resource.camera.acquire` 成功后，A3 adapter 使用 SDK 当前会话向设备发 `ctrl.camera.acquire`（同一 `client_id` 与剩余租期），设备拒绝则回滚 Host lease 并报告现有 `RESOURCE_BUSY` / 设备错误。
 2. 仅在设备 lease 有效期间，A3 使用 pinned SDK `camera.capture()` 请求帧。该 SDK API 负责 ACK 和返回 image 的 `session_id` 关联及其定义的 image fragmentation 重组。A3 只把完成且匹配该 capture session 的 `FRAME_IMAGE` payload 交给 A6；不把 WSPK header 或音频帧传给相机服务。
-3. 预览刷新按当前 Host `target_fps` 运行，单设备只允许一个 capture 在途；每个 lease 至多保留一个等待/最新完整 JPEG，落后帧丢弃，不累积无界队列。定时刷新达到 SDK/device capture 超时则停止本轮并显式报告 unavailable；不得把超时/断连前的旧帧作为新帧。
+3. 预览刷新按 Host `target_fps` 运行，但 SDK camera capture cadence 上限为 **2 FPS**，与 `CameraViewerService.iter_mjpeg()` 的当前最大输出一致；低于 2 FPS 的请求保留。单设备只允许一个 capture 在途；每个 lease 至多保留一个等待/最新完整 JPEG，落后帧丢弃，不累积无界队列。定时刷新达到 SDK/device capture 超时则停止本轮并显式报告 unavailable；不得把超时/断连前的旧帧作为新帧。此上限不证明硬件在持续负载下可稳定提供实时帧。
 4. A6 现有 JPEG 校验、single latest frame、lease owner 和 2000 ms stale 检查继续生效。HTTP viewer 只可在当前 Host lease owner 下读取新鲜帧；无有效租约或没有新鲜帧时返回不可用。
 5. Host lease release、expiry、SDK session disconnect、device reboot 均停止刷新并清空 Host latest frame；有连接时尽力发送现有 `ctrl.camera.release`。连接已断时记录 release 未确认，依赖设备租约超时清理，重连不得复用旧 session_id 或旧帧。
 
@@ -49,7 +49,7 @@ A3 adapter 复用本仓已定义的命令及 pinned SDK `send_command()` / `came
 | --- | --- | --- |
 | WebSocket 完整 WSPK message | ≤ `DESK_WSPK_MAX_FRAME_SIZE` = 131088 bytes（128 KiB payload + 16-byte header），超出在 Host 接收层拒绝 | `_run_managed_application()` 包装既有 SDK binary callback，在 SDK camera consumer 处理前拒绝非 bytes/超上限 payload；对应 managed-startup contract test 为 L2。Pinned Runtime 部署后的实际 ingress 仍未测 |
 | 单个相机 JPEG | 当前设备 source **≤65536 bytes**；A6 已接受至 128 KiB。若后续提高设备实际 capture 上限，须先另行核对 SRAM/PSRAM 并保持 WSPK payload ≤128 KiB | firmware `ctrl.camera.capture` 的 64 KiB allocation 是当前有效 source cap；不是 128 KiB |
-| 队列/重组 | 单设备一个 capture 在途、Host 一个最新 JPEG；由 pinned SDK camera API 关联 capture 与 image；adapter 再限制完整 JPEG ≤64 KiB | A3 adapter 已接入 SDK `camera.capture()` 并校验完整 image；15 项 WSL L2 测试覆盖 parser/adapter/managed startup；未测 Runtime/真机 |
+| 队列/重组与节流 | 单设备一个 capture 在途、Host 一个最新 JPEG；由 pinned SDK camera API 关联 capture 与 image；adapter 再限制完整 JPEG ≤64 KiB；capture cadence ≤2 FPS，低于 2 FPS 的请求保留 | commit `21d5505` 实施 2 FPS 上限；与 `CameraViewerService.iter_mjpeg()` 一致。combined WSL camera tests 53/53 passed，属 L2；设备负载/真实实时帧未测 |
 | Camera lease | Host 与设备使用现有 acquire/release 命令；租约 owner 与 duration 保持同一；设备 busy/无租约映射为既有错误，不创建第二种租约 | managed-mode adapter 已转发 acquire/release 并在 acquire 失败时回滚 Host lease；代码/fixture 测试为 L2 |
 | 无帧/坏帧 | WSPK/header/size/sequence/JPEG 校验失败只丢弃当前帧并保留诊断；capture 超时、无租约、设备 busy 作为失败返回；不能透传前一张图冒充成功 | camera handler 当前把驱动失败映射为 `RESOURCE_BUSY`；`interfaces.md` 已记录需修正为硬件错误，此处不改错误字典 |
 | 断线/释放 | 清理 Host latest frame、capture waiter、fragment assembly 和 lease owner；断线时 release 未确认必须记录；重连需新鲜 capture | managed SDK disconnect observer 已接线到非阻塞 camera invalidation，覆盖 L2；真实 Runtime 断线/重连与设备租约回收仍待 L3 验证 |
@@ -64,7 +64,7 @@ A3 adapter 复用本仓已定义的命令及 pinned SDK `send_command()` / `came
 
 **明确排除：** A4 的 `host/desk_agent/connectors/ha/` 与 HA 状态/服务接入不变；A6 的 viewer、管理页面及 CameraViewerService 所有权不变。A3 只增加 `connectors/robot/` 中的官方 SDK Robot/Camera transport adapter 与对应测试，并执行上述 `main.py` 最小接线；不得改 A4/A6 生产路径。
 
-当前协议足以裁决 image transport、WSPK parsing、session correlation、已有 lease commands 和 Host sink；**没有待新增的 wire protocol 字段**。A3 adapter、managed Application composition-root 接线及相机 callback 已有 L2 源码/测试证据；本轮 WSL 指定 suite 为 **15 tests, OK**：`tests.connectors.test_official_robot_camera_adapter`、`tests.sdk_contract.test_official_sdk_host_media_ingress`、`tests.core.test_managed_sdk_startup`。它使用 fake SDK transport、合成/fixture JPEG 和本地 managed-startup seam，不是对未修改 Runtime 部署或物理设备的 L3 证明。剩余门包括：官方 Runtime 在目标 Host 的实际部署/配置、设备与 Runtime 的真实配对及 WebSocket 媒体收发，以及实体相机真实 JPEG 可读性。此前现场相机空头/无 JPEG 问题仍未关闭。A2 `desk_sdk_ws_client_poll()` 的下行 binary 丢弃不能作为 A6 source；旧 TCP `RobotAdapter` callback 也不能被宣称自动接入 WebSocket Runtime。
+当前协议足以裁决 image transport、WSPK parsing、session correlation、已有 lease commands 和 Host sink；**没有待新增的 wire protocol 字段**。A3 adapter、managed Application 接线、相机 callback 与 capture cadence 上限已有 L2 源码/测试证据。commit `21d5505` 的实现由 combined WSL camera tests **53/53 passed** 验证；该结果只证明源码、fake transport 与 fixture 路径。设备负载和真实实时帧仍需 L3/L4；此外仍需验证官方 Runtime 在目标 Host 的实际部署/配置、设备与 Runtime 的真实配对和 WebSocket 媒体收发，以及实体相机真实 JPEG 可读性。此前现场相机空头/无 JPEG 问题仍未关闭。A2 `desk_sdk_ws_client_poll()` 的下行 binary 丢弃不能作为 A6 source；旧 TCP `RobotAdapter` callback 也不能被宣称自动接入 WebSocket Runtime。
 
 ## 5. 验收门槛
 
