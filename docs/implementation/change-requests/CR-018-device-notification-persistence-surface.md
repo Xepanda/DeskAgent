@@ -29,6 +29,18 @@
 
 当前工作包及 CR-017 批准都不包含上述产品决定。不得把“storage 分区有 4 MiB”解释为它全部空闲或可以直接挂载、格式化或写入。若没有决策，通知 durable dedupe/ack persistence 保持阻塞，不能宣称设备重启恢复闭环。
 
+### 2.1 Provider 不可用时的冻结 wire 错误
+
+为使 A2 可以在存储决策仍阻塞期间实现 fail-closed handler，本 CR 冻结 provider missing/unmounted/unavailable 的拒绝响应；这不解除 CR 状态，也不批准任何 provider、分区、擦写或存储实现。对合法的 `notification.deliver`，设备必须不执行呈现/播放、不发应用 `accepted` 或成功 `sys.ack`，并在 SDK WebSocket command envelope 中返回：
+
+```json
+{"type":"sys.nack","code":503,"data":{"type":"notification.deliver","command_id":"<原样回显请求 data.command_id>","error":"STORAGE_UNAVAILABLE"}}
+```
+
+该 shape 沿用已有 `desk_sdk_log_nack()` 与同套件 authenticated WebSocket tests：`data.type` 是被拒绝命令名，`data.command_id` 原样回显，`data.error` 是稳定错误码字符串。pinned SDK `DaemonApplicationTransport.send_command()` 生成 32 字符小写 hex `command_id`，放在请求 `data`，并用响应 `data.command_id` 完成该次 ACK/NACK waiter correlation。稳定通知幂等键仍是 `data.notification_id`（等于 `occurrence_id`）；重试复用通知 ID，不复用 SDK command_id。`data.error` 精确为大写 `STORAGE_UNAVAILABLE`，登记于 `contracts/error_codes.json`；registry `description` 提供固定通用 message `Notification storage provider is unavailable`，不含标题、提醒正文、token 或凭据，registry `retryable: true` 代表 provider 恢复后可按相同 notification_id 重试。既有 wire shape 不传 message/retryable 字段。不能把传输层 ACK 当作 durable accepted。
+
+该线格式是 Watcherobot SDK Application WebSocket command response，不是 `contracts/schemas/envelope_response.json` 的 DeskAgent `ResponseEnvelope`。后者保持 `schema_version/request_id/status/timestamp` 与顶层 `error` 结构；Host 如需映射，使用 `status="failed"`、相同大写 domain code/message、`error.retryable=true`，但不得将 SDK `command_id` 冒充 DeskAgent `request_id`。单独 schema：`contracts/schemas/sdk_sys_nack.json`。`code:503` 适配现有 integer NACK code 字段；当前没有针对 storage provider 的 deployed handler/端到端证据，因此 A2 若发现具体已部署 SDK/runtime 对 503 拒绝或改写，必须提交 A2/A0 change request，不得宣称该响应已可直接部署。
+
 ## 3. 决策后必须遵守的逻辑存储契约
 
 以下是 backend provider 的要求；**不是当前分区兼容声明，也不批准将候选空间落盘**。

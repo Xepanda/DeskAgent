@@ -62,6 +62,12 @@
       "retryable": true,
       "description": "Upstream service (HA Core, Tuya Cloud, or Codex app-server) is disconnected or unreachable."
     },
+    "STORAGE_UNAVAILABLE": {
+      "code": "STORAGE_UNAVAILABLE",
+      "category": "STORAGE_ERROR",
+      "retryable": true,
+      "description": "The durable notification provider is unavailable. Stable wire message: Notification storage provider is unavailable. Retry the same notification_id when the provider becomes available."
+    },
     "STATE_UNCONFIRMED": {
       "code": "STATE_UNCONFIRMED",
       "category": "INTEGRATION_ERROR",

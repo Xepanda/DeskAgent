@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deskagent.xepanda.com/schemas/sdk_sys_nack.json",
+  "title": "NotificationStorageUnavailableSysNack",
+  "description": "Fail-closed notification.deliver provider-unavailable response for the pinned Watcherobot SDK Application channel. This is not a DeskAgent ResponseEnvelope.",
+  "type": "object",
+  "required": ["type", "code", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "type": { "const": "sys.nack" },
+    "code": { "const": 503 },
+    "data": {
+      "type": "object",
+      "required": ["type", "command_id", "error"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "notification.deliver" },
+        "command_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "Echo the command_id supplied in the originating SDK command data."
+        },
+        "error": { "const": "STORAGE_UNAVAILABLE" }
+      }
+    }
+  }
+}

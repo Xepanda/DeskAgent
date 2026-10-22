@@ -16,10 +16,16 @@ Pinned official Python SDK 有 `ApplicationContext.robot.audio.play_file()/play_
 
 沿用现有 reminder occurrence 和 Host outbox，不新增云端提醒服务。以下本地消息/状态名称已由 Lead/A0 批准，作为 DeskAgent 组件间契约。A3 Host 侧 adapter、outbox 调用及 receipt 持久化已完成 L2；设备 handler、A1/A2 状态事件产生与 CR-018 provider 仍未实现/验证，不能据此宣称 pinned SDK 或当前设备支持这些业务消息：
 
-1. A3 持久化一个 occurrence 通知，使用稳定 `notification_id = occurrence_id`，并通过官方 managed Runtime 的受控命令发送入口投递 `notification.deliver`。负载只包括 `notification_id`、`reminder_id`、`occurrence_id`、`title`、`scheduled_at`、`expires_at` 和必要的 catch-up 标志。
+1. A3 持久化一个 occurrence 通知，使用稳定 `notification_id = occurrence_id`，并通过官方 managed Runtime 的受控命令发送入口投递 `notification.deliver`。应用命令 wire envelope 为 `{"type":"notification.deliver","code":0,"data":{"notification_id":"...","reminder_id":"...","occurrence_id":"...","title":"...","scheduled_at":"...","expires_at":"...","is_catchup":false,"command_id":"<SDK-generated 32-char lowercase hex>"}}`。payload allowlist 仅含前七个业务字段；pinned SDK `DaemonApplicationTransport.send_command()` 在 `data` 中注入单次命令 `command_id`，重试时该 ID 可变，但 `notification_id = occurrence_id` 必须稳定不变。`type/code/data/command_id` 属于 SDK WebSocket command envelope，不是 DeskAgent RequestEnvelope 或 ResponseEnvelope。
 2. **目标设备行为（未通过实机验证）：** 仅当 CR-018 批准的 provider 已原子写入并回读校验后，设备才可报告 durable `accepted`；当前 CR-018 BLOCKED，Host 不得把任何设备 `accepted` 观察归并为该阶段。后续设备按 ID 幂等处理，并按 UI/音频仲裁显示与尝试播放。设备发送 `notification.status`：`rendered`、`played`、`failed`、`expired` 或 `unknown`，并关联相同 ID。`played` 仅可由设备音频播放接口报告成功结束后发出；硬件缺少可验证播放完成信号时必须标 `unknown`/不发 `played`，不能由 Host ACK 代替。
 3. 用户通过明确交互确认“已看到/收到这条通知”时发送 `notification.acknowledged`，包含 `notification_id` 与确认来源。Host 持久化该通知回执，但**不得因此改变 reminder/occurrence 的完成或响铃状态**。停止响铃仍须走既有 `reminder.stop_ringing`；完成事项须由用户另行明确表达完成意图，再调用 `reminder.complete`。设备侧的短按/长按目前保留 TuyaOpen 语音语义、滚轮用于 UI 选择；本 CR 不改变按键映射。确认手势/语音意图由 A1 在实现时裁定，未实现前状态保持“未确认”。
 4. `accepted`、`rendered`、`played`、`unknown`、`acknowledged` 是不同阶段/回执；不允许把前一阶段升级推断为后一阶段。通知已确认只表示用户确认看到/收到；它不等于停止响铃或事项完成。无显式 ACK 时，Host 只能报告已排队/已受理/状态未知。
+
+### Provider 缺失时的 fail-closed 命令响应
+
+CR-018 provider 缺失、未挂载或不可用时，`notification.deliver` 必须拒绝命令：不得返回 `sys.ack`，不得报告应用 `accepted`，不得呈现/播放；返回符合现有 authenticated WebSocket NACK 形状的 `{"type":"sys.nack","code":503,"data":{"type":"notification.deliver","command_id":"<原样回显 SDK command_id>","error":"STORAGE_UNAVAILABLE"}}`。`data.type`、`data.command_id`、`data.error` 字符串与 `desk_sdk_log_nack()` 已生成的结构一致；不在 `data.error` 内增加嵌套对象或扩展字段。错误码的固定通用 message 为 `Notification storage provider is unavailable`，不含通知标题、提醒内容、token、秘钥或其他凭据；其 retryable 语义由 `contracts/error_codes.json` 登记为 true，不在线上 NACK 中另加字段。`command_id` 只关联一次 SDK 命令应答，不能代替稳定 `notification_id` 幂等键；同一通知重试必须沿用原 `notification_id`，但使用新一轮 SDK command_id。重试语义表示 provider 恢复后可安全重试同一 ID，不代表当前发生 durable acceptance。
+
+此 SDK WebSocket `sys.nack` 不得序列化为 DeskAgent `ResponseEnvelope`。跨模块 DeskAgent `ResponseEnvelope` 若由 Host 另行生成，须使用其自身的顶层 `schema_version/request_id/status="failed"/timestamp/error` 字段；其中 error 为 `code="STORAGE_UNAVAILABLE"`、同一通用 message、`retryable:true`。它没有 `type/code/data/command_id` 字段。详见 `contracts/schemas/sdk_sys_nack.json`；此合同只冻结 wire 语义，不证明 SDK 当前设备实际发出该响应。
 
 ### 幂等与重复
 
