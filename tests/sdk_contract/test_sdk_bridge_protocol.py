@@ -539,17 +539,16 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         data = resp.get("data", {})
         self.assertEqual(data.get("role"), "device")
         caps = data.get("capabilities", [])
-        expected_caps = ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools"]
+        expected_caps = ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools", "inputs"]
         self.assertEqual(caps, expected_caps)
-        self.assertNotIn("inputs", caps)
         self.assertNotIn("audio.stream", caps)
         self.assertNotIn("audio_stream", caps)
 
-    def test_ready_get_matches_capability_contract_without_inputs(self) -> None:
-        """Both SDK capability responses omit inputs and retain every other advertised domain."""
+    def test_ready_get_matches_capability_contract_with_roller_inputs(self) -> None:
+        """Both endpoints expose the same capability list; inputs currently means roller only."""
         hello = self._process_cmd({"type": "sys.client.hello", "data": {"role": "desktop"}})
         ready = self._process_cmd({"type": "sys.sdk.ready.get"})
-        expected_caps = ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools"]
+        expected_caps = ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools", "inputs"]
         self.assertEqual(hello.get("data", {}).get("capabilities"), expected_caps)
         self.assertEqual(ready.get("data", {}).get("capabilities"), expected_caps)
 
@@ -1120,11 +1119,20 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             self.assertEqual(parsed.timestamp_ms, 123456)
 
         for bad_data in (
+            {"action": "rotate", "delta": 1, "timestamp_ms": 1},
+            {"source": "roller", "delta": 1, "timestamp_ms": 1},
+            {"source": "roller", "action": "rotate", "timestamp_ms": 1},
+            {"source": "roller", "action": "rotate", "delta": 1},
             {"source": "roller", "action": "rotate", "delta": 0, "timestamp_ms": 1},
             {"source": "roller", "action": "rotate", "delta": True, "timestamp_ms": 1},
             {"source": "roller", "action": "rotate", "delta": "1", "timestamp_ms": 1},
             {"source": "roller", "action": "rotate", "delta": 1, "timestamp_ms": -1},
+            {"source": "roller", "action": "tap", "delta": 1, "timestamp_ms": 1},
             {"source": "screen_touch", "action": "tap", "delta": 1, "timestamp_ms": 1},
+            {"source": "screen_touch", "action": "rotate", "x": 1, "y": 1,
+             "delta": 1, "timestamp_ms": 1},
+            {"source": "back_touch", "action": "rotate", "touch_id": 1,
+             "delta": 1, "timestamp_ms": 1},
         ):
             self.assertIsNone(parse_input_event(bad_data))
 

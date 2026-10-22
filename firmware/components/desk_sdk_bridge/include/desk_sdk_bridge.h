@@ -31,6 +31,7 @@ extern "C" {
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
 #define DESK_SDK_CAP_EXPRESSION_ALT "expression"
 #define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"
+#define DESK_SDK_CAP_INPUTS        "inputs"
 
 /**
  * @brief Pending request states in the asynchronous correlation table.

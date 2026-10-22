@@ -1192,6 +1192,276 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         asyncio.run(exercise_runtime())
 
+    def test_c_roller_inputs_reach_official_sdk_wait_across_reconnect(self) -> None:
+        """The production C client delivers only live detents to pinned SDK inputs.wait()."""
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.desktop_session import DesktopRobotSession
+        from watcherobot.robot import WatcheRobot
+        from watcherobot.runtime.daemon.connections.registry import ExternalClientRole
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+
+        request_id = "51a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "a730f29e670c49f7a3320c4314eb9805"
+        pairing = DevicePairingSession(
+            daemon_instance_id=daemon_id,
+            request_id_factory=lambda: request_id,
+        )
+
+        async def exercise_runtime() -> None:
+            clock = {"now": 1.0}
+
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=clock["now"])
+                clock["now"] += 1.0
+
+            async def disconnected(_peer_ip: str) -> None:
+                pairing.device_disconnected(now=clock["now"])
+                clock["now"] += 1.0
+
+            server = ExternalWebSocketServer(
+                host="127.0.0.1",
+                port=0,
+                hardware_hello_authorizer=authorize,
+                device_disconnect_listener=disconnected,
+            )
+            await server.start()
+            poll_stop = asyncio.Event()
+
+            async def poll_c_client() -> None:
+                while not poll_stop.is_set():
+                    await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 50)
+
+            poll_task = asyncio.create_task(poll_c_client())
+            desktop = DesktopRobotSession(server.url, command_timeout=1.0)
+            robot = WatcheRobot._from_transport(desktop)
+            try:
+                request = PairRequest(
+                    request_id=request_id,
+                    daemon_instance_id=daemon_id,
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=server.bound_port,
+                )
+                pair_reply = ctypes.create_string_buffer(1024)
+                self.assertEqual(self.lib.desk_sdk_bridge_process_pairing_udp(
+                    encode_udp_message(request), pair_reply, len(pair_reply)
+                ), 0)
+                pair_accept = parse_udp_message(pair_reply.value)
+                pairing.start_pairing(
+                    pairing_code="123456", target_mode="python_sdk",
+                    websocket_port=server.bound_port, now=0.0,
+                )
+                pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=0.5)
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(
+                    b"127.0.0.1", server.bound_port
+                ), 0)
+                self.assertEqual(await asyncio.to_thread(
+                    self.lib.desk_sdk_ws_client_connect_paired
+                ), 0)
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+
+                await asyncio.to_thread(desktop.start)
+                self.assertEqual(self.lib.desk_sdk_bridge_send_roller_input(1, 101), 0)
+                positive = await asyncio.to_thread(robot.inputs.wait, 2.0)
+                self.assertEqual(type(positive).__name__, "RollerEvent")
+                self.assertEqual((positive.delta, positive.timestamp_ms), (1, 101))
+
+                self.assertEqual(self.lib.desk_sdk_bridge_send_roller_input(-1, 102), 0)
+                negative = await asyncio.to_thread(robot.inputs.wait, 2.0)
+                self.assertEqual(type(negative).__name__, "RollerEvent")
+                self.assertEqual((negative.delta, negative.timestamp_ms), (-1, 102))
+
+                # Close only the hardware side. A detent attempted without an
+                # authenticated Runtime connection must fail and must not be
+                # replayed after the production C reconnect path runs.
+                self.assertEqual(await server.registry.close_role(
+                    ExternalClientRole.DEVICE,
+                    code=1012,
+                    reason="roller reconnect check",
+                ), 1)
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and self.lib.desk_sdk_ws_client_is_connected():
+                    await asyncio.sleep(0.02)
+                self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
+                self.assertNotEqual(self.lib.desk_sdk_bridge_send_roller_input(1, 103), 0)
+
+                deadline = time.monotonic() + 8.0
+                reconnected = False
+                while time.monotonic() < deadline:
+                    if (self.lib.desk_sdk_ws_client_is_authenticated()
+                            and pairing.snapshot()["state"] == "connected"):
+                        reconnected = True
+                        break
+                    await asyncio.sleep(0.05)
+                self.assertTrue(reconnected, "production C client did not reconnect to pinned Runtime")
+
+                with self.assertRaises(TimeoutError):
+                    await asyncio.to_thread(robot.inputs.wait, 0.2)
+
+                self.assertEqual(self.lib.desk_sdk_bridge_send_roller_input(-1, 104), 0)
+                fresh = await asyncio.to_thread(robot.inputs.wait, 2.0)
+                self.assertEqual(type(fresh).__name__, "RollerEvent")
+                self.assertEqual((fresh.delta, fresh.timestamp_ms), (-1, 104))
+            finally:
+                desktop.close()
+                poll_stop.set()
+                await poll_task
+                await server.stop()
+
+        asyncio.run(exercise_runtime())
+
+    def test_c_roller_input_overflow_drops_oldest_and_counts_drops(self) -> None:
+        """Pinned Runtime loopback preserves only the newest bounded input stream."""
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.desktop_session import DesktopRobotSession
+        from watcherobot.inputs import InputDomain
+        from watcherobot.robot import WatcheRobot
+        from watcherobot.runtime.daemon.connections.registry import ExternalClientRole
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+
+        request_id = "61a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "b730f29e670c49f7a3320c4314eb9805"
+        pairing = DevicePairingSession(
+            daemon_instance_id=daemon_id,
+            request_id_factory=lambda: request_id,
+        )
+        runtime_inputs: list[dict] = []
+
+        async def exercise_runtime() -> None:
+            clock = {"now": 1.0}
+
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=clock["now"])
+                clock["now"] += 1.0
+
+            async def disconnected(_peer_ip: str) -> None:
+                pairing.device_disconnected(now=clock["now"])
+                clock["now"] += 1.0
+
+            async def observe_business_frame(connection, frame: str | bytes) -> None:
+                if connection.role is ExternalClientRole.DEVICE and isinstance(frame, str):
+                    message = json.loads(frame)
+                    if message.get("type") == "evt.sdk.input":
+                        runtime_inputs.append(message["data"])
+
+            server = ExternalWebSocketServer(
+                host="127.0.0.1",
+                port=0,
+                hardware_hello_authorizer=authorize,
+                device_disconnect_listener=disconnected,
+                business_frame_listener=observe_business_frame,
+            )
+            await server.start()
+            poll_stop = asyncio.Event()
+
+            async def poll_c_client() -> None:
+                while not poll_stop.is_set():
+                    await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 50)
+
+            poll_task = asyncio.create_task(poll_c_client())
+            desktop = DesktopRobotSession(server.url, command_timeout=1.0)
+            robot = WatcheRobot._from_transport(desktop)
+            queue_capacity = InputDomain()._queue.maxsize
+            self.assertEqual(queue_capacity, 64, "Pinned SDK InputDomain default changed")
+            overflow_per_round = 4
+            event_count = queue_capacity + overflow_per_round
+            try:
+                request = PairRequest(
+                    request_id=request_id,
+                    daemon_instance_id=daemon_id,
+                    pairing_code="123456",
+                    target_mode="python_sdk",
+                    websocket_port=server.bound_port,
+                )
+                pair_reply = ctypes.create_string_buffer(1024)
+                self.assertEqual(self.lib.desk_sdk_bridge_process_pairing_udp(
+                    encode_udp_message(request), pair_reply, len(pair_reply)
+                ), 0)
+                pair_accept = parse_udp_message(pair_reply.value)
+                pairing.start_pairing(
+                    pairing_code="123456", target_mode="python_sdk",
+                    websocket_port=server.bound_port, now=0.0,
+                )
+                pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=0.5)
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(
+                    b"127.0.0.1", server.bound_port
+                ), 0)
+                self.assertEqual(await asyncio.to_thread(
+                    self.lib.desk_sdk_ws_client_connect_paired
+                ), 0)
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                await asyncio.to_thread(desktop.start)
+
+                expected_drop_total = 0
+                expected_runtime_total = 0
+                for round_index in range(2):
+                    base_timestamp = 10_000 * (round_index + 1)
+                    drops_before = robot.inputs.dropped_events
+                    for index in range(event_count):
+                        timestamp_ms = base_timestamp + index
+                        delta = 1 if index % 2 == 0 else -1
+                        self.assertEqual(self.lib.desk_sdk_bridge_send_roller_input(
+                            delta, timestamp_ms
+                        ), 0)
+                        target_runtime_total = expected_runtime_total + index + 1
+                        deadline = time.monotonic() + 3.0
+                        while (len(runtime_inputs) < target_runtime_total
+                               and time.monotonic() < deadline):
+                            await asyncio.sleep(0.005)
+                        self.assertGreaterEqual(
+                            len(runtime_inputs), target_runtime_total,
+                            "Pinned Runtime did not receive every production C event",
+                        )
+
+                    expected_drop_total += overflow_per_round
+                    expected_runtime_total += event_count
+                    deadline = time.monotonic() + 3.0
+                    while (robot.inputs.dropped_events < expected_drop_total
+                           and time.monotonic() < deadline):
+                        await asyncio.sleep(0.005)
+                    self.assertEqual(
+                        robot.inputs.dropped_events - drops_before,
+                        overflow_per_round,
+                    )
+                    self.assertEqual(len(runtime_inputs), expected_runtime_total)
+                    self.assertEqual(robot.inputs._queue.qsize(), queue_capacity)
+
+                    retained_timestamps = []
+                    retained_deltas = []
+                    for _ in range(queue_capacity):
+                        event = await asyncio.to_thread(robot.inputs.wait, 2.0)
+                        retained_timestamps.append(event.timestamp_ms)
+                        retained_deltas.append(event.delta)
+                    expected_start = base_timestamp + overflow_per_round
+                    self.assertEqual(
+                        retained_timestamps,
+                        list(range(expected_start, base_timestamp + event_count)),
+                    )
+                    self.assertEqual(
+                        retained_deltas,
+                        [1 if index % 2 == 0 else -1
+                         for index in range(overflow_per_round, event_count)],
+                    )
+                    self.assertEqual(robot.inputs._queue.qsize(), 0)
+                    self.assertEqual(robot.inputs.dropped_events, expected_drop_total)
+
+                self.assertEqual(len(runtime_inputs), 2 * event_count)
+            finally:
+                desktop.close()
+                poll_stop.set()
+                await poll_task
+                await server.stop()
+
+        asyncio.run(exercise_runtime())
+
     def test_official_udp_pairing_rejected_when_unprovisioned(self) -> None:
         """Fail-closed: an unprovisioned device must not answer with pair.accept."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(None), 0)
@@ -1274,9 +1544,9 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         })
         self.assertEqual(resp["type"], "sys.ack")
         caps = resp["data"]["capabilities"]
-        self.assertNotIn("inputs", caps)
-        self.assertIn("motion", caps)
-        self.assertIn("camera", caps)
+        self.assertEqual(caps, [
+            "motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools", "inputs",
+        ])
         self.assertNotIn("audio.stream", caps)
         self.assertNotIn("audio_stream", caps)
         self.assertIn("expression.audio_follow.v1", caps)

@@ -174,9 +174,8 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         self.assertEqual(resp.get("code"), 0)
         caps = resp.get("data", {}).get("capabilities", [])
 
-        # Capability declaration is exact; local input/UI behavior remains covered elsewhere.
-        self.assertEqual(caps, ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools"])
-        self.assertNotIn("inputs", caps)
+        # Inputs means SDK roller events only; button and touch inputs are not included.
+        self.assertEqual(caps, ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools", "inputs"])
         self.assertNotIn("audio_stream", caps)
         self.assertNotIn("audio.stream", caps)
         self.assertIn("mcp_tools", caps)
