@@ -7,13 +7,21 @@
 - **依赖基线：** `contracts/dependency_lock.json` 锁定的 TuyaOpen SDK commit `cdc064e78daeeae598157470244e351cd37cbbed`；CR-015 已记录其 clean pinned checkout 的 L1 审计结果。该 CR 未访问或修改 SDK/vendor 源码。
 - **Owner：** TuyaOpen SDK owner 提供并维护公开接口；A0 维护契约与依赖 pin；A1 在 pin 更新并完成兼容审查后接入；A7 执行 L2/L3/L4 验收。
 
+## 0. 上游状态复核（2026-10-22）
+
+- **结果：未发现问题修复、typed readiness API 或同步错误传播；本 CR 维持 PROPOSED / BLOCKED。** 通过独立临时只读 checkout 检查官方 GitHub `https://github.com/tuya/TuyaOpen` 的 `master` HEAD `65dc25312ca2c3e25599d90966f3a9c3af87c871`，并检查当前最新稳定 tag `v1.9.0`，commit `b80932db6d9e0be1c5692aafb00b3109f3caf134`。GitHub 与锁定仓库配置中的官方 Gitee `https://gitee.com/tuya-open/TuyaOpen` 对 `master` 返回相同 HEAD 与 tags。
+- 两个 revision 的 `src/ai_components/ai_main/src/ai_chat_main.c::__ai_mqtt_connected_evt()` 都调用 `ai_mode_init(mode)` 后不检查其返回值，随后无条件设置 `sg_ai_agent_inited = true`（当前 main 行 317、327–329；v1.9.0 同文件相同代码）。
+- 两个 revision 的 `src/ai_components/ai_mode/src/ai_mode_wakeup.c` 都直接调用但不检查 `ai_audio_input_wakeup_mode_set(AI_AUDIO_VAD_AUTO)`、`tkl_kws_reg_wakeup_cb(...)`、`tkl_kws_enable()`（当前 main 行 167、169–170；v1.9.0 同文件相同代码）。
+- 两个 revision 的 `tools/porting/adapter/kws/tkl_kws.h` 仍只公开 `tkl_kws_init/reg_wakeup_cb/enable/disable/deinit`，未见 readiness snapshot/getter、typed status/event 或模型加载状态 API。对 `tools/porting/adapter` 与 `src/ai_components` 的 `readiness`、KWS/audio 状态词检索也未发现新增公开 readiness 接口。该核对针对上述 API 和调用链；不代表扫描了 Tuya 所有产品仓库或未公开组件。
+- **阻塞裁决不变：** 上游当前 main 与 v1.9.0 均不能解除 CR-015/CR-021 的公开 API 缺口。A1 继续等待 TuyaOpen SDK owner 提供公开 typed readiness/status API 并传播初始化失败，或依赖更新到包含该修复的明确 commit；不允许仅凭新版本号解除阻塞。核对仅使用临时下载，不改变 `D:\tuya_proj\TuyaOpen` dirty 工作区、DeskAgent 内 vendor 或 dependency pin。
+
 ## 1. 决策背景与当前能力缺口
 
 CR-015 已审计固定 pin 的公开 KWS 接口及调用路径：`tools/porting/adapter/kws/tkl_kws.h` 暴露 `tkl_kws_init()`、`tkl_kws_reg_wakeup_cb()`、`tkl_kws_enable()`、`tkl_kws_disable()`、`tkl_kws_deinit()` 操作，但没有读取实际模型名/ID、模型加载状态、启用状态或运行期错误的公开 getter/event。`ai_mode_wakeup.c` 对 `ai_audio_input_wakeup_mode_set()`、`tkl_kws_reg_wakeup_cb()` 和 `tkl_kws_enable()` 的结果未完整传播；`ai_chat_main.c` 仅检查 `tkl_kws_init()` 的返回值。因此现有接口不能由 A1 可靠报告并区分设备 open、AFE/VAD、WakeNet/KWS 模型与运行状态。以上为 CR-015 对依赖锁定 commit `cdc064e78daeeae598157470244e351cd37cbbed` 的既有 L1 审计结论，本 CR 未重新读取 vendor 源码。
 
 DeskAgent 当前公开 HAL 的 `desk_hardware_audio_get_status()` / `desk_watcher_audio_status()` 只提供板级 `ready/running/frames/errors/peak`。这能作为本地硬件/HAL 观测，不能替代 Tuya AI 音频输入、AFE/VAD 或 KWS/WakeNet readiness。MQTT connected、agent/session 创建、回调注册成功或 PCM 计数也不能作为替代信号。
 
-结论：固定 pin 的公开接口**不足以**满足 CR-015 的完整 readiness 契约。需要上游公开 API 与依赖 pin 更新；A1 不能靠私有符号、内部结构、推断模型文件或本地 vendor patch 补齐。
+结论：固定 pin 及本次核对的上游 main/v1.9.0 公开接口**不足以**满足 CR-015 的完整 readiness 契约。需要上游公开 API 与依赖 pin 更新；A1 不能靠私有符号、内部结构、推断模型文件或本地 vendor patch 补齐。
 
 ## 2. 请求的最小公开接口
 
