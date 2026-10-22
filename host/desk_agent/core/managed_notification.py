@@ -21,6 +21,49 @@ _PINNED_TAG = "v0.1.11"
 _STATUSES = frozenset({"accepted", "rendered", "played", "failed", "expired", "unknown"})
 _DEVICE_EVENTS = frozenset({"notification.status", "notification.acknowledged"})
 
+# Mirrors the notification error policy in contracts/error_codes.json and the
+# SDK sys.nack schema. Keep this local so the runtime adapter does not depend
+# on the repository's contract files being present in an installed Host.
+_NACK_POLICY: dict[str, tuple[frozenset[int], bool, str]] = {
+    "AUTH_REQUIRED": (frozenset({401}), False, "Notification delivery requires an authenticated device session."),
+    "STORAGE_FULL": (frozenset({507}), False, "Notification storage is full."),
+    "EXPIRED": (frozenset({410}), False, "Notification has expired."),
+    "INVALID_ARGUMENT": (frozenset({400}), False, "Invalid notification request."),
+    "STORAGE_UNAVAILABLE": (
+        frozenset({503}), True,
+        "Notification storage provider is unavailable. Retry the same notification_id when the provider becomes available.",
+    ),
+    "STORAGE_ERROR": (
+        frozenset({500}), True,
+        "Notification storage operation failed. Keep delivery unknown and retry the same notification_id.",
+    ),
+    "NOTIFICATION_DELIVERY_FAILED": (
+        frozenset({500, 503}), True,
+        "Notification delivery failed. Fail closed and retry only with the same notification_id.",
+    ),
+}
+
+
+class ManagedNotificationNackError(RuntimeError):
+    """A recognized notification ``sys.nack`` with its wire context intact."""
+
+    def __init__(self, *, code: int, error: str, command_id: str, operation: str) -> None:
+        allowed_codes, retryable, message = _NACK_POLICY[error]
+        if code not in allowed_codes:
+            raise ValueError("notification NACK code does not match its registered error")
+        super().__init__(message)
+        self.code = code
+        self.error = error
+        self.retryable = retryable
+        self.command_id = command_id
+        self.operation = operation
+
+
+class ManagedNotificationUnknownError(RuntimeError):
+    """An unrecognized or malformed response; retryable without invented codes."""
+
+    retryable = True
+
 
 def _check_sdk_pin(sdk_version: str | None, lock_path: Path | None = None) -> None:
     path = lock_path or Path(__file__).resolve().parents[3] / "contracts" / "dependency_lock.json"
@@ -107,8 +150,10 @@ class ManagedNotificationAdapter:
                 "user_acknowledged": False,
             }
         ack = self._send_command("notification.deliver", payload, timeout)
+        if isinstance(ack, dict) and ack.get("type") == "sys.nack":
+            self._raise_for_nack(ack)
         if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
-            raise RuntimeError("managed notification command was not acknowledged")
+            raise ManagedNotificationUnknownError("managed notification response was malformed or unrecognized")
         data = ack.get("data")
         accepted = isinstance(data, dict) and data.get("status") == "accepted" and data.get("accepted") is True
         return {
@@ -121,6 +166,35 @@ class ManagedNotificationAdapter:
             "played": False,
             "user_acknowledged": False,
         }
+
+    @staticmethod
+    def _raise_for_nack(nack: dict[str, Any]) -> None:
+        data = nack.get("data")
+        if not isinstance(data, dict):
+            raise ManagedNotificationUnknownError("managed notification NACK was malformed")
+        code = nack.get("code")
+        error = data.get("error")
+        operation = data.get("type")
+        command_id = data.get("command_id")
+        if (
+            isinstance(code, bool)
+            or not isinstance(code, int)
+            or operation != "notification.deliver"
+            or not isinstance(command_id, str)
+            or not command_id
+            or not isinstance(error, str)
+            or error not in _NACK_POLICY
+        ):
+            raise ManagedNotificationUnknownError("managed notification NACK was unrecognized")
+        allowed_codes, _retryable, _message = _NACK_POLICY[error]
+        if code not in allowed_codes:
+            raise ManagedNotificationUnknownError("managed notification NACK code and error did not match")
+        raise ManagedNotificationNackError(
+            code=code,
+            error=error,
+            command_id=command_id,
+            operation=operation,
+        )
 
     def close(self) -> None:
         if self._closed:

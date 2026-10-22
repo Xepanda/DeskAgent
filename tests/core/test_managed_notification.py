@@ -6,7 +6,10 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from host.desk_agent.core.managed_notification import ManagedNotificationAdapter
+from host.desk_agent.core.managed_notification import (
+    ManagedNotificationAdapter,
+    ManagedNotificationNackError,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,6 +71,98 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
         self.assertFalse(result["rendered"])
         self.assertFalse(result["played"])
         self.assertFalse(result["user_acknowledged"])
+        adapter.close()
+
+    def test_known_notification_nacks_preserve_contract_and_registry_retryability(self) -> None:
+        cases = (
+            (401, "AUTH_REQUIRED", False),
+            (507, "STORAGE_FULL", False),
+            (410, "EXPIRED", False),
+            (400, "INVALID_ARGUMENT", False),
+            (503, "STORAGE_UNAVAILABLE", True),
+            (500, "STORAGE_ERROR", True),
+            (503, "NOTIFICATION_DELIVERY_FAILED", True),
+        )
+        registry = json.loads((ROOT / "contracts" / "error_codes.json").read_text(encoding="utf-8"))
+        for code, wire_error, retryable in cases:
+            with self.subTest(wire_error=wire_error):
+                context = FakeContext()
+                context._transport.response = {
+                    "type": "sys.nack",
+                    "code": code,
+                    "data": {
+                        "type": "notification.deliver",
+                        "command_id": "a" * 32,
+                        "error": wire_error,
+                    },
+                }
+                adapter = ManagedNotificationAdapter(
+                    context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK
+                )
+                with self.assertRaises(ManagedNotificationNackError) as raised:
+                    adapter.deliver(notification())
+                error = raised.exception
+                self.assertEqual(error.code, code)
+                self.assertEqual(error.error, wire_error)
+                self.assertEqual(error.retryable, retryable)
+                self.assertEqual(error.retryable, registry["errors"][wire_error]["retryable"])
+                self.assertEqual(error.command_id, "a" * 32)
+                self.assertEqual(error.operation, "notification.deliver")
+                self.assertTrue(str(error))
+                adapter.close()
+
+    def test_unknown_or_malformed_nack_fails_closed_without_inventing_code(self) -> None:
+        responses = (
+            {
+                "type": "sys.nack",
+                "code": 599,
+                "data": {
+                    "type": "notification.deliver",
+                    "command_id": "a" * 32,
+                    "error": "FUTURE_ERROR",
+                },
+            },
+            {
+                "type": "sys.nack",
+                "code": 400,
+                "data": {
+                    "type": "notification.deliver",
+                    "command_id": "a" * 32,
+                    "error": "AUTH_REQUIRED",
+                },
+            },
+            {"type": "sys.nack", "code": 503, "data": {}},
+        )
+        for response in responses:
+            with self.subTest(response=response):
+                context = FakeContext()
+                context._transport.response = response
+                adapter = ManagedNotificationAdapter(
+                    context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK
+                )
+                with self.assertRaises(RuntimeError) as raised:
+                    adapter.deliver(notification())
+                self.assertNotIsInstance(raised.exception, ManagedNotificationNackError)
+                self.assertFalse(hasattr(raised.exception, "code"))
+                self.assertFalse(hasattr(raised.exception, "error"))
+                self.assertTrue(raised.exception.retryable)
+                adapter.close()
+
+    def test_transport_timeout_remains_original_unknown_exception(self) -> None:
+        context = FakeContext()
+        timeout = TimeoutError("transport response timed out")
+
+        def raise_timeout(*_args):
+            raise timeout
+
+        context._transport.send_command = raise_timeout
+        adapter = ManagedNotificationAdapter(
+            context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK
+        )
+        with self.assertRaises(TimeoutError) as raised:
+            adapter.deliver(notification())
+        self.assertIs(raised.exception, timeout)
+        self.assertFalse(hasattr(raised.exception, "code"))
         adapter.close()
 
     def test_retries_keep_same_occurrence_identity_and_extra_fields_are_not_forwarded(self) -> None:
