@@ -12,6 +12,7 @@
 
 #include "desk_watcher_motion.h"
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -29,6 +30,8 @@
 
 static bool s_motion_initialized = false;
 static uint32_t s_mcu_sequence = 0;
+/* Local diagnostic for the one-shot STOP paired with the last ambiguous MOVE. */
+static atomic_int s_last_ambiguous_move_stop_result = ATOMIC_VAR_INIT(DESK_HW_ERR_UNAVAILABLE);
 /* UART2 may be shared with another initialized component. Only delete a
  * driver instance that this module installed itself. */
 #ifdef ESP_PLATFORM
@@ -312,8 +315,11 @@ size_t desk_watcher_motion_pack_stop(bool emergency, uint32_t seq, uint8_t *out_
     return motion_pack_stop(emergency, seq, out_buf);
 }
 
-static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len, uint32_t expected_seq)
+static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
+                                    uint32_t expected_seq, bool allow_retries,
+                                    bool *out_may_have_sent)
 {
+    if (out_may_have_sent) *out_may_have_sent = false;
 #ifdef ESP_PLATFORM
     if (!s_motion_initialized || !uart_is_driver_installed(UART_NUM_2)) {
         return DESK_HW_ERR_UNAVAILABLE;
@@ -323,7 +329,8 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         return DESK_HW_ERR_BUSY;
     }
 
-    for (uint32_t attempt = 0; attempt <= MCU_MAX_RETRIES; ++attempt) {
+    uint32_t max_attempts = allow_retries ? MCU_MAX_RETRIES + 1U : 1U;
+    for (uint32_t attempt = 0; attempt < max_attempts; ++attempt) {
         if (attempt > 0) {
             vTaskDelay(pdMS_TO_TICKS(MCU_RETRY_BACKOFF_MS));
         }
@@ -332,6 +339,9 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         uart_flush_input(UART_NUM_2);
 
         int written = uart_write_bytes(UART_NUM_2, (const char *)frame_data, frame_len);
+        /* A nonzero or indeterminate write result means some command bytes may
+         * have reached the peer. Only an exact zero proves no TX occurred. */
+        if (written != 0 && out_may_have_sent) *out_may_have_sent = true;
         if (written != (int)frame_len) {
             xSemaphoreGive(s_motion_mutex);
             return DESK_HW_ERR_IO;
@@ -398,7 +408,7 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
     xSemaphoreGive(s_motion_mutex);
     return DESK_HW_ERR_TIMEOUT;
 #else
-    (void)frame_data; (void)frame_len; (void)expected_seq;
+    (void)frame_data; (void)frame_len; (void)expected_seq; (void)allow_retries;
     return DESK_HW_OK;
 #endif
 }
@@ -415,7 +425,28 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
     uint32_t seq = ++s_mcu_sequence;
     size_t len = motion_pack_move(pan_deg, tilt_deg, duration_ms, seq, tx_buf);
     if (len == 0) return DESK_HW_ERR_INVALID_ARG;
-    return motion_send_and_wait_ack(tx_buf, len, seq);
+    atomic_store_explicit(&s_last_ambiguous_move_stop_result,
+                          DESK_HW_ERR_UNAVAILABLE, memory_order_relaxed);
+    bool may_have_sent = false;
+    int result = motion_send_and_wait_ack(tx_buf, len, seq, true, &may_have_sent);
+    if (result != DESK_HW_OK && may_have_sent) {
+        /* Keep this inside the MOVE driver call: its caller still holds the
+         * gimbal owner. Allocate a distinct sequence and never retry STOP. */
+        uint8_t stop_buf[32];
+        uint32_t stop_seq = ++s_mcu_sequence;
+        size_t stop_len = motion_pack_stop(false, stop_seq, stop_buf);
+        bool stop_may_have_sent = false;
+        int stop_result = motion_send_and_wait_ack(
+            stop_buf, stop_len, stop_seq, false, &stop_may_have_sent);
+        atomic_store_explicit(&s_last_ambiguous_move_stop_result,
+                              stop_result, memory_order_relaxed);
+#ifdef ESP_PLATFORM
+        ESP_LOGW(TAG, "ambiguous MOVE seq=%lu rc=%d; one-shot STOP seq=%lu rc=%d",
+                 (unsigned long)seq, result, (unsigned long)stop_seq,
+                 stop_result);
+#endif
+    }
+    return result;
 }
 
 int desk_watcher_motion_stop(bool emergency)
@@ -423,7 +454,13 @@ int desk_watcher_motion_stop(bool emergency)
     uint8_t tx_buf[32];
     uint32_t seq = ++s_mcu_sequence;
     size_t len = motion_pack_stop(emergency, seq, tx_buf);
-    return motion_send_and_wait_ack(tx_buf, len, seq);
+    return motion_send_and_wait_ack(tx_buf, len, seq, true, NULL);
+}
+
+int desk_watcher_motion_get_last_ambiguous_move_stop_result(void)
+{
+    return atomic_load_explicit(&s_last_ambiguous_move_stop_result,
+                                memory_order_relaxed);
 }
 
 int desk_watcher_motion_deinit(void)

@@ -18,6 +18,9 @@ extern "C" {
 int desk_watcher_motion_init(void);
 int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms);
 int desk_watcher_motion_stop(bool emergency);
+/* Result of the last best-effort STOP sent after an ambiguous MOVE failure.
+ * This diagnostic does not confirm peer receipt or physical motion state. */
+int desk_watcher_motion_get_last_ambiguous_move_stop_result(void);
 int desk_watcher_motion_deinit(void);
 bool desk_watcher_motion_is_ready(void);
 

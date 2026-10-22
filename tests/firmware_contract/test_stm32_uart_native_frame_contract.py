@@ -9,6 +9,24 @@ MOTION_C = ROOT / "firmware/components/desk_hardware/src/desk_watcher_motion.c"
 
 
 class TestStm32UartNativeFrameContract(unittest.TestCase):
+    def test_ambiguous_move_failure_sends_one_new_sequence_stop_without_retry(self) -> None:
+        source = MOTION_C.read_text(encoding="utf-8")
+        move = source.split("int desk_watcher_motion_move", 1)[1].split(
+            "int desk_watcher_motion_stop", 1
+        )[0]
+        transaction = source.split("static int motion_send_and_wait_ack", 1)[1].split(
+            "int desk_watcher_motion_move", 1
+        )[0]
+
+        self.assertIn("may_have_sent", transaction)
+        self.assertIn("if (result != DESK_HW_OK && may_have_sent)", move)
+        self.assertIn("++s_mcu_sequence", move)
+        self.assertRegex(
+            move,
+            r"motion_send_and_wait_ack\(\s*stop_buf, stop_len, stop_seq, false,",
+        )
+        self.assertIn("s_last_ambiguous_move_stop_result", move)
+
     def test_uart_transaction_uses_raw_binary_frames(self) -> None:
         source = MOTION_C.read_text(encoding="utf-8")
         transaction = source.split("static int motion_send_and_wait_ack", 1)[1].split(
