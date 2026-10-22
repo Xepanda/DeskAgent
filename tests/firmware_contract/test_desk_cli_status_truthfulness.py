@@ -150,6 +150,14 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn("Body emergency stop failed: rc=%d", body)
         self.assertIn("physical stop is unconfirmed", body)
 
+    def test_body_rejects_extra_stop_args_and_unknown_subcommands(self) -> None:
+        body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",
+                             "static void cmd_peripherals(int argc, char *argv[])\n{")
+        self.assertIn('argc == 2 && strcmp(argv[1], "stop") == 0', body)
+        self.assertIn('argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)', body)
+        self.assertIn('Usage: body [status|move <pan_deg> <tilt_deg> [duration_ms]|stop]', body)
+        self.assertIn('return;\n    }\n    printf("Usage: body', body)
+
     def test_cli_rejects_truncated_lines_and_ignored_extra_arguments(self) -> None:
         execute = self.source.split("int desk_cli_exec(const char *cmd_line)\n{", 1)[1].split(
             "void desk_cli_echo(", 1

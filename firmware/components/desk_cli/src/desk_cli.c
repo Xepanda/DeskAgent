@@ -487,7 +487,7 @@ static void cmd_body(int argc, char *argv[])
         }
         return;
     }
-    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+    if (argc == 2 && strcmp(argv[1], "stop") == 0) {
         int rc;
 #ifdef ESP_PLATFORM
         rc = desk_hardware_motion_stop(true);
@@ -499,7 +499,9 @@ static void cmd_body(int argc, char *argv[])
         } else {
             printf("Body emergency stop failed: rc=%d\r\n", rc);
         }
-    } else {
+        return;
+    }
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)) {
         float pan = 0.0f, tilt = 0.0f;
         int position_rc = desk_hardware_motion_get_position(&pan, &tilt);
         uint8_t last_frame[64];
@@ -526,7 +528,9 @@ static void cmd_body(int argc, char *argv[])
         }
         printf("  STM32 peer/ACK state: UNKNOWN (no independent peer status in CLI)\r\n");
         printf("  UART Protocol: A5 5A Class=0x02 Motion Frame\r\n");
+        return;
     }
+    printf("Usage: body [status|move <pan_deg> <tilt_deg> [duration_ms]|stop]\r\n");
 }
 
 static void cmd_peripherals(int argc, char *argv[])
