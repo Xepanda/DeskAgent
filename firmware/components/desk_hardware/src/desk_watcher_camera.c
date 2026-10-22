@@ -10,6 +10,7 @@
 
 #include "desk_watcher_camera.h"
 #include "desk_watcher_board.h"
+#include "desk_watcher_log_source.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -590,6 +591,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         (void)spi_device_transmit(s_spi_dev, &close_trans);
         spi_device_release_bus(s_spi_dev);
         if (empty_attempt + 1U >= CAM_PTL_EMPTY_RETRY_LIMIT) {
+            (void)desk_watcher_log_source_publish_camera_capture_empty();
             return camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY);
         }
         vTaskDelay(pdMS_TO_TICKS(CAM_PTL_EMPTY_BACKOFF_MS));
