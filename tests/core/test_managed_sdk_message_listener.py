@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from host.desk_agent.core.managed_sdk_listener import ManagedSdkMessageListener
+from host.desk_agent.services.network_log_consumer import NetworkLogConsumer
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +97,39 @@ class ManagedSdkMessageListenerTests(unittest.TestCase):
             original_callbacks,
         )
         adapter.remove(broken_listener)
+        transport.close()
+
+    def test_consumer_observes_device_channel_only_through_pinned_listener(self) -> None:
+        transport = self.DaemonApplicationTransport()
+        context = self.ApplicationContext(app_id="network-log-test", transport=transport)
+        adapter = ManagedSdkMessageListener(context)
+        consumer = NetworkLogConsumer(enabled=True)
+        message = {
+            "type": "sys.log.event",
+            "data": {
+                "log_schema_version": "1.0.0",
+                "stream_id": "logstream_01",
+                "boot_id": "boot-opaque-id",
+                "sequence": 1,
+                "uptime_ms": 123456,
+                "level": "WARN",
+                "component": "camera",
+                "event_id": "CAMERA_CAPTURE_EMPTY",
+                "fields": {},
+            },
+        }
+
+        def receive(event: dict) -> None:
+            consumer.ingest(event, authorized=True)
+
+        adapter.add(receive)
+        asyncio.run(transport._on_frame(self.ApplicationChannel.DESKTOP, json.dumps(message)))
+        self.assertEqual(consumer.drain(), [])
+        asyncio.run(transport._on_frame(self.ApplicationChannel.DEVICE, json.dumps(message)))
+        self.assertEqual(consumer.drain(), [message])
+
+        adapter.remove(receive)
+        consumer.close()
         transport.close()
 
 
