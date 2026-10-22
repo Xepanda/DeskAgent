@@ -41,10 +41,13 @@ class WebSocketClientSourceContract(unittest.TestCase):
     def test_control_close_and_command_response_paths_exist(self) -> None:
         self.assertIn("if (op == 0x8)", self.ws)
         self.assertIn("if (op == 0x9)", self.ws)
-        self.assertIn("ws_send_frame(0xA, payload, len)", self.ws)
+        # Control frames use the same serialized writer as command responses,
+        # avoiding concurrent writes to a single WebSocket stream.
+        self.assertIn("if (op == 0x9) { return ws_enqueue_frame(0xA, payload, len); }", self.ws)
+        self.assertIn("send_rc = ws_send_frame_deadline(frame->opcode", self.ws)
         self.assertIn("DESK_SDK_WS_HELLO_SENT", self.ws)
         self.assertIn("desk_sdk_ws_client_get_state", (ROOT / "firmware/components/desk_sdk_bridge/include/desk_sdk_bridge.h").read_text(encoding="utf-8"))
-        self.assertIn("desk_sdk_bridge_process_command", self.ws)
+        self.assertIn("desk_sdk_bridge_process_ws_command", self.ws)
         self.assertIn("desk_sdk_ws_client_send_text(s_ws_response)", self.ws)
         self.assertIn("ws_disconnect_and_schedule(); return -1", self.ws)
 
