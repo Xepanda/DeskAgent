@@ -743,6 +743,8 @@ class LifeService:
         Snoozes a reminder: advances due_at and schedules a new pending occurrence.
         Does NOT mark the task completed.
         """
+        if snooze_minutes <= 0:
+            raise ValueError("snooze_minutes must be positive")
         now = datetime.now(timezone.utc)
         now_str = now.isoformat().replace("+00:00", "Z")
         new_due = (now + timedelta(minutes=snooze_minutes)).isoformat().replace("+00:00", "Z")

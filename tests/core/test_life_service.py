@@ -261,6 +261,19 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
         self.assertNotEqual(first["occurrence_id"], second["occurrence_id"])
 
+    def test_snooze_rejects_non_positive_duration_without_mutating_reminder(self) -> None:
+        self.service.create_reminder(
+            reminder_id="rem-invalid-snooze",
+            title="Future reminder",
+            due_at="2030-01-01T00:00:00Z",
+        )
+        for minutes in (0, -1):
+            with self.subTest(minutes=minutes), self.assertRaisesRegex(ValueError, "positive"):
+                self.service.snooze_reminder("rem-invalid-snooze", snooze_minutes=minutes)
+
+        self.assertEqual(self.service.get_reminder("rem-invalid-snooze")["status"], "scheduled")
+        self.assertEqual(len(self.service.get_all_occurrences("rem-invalid-snooze")), 1)
+
     # -------------------------------------------------------------------------
     # 4. Outbox Notification Queue
     # -------------------------------------------------------------------------
