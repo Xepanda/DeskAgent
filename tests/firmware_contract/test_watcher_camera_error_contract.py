@@ -15,6 +15,61 @@ CAMERA_BUS_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_ca
 
 
 class TestWatcherCameraErrorContract(unittest.TestCase):
+    def test_bus_acquire_uses_remaining_capture_deadline_ticks(self):
+        source_text = CAMERA_C.read_text(encoding="utf-8")
+        bus_header = CAMERA_BUS_H.read_text(encoding="utf-8")
+        capture = source_text.split("int desk_watcher_camera_capture(", 1)[1]
+
+        self.assertIn("desk_watcher_camera_bus_deadline_ticks", bus_header)
+        self.assertGreaterEqual(capture.count("camera_capture_acquire_bus(camera_capture_deadline_us)"), 2)
+        self.assertEqual(capture.count("return camera_capture_release(acquire_rc);"), 2)
+        self.assertNotIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", capture)
+        self.assertIn("desk_watcher_camera_bus_acquire_error", bus_header)
+        acquire = source_text.split("static int camera_capture_acquire_bus(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("desk_watcher_camera_bus_acquire_error(err, ESP_ERR_TIMEOUT", acquire)
+        self.assertLess(acquire.index("if (err != ESP_OK)"),
+                        acquire.index("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)"))
+        self.assertIn("DESK_HW_ERR_TIMEOUT", acquire)
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_SPI", acquire)
+        self.assertIn("if (esp_timer_get_time() >= deadline_us)", acquire)
+        self.assertIn("camera_capture_release_bus()", acquire)
+
+        compiler = shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("native gcc is unavailable; deadline C harness is ready for host CI")
+
+        harness = r'''#include <assert.h>
+#include <stdint.h>
+#include "desk_watcher_camera_bus.h"
+
+int main(void) {
+    uint64_t ticks = 999;
+    assert(desk_watcher_camera_bus_deadline_ticks(20500, 10000, 1000, 500, &ticks));
+    assert(ticks == 11); /* ceil 10.5ms to the next scheduler tick */
+    ticks = 999;
+    assert(!desk_watcher_camera_bus_deadline_ticks(10000, 10000, 1000, 500, &ticks));
+    assert(ticks == 0); /* expired deadlines cannot wait */
+    ticks = 0;
+    assert(desk_watcher_camera_bus_deadline_ticks(1000000, 0, 1000, 50, &ticks));
+    assert(ticks == 50); /* always cap at a finite acquire timeout */
+    assert(desk_watcher_camera_bus_acquire_error(-7, -7, -3, -24) == -3);
+    assert(desk_watcher_camera_bus_acquire_error(-8, -7, -3, -24) == -24);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="desk-camera-deadline-") as temp_dir:
+            source = Path(temp_dir) / "camera_deadline_test.c"
+            executable = Path(temp_dir) / "camera_deadline_test.exe"
+            source.write_text(harness, encoding="utf-8")
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 f"-I{CAMERA_BUS_H.parent}", str(source), "-o", str(executable)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            run = subprocess.run([str(executable)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
     def test_spi_bus_ownership_releases_once_after_reacquire_deadline(self):
         """Exercise the same ownership transition used by capture cleanup."""
         harness = r'''#include <assert.h>
@@ -45,7 +100,7 @@ int main(void) {
 '''
         source_text = CAMERA_C.read_text(encoding="utf-8")
         capture = source_text.split("int desk_watcher_camera_capture(", 1)[1]
-        self.assertIn("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)", capture)
+        self.assertIn("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)", source_text)
         self.assertIn("camera_capture_release_bus()", capture)
         empty_deadline = capture.split("if (!header_received)", 1)[1].split("int ptl_rc", 1)[0]
         self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", empty_deadline)

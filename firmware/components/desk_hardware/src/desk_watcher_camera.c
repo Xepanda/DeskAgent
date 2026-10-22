@@ -275,6 +275,34 @@ static void camera_capture_release_bus(void)
     }
 }
 
+static int camera_capture_acquire_bus(int64_t deadline_us)
+{
+    uint64_t timeout_ticks = 0;
+    const uint64_t tick_period_us = (uint64_t)portTICK_PERIOD_MS * 1000ULL;
+    const uint64_t finite_max_ticks = (uint64_t)portMAX_DELAY - 1ULL;
+    if (!desk_watcher_camera_bus_deadline_ticks((uint64_t)deadline_us,
+                                                 (uint64_t)esp_timer_get_time(),
+                                                 tick_period_us,
+                                                 finite_max_ticks,
+                                                 &timeout_ticks)) {
+        return DESK_HW_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = spi_device_acquire_bus(s_spi_dev, (TickType_t)timeout_ticks);
+    if (err != ESP_OK) {
+        return desk_watcher_camera_bus_acquire_error(err, ESP_ERR_TIMEOUT,
+                                                     DESK_HW_ERR_TIMEOUT,
+                                                     DESK_WATCHER_CAMERA_ERR_SPI);
+    }
+
+    desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true);
+    if (esp_timer_get_time() >= deadline_us) {
+        camera_capture_release_bus();
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    return DESK_HW_OK;
+}
+
 static int camera_capture_release(int result)
 {
     /* Every capture exit, including an expired retry deadline, drops any SPI
@@ -551,13 +579,13 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
      * edge because the complete PTL header may not yet be in the slave FIFO. */
     if (!s_ptl_resynchronizing) vTaskDelay(pdMS_TO_TICKS(CAM_SYNC_GUARD_MS));
 
-    /* Acquire bus for multi-step transaction */
-    esp_err_t err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPI bus acquire failed: %s (%d)", esp_err_to_name(err), (int)err);
-        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI);
+    /* Acquire bus only for the remaining portion of the absolute deadline. */
+    int acquire_rc = camera_capture_acquire_bus(camera_capture_deadline_us);
+    if (acquire_rc != DESK_HW_OK) {
+        ESP_LOGE(TAG, "SPI bus acquire failed or exceeded capture deadline: rc=%d", acquire_rc);
+        return camera_capture_release(acquire_rc);
     }
-    desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true);
+    esp_err_t err = ESP_OK;
 
     size_t prefetched = 0;
     uint32_t body_size = 0;
@@ -621,9 +649,11 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(CAM_SYNC_GUARD_MS));
-        err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
-        if (err != ESP_OK) return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI);
-        desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true);
+        acquire_rc = camera_capture_acquire_bus(camera_capture_deadline_us);
+        if (acquire_rc != DESK_HW_OK) {
+            ESP_LOGE(TAG, "SPI bus reacquire failed or exceeded capture deadline: rc=%d", acquire_rc);
+            return camera_capture_release(acquire_rc);
+        }
     }
 
     if (!header_received) {
