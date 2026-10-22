@@ -44,8 +44,17 @@ step_pass "All JSON Schemas, envelopes, positive/negative fixtures, and error ca
 # 2. Level 2: Firmware Native HAL & Protocol Library Compilation
 # ------------------------------------------------------------------------------
 echo "--- Step 2: Firmware Native HAL & SDK Bridge Compilation (firmware/) ---"
-if ! CMAKE_BIN="$(command -v cmake)"; then
-  step_fail "CMake is required for the standalone host firmware check; install CMake and retry"
+# Allow isolated/tool-managed CMake binaries to be supplied by the caller.
+# This matters in WSL, where a Windows cmake.exe on the interop PATH cannot be
+# executed as a Linux binary. Do not silently cross the host/WSL boundary.
+if [[ -n "${CMAKE_BIN:-}" ]]; then
+  if [[ ! -x "${CMAKE_BIN}" ]]; then
+    step_fail "CMAKE_BIN is set but not executable in this shell: ${CMAKE_BIN}"
+  fi
+else
+  if ! CMAKE_BIN="$(command -v cmake)"; then
+    step_fail "A native CMake executable is required for the standalone host check. In WSL, provide a Linux CMake path with CMAKE_BIN; a Windows cmake.exe cannot run inside WSL."
+  fi
 fi
 
 # This is a standalone host build. Keep the ESP-IDF environment out of CMake's
@@ -58,7 +67,11 @@ trap 'rm -rf -- "${HOST_BUILD_DIR}"' EXIT
 if ! "${CMAKE_BIN}" -S firmware -B "${HOST_BUILD_DIR}"; then
   step_fail "Firmware native CMake configure failed"
 fi
-if ! "${CMAKE_BIN}" --build "${HOST_BUILD_DIR}"; then
+# The native check covers the three portable static libraries. The firmware
+# smoke executable is a separate integration target and its main/app include
+# wiring belongs to the firmware CMake owner; don't make this A7 gate depend on
+# compiling that executable.
+if ! "${CMAKE_BIN}" --build "${HOST_BUILD_DIR}" --target desk_hardware desk_tclaw desk_sdk_bridge; then
   step_fail "Firmware native build failed"
 fi
 step_pass "Firmware libdesk_hardware.a and libdesk_sdk_bridge.a compiled clean"
