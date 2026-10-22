@@ -814,6 +814,12 @@ class TestCodexCompanion(unittest.TestCase):
         def observer(event: str, data: dict[str, Any]) -> None:
             events.append((event, data))
             stop_after_delivery.set()
+            # Keep the poller inside this first callback until the test calls
+            # close(). A listener that does not explicitly return True is
+            # intentionally retried; letting the callback return immediately
+            # races the next poll against the test thread and makes the event
+            # count nondeterministic.
+            client._stop_event.wait()
 
         try:
             client.add_event_listener(observer)
@@ -909,8 +915,16 @@ class TestCodexCompanion(unittest.TestCase):
             },
         }
         events: list[tuple[str, dict[str, Any]]] = []
+
+        def observe_restored_event(event: str, data: dict[str, Any]) -> None:
+            events.append((event, data))
+            # This legacy listener does not acknowledge the event. Hold the
+            # first delivery until close() stops the poller, so the test checks
+            # payload sanitization without racing the intentional retry.
+            client._stop_event.wait()
+
         try:
-            client.add_event_listener(lambda event, data: events.append((event, data)))
+            client.add_event_listener(observe_restored_event)
             deadline = time.time() + 2.0
             while time.time() < deadline and not events:
                 time.sleep(0.01)

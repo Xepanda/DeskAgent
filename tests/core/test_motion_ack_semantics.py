@@ -491,6 +491,14 @@ class RobotAdapterCorrelationTestCase(unittest.TestCase):
                 if "req-coal-1" in adapter._awaiting_ids and "req-coal-2" in adapter._awaiting_ids:
                     break
                 time.sleep(0.005)
+            with adapter._lock:
+                awaiting_ids = set(adapter._awaiting_ids)
+            expected_ids = {"req-coal-1", "req-coal-2"}
+            self.assertTrue(
+                expected_ids.issubset(awaiting_ids),
+                f"iteration {iteration}: ACKs must not be sent before both waiters register; "
+                f"awaiting_ids={awaiting_ids!r}",
+            )
             time.sleep(0.02)  # let both waiters enter the fallback loop
             coalesced = "".join(
                 json.dumps({
@@ -507,8 +515,14 @@ class RobotAdapterCorrelationTestCase(unittest.TestCase):
 
             self.assertIn(1, results, f"iteration {iteration}: waiter 1 was starved by the fallback reader")
             self.assertIn(2, results, f"iteration {iteration}: waiter 2 was starved by the fallback reader")
-            self.assertEqual(results[1]["data"]["seq"], 1)
-            self.assertEqual(results[2]["data"]["seq"], 2)
+            for seq in (1, 2):
+                response = results[seq]
+                detail = f"iteration {iteration}: waiter {seq} response={response!r}"
+                self.assertEqual(response.get("type"), "sys.ack", detail)
+                self.assertEqual(response.get("code"), 0, detail)
+                self.assertEqual(response.get("request_id"), f"req-coal-{seq}", detail)
+                self.assertIn("data", response, detail)
+                self.assertEqual(response["data"].get("seq"), seq, detail)
 
     def test_fallback_read_respects_deadline(self) -> None:
         """The worker-less fallback must never block past the caller's deadline."""
