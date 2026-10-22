@@ -44,8 +44,23 @@ step_pass "All JSON Schemas, envelopes, positive/negative fixtures, and error ca
 # 2. Level 2: Firmware Native HAL & Protocol Library Compilation
 # ------------------------------------------------------------------------------
 echo "--- Step 2: Firmware Native HAL & SDK Bridge Compilation (firmware/) ---"
-CMAKE_BIN="$(command -v /usr/bin/cmake || which cmake)"
-${CMAKE_BIN} -B firmware/build -S firmware && ${CMAKE_BIN} --build firmware/build --clean-first || step_fail "Firmware native build failed"
+if ! CMAKE_BIN="$(command -v cmake)"; then
+  step_fail "CMake is required for the standalone host firmware check; install CMake and retry"
+fi
+
+# This is a standalone host build. Keep the ESP-IDF environment out of CMake's
+# configuration and never reuse firmware/build, which contains IDF artifacts.
+unset IDF_PATH
+HOST_BUILD_DIR="$(mktemp -d "/tmp/desk-agent-host-cmake.XXXXXX")" \
+  || step_fail "Could not create a unique temporary host CMake build directory"
+trap 'rm -rf -- "${HOST_BUILD_DIR}"' EXIT
+
+if ! "${CMAKE_BIN}" -S firmware -B "${HOST_BUILD_DIR}"; then
+  step_fail "Firmware native CMake configure failed"
+fi
+if ! "${CMAKE_BIN}" --build "${HOST_BUILD_DIR}"; then
+  step_fail "Firmware native build failed"
+fi
 step_pass "Firmware libdesk_hardware.a and libdesk_sdk_bridge.a compiled clean"
 
 # ------------------------------------------------------------------------------
