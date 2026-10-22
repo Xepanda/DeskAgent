@@ -107,6 +107,12 @@ class FrameCapturePipeline:
             if self._running:
                 return
             self._running = True
+            # A disconnect can stop the pipeline while the source callback is
+            # blocked in transport I/O. If the lease returns before that call
+            # unwinds, resume the existing worker instead of creating a second
+            # concurrent caller for a non-reentrant camera source.
+            if self._thread and self._thread.is_alive():
+                return
             self._thread = threading.Thread(target=self._capture_loop, name="camera-capture-pipeline", daemon=True)
             self._thread.start()
 
