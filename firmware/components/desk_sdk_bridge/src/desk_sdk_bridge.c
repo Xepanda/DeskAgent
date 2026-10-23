@@ -3716,6 +3716,9 @@ static void desk_sdk_audio_poll_locked(uint32_t connection_generation,
 
 void desk_sdk_bridge_audio_poll(uint32_t connection_generation)
 {
+    /* Ignore delayed callbacks from a retired session. A current-generation
+     * poll still owns teardown cleanup and may drain an older HAL stream. */
+    if (!desk_sdk_ws_client_audio_generation_acquire(connection_generation)) return;
     desk_audio_stream_status_t status;
     char reason[32] = {0}, digest[65] = {0};
     bool emit = false;
@@ -3723,6 +3726,7 @@ void desk_sdk_bridge_audio_poll(uint32_t connection_generation)
     desk_sdk_audio_poll_locked(connection_generation, &status, reason, digest, &emit);
     pthread_mutex_unlock(&s_sdk_audio.mutex);
     if (emit) desk_sdk_audio_emit(&status, reason, digest[0] ? digest : NULL);
+    desk_sdk_ws_client_audio_command_release();
 }
 
 void desk_sdk_bridge_audio_session_closed(uint32_t connection_generation)
@@ -3744,6 +3748,7 @@ int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
         header.payload_size != len - DESK_WSPK_HEADER_SIZE ||
         header.payload_size < 2 || header.payload_size > DESK_AUDIO_STREAM_CHUNK_BYTES ||
         (header.payload_size & 1u) || (header.flags & (uint8_t)~0x03u) != 0) return -1;
+    if (!desk_sdk_ws_client_audio_generation_acquire(connection_generation)) return -1;
 
     desk_audio_stream_status_t status;
     bool emit_flow = false;
@@ -3753,6 +3758,7 @@ int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
     pthread_mutex_lock(&s_sdk_audio.mutex);
     if (!s_sdk_audio.active) {
         pthread_mutex_unlock(&s_sdk_audio.mutex);
+        desk_sdk_ws_client_audio_command_release();
         return -1;
     }
     if (s_sdk_audio.generation != connection_generation ||
@@ -3814,6 +3820,7 @@ int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
     pthread_mutex_unlock(&s_sdk_audio.mutex);
 
     if (emit_flow) desk_sdk_audio_emit(&status, "running", NULL);
+    desk_sdk_ws_client_audio_command_release();
     desk_sdk_bridge_audio_poll(connection_generation);
     (void)stream_id;
     return stale_generation ? -1 : 0;

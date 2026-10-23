@@ -894,6 +894,16 @@ bool desk_sdk_ws_client_audio_command_acquire(uint32_t connection_generation)
     return valid;
 }
 
+bool desk_sdk_ws_client_audio_generation_acquire(uint32_t connection_generation)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool valid = !s_ws_lifecycle_closing && connection_generation != 0 &&
+                 connection_generation == s_ws_generation;
+    if (valid) ++s_ws_audio_commands_inflight;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return valid;
+}
+
 void desk_sdk_ws_client_audio_command_release(void)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
@@ -1051,7 +1061,7 @@ int desk_sdk_ws_client_poll(int timeout_ms)
     if (op == 0x2) {
         if (desk_sdk_bridge_process_ws_audio_frame(payload, len,
                                                   frame_generation) != 0) {
-            ws_disconnect_and_schedule();
+            ws_disconnect_generation_and_schedule(frame_generation);
             return -1;
         }
         desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
