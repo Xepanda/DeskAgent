@@ -1,6 +1,7 @@
 # COM21 只读现场状态快照（2026-10-23）
 
-**源码基线**：PR #15 head `ae4dbcbbc892ec37643694d2e65407f6aae3a6fe`  
+**源码基线**：PR #15 head `ae4dbcbbc892ec37643694d2e65407f6aae3a6fe`
+
 **证据级别**：Level 3，单项设备状态快照
 
 ## 证据范围
