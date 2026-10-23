@@ -112,6 +112,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'const char *desk_sdk_test_last_ack(void) { return (const char *)s_ws_ack; }\n'
                 'const char *desk_sdk_test_http_response(void) { return s_ws_http_response; }\n'
                 'int desk_sdk_test_ws_state(void) { return (int)s_ws_state; }\n'
+                'void desk_sdk_test_ws_force_disconnect(void) { ws_disconnect_and_schedule(); }\n'
                 'void desk_sdk_test_seed_ws_auth_latch(void) { s_ws_ready = true; s_ws_authenticated = true; }\n'
                 'void desk_sdk_test_prepare_log_pair(void) { s_paired = true; '
                 'strcpy(s_pair_request_id, "31a9dbf05ea3443480e62076f79a3b12"); '
@@ -155,9 +156,14 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'void desk_sdk_test_resume_writer(void) { s_ws_writer_started = false; }\n'
                 'static desk_audio_stream_status_t test_audio_status;\n'
                 'static uint32_t test_audio_free_frames = 8; static int test_audio_active; static unsigned test_audio_drain_checks;\n'
+                'static int test_audio_hold_stop_drain;\n'
                 'void desk_sdk_test_audio_reset(void) { memset(&test_audio_status, 0, sizeof(test_audio_status)); '
-                'test_audio_free_frames = 8; test_audio_active = 0; test_audio_drain_checks = 0; }\n'
+                'test_audio_free_frames = 8; test_audio_active = 0; test_audio_drain_checks = 0; test_audio_hold_stop_drain = 0; }\n'
                 'int desk_sdk_test_audio_is_active(void) { return test_audio_active; }\n'
+                'void desk_sdk_test_audio_hold_stop_drain(int hold) { test_audio_hold_stop_drain = hold; }\n'
+                'void desk_sdk_test_audio_release_drain(void) { test_audio_status.tx_drained = true; '
+                'test_audio_status.queue_depth = 0; test_audio_status.pending_frames = 0; '
+                'test_audio_status.free_frames = 8; test_audio_active = 0; }\n'
                 'int desk_sdk_test_audio_inject(const uint8_t *frame, size_t len, uint32_t generation) { '
                 'return desk_sdk_bridge_process_ws_audio_frame(frame, len, generation); }\n'
                 'int __wrap_desk_hardware_audio_stream_begin(uint64_t handle, uint32_t generation, uint32_t stream_id, '
@@ -182,6 +188,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'test_audio_drain_checks = 0; return DESK_HW_OK; }\n'
                 'int __wrap_desk_hardware_audio_stream_stop(uint64_t handle, uint32_t timeout_ms) { (void)timeout_ms; '
                 'if (test_audio_status.handle != handle) return DESK_HW_ERR_INVALID_ARG; '
+                'if (test_audio_hold_stop_drain) { test_audio_status.state = DESK_AUDIO_STREAM_CANCELED; '
+                'test_audio_status.tx_drained = false; return DESK_HW_ERR_TIMEOUT; } '
                 'test_audio_status.state = DESK_AUDIO_STREAM_CANCELED; test_audio_status.tx_drained = true; '
                 'test_audio_active = 0; test_audio_status.playing = false; test_audio_status.queue_depth = 0; '
                 'test_audio_status.pending_frames = 0; test_audio_status.free_frames = 8; return DESK_HW_OK; }\n'
@@ -2232,6 +2240,28 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     cancelled = json.loads(await asyncio.wait_for(desktop.recv(), 2))
                     self.assertEqual(cancelled["type"], "evt.audio.buffer_status", cancelled)
                     self.assertEqual(cancelled["data"]["reason"], "aborted", cancelled)
+
+                    # Disconnect cancellation keeps the HAL stream owner alive
+                    # until the asynchronous output drain is confirmed.
+                    disconnect_pcm = b"\x56\x78" * 512
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stream.begin", "code": 0,
+                        "request_id": "audio-begin-disconnect", "data": {
+                            "stream_id": 76, "total_bytes": len(disconnect_pcm),
+                            "sample_rate_hz": 24000, "channels": 1,
+                            "sample_width_bytes": 2,
+                            "audio_sha256": hashlib.sha256(disconnect_pcm).hexdigest()}}))
+                    disconnect_ack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(disconnect_ack["type"], "sys.ack", disconnect_ack)
+                    disconnect_credit = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(disconnect_credit["data"]["free_frames"], 8, disconnect_credit)
+                    self.lib.desk_sdk_test_audio_hold_stop_drain(1)
+                    self.lib.desk_sdk_test_ws_force_disconnect()
+                    self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 1,
+                                     "disconnect must not release playback owner before drain")
+                    self.lib.desk_sdk_test_audio_release_drain()
+                    self.lib.desk_sdk_bridge_audio_poll(self.lib.desk_sdk_test_ws_generation())
+                    self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 0,
+                                     "owner is released after HAL confirms output drain")
             finally:
                 poll_stop.set()
                 await poll_task
