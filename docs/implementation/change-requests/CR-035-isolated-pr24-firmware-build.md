@@ -38,7 +38,8 @@
 
 ## 当前未决项与执行边界
 
-- 本 CR 未运行构建，未读取共享 SDK 的 ignored `sdkconfig`，也未访问任何凭据；因此目前没有目标构建通过证据。
-- 需由 A1/A0 实现或确认的隔离构建入口，必须满足上述规则。若现有入口会复制共享 `sdkconfig` 或将 build 写入归档之外，应先由 A0 单独裁决改造范围，再运行目标构建；本 CR 本身不授权修改 runner。
-- 若 Kconfig/config 生成仍要求无法从已审核 defaults 得出的非敏感选项，执行者应列出**符号名、为何必需、可接受的非敏感值格式**，请求人工提供 sanitized input。不得展示或请求真实凭据值。
+- **已确认的构建阻塞：当前 runner 不符合本 CR，PR #24 目标构建不得使用现有 runner 执行。** 静态源码审计确认：`tools/verification/build_isolated_firmware.py::stage_sdk` 对 TuyaOpen `tuya_open_sdk` 使用 `copytree`，只排除 `build`、`managed_components`、`.git`，因此也会复制 ignored/generated `sdkconfig`；随后配置阶段读取该 staged 文件的原始字节、修改并计算其 SHA256。对应 `tools/verification/test_build_isolated_firmware.py::test_sdk_staging_keeps_project_build_and_managed_components_local` 还明确断言 staged 项目保留 `sdkconfig`。另外，`tools/build_watcher_firmware.ps1` 会读取共享 SDK `sdkconfig` 的字节和时间戳、修改配置并记录原始哈希。上述代码路径可能触及潜在敏感内容；本 CR 执行者未读取任何实际 `sdkconfig` 文件或凭据，也未运行这些 runner。
+- **解除阻塞前置条件：** 后续获批实现须从 stage SDK 输入中排除共享 `sdkconfig*` 与所有生成配置，删除对共享配置内容/哈希/时间戳的读取；只在新归档 stage 内依据本 CR 批准的非敏感 defaults 重新生成配置；同步改写断言“复制 sdkconfig”的测试，并使 PowerShell 入口同样不读共享配置。若新生成配置仍需要无法从已审 defaults 推导的选项，保持 **BLOCKED**，仅请求人工提供列出符号名、原因与允许值格式的 sanitized 非敏感输入。不得以共享配置、真实凭据、假凭据或推断值解阻。
+- 本 CR 未运行构建，未读取共享 SDK 的 ignored `sdkconfig`，也未访问任何凭据；因此目前没有目标构建通过证据。现有 archive/stage 设计本身不足以证明安全隔离，因为 stage 当前会复制并读取共享生成配置。
+- 本 CR 本身不授权改 runner、改测试、运行构建、安装依赖、连接设备或烧录；必须先由相应 owner 提交并验收 runner 改造，再按 L2 条件单独复核构建证据。
 - 本契约与 PR #24 的实际源码链接/编译结果尚未验证；补齐 L2 后仍须等待硬件连接，另行验收音频 HAL 的 L3/L4。
