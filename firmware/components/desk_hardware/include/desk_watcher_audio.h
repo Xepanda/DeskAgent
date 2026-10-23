@@ -5,6 +5,8 @@
 int desk_watcher_audio_init(void);
 int desk_watcher_audio_read(int16_t *pcm, size_t samples, size_t *read_samples);
 int desk_watcher_audio_play(const int16_t *pcm, size_t samples, uint32_t rate);
+/* One-shot helper keeps owner stable across PCM write and DMA EOF fence. */
+int desk_watcher_audio_play_one_shot(const int16_t *pcm, size_t samples, uint32_t rate);
 int desk_watcher_audio_play_stop(void);
 /* Wait for ordered TX DMA EOF completion after writing one ring of silence. */
 int desk_watcher_audio_tx_drain(uint32_t timeout_ms);

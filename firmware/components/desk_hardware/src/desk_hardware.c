@@ -1205,6 +1205,10 @@ int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void 
 
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz)
 {
+    if (!pcm_buf || !samples) return DESK_HW_ERR_INVALID_ARG;
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    if (sample_rate_hz != 16000) return DESK_HW_ERR_INVALID_ARG;
+#endif
 #ifdef ESP_PLATFORM
     if (!s_board_driver_initialized || !s_board_driver_ops ||
         !s_board_driver_ops->audio_play_pcm) {
@@ -1218,7 +1222,12 @@ int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_
         }
     }
     if (s_board_driver_ops && s_board_driver_ops->audio_play_pcm && pcm_buf && samples > 0) {
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        /* Keep owner stable across the payload and its TX EOF fence. */
+        int rc = desk_watcher_audio_play_one_shot(pcm_buf, samples, sample_rate_hz);
+#else
         int rc = s_board_driver_ops->audio_play_pcm(pcm_buf, samples, sample_rate_hz);
+#endif
         if (rc != DESK_HW_OK) return rc;
     }
     if (s_audio_play_cb && pcm_buf && samples > 0) {
