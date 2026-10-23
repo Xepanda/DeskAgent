@@ -451,9 +451,9 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         }
     }
 
-    xSemaphoreGive(s_motion_mutex);
     atomic_fetch_add_explicit(&s_diag_timeout_count, 1U, memory_order_relaxed);
     atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT, memory_order_relaxed);
+    xSemaphoreGive(s_motion_mutex);
     desk_hardware_record_mcu_ack_timeout();
     return DESK_HW_ERR_TIMEOUT;
 #else
