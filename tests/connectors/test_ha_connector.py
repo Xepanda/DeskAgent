@@ -187,6 +187,31 @@ class TestHAConnector(unittest.TestCase):
             ha.execute("light.desk", "turn_on", parameters={"entity_id": "light.restricted"})
         self.assertEqual(posted, [])
 
+    def test_parameters_cannot_widen_allowlisted_entity_target(self) -> None:
+        """HA alternative target selectors must not bypass the entity allowlist."""
+        posted: list[Mapping[str, Any]] = []
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "POST":
+                posted.append(payload or {})
+            return 200, {"entity_id": "light.desk", "state": "on"}
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            allowed_entities=["light.desk"],
+            transport=mock_transport,
+        )
+        for selector in ("area_id", "device_id", "floor_id", "label_id", "target"):
+            with self.subTest(selector=selector):
+                with self.assertRaises(ValueError):
+                    ha.execute("light.desk", "turn_on", parameters={selector: "other-target"})
+        for invalid_parameters in ([], ["brightness", 200]):
+            with self.subTest(parameters=invalid_parameters):
+                with self.assertRaises(ValueError):
+                    ha.execute("light.desk", "turn_on", parameters=invalid_parameters)
+        self.assertEqual(posted, [])
+
     def test_invalid_state_confirmation_timeout_rejected_before_service_call(self) -> None:
         """Malformed or negative confirmation waits must not trigger a service call."""
         recorded_methods: list[str] = []

@@ -79,6 +79,16 @@ DEFAULT_ALLOWED_SERVICES = frozenset({
 
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 MAX_STATE_CONFIRMATION_TIMEOUT_MS = 30_000
+# HA service payloads can select targets through fields other than entity_id.
+# Those selectors can widen an entity-scoped request to devices, areas, floors,
+# or labels, so the connector rejects them and requires one authorized entity.
+HA_TARGET_SELECTOR_PARAMETER_KEYS = frozenset({
+    "area_id",
+    "device_id",
+    "floor_id",
+    "label_id",
+    "target",
+})
 
 
 def _normalize_confirmation_timeout_ms(value: Any) -> float:
@@ -723,10 +733,17 @@ class HAConnector:
         service_path = f"/api/services/{domain}/{action}"
 
         body: dict[str, Any] = {"entity_id": entity_id}
-        if parameters:
-            if "entity_id" in parameters and parameters["entity_id"] != entity_id:
-                raise ValueError("parameters.entity_id cannot differ from the allowlisted target entity")
-            body.update(parameters)
+        if parameters is not None:
+            if not isinstance(parameters, Mapping):
+                raise ValueError("parameters must be an object")
+            if parameters:
+                if "entity_id" in parameters and parameters["entity_id"] != entity_id:
+                    raise ValueError("parameters.entity_id cannot differ from the allowlisted target entity")
+                extra_target_selectors = HA_TARGET_SELECTOR_PARAMETER_KEYS.intersection(parameters)
+                if extra_target_selectors:
+                    selectors = ", ".join(sorted(extra_target_selectors))
+                    raise ValueError(f"parameters cannot widen the allowlisted entity target: {selectors}")
+                body.update(parameters)
 
         # Resolve target state and attributes confirmation requirements
         expected_state: Optional[str] = None
