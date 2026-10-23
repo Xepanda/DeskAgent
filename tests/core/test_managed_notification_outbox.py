@@ -195,6 +195,44 @@ class ManagedNotificationOutboxTests(unittest.TestCase):
             finally:
                 app.close()
 
+    def test_summary_delivery_claim_failure_skips_adapter(self) -> None:
+        from unittest.mock import patch
+        from datetime import datetime, timedelta, timezone
+        from host.desk_agent.services.life_service import LifeService
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ):
+            config_path, _ = self._write_test_config(directory)
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            try:
+                self._stop_delivery_thread(app)
+                now = datetime.now(timezone.utc)
+                app.life_service.create_reminder(
+                    reminder_id="rem-summary-claim-failure",
+                    title="Claim failure test",
+                    due_at=(now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                    timezone_str="UTC",
+                )
+                with patch("host.desk_agent.services.life_service._format_summary_display_time", return_value="test time"):
+                    batch = app.life_service.create_recovery_summary_batch()
+                self.assertIsNotNone(batch)
+                adapter = _FakeNotificationAdapter()
+                app.managed_notification_adapter = adapter
+
+                with patch.object(LifeService, "claim_recovery_summary_delivery", return_value=False) as claim:
+                    app._scheduler_stop = _OneIterationStop()
+                    app._delivery_loop()
+
+                claim.assert_called_once_with(batch["outbox_id"], batch["summary_id"])
+                self.assertEqual(adapter.summaries, [], "failed claim must not reach the device adapter")
+                row = app.life_service._get_connection().execute(
+                    "SELECT state FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+                ).fetchone()
+                self.assertEqual(row["state"], "pending")
+            finally:
+                app.close()
+
     def test_managed_outbox_retries_same_id_and_never_marks_dispatched(self) -> None:
         from unittest.mock import patch
 
