@@ -164,6 +164,10 @@ static int camera_sync_is_active(bool *active)
 #ifdef ESP_PLATFORM
 static void camera_control_deinit(void);
 static bool camera_capture_spi_budget_available(int64_t deadline_us, size_t transfer_bytes);
+static int
+camera_read_resynchronized_header(uint8_t header[HX_PTL_BASE_HEADER_SIZE],
+                                  uint32_t *body_size, size_t *prefetched,
+                                  int64_t capture_deadline_us);
 
 /* The upstream mode controller drains the immutable PTL frame while HX is in
  * its transitional mode (3). Without this, MODE 0 can remain pending forever
@@ -175,36 +179,62 @@ static void camera_control_drain_transition_frame(int64_t deadline_us)
     if (s_capture_bus_acquired) return;
     const int64_t drain_deadline_us = esp_timer_get_time() + 20000LL;
     const int64_t limit_us = drain_deadline_us < deadline_us ? drain_deadline_us : deadline_us;
-    bool ready = false;
-    while (esp_timer_get_time() < limit_us) {
+    bool resynchronizing = s_ptl_resynchronizing;
+    bool ready = resynchronizing;
+    while (!ready && esp_timer_get_time() < limit_us) {
         if (camera_sync_is_active(&ready) != DESK_HW_OK || ready) break;
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     if (!ready || esp_timer_get_time() >= limit_us) return;
-    vTaskDelay(pdMS_TO_TICKS(CAM_SYNC_GUARD_MS));
-    if (esp_timer_get_time() >= deadline_us) return;
+    if (!resynchronizing) {
+        vTaskDelay(pdMS_TO_TICKS(CAM_SYNC_GUARD_MS));
+        if (esp_timer_get_time() >= deadline_us) return;
+    }
 
     if (spi_device_acquire_bus(s_spi_dev, portMAX_DELAY) != ESP_OK) return;
     uint8_t header[HX_PTL_BASE_HEADER_SIZE] = {0};
-    spi_transaction_t header_trans = {
-        .length = sizeof(header) * 8U, .rxlength = sizeof(header) * 8U,
-        .rx_buffer = header, .flags = SPI_TRANS_CS_KEEP_ACTIVE,
-    };
-    esp_err_t err = spi_device_transmit(s_spi_dev, &header_trans);
     uint32_t body_size = 0;
-    if (err == ESP_OK && desk_watcher_camera_parse_ptl_header(header, sizeof(header), &body_size) == 0 &&
-        camera_capture_spi_budget_available(deadline_us, body_size)) {
-        spi_transaction_t body_trans = {
-            .length = body_size * 8U, .rxlength = body_size * 8U,
-            .rx_buffer = s_ptl_body, .flags = 0,
+    size_t prefetched = 0;
+    int header_rc = 0;
+    bool transport_error = false;
+    if (resynchronizing) {
+        header_rc = camera_read_resynchronized_header(header, &body_size, &prefetched, deadline_us);
+    } else {
+        spi_transaction_t header_trans = {
+            .length = sizeof(header) * 8U, .rxlength = sizeof(header) * 8U,
+            .rx_buffer = header, .flags = SPI_TRANS_CS_KEEP_ACTIVE,
         };
-        (void)spi_device_transmit(s_spi_dev, &body_trans);
+        esp_err_t err = spi_device_transmit(s_spi_dev, &header_trans);
+        if (err != ESP_OK) {
+            header_rc = -1;
+            transport_error = true;
+        } else {
+            header_rc = desk_watcher_camera_parse_ptl_header(header, sizeof(header), &body_size);
+        }
+    }
+    if (header_rc == 0 && camera_capture_spi_budget_available(deadline_us, body_size - prefetched)) {
+        spi_transaction_t body_trans = {
+            .length = (body_size - prefetched) * 8U,
+            .rxlength = (body_size - prefetched) * 8U,
+            .rx_buffer = s_ptl_body + prefetched, .flags = 0,
+        };
+        if (body_size > prefetched && spi_device_transmit(s_spi_dev, &body_trans) != ESP_OK) {
+            transport_error = true;
+        }
+        s_ptl_resynchronizing = transport_error;
+        if (transport_error) memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
     } else {
         uint8_t discard = 0;
         spi_transaction_t close_trans = {
             .length = 8U, .rxlength = 8U, .rx_buffer = &discard, .flags = 0,
         };
-        (void)spi_device_transmit(s_spi_dev, &close_trans);
+        if (!resynchronizing) (void)spi_device_transmit(s_spi_dev, &close_trans);
+        uint8_t header_or = 0;
+        for (size_t i = 0; i < sizeof(header); ++i) header_or |= header[i];
+        if (resynchronizing || header_or != 0 || transport_error) {
+            s_ptl_resynchronizing = true;
+            memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
+        }
     }
     spi_device_release_bus(s_spi_dev);
 }

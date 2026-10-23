@@ -447,6 +447,8 @@ int main(void) {
         self.assertIn("state.mode == 3U", mode)
         self.assertIn("camera_control_drain_transition_frame(deadline_us)", mode)
         self.assertIn("s_capture_bus_acquired", drain)
+        self.assertIn("bool ready = resynchronizing", drain)
+        self.assertIn("camera_read_resynchronized_header", drain)
         self.assertIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", drain)
         self.assertIn("CAM_SYNC", source)
         self.assertIn("desk_watcher_camera_parse_ptl_header", drain)
