@@ -19,7 +19,7 @@ import threading
 import time
 import unittest
 from typing import Any, Mapping, Optional
-from host.desk_agent.connectors.ha.ha_connector import HAConnector
+from host.desk_agent.connectors.ha.ha_connector import HAConnector, _normalize_state_poll_interval_sec
 
 
 class MockWebSocketClient:
@@ -72,6 +72,28 @@ class TestHAConnector(unittest.TestCase):
         ha = HAConnector(base_url="http://127.0.0.1:59999", token="dummy-token", timeout_sec=0.5)
         with self.assertRaises(ConnectionError):
             ha.execute("light.desk", "turn_on")
+
+    def test_state_subscription_rejects_invalid_poll_interval_before_starting_workers(self) -> None:
+        """Invalid fallback intervals must not create a busy loop or poison the WS worker."""
+        for interval in (0, -0.1, 1e-300, 0.999, float("nan"), float("inf"), True):
+            with self.subTest(interval=interval):
+                ha = HAConnector(base_url="http://ha.test:8123", token="token", mock_mode=True)
+                stop = None
+                try:
+                    with self.assertRaises(ValueError):
+                        stop = ha.subscribe_state_changes(lambda *args: None, interval_sec=interval)
+                finally:
+                    if stop is not None:
+                        stop()
+                self.assertEqual(ha._subscribers, [])
+                self.assertIsNone(ha._ws_thread)
+                ha.close()
+
+    def test_state_poll_interval_is_capped_to_keep_waits_platform_safe(self) -> None:
+        self.assertEqual(_normalize_state_poll_interval_sec(1e300), 300.0)
+
+    def test_state_poll_interval_accepts_documented_minimum(self) -> None:
+        self.assertEqual(_normalize_state_poll_interval_sec(1.0), 1.0)
 
     # -------------------------------------------------------------------------
     # 2. Domain & Entity Allowlist / Denylist Tests
@@ -455,7 +477,7 @@ class TestHAConnector(unittest.TestCase):
         ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
         ha.reconcile_states()
         current_attributes["profile"]["modes"].append("bright")
-        stop = ha.subscribe_state_changes(subscriber, interval_sec=0.01)
+        stop = ha.subscribe_state_changes(subscriber, interval_sec=1.0)
         try:
             self.assertTrue(first_event.wait(timeout=1))
             time.sleep(0.05)
@@ -483,7 +505,7 @@ class TestHAConnector(unittest.TestCase):
             if entity_id == "switch.heater":
                 heater_event.set()
 
-        stop = ha.subscribe_state_changes(subscriber, interval_sec=0.02)
+        stop = ha.subscribe_state_changes(subscriber, interval_sec=1.0)
         try:
             self.assertTrue(heater_event.wait(timeout=1.0))
             self.assertEqual(delivered, ["light.desk", "switch.heater"])
@@ -917,7 +939,7 @@ class TestHAConnector(unittest.TestCase):
             transport=lambda *args: (200, []),
             ws_factory=ws_factory,
         )
-        stop_sub = ha.subscribe_state_changes(lambda *args: None, interval_sec=0.1)
+        stop_sub = ha.subscribe_state_changes(lambda *args: None, interval_sec=1.0)
         try:
             deadline = time.monotonic() + 3.5
             while not ha.is_ws_connected and time.monotonic() < deadline:
