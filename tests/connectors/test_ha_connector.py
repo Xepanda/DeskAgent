@@ -168,6 +168,26 @@ class TestHAConnector(unittest.TestCase):
         with self.assertRaises(PermissionError):
             ha.execute("light.desk", "turn_on")
 
+    def test_service_action_must_be_a_single_ha_service_segment(self) -> None:
+        """A configured service name cannot inject extra REST path segments."""
+        requests: list[tuple[str, str]] = []
+
+        def transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            requests.append((method, url))
+            return 200, []
+
+        malformed_action = "turn_on/../../states"
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            allowed_services=[f"light.{malformed_action}"],
+            transport=transport,
+        )
+        with self.assertRaises(ValueError):
+            ha.execute("light.desk", malformed_action)
+
+        self.assertEqual(requests, [])
+
     def test_parameters_cannot_replace_allowlisted_target_entity(self) -> None:
         """A caller cannot pass entity authorization for one entity and execute against another."""
         posted: list[Mapping[str, Any]] = []

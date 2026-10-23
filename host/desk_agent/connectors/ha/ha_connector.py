@@ -78,6 +78,7 @@ DEFAULT_ALLOWED_SERVICES = frozenset({
 })
 
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+SERVICE_ACTION_REGEX = re.compile(r"^[a-z0-9_]{1,64}$")
 MAX_STATE_CONFIRMATION_TIMEOUT_MS = 30_000
 # HA service payloads can select targets through fields other than entity_id.
 # Those selectors can widen an entity-scoped request to devices, areas, floors,
@@ -270,6 +271,8 @@ class HAConnector:
 
     def is_service_allowed(self, domain: str, action: str) -> bool:
         """Enforces service-level permissions and denylists."""
+        if not isinstance(domain, str) or not isinstance(action, str) or not SERVICE_ACTION_REGEX.fullmatch(action):
+            return False
         full_svc = f"{domain}.{action}"
         if full_svc in self.denied_services or action in self.denied_services:
             return False
@@ -717,6 +720,8 @@ class HAConnector:
         - Verifies both target state and target attributes (explicit or inferred from parameters).
         - Returns structured result conforming to `domain_ha.json` contract.
         """
+        if not isinstance(action, str) or not SERVICE_ACTION_REGEX.fullmatch(action):
+            raise ValueError("action must be a 1-64 character lowercase Home Assistant service name")
         if not self.is_entity_allowed(entity_id):
             raise PermissionError(f"Entity '{entity_id}' is outside allowed domain/entity scope")
 
