@@ -165,6 +165,65 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertNotIn("thread_id", interrupt_call["params"])
         self.assertNotIn("turn_id", interrupt_call["params"])
 
+    def test_cancel_success_response_does_not_overwrite_terminal_notification(self) -> None:
+        cases = (
+            ("completed", "completed", "codex.turn_completed"),
+            ("failed", "failed", "codex.failed"),
+            ("interrupted", "interrupted", "codex.interrupted"),
+            ("cancelled", "cancelled", "codex.interrupted"),
+        )
+
+        for terminal_event_status, expected_status, expected_event in cases:
+            with self.subTest(status=terminal_event_status):
+                db_path = os.path.join(self.temp_dir.name, f"cancel-race-{terminal_event_status}.db")
+                companion: CodexCompanion
+
+                class InterleavingTransport(JsonRpcTransport):
+                    def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                        if method == "initialize":
+                            return {"server_version": "test"}
+                        if method == "thread/create":
+                            return {"thread_id": "thr-cancel-race"}
+                        if method == "turn/start":
+                            return {"turn_id": "trn-cancel-race", "state": "running"}
+                        if method == "turn/interrupt":
+                            notification: dict[str, Any] = {
+                                "threadId": params["threadId"],
+                                "turnId": params["turnId"],
+                                "status": terminal_event_status,
+                            }
+                            if terminal_event_status == "failed":
+                                notification["error"] = {"message": "server failed before interrupt response"}
+                            companion._handle_server_notification("turn/completed", notification)
+                            return {"interrupted": True}
+                        return {}
+
+                companion = CodexCompanion(
+                    allowed_workspaces=self.workspaces,
+                    transport=InterleavingTransport(),
+                    db_path=db_path,
+                )
+                companion.submit_task("tsk-cancel-race", "test-project", "stop if still running")
+                events: list[tuple[str, dict[str, Any]]] = []
+                companion.add_event_listener(lambda event, data: events.append((event, data)))
+
+                try:
+                    result = companion.cancel_task("tsk-cancel-race", reason="user requested stop")
+                    persisted_status = companion.get_task_status("tsk-cancel-race")["status"]
+                    self.assertEqual(result["status"], expected_status)
+                    self.assertEqual(persisted_status, expected_status)
+                    self.assertEqual([event for event, _ in events], [expected_event])
+                finally:
+                    companion.close()
+
+                restored = CodexCompanion(
+                    allowed_workspaces=self.workspaces,
+                    transport=DefaultMockTransport(),
+                    db_path=db_path,
+                )
+                self.assertEqual(restored.get_task_status("tsk-cancel-race")["status"], expected_status)
+                restored.close()
+
     def test_default_model_is_omitted_and_explicit_model_is_preserved(self) -> None:
         sent_calls: list[dict[str, Any]] = []
 

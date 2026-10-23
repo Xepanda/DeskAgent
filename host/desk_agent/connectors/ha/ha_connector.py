@@ -14,6 +14,7 @@ Implements real Home Assistant REST API interactions and WebSocket real-time eve
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import math
@@ -127,6 +128,24 @@ def _snapshot_attributes(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Return an independent, normalized copy of a snapshot's full attributes."""
     attributes = snapshot.get("attributes")
     return copy.deepcopy(dict(attributes)) if isinstance(attributes, Mapping) else {}
+
+
+def _notify_state_subscriber(
+    callback: Callable[..., None],
+    entity_id: str,
+    old_state: Optional[str],
+    new_state: Optional[str],
+    attributes: Optional[Mapping[str, Any]],
+) -> None:
+    """Dispatch the extended event while preserving existing three-argument consumers."""
+    try:
+        inspect.signature(callback).bind(entity_id, old_state, new_state, attributes)
+    except TypeError:
+        callback(entity_id, old_state, new_state)
+    except (ValueError, AttributeError):
+        callback(entity_id, old_state, new_state, attributes)
+    else:
+        callback(entity_id, old_state, new_state, attributes)
 
 KNOWN_ATTRIBUTE_KEYS = frozenset({
     "brightness",
@@ -396,7 +415,9 @@ class HAConnector:
                         res = self.reconcile_states()
                         for chg in res["reconciled_changes"]:
                             try:
-                                callback(chg["entity_id"], chg["old_state"], chg["new_state"], chg.get("attributes"))
+                                _notify_state_subscriber(
+                                    callback, chg["entity_id"], chg["old_state"], chg["new_state"], chg.get("attributes")
+                                )
                             except Exception as callback_err:
                                 # A consumer failure must not suppress other changes from
                                 # this snapshot. Reconciliation updates the cache first,
@@ -485,7 +506,9 @@ class HAConnector:
                     for change in report["reconciled_changes"]:
                         for cb in active_subs:
                             try:
-                                cb(change["entity_id"], change["old_state"], change["new_state"], change.get("attributes"))
+                                        _notify_state_subscriber(
+                                            cb, change["entity_id"], change["old_state"], change["new_state"], change.get("attributes")
+                                        )
                             except Exception as cb_err:
                                 logger.exception("Error in HA reconnect state subscriber: %s", cb_err)
                 except Exception as rec_err:
@@ -536,7 +559,7 @@ class HAConnector:
                                         active_subs = list(self._subscribers)
                                     for cb in active_subs:
                                         try:
-                                            cb(entity_id, old_st, new_st, event_attributes)
+                                            _notify_state_subscriber(cb, entity_id, old_st, new_st, event_attributes)
                                         except Exception as cb_err:
                                             logger.exception("Error in state subscriber callback: %s", cb_err)
 
