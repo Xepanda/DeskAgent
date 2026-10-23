@@ -406,6 +406,79 @@ class TestCameraService(unittest.TestCase):
         self.assertNotIn("viewer", cam._active_stream_owners)
         cam.release_lease("viewer")
 
+    def test_live_mjpeg_carries_atomic_stream_metadata_and_uses_15fps_ceiling(self) -> None:
+        cam = CameraViewerService(stale_threshold_ms=2000)
+        cam.acquire_lease("viewer", lease_ms=2000)
+        stream_meta = {
+            "sequence": 7,
+            "capture_timestamp_ms": 1234,
+            "session_generation": "session-a",
+            "host_receive_monotonic_ms": 2000,
+            "clock_offset_ms": 100.0,
+            "clock_uncertainty_ms": 20.0,
+            "latency_ms": 766.0,
+        }
+        cam.ingest_robot_frame(TEST_JPEG, metadata=stream_meta)
+        stored = cam.get_latest_frame("viewer")
+        self.assertEqual(stored["metadata"], stream_meta)
+
+        stream = cam.iter_mjpeg("viewer", target_fps=30, wait_timeout=0.05)
+        cam.ingest_robot_frame(b"\xff\xd8new-frame\xff\xd9", metadata={**stream_meta, "sequence": 8})
+        part = next(stream)
+        self.assertIn(b"X-Device-Capture-Monotonic-Ms: 1234\r\n", part)
+        self.assertIn(b"X-Host-Receive-Monotonic-Ms: 2000\r\n", part)
+        self.assertIn(b"X-Clock-Offset-Ms: 100.0\r\n", part)
+        self.assertIn(b"X-Clock-Uncertainty-Ms: 20.0\r\n", part)
+        self.assertIn(b"X-Session-Generation: session-a\r\n", part)
+        self.assertIn(b"X-Frame-Seq: 2\r\n", part)
+        self.assertIn(b"X-Device-Sequence: 8\r\n", part)
+        stream.close()
+        cam.release_lease("viewer")
+
+    def test_live_mjpeg_caps_delivery_at_fifteen_fps(self) -> None:
+        cam = CameraViewerService()
+        cam.acquire_lease("viewer", lease_ms=2000)
+        stream = cam.iter_mjpeg("viewer", wait_timeout=0.2)
+        cam.ingest_robot_frame(b"\xff\xd8frame-one\xff\xd9")
+        next(stream)
+        cam.ingest_robot_frame(b"\xff\xd8frame-two\xff\xd9")
+        started = time.monotonic()
+        next(stream)
+        self.assertGreaterEqual(time.monotonic() - started, 0.045)
+        stream.close()
+        cam.release_lease("viewer")
+
+    def test_live_stream_rejects_stale_session_and_non_forward_sequence(self) -> None:
+        cam = CameraViewerService()
+        cam.acquire_lease("viewer", lease_ms=2000)
+        metadata = {"sequence": 10, "session_generation": "session-a"}
+        cam.ingest_robot_frame(TEST_JPEG, metadata)
+        original = cam.get_latest_frame("viewer")
+        cam.ingest_robot_frame(b"\xff\xd8duplicate\xff\xd9", {**metadata, "sequence": 10})
+        cam.ingest_robot_frame(b"\xff\xd8old\xff\xd9", {**metadata, "sequence": 9})
+        cam.ingest_robot_frame(b"\xff\xd8foreign\xff\xd9", {**metadata, "sequence": 11, "session_generation": "session-b"})
+        current = cam.get_latest_frame("viewer")
+        self.assertEqual(current["frame_seq"], original["frame_seq"])
+        self.assertEqual(current["metadata"], metadata)
+        cam.release_lease("viewer")
+
+    def test_live_stream_clears_frame_after_one_second_even_when_snapshot_threshold_is_longer(self) -> None:
+        cam = CameraViewerService(stale_threshold_ms=2000)
+        cam.acquire_lease("viewer", lease_ms=3000)
+        stream = cam.iter_mjpeg("viewer", wait_timeout=0.05)
+        producer = threading.Thread(target=lambda: (time.sleep(0.01), cam.ingest_robot_frame(TEST_JPEG)))
+        producer.start()
+        next(stream)
+        producer.join()
+        with cam._lock:
+            cam._latest_frame_monotonic = time.monotonic() - 1.01
+        with self.assertRaises(StopIteration):
+            next(stream)
+        self.assertIsNone(cam._latest_jpeg)
+        self.assertIsNone(cam.get_latest_frame("viewer"))
+        stream.close()
+        cam.release_lease("viewer")
+
 
     def test_get_snapshot_auto_acquire(self) -> None:
         """Confirms get_snapshot auto-acquires a lease and waits for a real frame source."""

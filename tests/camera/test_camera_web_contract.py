@@ -22,10 +22,10 @@ class TestCameraWebContract(unittest.TestCase):
 
     def test_viewer_never_shows_non_hardware_stale_or_undecodable_images(self) -> None:
         source = WEB.read_text(encoding="utf-8")
-        self.assertIn("effectiveAgeMs > 2000", source)
+        self.assertIn("effectiveAgeMs > 1000", source)
         self.assertIn("createImageBitmap(blob)", source)
         self.assertIn("URL.revokeObjectURL(currentObjectUrl)", source)
-        self.assertIn("画面已过期", source)
+        self.assertIn("LIVE 不可用：超过 1 秒没有新帧", source)
         self.assertIn("Host 暂时连接中断", source)
 
     def test_viewer_can_release_lease_explicitly_and_on_pagehide(self) -> None:
@@ -45,6 +45,15 @@ class TestCameraWebContract(unittest.TestCase):
         self.assertIn("multipart\\/x-mixed-replace", source)
         self.assertNotIn("refreshSnapshot", source)
         self.assertIn("cache: \"no-store\"", source)
+        self.assertIn("实时相机画面（LIVE · 目标 15 帧/秒）", source)
+        self.assertIn("rollingFps(streamFrameTimes, now)", source)
+        self.assertIn("rollingFps(renderedFrameTimes, now)", source)
+        self.assertIn("uncertainty <= 100", source)
+        self.assertIn("X-Device-Capture-Monotonic-Ms", source)
+        self.assertIn("X-Host-Receive-Monotonic-Ms", source)
+        self.assertIn("X-Clock-Offset-Ms", source)
+        self.assertIn("X-Clock-Uncertainty-Ms", source)
+        self.assertIn("X-Session-Generation", source)
 
     def test_transient_unavailable_and_stream_end_retry_without_releasing_lease(self) -> None:
         source = WEB.read_text(encoding="utf-8")
@@ -69,7 +78,7 @@ const enc = new TextEncoder();
 const boundary = "demo-boundary";
 const jpeg = Uint8Array.from([255, 216, 1, 2, 255, 217]);
 function part(type = "image/jpeg", sep = "\r\n--" + boundary + "\r\n", b = boundary) {
-  const head = `--${b}\r\nContent-Type: ${type}\r\nContent-Length: ${jpeg.length}\r\nX-Frame-Seq: 7\r\nX-Frame-Age-Ms: 3\r\n\r\n`;
+  const head = `--${b}\r\nContent-Type: ${type}\r\nContent-Length: ${jpeg.length}\r\nX-Frame-Seq: 7\r\nX-Frame-Age-Ms: 3\r\nX-Device-Sequence: 7\r\nX-Device-Capture-Monotonic-Ms: 1234\r\nX-Host-Receive-Monotonic-Ms: 2000\r\nX-Clock-Offset-Ms: 100.0\r\nX-Clock-Uncertainty-Ms: 20.0\r\nX-Source-To-Host-Receive-Ms: 766.0\r\nX-Session-Generation: session-a\r\n\r\n`;
   const out = new Uint8Array(enc.encode(head).length + jpeg.length + enc.encode(sep).length);
   let offset = 0; out.set(enc.encode(head), offset); offset += enc.encode(head).length;
   out.set(jpeg, offset); offset += jpeg.length; out.set(enc.encode(sep), offset);
@@ -79,6 +88,13 @@ let valid = parseMjpegBuffer(part(), boundary);
 assert.equal(valid.parts.length, 1);
 assert.equal(valid.parts[0].seq, "7");
 assert.equal(valid.parts[0].ageMs, 3);
+assert.equal(valid.parts[0].deviceSeq, 7);
+assert.equal(valid.parts[0].captureTimestampMs, 1234);
+assert.equal(valid.parts[0].hostReceiveMonotonicMs, 2000);
+assert.equal(valid.parts[0].clockOffsetMs, 100);
+assert.equal(valid.parts[0].clockUncertaintyMs, 20);
+assert.equal(valid.parts[0].sourceLatencyMs, 766);
+assert.equal(valid.parts[0].sessionGeneration, "session-a");
 assert.deepEqual(Array.from(valid.parts[0].jpeg), Array.from(jpeg));
 assert.equal(new TextDecoder().decode(valid.remainder), `--${boundary}\r\n`);
 for (const invalid of [part("text/plain"), part("image/jpeg", "\n--" + boundary + "\r\n"), part("image/jpeg", undefined, "wrong-boundary")]) {
@@ -125,6 +141,9 @@ global.leaseActive = true;
 global.frameExpiryTimer = null;
 global.lastFrameSeq = null;
 global.currentObjectUrl = null;
+global.streamFrameTimes = [];
+global.renderedFrameTimes = [];
+global.pendingRenderMetric = null;
 global.document = { getElementById: () => ({ style: {}, innerText: "" }) };
 global.Blob = class { constructor(parts) { this.parts = parts; } };
 global.createImageBitmap = async () => ({ close() {} });
@@ -173,9 +192,9 @@ global.clearTimeout = () => {};
 global.setTimeout = callback => { expiry = callback; return 1; };
 (async () => {
   const jpeg = Uint8Array.from([255, 216, 1, 2, 255, 217]);
-  await renderStreamFrame(jpeg, 4, 2001);
+  await renderStreamFrame(jpeg, { seq: 4, ageMs: 1001 }, 0);
   assert.equal(created, 0, "a stale incoming frame must never be displayed");
-  await renderStreamFrame(jpeg, 5, 10);
+  await renderStreamFrame(jpeg, { seq: 5, ageMs: 10 }, 0);
   assert.equal(created, 1);
   assert.equal(nodes.get("cameraFrame").style.display, "block");
   expiry();
@@ -201,7 +220,7 @@ global.setTimeout = callback => { expiry = callback; return 1; };
     def test_browser_includes_network_and_decode_delay_in_frame_freshness(self) -> None:
         source = WEB.read_text(encoding="utf-8")
         script = source.split("<script>", 1)[1].split("</script>", 1)[0]
-        helpers = script[script.index("async function renderStreamFrame"):script.index("async function consumeMjpeg")]
+        helpers = script[script.index("function rollingFps"):script.index("async function consumeMjpeg")]
         checks = r'''
 const assert = require("node:assert/strict");
 const nodes = new Map();
@@ -213,6 +232,9 @@ global.leaseActive = true;
 global.frameExpiryTimer = null;
 global.currentObjectUrl = null;
 global.lastFrameSeq = null;
+global.streamFrameTimes = [];
+global.renderedFrameTimes = [];
+global.pendingRenderMetric = null;
 let now = 0;
 let created = 0;
 global.performance = { now: () => now };
@@ -222,14 +244,24 @@ global.URL = { createObjectURL: () => `blob:${++created}`, revokeObjectURL() {} 
 global.clearTimeout = () => {};
 global.setTimeout = () => 1;
 (async () => {
-  await renderStreamFrame(Uint8Array.from([255, 216, 1, 2, 255, 217]), 1, 1900, 0);
+  await renderStreamFrame(Uint8Array.from([255, 216, 1, 2, 255, 217]), { seq: 1, ageMs: 950 }, 0);
   assert.equal(created, 0, "a frame that expires during image decoding must never appear");
 
   now = 0;
   global.createImageBitmap = async () => { now += 80; return { close() {} }; };
-  await renderStreamFrame(Uint8Array.from([255, 216, 1, 2, 255, 217]), 2, 500, 0);
+  await renderStreamFrame(Uint8Array.from([255, 216, 1, 2, 255, 217]), { seq: 2, ageMs: 500 }, 0);
   assert.equal(created, 1);
   assert.match(nodes.get("frameStats").innerText, /新鲜度: 580 ms/);
+  nodes.get("cameraFrame").onload();
+  assert.match(nodes.get("frameStats").innerText, /采集到显示 未知/);
+
+  now = 0;
+  await renderStreamFrame(Uint8Array.from([255, 216, 1, 2, 255, 217]), {
+    seq: 3, ageMs: 10, sourceLatencyMs: 100, clockUncertaintyMs: 50,
+  }, 0);
+  nodes.get("cameraFrame").onload();
+  assert.match(nodes.get("frameStats").innerText, /接收 0\.0 FPS/);
+  assert.match(nodes.get("frameStats").innerText, /采集到显示 180 ms/);
 })().catch(err => { console.error(err); process.exitCode = 1; });
 ''';
         completed = subprocess.run(

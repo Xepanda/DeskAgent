@@ -13,6 +13,7 @@ Provides secure local network JPEG frame viewing with:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections.abc import Iterator
@@ -21,6 +22,8 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 MAX_CAMERA_JPEG_BYTES = 128 * 1024
+MAX_LIVE_CAMERA_FPS = 15.0
+LIVE_CAMERA_STALE_THRESHOLD_MS = 1000
 MAX_CAMERA_STREAMS = 4
 MAX_CAMERA_STREAMS_PER_OWNER = 1
 
@@ -209,8 +212,12 @@ class CameraViewerService:
         # Bounded single latest frame buffer
         self._latest_jpeg: Optional[bytes] = None
         self._latest_frame_time: float = 0.0
+        self._latest_frame_monotonic: float = 0.0
         self._frame_seq: int = 0
         self._is_hardware_frame: bool = False
+        self._latest_frame_metadata: Optional[dict[str, Any]] = None
+        self._camera_session_generation: Optional[str] = None
+        self._last_device_sequence: Optional[int] = None
         self._active_stream_owners: set[str] = set()
         self.pipeline = FrameCapturePipeline(fps=10.0, allow_synthetic=False)
 
@@ -230,9 +237,9 @@ class CameraViewerService:
         """Sets external hardware frame capture callback (e.g. V4L2 device or robot frame stream)."""
         self.pipeline.set_frame_source(source_fn)
 
-    def ingest_robot_frame(self, frame_bytes: bytes) -> None:
-        """Ingests live raw JPEG frame from physical robot camera link."""
-        self.push_frame(frame_bytes, is_hardware=True)
+    def ingest_robot_frame(self, frame_bytes: bytes, metadata: Optional[dict[str, Any]] = None) -> None:
+        """Atomically ingest a live JPEG and the metadata received with that frame."""
+        self.push_frame(frame_bytes, is_hardware=True, metadata=metadata)
 
     def acquire_lease(
         self,
@@ -289,6 +296,11 @@ class CameraViewerService:
                 self._active_lease_owner = None
                 self._lease_expires_at = 0.0
                 self._latest_jpeg = None
+                self._latest_frame_time = 0.0
+                self._latest_frame_monotonic = 0.0
+                self._latest_frame_metadata = None
+                self._camera_session_generation = None
+                self._last_device_sequence = None
                 self._is_hardware_frame = False
                 self._frame_changed.notify_all()
             else:
@@ -313,6 +325,10 @@ class CameraViewerService:
             self._lease_expires_at = 0.0
             self._latest_jpeg = None
             self._latest_frame_time = 0.0
+            self._latest_frame_monotonic = 0.0
+            self._latest_frame_metadata = None
+            self._camera_session_generation = None
+            self._last_device_sequence = None
             self._is_hardware_frame = False
             self._frame_changed.notify_all()
         self.pipeline.request_stop()
@@ -335,6 +351,11 @@ class CameraViewerService:
             self._active_lease_owner = None
             self._lease_expires_at = 0.0
             self._latest_jpeg = None
+            self._latest_frame_time = 0.0
+            self._latest_frame_monotonic = 0.0
+            self._latest_frame_metadata = None
+            self._camera_session_generation = None
+            self._last_device_sequence = None
             self._is_hardware_frame = False
             self._frame_changed.notify_all()
             return owner
@@ -347,7 +368,12 @@ class CameraViewerService:
             except Exception as exc:
                 logger.error("Error executing camera teardown callback: %s", exc)
 
-    def push_frame(self, jpeg_data: bytes, is_hardware: bool = False) -> None:
+    def push_frame(
+        self,
+        jpeg_data: bytes,
+        is_hardware: bool = False,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
         """
         Receives captured JPEG frame from device hardware or fallback pipeline.
         Only stores the latest frame if an active lease exists.
@@ -363,6 +389,23 @@ class CameraViewerService:
             return
         with self._lock:
             if self._active_lease_owner and time.time() < self._lease_expires_at:
+                incoming_metadata = dict(metadata) if isinstance(metadata, dict) else None
+                incoming_session = incoming_metadata.get("session_generation") if incoming_metadata else None
+                incoming_sequence = incoming_metadata.get("sequence") if incoming_metadata else None
+                if incoming_session is not None:
+                    if not isinstance(incoming_session, str) or not incoming_session:
+                        return
+                    if self._camera_session_generation is not None and incoming_session != self._camera_session_generation:
+                        logger.debug("Rejected frame from a stale or foreign camera session")
+                        return
+                if incoming_sequence is not None:
+                    if isinstance(incoming_sequence, bool) or not isinstance(incoming_sequence, int) or not 0 <= incoming_sequence <= 0xFFFFFFFF:
+                        return
+                    if self._last_device_sequence is not None:
+                        delta = (incoming_sequence - self._last_device_sequence) & 0xFFFFFFFF
+                        if not 0 < delta < 0x80000000:
+                            logger.debug("Rejected repeated or out-of-order camera sequence")
+                            return
                 # Never let a synthetic frame overwrite a non-stale live hardware frame
                 if not is_hardware and getattr(self, "_is_hardware_frame", False) and self._latest_jpeg is not None:
                     now = time.time()
@@ -370,7 +413,13 @@ class CameraViewerService:
                         return
                 self._latest_jpeg = jpeg_data
                 self._latest_frame_time = time.time()
+                self._latest_frame_monotonic = time.monotonic()
                 self._is_hardware_frame = is_hardware
+                self._latest_frame_metadata = incoming_metadata
+                if incoming_session is not None:
+                    self._camera_session_generation = incoming_session
+                if incoming_sequence is not None:
+                    self._last_device_sequence = incoming_sequence
                 self._frame_seq += 1
                 self._frame_changed.notify_all()
 
@@ -379,7 +428,7 @@ class CameraViewerService:
         client_id: str,
         *,
         boundary: str = "deskagent-frame",
-        target_fps: float = 2.0,
+        target_fps: float = MAX_LIVE_CAMERA_FPS,
         wait_timeout: float = 0.5,
     ) -> Iterator[bytes]:
         """Yield fresh physical JPEG parts while the caller owns the camera lease.
@@ -390,7 +439,7 @@ class CameraViewerService:
         a snapshot as the first stream frame. Each wait is bounded, allowing lease
         expiry and generator close to be observed promptly without a background task.
         """
-        fps = max(0.1, min(2.0, float(target_fps)))
+        fps = max(0.1, min(MAX_LIVE_CAMERA_FPS, float(target_fps)))
         interval = 1.0 / fps
         with self._lock:
             owner = None
@@ -438,23 +487,36 @@ class CameraViewerService:
                             break
                         now = time.monotonic()
                         if self._latest_jpeg is not None and self._frame_seq > last_seq:
-                            age_ms = (time.time() - self._latest_frame_time) * 1000
-                            if age_ms <= self.stale_threshold_ms and self._is_hardware_frame:
+                            age_ms = (time.monotonic() - self._latest_frame_monotonic) * 1000
+                            if age_ms <= LIVE_CAMERA_STALE_THRESHOLD_MS and self._is_hardware_frame:
                                 candidate = {
                                     "jpeg_data": self._latest_jpeg,
                                     "frame_seq": self._frame_seq,
                                     "frame_age_ms": max(0, int(age_ms)),
+                                    "metadata": dict(self._latest_frame_metadata or {}),
                                 }
                                 if now - last_emit >= interval:
                                     frame = candidate
                                     break
                         remaining = deadline - now
+                        if self._latest_jpeg is not None and self._latest_frame_monotonic > 0:
+                            until_live_expiry = (
+                                self._latest_frame_monotonic
+                                + LIVE_CAMERA_STALE_THRESHOLD_MS / 1000.0
+                                - now
+                            )
+                            remaining = min(remaining, max(0.0, until_live_expiry))
                         if remaining <= 0:
                             break
                         self._frame_changed.wait(min(remaining, interval))
+                    if not lease_expired and frame is None and self._latest_jpeg is not None:
+                        age_ms = (time.monotonic() - self._latest_frame_monotonic) * 1000
+                        if age_ms > LIVE_CAMERA_STALE_THRESHOLD_MS:
+                            self._clear_latest_frame_locked()
+                            self._frame_changed.notify_all()
                     if not lease_expired and frame is None and first_frame:
                         raise CameraStreamFrameUnavailable("NO_FRESH_FRAME")
-                    if not lease_expired and frame is None and not first_frame and time.monotonic() - last_valid_frame_at > self.stale_threshold_ms / 1000.0:
+                    if not lease_expired and frame is None and not first_frame and time.monotonic() - last_valid_frame_at > LIVE_CAMERA_STALE_THRESHOLD_MS / 1000.0:
                         return
                 if lease_expired:
                     # Re-enter the standard expiry path outside the condition lock
@@ -473,11 +535,48 @@ class CameraViewerService:
                     "Content-Type: image/jpeg\r\n"
                     f"Content-Length: {len(jpeg)}\r\n"
                     f"X-Frame-Seq: {frame['frame_seq']}\r\n"
-                    f"X-Frame-Age-Ms: {frame['frame_age_ms']}\r\n\r\n"
+                    f"X-Frame-Age-Ms: {frame['frame_age_ms']}\r\n"
+                    + self._metadata_headers(frame["metadata"])
+                    + "\r\n"
                 ).encode("ascii") + jpeg + b"\r\n"
                 yield part
 
         return _ReservedCameraStream(stream(), release_reservation)
+
+    @staticmethod
+    def _metadata_headers(metadata: dict[str, Any]) -> str:
+        """Encode only bounded, validated CR-022 timing/session metadata headers."""
+        names = {
+            "sequence": "X-Device-Sequence",
+            "capture_timestamp_ms": "X-Device-Capture-Monotonic-Ms",
+            "host_receive_monotonic_ms": "X-Host-Receive-Monotonic-Ms",
+            "clock_offset_ms": "X-Clock-Offset-Ms",
+            "clock_uncertainty_ms": "X-Clock-Uncertainty-Ms",
+            "latency_ms": "X-Source-To-Host-Receive-Ms",
+        }
+        lines = []
+        uint32_fields = {"sequence", "capture_timestamp_ms", "host_receive_monotonic_ms"}
+        for key, name in names.items():
+            value = metadata.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if key in uint32_fields:
+                if not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+                    continue
+            elif abs(value) > 0x7FFFFFFF or not math.isfinite(value):
+                continue
+            lines.append(f"{name}: {value}\r\n")
+        generation = metadata.get("session_generation")
+        if isinstance(generation, str) and generation.isascii() and generation and len(generation) <= 128 and all(ch.isalnum() or ch in "-_" for ch in generation):
+            lines.append(f"X-Session-Generation: {generation}\r\n")
+        return "".join(lines)
+
+    def _clear_latest_frame_locked(self) -> None:
+        self._latest_jpeg = None
+        self._latest_frame_time = 0.0
+        self._latest_frame_monotonic = 0.0
+        self._latest_frame_metadata = None
+        self._is_hardware_frame = False
 
     def get_latest_frame(self, client_id: str) -> Optional[dict[str, Any]]:
         """
@@ -513,6 +612,7 @@ class CameraViewerService:
                 "is_masked": False,
                 "source": "hardware_sensor" if is_hw else "external_source",
                 "is_hardware": is_hw,
+                "metadata": dict(self._latest_frame_metadata or {}),
             }
 
     def get_snapshot(
