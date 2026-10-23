@@ -222,7 +222,9 @@ class OfficialCameraStreamIngress:
         self.session_generation = session_generation or uuid.uuid4().hex
         self._clock_ping_interval = max(0.1, float(clock_ping_interval))
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
         self._owner: str | None = None
+        self._lease_generation: int | None = None
         self._stream_id: int | None = None
         self._active = True
         self._session_available = True
@@ -253,7 +255,19 @@ class OfficialCameraStreamIngress:
         with self._lock:
             return self._clock_uncertainty_ms is not None and self._clock_uncertainty_ms <= 100.0
 
-    def start(self, client_id: str, lease_ms: int) -> dict[str, Any]:
+    def start(self, client_id: str, lease_ms: int, *, lease_generation: int | None = None) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            with self._lock:
+                current_generation = self._lease_generation
+                replace_generation = self._owner == client_id and lease_generation is not None \
+                    and lease_generation != current_generation
+            if replace_generation:
+                self.stop(expected_generation=current_generation)
+            return self._start_locked(client_id, lease_ms, lease_generation=lease_generation)
+
+    def _start_locked(
+        self, client_id: str, lease_ms: int, *, lease_generation: int | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             if self._closed or not self._session_available:
                 return {"started": False, "reason": "SESSION_UNAVAILABLE"}
@@ -265,7 +279,7 @@ class OfficialCameraStreamIngress:
             active_stream_id = self._stream_id
             if active_owner and active_owner != client_id:
                 return {"started": False, "reason": "STREAM_ALREADY_ACTIVE"}
-            if not self._owner_is_valid(client_id):
+            if not self._owner_generation_is_valid(client_id, lease_generation):
                 return {"started": False, "reason": "NO_ACTIVE_LEASE"}
         if active_owner == client_id:
             # Host lease renewals must renew the device lease too; they must not
@@ -277,6 +291,9 @@ class OfficialCameraStreamIngress:
                     2.0,
                 )
                 if self._ack_succeeded(ack):
+                    if lease_generation is not None:
+                        with self._lock:
+                            self._lease_generation = lease_generation
                     return {"started": True, "client_id": client_id, "stream_id": active_stream_id}
                 return {"started": False, "reason": "CAMERA_LEASE_RENEWAL_REJECTED"}
             except Exception as error:
@@ -308,12 +325,13 @@ class OfficialCameraStreamIngress:
                 acquired = False
                 return {"started": False, "reason": "CAMERA_STREAM_START_REJECTED"}
             with self._lock:
-                if self._closed or not self._owner_is_valid(client_id):
+                if self._closed or not self._owner_generation_is_valid(client_id, lease_generation):
                     self._send_command("ctrl.camera.stream.stop", {"client_id": client_id, "stream_id": stream_id}, 1.0)
                     self._send_command("ctrl.camera.release", {"client_id": client_id}, 1.0)
                     acquired = False
                     return {"started": False, "reason": "LEASE_EXPIRED_DURING_START"}
                 self._owner = client_id
+                self._lease_generation = lease_generation
                 self._stream_id = stream_id
                 self._last_sequence = None
                 self._last_timestamp = None
@@ -337,20 +355,30 @@ class OfficialCameraStreamIngress:
             logger.warning("Official SDK camera stream start failed: %s", error)
             return {"started": False, "reason": "UPSTREAM_UNAVAILABLE"}
 
-    def acquire(self, client_id: str, lease_ms: int, target_fps: float = 15.0) -> dict[str, Any]:
+    def acquire(
+        self, client_id: str, lease_ms: int, target_fps: float = 15.0,
+        *, lease_generation: int | None = None,
+    ) -> dict[str, Any]:
         """Camera lease adapter shape used by the Host's existing lease handler."""
         if target_fps < 15.0:
             return {"granted": False, "reason": "LIVE_STREAM_REQUIRES_15_FPS"}
-        result = self.start(client_id, lease_ms)
+        result = self.start(client_id, lease_ms, lease_generation=lease_generation)
         if not result.get("started"):
             return {"granted": False, "reason": result.get("reason", "DEVICE_ERROR")}
         return {"granted": True, "client_id": client_id, "stream_id": result["stream_id"]}
 
-    def release(self, client_id: str) -> bool:
+    def release(self, client_id: str, *, expected_generation: int | None = None) -> bool:
         with self._lock:
-            if self._owner != client_id:
+            if (self._owner != client_id
+                    or (expected_generation is not None and expected_generation != self._lease_generation)):
                 return False
-        return self.stop()
+        return self.stop(expected_generation=expected_generation)
+
+    def _owner_generation_is_valid(self, owner: str, generation: int | None) -> bool:
+        try:
+            return bool(self._owner_is_valid(owner, generation))
+        except TypeError:
+            return bool(self._owner_is_valid(owner))
 
     def on_application_frame(
         self,
@@ -367,7 +395,7 @@ class OfficialCameraStreamIngress:
             stream_id = self._stream_id
             if (not self._active or not owner or stream_id is None
                     or (session_generation is not None and session_generation != self.session_generation)
-                    or not self._owner_is_valid(owner)):
+                    or not self._owner_generation_is_valid(owner, self._lease_generation)):
                 self._drop_count += 1
                 return False
         try:
@@ -398,7 +426,7 @@ class OfficialCameraStreamIngress:
                     "latency_ms": latency,
                 })
                 if (not self._active or owner != self._owner or stream_id != self._stream_id
-                        or not self._owner_is_valid(owner)):
+                        or not self._owner_generation_is_valid(owner, self._lease_generation)):
                     self._drop_count += 1
                     return False
                 self._last_sequence = parsed["sequence"]
@@ -462,14 +490,21 @@ class OfficialCameraStreamIngress:
                     return
             self.ping_clock()
 
-    def stop(self) -> bool:
+    def stop(self, *, expected_generation: int | None = None) -> bool:
+        with self._lifecycle_lock:
+            return self._stop_locked(expected_generation=expected_generation)
+
+    def _stop_locked(self, *, expected_generation: int | None = None) -> bool:
         with self._lock:
             owner = self._owner
+            generation = self._lease_generation
             stream_id = self._stream_id
-            if owner is None:
+            if (owner is None
+                    or (expected_generation is not None and expected_generation != generation)):
                 return False
             self._active = False
             self._owner = None
+            self._lease_generation = None
             self._stream_id = None
             self._last_sequence = None
             self._last_timestamp = None
@@ -496,22 +531,24 @@ class OfficialCameraStreamIngress:
             stop_ok = False
             logger.warning("Camera lease release unconfirmed: %s", error)
         if self._clear_frame:
-            self._clear_frame(owner)
+            self._clear_frame_for_generation(owner, generation)
         return stop_ok
 
     def on_session_disconnect(self) -> None:
         with self._lock:
             owner = self._owner
+            generation = self._lease_generation
             self._active = False
             self._session_available = False
             self._owner = None
+            self._lease_generation = None
             self._stream_id = None
             self._latest_frame_metadata = None
             self._clock_offset_ms = None
             self._clock_uncertainty_ms = None
             self._ping_stop.set()
         if owner and self._clear_frame:
-            self._clear_frame(owner)
+            self._clear_frame_for_generation(owner, generation)
 
     def close(self) -> None:
         with self._lock:
@@ -524,6 +561,14 @@ class OfficialCameraStreamIngress:
     @staticmethod
     def _ack_succeeded(ack: Any) -> bool:
         return isinstance(ack, dict) and ack.get("type") == "sys.ack" and ack.get("code") == 0
+
+    def _clear_frame_for_generation(self, owner: str, generation: int | None) -> None:
+        if not self._clear_frame:
+            return
+        try:
+            self._clear_frame(owner, expected_generation=generation)
+        except TypeError:
+            self._clear_frame(owner)
 
     def set_clear_frame_callback(self, callback: Callable[[str], None] | None) -> None:
         self._clear_frame = callback

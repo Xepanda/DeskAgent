@@ -189,6 +189,7 @@ class DeskAgentHostApp:
         self._managed_camera_raw_observer_remove: Optional[Callable[[], None]] = None
         self._camera_stream_metadata_lock = threading.Lock()
         self._latest_camera_stream_metadata: Optional[dict[str, Any]] = None
+        self._latest_camera_stream_lease_generation: Optional[int] = None
         self._snapshot_rate_limit_lock = threading.Lock()
         self._last_snapshot_request_at: dict[str, float] = {}
 
@@ -917,6 +918,7 @@ class DeskAgentHostApp:
         lease_ms = req.arguments.get("lease_duration_ms")
         target_fps = req.arguments.get("target_fps")
         res = self.camera_service.acquire_lease(client_id, lease_ms, target_fps=target_fps)
+        lease_generation = res.get("lease_generation")
         if not res["granted"]:
             return ResponseEnvelope.create_error(
                 req.request_id,
@@ -929,9 +931,10 @@ class DeskAgentHostApp:
                 client_id,
                 res.get("lease_duration_ms", 10000),
                 target_fps=15.0,
+                lease_generation=lease_generation,
             )
             if not device_result.get("granted"):
-                self.camera_service.release_lease(client_id)
+                self.camera_service.release_lease(client_id, expected_generation=lease_generation)
                 return ResponseEnvelope.create_error(
                     req.request_id,
                     code=device_result.get("reason", "DEVICE_ERROR"),
@@ -940,10 +943,12 @@ class DeskAgentHostApp:
                 )
         elif self.official_camera_adapter is not None:
             device_result = self.official_camera_adapter.acquire(
-                client_id, res.get("lease_duration_ms", 10000), target_fps=float(target_fps or res.get("target_fps", 2.0))
+                client_id, res.get("lease_duration_ms", 10000),
+                target_fps=float(target_fps or res.get("target_fps", 2.0)),
+                lease_generation=lease_generation,
             )
             if not device_result.get("granted"):
-                self.camera_service.release_lease(client_id)
+                self.camera_service.release_lease(client_id, expected_generation=lease_generation)
                 return ResponseEnvelope.create_error(
                     req.request_id,
                     code=device_result.get("reason", "DEVICE_ERROR"),
@@ -959,7 +964,7 @@ class DeskAgentHostApp:
                 }, timeout=1.0)
                 if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
                     logger.warning("Robot rejected camera acquire: %s. Rolling back host lease.", ack)
-                    self.camera_service.release_lease(client_id)
+                    self.camera_service.release_lease(client_id, expected_generation=lease_generation)
                     err_info = ack.get("error", {}) if isinstance(ack, dict) else {}
                     return ResponseEnvelope.create_error(
                         req.request_id,
@@ -972,18 +977,24 @@ class DeskAgentHostApp:
                 }, timeout=1.0)
             except Exception as e:
                 logger.warning("Failed to dispatch camera acquire/capture to robot: %s. Rolling back lease.", e)
-                self.camera_service.release_lease(client_id)
+                self.camera_service.release_lease(client_id, expected_generation=lease_generation)
                 return ResponseEnvelope.create_error(
                     req.request_id,
                     code="DEVICE_ERROR",
                     message=f"Failed to communicate with robot camera: {e}",
                 )
-        return ResponseEnvelope.create_success(req.request_id, res)
+        # lease_generation is Host-internal teardown coordination and must not
+        # change the stable device/client wire contract.
+        return ResponseEnvelope.create_success(
+            req.request_id, {key: value for key, value in res.items() if key != "lease_generation"}
+        )
 
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")
         released = self.camera_service.release_lease(client_id)
-        if released and self.official_camera_adapter is None and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+        if (released and self.official_camera_adapter is None
+                and self.official_camera_stream_ingress is None
+                and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command")):
             try:
                 self._robot_client.send_command({
                     "type": "ctrl.camera.release",
@@ -1015,10 +1026,11 @@ class DeskAgentHostApp:
         )
         self.official_camera_adapter = adapter
 
-        def owner_is_valid(owner: str) -> bool:
+        def owner_is_valid(owner: str, generation: int | None = None) -> bool:
             with self.camera_service._lock:
                 return (
                     self.camera_service._active_lease_owner == owner
+                    and (generation is None or self.camera_service._active_lease_generation == generation)
                     and time.time() < self.camera_service._lease_expires_at
                 )
 
@@ -1035,11 +1047,12 @@ class DeskAgentHostApp:
                 communicators, ingress.on_application_frame
             )
 
-        def release_device_lease(owner: str, reason: str) -> None:
+        def release_device_lease(owner: str, reason: str, lease_generation: int) -> None:
             if previous_teardown:
-                previous_teardown(owner, reason)
-            adapter.release(owner)
-            ingress.release(owner)
+                previous_teardown(owner, reason, lease_generation)
+            adapter.release(owner, expected_generation=lease_generation)
+            ingress.release(owner, expected_generation=lease_generation)
+            self._clear_camera_stream_metadata(expected_generation=lease_generation)
 
         self.camera_service.on_lease_released = release_device_lease
         if on_disconnect is not None:
@@ -1057,17 +1070,31 @@ class DeskAgentHostApp:
         """Preserve stream metadata at the A3-to-A6 seam while updating A6's JPEG slot."""
         with self._camera_stream_metadata_lock:
             self._latest_camera_stream_metadata = dict(metadata)
+            ingress = getattr(self, "official_camera_stream_ingress", None)
+            self._latest_camera_stream_lease_generation = (
+                ingress._lease_generation if ingress is not None else None
+            )
         self.camera_service.ingest_robot_frame(jpeg, metadata)
 
-    def _clear_camera_stream_metadata(self) -> None:
+    def _clear_camera_stream_metadata(self, *, expected_generation: int | None = None) -> None:
         lock = getattr(self, "_camera_stream_metadata_lock", None)
         if lock is not None:
             with lock:
+                current_generation = getattr(self, "_latest_camera_stream_lease_generation", None)
+                if (expected_generation is not None and current_generation is not None
+                        and current_generation != expected_generation):
+                    return
                 self._latest_camera_stream_metadata = None
+                self._latest_camera_stream_lease_generation = None
 
-    def _invalidate_official_camera_owner(self, owner: str) -> None:
-        self.camera_service.invalidate_owner_on_upstream_disconnect(owner)
-        self._clear_camera_stream_metadata()
+    def _invalidate_official_camera_owner(
+        self, owner: str, *, expected_generation: int | None = None,
+    ) -> None:
+        invalidated = self.camera_service.invalidate_owner_on_upstream_disconnect(
+            owner, expected_generation=expected_generation
+        )
+        if invalidated:
+            self._clear_camera_stream_metadata(expected_generation=expected_generation)
 
     def _on_official_camera_session_disconnect(self) -> None:
         if self.official_camera_stream_ingress is not None:
@@ -1526,6 +1553,7 @@ def make_request_handler(app: DeskAgentHostApp):
 
                 if is_snapshot_path:
                     ephemeral_lease_acquired = False
+                    ephemeral_lease_generation = None
                     if app.camera_service.is_lease_valid():
                         if not client_id or app.camera_service._active_lease_owner != client_id:
                             self.send_response(403)
@@ -1543,10 +1571,30 @@ def make_request_handler(app: DeskAgentHostApp):
                             self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
                             return
                         ephemeral_lease_acquired = True
-                        if app.official_camera_adapter is not None:
-                            device_acq = app.official_camera_adapter.acquire(effective_client, 5000, target_fps=10.0)
+                        ephemeral_lease_generation = acq.get("lease_generation")
+                        if app.official_camera_stream_ingress is not None:
+                            device_acq = app.official_camera_stream_ingress.acquire(
+                                effective_client, 5000, target_fps=15.0,
+                                lease_generation=ephemeral_lease_generation,
+                            )
                             if not device_acq.get("granted"):
-                                app.camera_service.release_lease(effective_client)
+                                app.camera_service.release_lease(
+                                    effective_client, expected_generation=ephemeral_lease_generation
+                                )
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": device_acq.get("reason", "DEVICE_UNAVAILABLE")}).encode())
+                                return
+                        elif app.official_camera_adapter is not None:
+                            device_acq = app.official_camera_adapter.acquire(
+                                effective_client, 5000, target_fps=10.0,
+                                lease_generation=ephemeral_lease_generation,
+                            )
+                            if not device_acq.get("granted"):
+                                app.camera_service.release_lease(
+                                    effective_client, expected_generation=ephemeral_lease_generation
+                                )
                                 self.send_response(503)
                                 self.send_header("Content-Type", "application/json")
                                 self.end_headers()
@@ -1561,7 +1609,9 @@ def make_request_handler(app: DeskAgentHostApp):
                                 }, timeout=1.0)
                                 if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
                                     logger.warning("Robot rejected snapshot camera acquire: %s", ack)
-                                    app.camera_service.release_lease(effective_client)
+                                    app.camera_service.release_lease(
+                                        effective_client, expected_generation=ephemeral_lease_generation
+                                    )
                                     self.send_response(403)
                                     self.send_header("Content-Type", "application/json")
                                     self.end_headers()
@@ -1569,7 +1619,9 @@ def make_request_handler(app: DeskAgentHostApp):
                                     return
                             except Exception as exc:
                                 logger.warning("Snapshot acquire dispatch error: %s", exc)
-                                app.camera_service.release_lease(effective_client)
+                                app.camera_service.release_lease(
+                                    effective_client, expected_generation=ephemeral_lease_generation
+                                )
                                 self.send_response(503)
                                 self.send_header("Content-Type", "application/json")
                                 self.end_headers()
@@ -1578,7 +1630,8 @@ def make_request_handler(app: DeskAgentHostApp):
 
                     try:
                         initial_seq = getattr(app.camera_service, "_frame_seq", 0)
-                        if app.official_camera_adapter is not None:
+                        if (app.official_camera_adapter is not None
+                                or app.official_camera_stream_ingress is not None):
                             frame_info = None
                             deadline = time.time() + 1.2
                             while time.time() < deadline:
@@ -1661,8 +1714,12 @@ def make_request_handler(app: DeskAgentHostApp):
                         self.wfile.write(frame_info["jpeg_data"])
                     finally:
                         if ephemeral_lease_acquired:
-                            app.camera_service.release_lease(effective_client)
-                            if app.official_camera_adapter is None and app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                            app.camera_service.release_lease(
+                                effective_client, expected_generation=ephemeral_lease_generation
+                            )
+                            if (app.official_camera_adapter is None
+                                    and app.official_camera_stream_ingress is None
+                                    and app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command")):
                                 try:
                                     app._robot_client.send_command({
                                         "type": "ctrl.camera.release",

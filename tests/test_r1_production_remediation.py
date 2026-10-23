@@ -233,6 +233,8 @@ class TestCameraAcquireReleasePipeline(unittest.TestCase):
         req = make_req("resource.camera.acquire", {"client_id": "test-viewer", "lease_duration_ms": 5000}, client_id="test-viewer")
         resp = self.app._handle_camera_acquire(req)
         self.assertEqual(resp.status, ResponseStatus.SUCCEEDED)
+        self.assertNotIn("lease_generation", resp.to_dict()["result"])
+        self.assertIsNotNone(self.app.camera_service._active_lease_generation)
 
         commands_sent = [call.args[0]["type"] for call in self.mock_robot.send_command.call_args_list]
         self.assertIn("ctrl.camera.acquire", commands_sent)
