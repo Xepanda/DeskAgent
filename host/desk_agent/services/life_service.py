@@ -885,7 +885,7 @@ class LifeService:
 
     @staticmethod
     def _expire_recovery_summaries(conn: sqlite3.Connection, now_iso: str) -> None:
-        """Stop pending summary delivery at the immutable summary TTL."""
+        """Stop expired summaries and resolve their still-pending occurrences."""
         conn.execute(
             "UPDATE recovery_batches SET state = 'expired' WHERE expires_at <= ? AND state = 'pending'",
             (now_iso,),
@@ -895,6 +895,46 @@ class LifeService:
             "AND state IN ('pending', 'dispatching') AND json_extract(payload_json, '$.expires_at') <= ?",
             (now_iso,),
         )
+        overdue = conn.execute(
+            """SELECT o.occurrence_id, o.reminder_id, o.scheduled_at,
+                      r.repeat_rule, r.timezone
+               FROM recovery_batch_items bi
+               JOIN recovery_batches b ON b.batch_id = bi.batch_id
+               JOIN occurrences o ON o.occurrence_id = bi.occurrence_id
+               JOIN reminders r ON r.reminder_id = o.reminder_id
+               WHERE b.state = 'expired' AND b.expires_at <= ? AND o.state = 'pending'
+                 AND r.status NOT IN ('completed', 'cancelled', 'archived')""",
+            (now_iso,),
+        ).fetchall()
+        for row in overdue:
+            conn.execute(
+                "UPDATE occurrences SET state = 'expired' WHERE occurrence_id = ? AND state = 'pending'",
+                (row["occurrence_id"],),
+            )
+            next_due = (
+                _next_occurrence_after(row["scheduled_at"], row["repeat_rule"], now_iso, row["timezone"])
+                if row["repeat_rule"]
+                else None
+            )
+            if next_due:
+                next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
+                next_occurrence_id = f"occ-{row['reminder_id']}-{next_ts}"
+                conn.execute(
+                    "INSERT OR IGNORE INTO occurrences (occurrence_id, reminder_id, scheduled_at, state) "
+                    "VALUES (?, ?, ?, 'pending')",
+                    (next_occurrence_id, row["reminder_id"], next_due),
+                )
+                conn.execute(
+                    "UPDATE reminders SET due_at = ?, status = 'scheduled', updated_at = ? "
+                    "WHERE reminder_id = ? AND status NOT IN ('completed', 'cancelled', 'archived')",
+                    (next_due, now_iso, row["reminder_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE reminders SET status = 'missed', updated_at = ? "
+                    "WHERE reminder_id = ? AND status NOT IN ('completed', 'cancelled', 'archived')",
+                    (now_iso, row["reminder_id"]),
+                )
 
     def get_all_occurrences(self, reminder_id: str) -> list[dict[str, Any]]:
         """Returns all occurrences for a reminder ordered by scheduled_at."""

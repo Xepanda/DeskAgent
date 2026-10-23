@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import timezone
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfoNotFoundError
@@ -194,8 +195,11 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertEqual(self.service.get_all_occurrences("ack")[0], before)
 
     def test_expired_summary_is_not_pending_and_late_ack_is_ignored(self) -> None:
-        self._reminder("ttl", "2026-10-23T11:00:00Z")
-        batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+        occurrence_id = self._reminder("ttl", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+        self.service.close()
+        self.service = LifeService(self.db_path)
 
         pending = self.service.get_pending_outbox_messages(now_iso="2026-10-24T12:00:00Z")
         late_ack = self.service.record_recovery_summary_ack(
@@ -207,6 +211,38 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertEqual(late_ack, "ignored")
         receipt = self.service.get_recovery_summary_receipt(batch["summary_id"])
         self.assertFalse(receipt["acknowledged"])
+        self.assertEqual(self.service.get_all_occurrences("ttl")[0]["state"], "expired")
+        self.assertEqual(self.service.get_reminder("ttl")["status"], "missed")
+        self.assertEqual(self.service.get_all_occurrences("ttl")[0]["occurrence_id"], occurrence_id)
+
+    def test_expired_summary_advances_recurring_reminder_past_offline_misses(self) -> None:
+        occurrence_id = self._reminder(
+            "repeat-ttl", "2026-10-23T11:00:00Z", "UTC"
+        )
+        self.service.update_reminder("repeat-ttl", repeat_rule="daily")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+        self.service.close()
+        self.service = LifeService(self.db_path)
+
+        self.service.get_pending_outbox_messages(now_iso="2026-10-24T12:00:00Z")
+        self.service.get_pending_outbox_messages(now_iso="2026-10-24T12:01:00Z")
+
+        occurrences = self.service.get_all_occurrences("repeat-ttl")
+        self.assertEqual(
+            [(item["occurrence_id"], item["state"], item["scheduled_at"]) for item in occurrences],
+            [
+                (occurrence_id, "expired", "2026-10-23T11:00:00Z"),
+                ("occ-repeat-ttl-1792926000", "pending", "2026-10-25T11:00:00Z"),
+            ],
+        )
+        self.assertEqual(self.service.get_reminder("repeat-ttl")["status"], "scheduled")
+        self.assertEqual(
+            self.service._get_connection().execute(
+                "SELECT state FROM recovery_batches WHERE batch_id = ?", (batch["batch_id"],)
+            ).fetchone()["state"],
+            "expired",
+        )
 
     def test_batch_membership_and_outbox_rollback_together_on_sqlite_failure(self) -> None:
         self._reminder("rollback", "2026-10-23T11:00:00Z")
