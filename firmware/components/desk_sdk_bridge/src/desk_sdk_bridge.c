@@ -19,6 +19,8 @@
 #include <fcntl.h>
 #ifdef ESP_PLATFORM
 #include <sys/poll.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_attr.h"
 #include "tal_api.h"
 #define DESK_PROTOCOL_BSS EXT_RAM_BSS_ATTR
@@ -2618,8 +2620,13 @@ static void *desk_sdk_camera_stream_worker(void *unused)
                 break;
             }
         }
-        struct timespec pause = { .tv_sec = 0, .tv_nsec = 5000000L };
+#ifdef ESP_PLATFORM
+        TickType_t pause_ticks = pdMS_TO_TICKS(5U);
+        vTaskDelay(pause_ticks > 0 ? pause_ticks : 1);
+#else
+        const struct timespec pause = { .tv_sec = 0, .tv_nsec = 5000000L };
         nanosleep(&pause, NULL);
+#endif
     }
     pthread_mutex_lock(&s_camera_stream.mutex);
     s_camera_stream.stop_requested = true;
@@ -4894,8 +4901,6 @@ int desk_firmware_poll(int timeout_ms)
 }
 
 #ifdef ESP_PLATFORM
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 static TaskHandle_t s_worker_task_handle = NULL;
