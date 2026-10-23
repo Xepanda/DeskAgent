@@ -1,5 +1,7 @@
 import importlib.util
 import builtins
+import contextlib
+import io
 from pathlib import Path
 import subprocess
 import sys
@@ -203,6 +205,100 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
                     MODULE.run_build(repo, sdk, repo / "firmware" / ".target_logging" / "attempt")
             self.assertEqual(len(calls), 1)
             self.assertNotIn(str(sdk), str(calls))
+
+    def test_main_checks_repo_manifest_before_resolving_sdk_argument(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            sdk = root / "shared-sdk"
+            archive = repo / "firmware" / ".target_logging" / "attempt"
+            (repo / "firmware" / ".target_logging").mkdir(parents=True)
+            sdk.mkdir()
+            commands = []
+
+            def missing_manifest(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"missing")
+
+            stderr = io.StringIO()
+            with self._forbidden_access_guards([sdk]), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=missing_manifest), \
+                    mock.patch.object(sys, "argv", [str(MODULE_PATH), "--repo", str(repo),
+                                                       "--sdk", str(sdk), "--archive", str(archive)]), \
+                    contextlib.redirect_stderr(stderr):
+                result = MODULE.main()
+            self.assertEqual(result, 2)
+            self.assertIn("tracked SDK provenance manifest", stderr.getvalue())
+            self.assertEqual(len(commands), 1)
+            self.assertNotIn(str(sdk), str(commands))
+
+    def test_configure_partition_cli_rejects_missing_stage_token_before_touching_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            archive = repo / "firmware" / ".target_logging" / "run-unique"
+            sdkconfig = root / "shared" / "sdkconfig"
+            csv_path = root / "shared" / "partitions.csv"
+            sdkconfig.parent.mkdir()
+            sdkconfig.write_text("SENTINEL_CONFIG", encoding="utf-8")
+            csv_path.write_text("SENTINEL_CSV", encoding="utf-8")
+            forbidden = [sdkconfig, csv_path]
+            stderr = io.StringIO()
+            with self._forbidden_access_guards(forbidden), \
+                    mock.patch.object(sys, "argv", [
+                        str(MODULE_PATH), "--configure-partition", str(sdkconfig), str(csv_path),
+                        "--archive", str(archive), "--stage-manifest",
+                        str(archive / "stage" / "runner-stage-token.json"), "--repo", str(repo),
+                    ]), contextlib.redirect_stderr(stderr):
+                result = MODULE.main()
+            self.assertEqual(result, 2)
+            self.assertIn("runner stage token", stderr.getvalue())
+            self.assertEqual(sdkconfig.read_text(encoding="utf-8"), "SENTINEL_CONFIG")
+            self.assertEqual(csv_path.read_text(encoding="utf-8"), "SENTINEL_CSV")
+
+    def test_configure_partition_cli_rejects_paths_outside_authorized_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            archive = repo / "firmware" / ".target_logging" / "run-unique"
+            stage = archive / "stage"
+            stage.mkdir(parents=True)
+            token_path = MODULE.write_stage_authorization(archive, archive)
+            shared = root / "shared"
+            sdkconfig = shared / "sdkconfig"
+            csv_path = shared / "partitions.csv"
+            shared.mkdir()
+            sdkconfig.write_text("SENTINEL_CONFIG", encoding="utf-8")
+            csv_path.write_text("SENTINEL_CSV", encoding="utf-8")
+            stderr = io.StringIO()
+            with self._forbidden_access_guards([sdkconfig, csv_path]), \
+                    mock.patch.object(sys, "argv", [
+                        str(MODULE_PATH), "--configure-partition", str(sdkconfig), str(csv_path),
+                        "--archive", str(archive), "--stage-manifest", str(token_path), "--repo", str(repo),
+                    ]), contextlib.redirect_stderr(stderr):
+                result = MODULE.main()
+            self.assertEqual(result, 2)
+            self.assertIn("outside the authorized archive stage", stderr.getvalue())
+
+    def test_configure_partition_cli_accepts_only_runner_authorized_stage_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            archive = repo / "firmware" / ".target_logging" / "run-unique"
+            stage = archive / "stage"
+            sdkconfig = stage / MODULE.STAGE_CONFIG_RELATIVE
+            csv_path = stage / MODULE.STAGE_PARTITIONS_RELATIVE
+            sdkconfig.parent.mkdir(parents=True)
+            csv_path.parent.mkdir(parents=True)
+            sdkconfig.write_text('CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"\n', encoding="utf-8")
+            csv_path.write_text("csv", encoding="utf-8")
+            token_path = MODULE.write_stage_authorization(archive, archive)
+            with mock.patch.object(sys, "argv", [
+                str(MODULE_PATH), "--configure-partition", str(sdkconfig), str(csv_path),
+                "--archive", str(archive), "--stage-manifest", str(token_path), "--repo", str(repo),
+            ]):
+                self.assertEqual(MODULE.main(), 0)
+            self.assertIn(str(csv_path.resolve()).replace("\\", "/"),
+                          sdkconfig.read_text(encoding="utf-8"))
 
     def test_bridge_direct_cli_refuses_before_sdk_filesystem_or_subprocess_access(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -516,24 +612,31 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
 
     def test_partition_config_reasserts_absolute_staged_csv(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            config = root / "sdkconfig"
-            csv = root / "app" / "partitions.csv"
-            csv.parent.mkdir()
+            repo = Path(temp) / "repo"
+            archive = repo / "firmware" / ".target_logging" / "run"
+            stage = archive / "stage"
+            config = stage / MODULE.STAGE_CONFIG_RELATIVE
+            csv = stage / MODULE.STAGE_PARTITIONS_RELATIVE
+            config.parent.mkdir(parents=True)
+            csv.parent.mkdir(parents=True)
             csv.write_text("csv", encoding="utf-8")
             config.write_text('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"\n'
                               'CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"\n', encoding="utf-8")
-            MODULE.configure_staged_partition_config(config, csv)
+            token_path = MODULE.write_stage_authorization(archive, archive)
+            authorization = MODULE.validate_partition_stage_token(config, csv, archive, token_path, repo)
+            MODULE.configure_staged_partition_config(config, csv, authorization=authorization)
             resolved = csv.resolve().as_posix()
             result = config.read_text(encoding="utf-8")
             self.assertIn(f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{resolved}"', result)
             self.assertIn(f'CONFIG_PARTITION_TABLE_FILENAME="{resolved}"', result)
             self.assertNotIn('CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"', result)
 
-    def test_cli_arguments_allow_helper_without_archive_but_require_it_for_build(self):
-        helper = MODULE.parse_arguments(["--configure-partition", "sdkconfig", "partitions.csv"])
+    def test_cli_arguments_require_stage_token_for_helper_and_archive_for_build(self):
+        helper = MODULE.parse_arguments(["--configure-partition", "sdkconfig", "partitions.csv",
+                                         "--archive", "firmware/.target_logging/run",
+                                         "--stage-manifest", "firmware/.target_logging/run/stage/runner-stage-token.json"])
         self.assertEqual(helper.configure_partition, ["sdkconfig", "partitions.csv"])
-        self.assertIsNone(helper.archive)
+        self.assertEqual(helper.archive, Path("firmware/.target_logging/run"))
 
         build = MODULE.parse_arguments(["--archive", "firmware/.target_logging/run"])
         self.assertEqual(build.archive, Path("firmware/.target_logging/run"))

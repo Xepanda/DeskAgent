@@ -15,7 +15,9 @@ import ntpath
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -27,6 +29,9 @@ EXCLUDED_FIRMWARE_DIRS = {
 IDF_VERSION = "5.4"
 IDF_TARGET = "esp32s3"
 SDK_PROVENANCE_MANIFEST = Path("docs/acceptance/cr035-sdk-inputs.json")
+STAGE_TOKEN_NAME = "runner-stage-token.json"
+STAGE_CONFIG_RELATIVE = Path("sdk/platform/ESP32/tuya_open_sdk/sdkconfig")
+STAGE_PARTITIONS_RELATIVE = Path("app/partitions.csv")
 
 
 def is_within(path: Path, root: Path) -> bool:
@@ -439,8 +444,95 @@ def idf_export_prefix(idf_tools_root: Path, python_scripts: Path, export_bat: Pa
     )
 
 
-def configure_staged_partition_config(config_path: Path, csv_path: Path) -> None:
+def write_stage_authorization(archive: Path, mount_root: Path) -> Path:
+    """Write a one-run marker that authorizes the staged partition helper only."""
+    archive_root = Path(os.path.abspath(str(archive)))
+    mount_alias = Path(os.path.abspath(str(mount_root)))
+    token_path = archive_root / "stage" / STAGE_TOKEN_NAME
+    token = {
+        "schema": "deskagent-stage-token-v1",
+        "nonce": secrets.token_hex(32),
+        "archive_root": str(archive_root),
+        "stage_root": str(archive_root / "stage"),
+        "stage_alias": str(mount_alias),
+        "sdkconfig_path": str(Path(os.path.abspath(str(mount_alias / "stage" / STAGE_CONFIG_RELATIVE)))),
+        "partition_csv_path": str(Path(os.path.abspath(str(mount_alias / "stage" / STAGE_PARTITIONS_RELATIVE)))),
+    }
+    token_path.write_text(json.dumps(token, indent=2) + "\n", encoding="utf-8")
+    return token_path
+
+
+def validate_partition_stage_token(
+    config_path: Path,
+    csv_path: Path,
+    archive: Path,
+    stage_manifest: Path,
+    repo: Path,
+) -> dict[str, object]:
+    """Validate a runner-created token before touching the requested config or CSV."""
+    archive_root = Path(os.path.abspath(str(archive)))
+    archive_base = Path(os.path.abspath(str(repo / "firmware" / ".target_logging")))
+    try:
+        relative = archive_root.relative_to(archive_base)
+    except ValueError as exc:
+        raise RuntimeError("BLOCKED: archive must be a unique child of firmware/.target_logging.") from exc
+    if not relative.parts or relative == Path("."):
+        raise RuntimeError("BLOCKED: archive must be a unique child of firmware/.target_logging.")
+
+    expected_manifest = archive_root / "stage" / STAGE_TOKEN_NAME
+    manifest_path = Path(os.path.abspath(str(stage_manifest)))
+    if os.path.normcase(str(manifest_path)) != os.path.normcase(str(expected_manifest)):
+        raise RuntimeError("BLOCKED: runner stage token must be inside this archive's stage directory.")
+
+    # lstat only the runner-owned archive/token path; refuse links before open.
+    checked_paths = (
+        repo / "firmware",
+        archive_base,
+        archive_root,
+        archive_root / "stage",
+        expected_manifest,
+    )
+    for checked in checked_paths:
+        try:
+            metadata = checked.lstat()
+        except OSError as exc:
+            raise RuntimeError("BLOCKED: runner stage token is missing or inaccessible.") from exc
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        if stat.S_ISLNK(metadata.st_mode) or attributes & 0x400:
+            raise RuntimeError("BLOCKED: runner stage token path contains a link or reparse point.")
+
+    try:
+        token = json.loads(expected_manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("BLOCKED: runner stage token is unreadable or invalid.") from exc
+    if not isinstance(token, dict) or token.get("schema") != "deskagent-stage-token-v1":
+        raise RuntimeError("BLOCKED: runner stage token schema is invalid.")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(token.get("nonce", ""))):
+        raise RuntimeError("BLOCKED: runner stage token nonce is invalid.")
+    if os.path.normcase(str(token.get("archive_root", ""))) != os.path.normcase(str(archive_root)):
+        raise RuntimeError("BLOCKED: runner stage token belongs to a different archive.")
+    expected_stage = archive_root / "stage"
+    if os.path.normcase(str(token.get("stage_root", ""))) != os.path.normcase(str(expected_stage)):
+        raise RuntimeError("BLOCKED: runner stage token stage root is invalid.")
+    for supplied, key in ((config_path, "sdkconfig_path"), (csv_path, "partition_csv_path")):
+        normalized = os.path.abspath(str(supplied))
+        if os.path.normcase(normalized) != os.path.normcase(str(token.get(key, ""))):
+            raise RuntimeError(f"BLOCKED: {key} is outside the authorized archive stage.")
+    return token
+
+
+def configure_staged_partition_config(
+    config_path: Path,
+    csv_path: Path,
+    *,
+    authorization: dict[str, object] | None = None,
+) -> None:
     """Restore the repository CSV after IDF set-target rewrites sdkconfig."""
+    if not authorization or authorization.get("schema") != "deskagent-stage-token-v1":
+        raise RuntimeError("BLOCKED: a validated runner stage token is required.")
+    for supplied, key in ((config_path, "sdkconfig_path"), (csv_path, "partition_csv_path")):
+        if os.path.normcase(os.path.abspath(str(supplied))) != os.path.normcase(str(authorization.get(key, ""))):
+            raise RuntimeError(f"BLOCKED: {key} is outside the authorized archive stage.")
     import re
     text = config_path.read_text(encoding="utf-8")
     text = re.sub(r'(?m)^CONFIG_PARTITION_TABLE_(?:CUSTOM_FILENAME|FILENAME)=.*\r?\n?', "", text)
@@ -484,6 +576,7 @@ def _run_mounted_build(
     native_config = staged_project / "sdkconfig"
     project_csv = (staged_app / "partitions.csv").as_posix()
     (staged_project / "partitions.csv").write_bytes((staged_app / "partitions.csv").read_bytes())
+    stage_token_path = write_stage_authorization(archive, mount_root)
 
     bridge = repo / "tools" / "verification" / "run_isolated_tuyaopen_bridge.py"
     idf_export = staged_sdk / "platform" / "ESP32" / "esp-idf" / "export.bat"
@@ -500,7 +593,8 @@ def _run_mounted_build(
 
     config_helper_command = (
         f'"{python}" "{Path(__file__).resolve()}" --configure-partition '
-        f'"{native_config}" "{staged_app / "partitions.csv"}"'
+        f'"{native_config}" "{staged_app / "partitions.csv"}" '
+        f'--archive "{archive}" --stage-manifest "{stage_token_path}" --repo "{repo}"'
     )
     wrapper = paths["archive"] / "run-isolated-bridge-mounted.py"
     wrapper.write_text(mounted_bridge_wrapper_source(), encoding="utf-8")
@@ -594,7 +688,10 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--sdk", type=Path, default=Path.home() / "TuyaOpenIDE" / "TuyaOpenSDK")
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--stage-manifest", type=Path)
     args = parser.parse_args(argv)
+    if args.configure_partition and (args.archive is None or args.stage_manifest is None):
+        parser.error("--configure-partition requires --archive and --stage-manifest")
     if not args.configure_partition and args.archive is None:
         parser.error("--archive is required for a firmware build")
     return args
@@ -602,11 +699,16 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_arguments()
-    if args.configure_partition:
-        configure_staged_partition_config(Path(args.configure_partition[0]), Path(args.configure_partition[1]))
-        return 0
     try:
-        return run_build(args.repo.resolve(), args.sdk.resolve(), args.archive)
+        if args.configure_partition:
+            config_path, csv_path = (Path(item) for item in args.configure_partition)
+            authorization = validate_partition_stage_token(
+                config_path, csv_path, args.archive, args.stage_manifest, args.repo,
+            )
+            configure_staged_partition_config(config_path, csv_path, authorization=authorization)
+            return 0
+        require_tracked_sdk_provenance(args.repo)
+        return run_build(args.repo.resolve(), args.sdk, args.archive)
     except Exception as exc:
         print(f"isolated firmware build refused/failed before completion: {exc}", file=sys.stderr)
         return 2
