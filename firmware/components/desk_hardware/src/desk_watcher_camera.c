@@ -56,7 +56,7 @@
 #define CAM_CONTROL_RETRIES       3U
 #define CAM_CONTROL_MODE_TIMEOUT_MS 3500U
 #define CAM_PTL_EMPTY_BACKOFF_MS  5U
-#define CAM_PTL_CAPTURE_TIMEOUT_MS 500U
+#define CAM_PTL_CAPTURE_TIMEOUT_MS 5000U
 #define CAM_PTL_RESYNC_TIMEOUT_MS 50U
 #define CAM_PTL_RESYNC_CHUNK_SIZE 16U
 #define CAM_PTL_RESYNC_MAX_CHUNKS 256U
@@ -565,6 +565,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
 
     if (timeout_ms == 0U) timeout_ms = CAM_PTL_CAPTURE_TIMEOUT_MS;
     const int64_t camera_capture_deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    /* Count the HX control-mode transition against the caller's one-shot budget. */
     if (camera_control_mode(1U, 0U) != 0) {
         xSemaphoreGive(s_cam_mutex);
         ESP_LOGE(TAG, "HX6538 failed to enter PTL capture mode");

@@ -352,6 +352,20 @@ int main(void) {
         self.assertIn("size_t *out_len, uint32_t timeout_ms)", camera)
         self.assertIn("(unsigned)timeout_ms", camera)
 
+    def test_capture_retry_budget_covers_control_mode_and_empty_fifo_warmup(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1].split("int desk_watcher_camera_deinit", 1)[0]
+        self.assertIn("CAM_PTL_CAPTURE_TIMEOUT_MS 5000U", source)
+        self.assertIn("camera_capture_deadline_us", capture)
+        self.assertLess(capture.index("camera_capture_deadline_us ="), capture.index("camera_control_mode(1U, 0U)"))
+        self.assertIn("while (esp_timer_get_time() < camera_capture_deadline_us)", capture)
+        self.assertIn("CAM_PTL_EMPTY_BACKOFF_MS", capture)
+
+    def test_cli_camera_capture_uses_upstream_five_second_default(self):
+        cli = (ROOT / "firmware/components/desk_cli/src/desk_cli.c").read_text(encoding="utf-8")
+        camera_command = cli.rsplit("static void cmd_camera(int argc, char *argv[])", 1)[1].split("static void cmd_body", 1)[0]
+        self.assertIn("&out_len, 5000)", camera_command)
+
 
 if __name__ == "__main__":
     unittest.main()
