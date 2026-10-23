@@ -29,6 +29,7 @@
 #ifdef ESP_PLATFORM
 #include "netmgr.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -284,7 +285,27 @@ static void cmd_sys_log_enable(int argc, char *argv[])
 static void cmd_sys_version(int argc, char *argv[])
 {
     (void)argc; (void)argv;
-    printf("Desk Agent R1 Firmware v1.0.0 (ESP-IDF v5.4, ESP32-S3 QFN56 v0.2)\r\n");
+#ifdef ESP_PLATFORM
+    const esp_app_desc_t *desc = esp_app_get_description();
+    if (!desc) {
+        printf("Running application identity: UNKNOWN (app descriptor unavailable)\r\n");
+        return;
+    }
+    printf("Running Application: project=%.*s version=%.*s\r\n",
+           (int)sizeof(desc->project_name), desc->project_name,
+           (int)sizeof(desc->version), desc->version);
+    printf("Build: date=%.*s time=%.*s ESP-IDF=%.*s\r\n",
+           (int)sizeof(desc->date), desc->date,
+           (int)sizeof(desc->time), desc->time,
+           (int)sizeof(desc->idf_ver), desc->idf_ver);
+    printf("ELF SHA256 (not source SHA): ");
+    for (size_t i = 0; i < sizeof(desc->app_elf_sha256); ++i) {
+        printf("%02x", (unsigned)desc->app_elf_sha256[i]);
+    }
+    printf("\r\n");
+#else
+    printf("Running application identity: UNKNOWN (host simulation)\r\n");
+#endif
 }
 
 extern uint32_t desk_app_task_stack_hwm(void);

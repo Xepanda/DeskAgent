@@ -85,6 +85,20 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertNotIn("Hardware Arbiter    : ACTIVE", system)
         self.assertNotIn("desk_arbiter_get_owner", system)
 
+    def test_system_version_reports_runtime_app_descriptor_identity(self) -> None:
+        version = function_body(self.source, "static void cmd_sys_version(int argc, char *argv[])\n{",
+                                "extern uint32_t desk_app_task_stack_hwm(void);")
+        component = (ROOT / "firmware/components/desk_cli/CMakeLists.txt").read_text(encoding="utf-8")
+
+        self.assertIn('#include "esp_app_desc.h"', self.source)
+        self.assertIn("esp_app_get_description()", version)
+        for field in ("project_name", "version", "date", "time", "idf_ver", "app_elf_sha256"):
+            self.assertIn(f"desc->{field}", version)
+        self.assertIn("ELF SHA256", version)
+        self.assertIn("not source SHA", version)
+        self.assertNotIn("git", version.lower())
+        self.assertIn("esp_app_format", component)
+
     def test_display_reports_initialization_shadow_and_scanout_independently(self) -> None:
         display = function_body(self.source, "static void cmd_display(int argc, char *argv[])\n{",
                                 "static void cmd_audio(int argc, char *argv[])\n{")
