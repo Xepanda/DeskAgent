@@ -1285,10 +1285,21 @@ class CodexCompanion:
             raise
 
         with self._lock:
-            task["state"] = "cancelling"
-            task["status"] = "cancelling"
-            self._persist_task(task)
-        return {"task_id": task_id, "turn_id": turn_id, "status": "cancelling", "reason": reason}
+            terminal_statuses = {"completed", "failed", "interrupted", "cancelled", "succeeded", "error"}
+            current_status = str(task.get("status") or "").lower()
+            if current_status not in terminal_statuses:
+                task["state"] = "cancelling"
+                task["status"] = "cancelling"
+                self._persist_task(task)
+            result = {
+                "task_id": task_id,
+                "turn_id": turn_id,
+                "status": task["status"],
+                "reason": reason,
+            }
+            if current_status in terminal_statuses:
+                result["summary"] = task.get("summary") or task.get("last_output") or ""
+        return result
 
     def request_approval(
         self,
