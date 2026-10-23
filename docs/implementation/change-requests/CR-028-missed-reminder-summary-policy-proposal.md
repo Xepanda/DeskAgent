@@ -3,7 +3,7 @@
 - **提出方：** A0 架构与协议
 - **状态：** **APPROVED — R1 本地产品/协议契约；尚未授权各业务 owner 实现**
 - **范围：** 冻结全局错过提醒策略、恢复批次、摘要消息及幂等/过期语义。A3 Host、A2 SDK bridge、A1 设备 handler/UI 后续按各自独立工作包实施。
-- **关联：** V2.1 用户体验草案 §1、§9；`contracts/schemas/notification_summary.json`；CR-017（单 occurrence `notification.deliver`）；CR-018（设备持久化仍 BLOCKED）；CR-019（Host outbox adapter）。
+- **关联：** V2.1 用户体验草案 §1、§9；`contracts/schemas/notification_summary.json`；CR-017（单 occurrence `notification.deliver`）；CR-018（Host SQLite canonical storage、设备易失呈现）；CR-019（Host outbox adapter）。
 - **证据级别：** 本 CR 与 JSON Schema 是 L1 契约；其本身不代表代码实现、节点实测或端到端恢复通过。
 
 ## 1. 已批准决策
@@ -15,7 +15,7 @@
 5. **用户呈现：** 每个恢复批次只产生一条不响铃摘要，不逐条重播，也不为其中 occurrence 另发 CR-017 单条通知。设备可以按 A1 后续获批实现显示摘要；此 CR 不批准语音播报、声音、交互手势或 UI 形式。
 6. **过期：** 摘要 outbox 自生成时起有效 24 小时，`expires_at = created_at + 24h`。过期后不再投递，迟到 ACK 不复活摘要。时间比较使用 UTC；每项本地时间显示由该 item 的 `timezone` 指定。
 7. **确认：** 对有效且未过期摘要收到 ACK 时，Host 必须在一个事务中持久写入 summary receipt，并将对应 summary outbox 和 batch 标记为终态 acknowledged，停止该摘要后续投递/重试。ACK 只表示摘要通知已收到/看到，不表示其中任何提醒完成、停止响铃或已处理；ACK 不得调用 `reminder.complete` 或 `reminder.stop_ringing`，也不得改变任何原 occurrence 状态。迟到或已过期摘要的 ACK 忽略，不写入有效 receipt、不复活摘要；重复有效 ACK 幂等，不重复改变状态。
-8. **幂等：** `summary_id` 是稳定且全局唯一的摘要通知 ID；同一批次重扫、重启和发送重试必须复用。摘要 outbox、batch 终态和 ACK receipt 均以 `summary_id` 幂等。设备侧在获批存储实现后也必须按此 ID 去重。实现须以事务方式持久化 batch、成员关系、冻结 payload 与 outbox，避免 occurrence 已消费但摘要未创建或重复建摘要。
+8. **幂等：** `summary_id` 是稳定且全局唯一的摘要通知 ID；同一批次重扫、Host 重启和发送重试必须复用。摘要 outbox、batch 终态和 ACK receipt 均以 `summary_id` 幂等并由 Host SQLite 持久化。设备侧仅可在当前运行期间按此 ID 做 RAM 去重；设备重启会清除此状态，未知结果按同 ID 重投可能重复显示/播报，不承诺 exactly-once。实现须以事务方式持久化 batch、成员关系、冻结 payload 与 outbox，避免 occurrence 已消费但摘要未创建或重复建摘要。
 
 ## 2. 摘要消息与 CR-017 兼容边界
 
@@ -37,9 +37,9 @@ CR-017 的 `notification.deliver` 保持原样：`notification_id = occurrence_i
 
 本 CR 不授权新增或修改 reminder schema 的用户配置字段，不授权实现数据库迁移，不授权修改 CR-017 的 occurrence 消息，不授权新增声音/语音策略，也不授权任何 owner 越过自身路径。
 
-## 4. CR-018 持久化依赖
+## 4. CR-018 Host 持久化与设备呈现
 
-CR-018 仍为 **BLOCKED**。本 CR 不选择或批准 flash 分区、命名空间、配额、加密密钥、标题持久化或设备重启恢复方案。设备在 CR-018 解除前不得声称摘要 durable accepted；设备 handler 若尚不能持久去重，必须 fail closed，Host 保持 pending/unknown 并依摘要 TTL 处理。Host 侧数据库事务要求不替代设备 durable acceptance。
+CR-018 已 **APPROVED**：Host `LifeService` SQLite 是摘要 batch、冻结 payload、outbox 与 receipt 的唯一 durable store；设备仅接收有界摘要用于当前运行期显示，不写 Flash/NVS，也不需要设备持久化 provider。Host 在 SQLite 中持久化摘要投递不等于设备已显示/播报。设备断线或重启导致结果不确定时，Host 在 24 小时有效期内按原 `summary_id` 重投；设备重启边界可能重复显示/播报，因此不承诺 exactly-once。Host 数据库事务不替代真实设备呈现验收。
 
 不得将摘要标题写入未批准的设备存储面。Host 数据库中的摘要 payload/receipt 按 A3 已有数据治理和隐私约束处理；本 CR 不扩大日志内容。
 
@@ -61,6 +61,6 @@ CR-018 仍为 **BLOCKED**。本 CR 不选择或批准 flash 分区、命名空�
 
 - **L2：** 需由 A3/A2/A1 各自后续实施并通过上述定向软件测试；本契约批准不代表 L2 已通过。
 - **L3：** 需在真实 Edge Host、设备与 pinned SDK Runtime 上验证摘要到达、UI 显示与无铃声行为；目前未验证。
-- **L4：** 需验证真实断网、崩溃、重启、重连、重复投递与过期后的端到端恢复、不丢失/不重复；目前未验证。CR-018 设备持久化未获批准前不能宣称完成该闭环。
+- **L4：** 需验证真实断网、Host/设备崩溃重启、重连、同 ID 重投与过期后的端到端恢复；设备重启边界允许重复呈现/播报，不以“不重复”作为设备持久化验收前提。目前未验证。
 
 Acceptance matrix 中既有 build failure 记录维持原样，由其负责 owner 另行更新；本 CR 不修改验收矩阵或构建状态。
