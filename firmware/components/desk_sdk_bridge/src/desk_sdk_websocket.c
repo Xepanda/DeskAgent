@@ -74,6 +74,9 @@ static uint32_t s_ws_hello_pending_generation = 0;
 /* Serializes only the ACK latch and its generation. It is never held while
  * taking the pairing mutex or doing network I/O. */
 static pthread_mutex_t s_ws_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_ws_lifecycle_cond = PTHREAD_COND_INITIALIZER;
+static bool s_ws_lifecycle_closing = false;
+static unsigned s_ws_audio_commands_inflight = 0;
 static pthread_mutex_t s_ws_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_ws_generation = 0;
 static desk_sdk_ws_state_t s_ws_state = DESK_SDK_WS_OFFLINE;
@@ -415,10 +418,18 @@ static void ws_schedule_reconnect(void)
 static bool ws_transport_close_for_generation(uint32_t expected_generation, bool check_generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    while (s_ws_lifecycle_closing)
+        pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex);
     if (check_generation && expected_generation != s_ws_generation) {
         pthread_mutex_unlock(&s_ws_lifecycle_mutex);
         return false;
     }
+    /* Block new audio commands and wait for the bounded HAL operation that
+     * already owns this generation before invalidating its identity. */
+    s_ws_lifecycle_closing = true;
+    while (s_ws_audio_commands_inflight != 0)
+        pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex);
+    uint32_t closed_generation = s_ws_generation;
     ++s_ws_generation;
     s_ws_ready = false;
     s_ws_authenticated = false;
@@ -432,6 +443,8 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     }
     s_ws_state = DESK_SDK_WS_OFFLINE;
     s_ws_rx_len = 0;
+    s_ws_lifecycle_closing = false;
+    pthread_cond_broadcast(&s_ws_lifecycle_cond);
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
     if (fd >= 0 && pthread_mutex_trylock(&s_ws_socket_write_mutex) == 0) {
         pthread_mutex_lock(&s_ws_lifecycle_mutex);
@@ -443,6 +456,7 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     ws_clear_outbound_queue();
     desk_sdk_bridge_log_session_closed();
     desk_sdk_bridge_camera_session_closed();
+    desk_sdk_bridge_audio_session_closed(closed_generation);
     return true;
 }
 
@@ -652,7 +666,7 @@ static bool ws_hardware_hello_ack_valid(const char *json)
 static bool ws_commit_hardware_hello_ack(uint32_t generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
-    bool current = generation == s_ws_generation && s_ws_hello_pending &&
+    bool current = !s_ws_lifecycle_closing && generation == s_ws_generation && s_ws_hello_pending &&
                    s_ws_hello_pending_generation == generation && !s_ws_ready &&
                    s_ws_state == DESK_SDK_WS_HELLO_SENT;
     if (current) {
@@ -868,6 +882,26 @@ bool desk_sdk_ws_client_is_authenticated(void)
     return authenticated;
 }
 desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void) { return s_ws_state; }
+uint32_t desk_sdk_ws_client_generation(void) { return ws_lifecycle_generation(); }
+
+bool desk_sdk_ws_client_audio_command_acquire(uint32_t connection_generation)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool valid = !s_ws_lifecycle_closing && connection_generation != 0 &&
+                 connection_generation == s_ws_generation && s_ws_ready && s_ws_authenticated;
+    if (valid) ++s_ws_audio_commands_inflight;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return valid;
+}
+
+void desk_sdk_ws_client_audio_command_release(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    if (s_ws_audio_commands_inflight > 0) --s_ws_audio_commands_inflight;
+    if (s_ws_audio_commands_inflight == 0)
+        pthread_cond_broadcast(&s_ws_lifecycle_cond);
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+}
 
 int desk_sdk_ws_client_send_text(const char *text)
 {
@@ -993,6 +1027,7 @@ fail:
 
 int desk_sdk_ws_client_poll(int timeout_ms)
 {
+    desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
     if (!s_ws_ready) {
         if (s_pairing_target_valid && s_ws_retry_at != 0 && time(NULL) >= s_ws_retry_at) {
             s_reconnect_attempt = true;
@@ -1001,21 +1036,25 @@ int desk_sdk_ws_client_poll(int timeout_ms)
         }
         return 0;
     }
+    uint32_t frame_generation = ws_lifecycle_generation();
     uint8_t op; uint8_t *payload = s_ws_payload; size_t len = 0;
     int rc = ws_read_frame(timeout_ms, &op, payload, WS_FRAME_CAP-1, &len);
     if (rc == 1) return 0;
     if (rc != 0) { ws_disconnect_and_schedule(); return -1; }
+    if (frame_generation != ws_lifecycle_generation()) {
+        ws_disconnect_generation_and_schedule(frame_generation);
+        return -1;
+    }
     if (op == 0x8) { return ws_enqueue_frame(0x8, payload, len); }
     if (op == 0x9) { return ws_enqueue_frame(0xA, payload, len); }
     if (op == 0xA) return 0;
     if (op == 0x2) {
-        desk_wspk_header_t media_header;
-        if (len < DESK_WSPK_HEADER_SIZE || desk_wspk_unpack_header(payload, len, &media_header) != 0 ||
-            media_header.payload_size != len - DESK_WSPK_HEADER_SIZE) {
+        if (desk_sdk_bridge_process_ws_audio_frame(payload, len,
+                                                  frame_generation) != 0) {
             ws_disconnect_and_schedule();
             return -1;
         }
-        /* Binary media ingress is validated here; no application ingress callback exists yet. */
+        desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
         return 0;
     }
     if (op != 0x1) { ws_disconnect_and_schedule(); return -1; }
@@ -1024,14 +1063,17 @@ int desk_sdk_ws_client_poll(int timeout_ms)
     char message_type[64] = "";
     if (json_parse_top_level_str((const char *)payload, "type", message_type, sizeof(message_type)) &&
         strcmp(message_type, "sys.client.hello") == 0) { ws_disconnect_and_schedule(); return -1; }
-    if (desk_sdk_bridge_process_ws_command((const char *)payload, s_ws_response, sizeof(s_ws_response)) == 0) {
+    if (desk_sdk_bridge_process_ws_command_for_generation((const char *)payload,
+            s_ws_response, sizeof(s_ws_response), frame_generation) == 0) {
         if (strcmp(message_type, "ctrl.camera.stream.start") == 0 &&
             strstr(s_ws_response, "\"type\":\"sys.ack\""))
             return desk_sdk_ws_client_send_camera_start_ack(s_ws_response);
         if (strcmp(message_type, "sys.log.subscribe") == 0 &&
             strstr(s_ws_response, "\"type\":\"sys.ack\""))
             return desk_sdk_ws_client_send_log_subscribe_ack(s_ws_response);
-        return desk_sdk_ws_client_send_text(s_ws_response);
+        int send_rc = desk_sdk_ws_client_send_text(s_ws_response);
+        desk_sdk_bridge_audio_poll(frame_generation);
+        return send_rc;
     }
     return 0;
 }

@@ -34,6 +34,11 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#ifdef ESP_PLATFORM
+#include "mbedtls/sha256.h"
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+#include <openssl/evp.h>
+#endif
 
 static pthread_mutex_t s_ws_camera_owner_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char s_ws_camera_owner_id[32];
@@ -154,6 +159,161 @@ static char s_pair_target_mode[32] = "";
 static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
 static bool desk_sdk_is_lower_hex_64(const char *s);
+static int desk_sdk_audio_stream_begin_command(const char *json_in,
+                                               char *out_buf, size_t max_out_len,
+                                               uint32_t connection_generation);
+static int desk_sdk_audio_stop_command(const char *json_in,
+                                       char *out_buf, size_t max_out_len,
+                                       uint32_t connection_generation);
+static bool desk_sdk_audio_playback_available(void);
+static int desk_sdk_build_capabilities_json(char *out, size_t out_len);
+
+/* The official SDK's `audio.stream` means host-to-device PCM playback only.
+ * The A1 status API reports ready only after the Watcher audio resources,
+ * including the speaker and stream queue, have initialized successfully. */
+static bool desk_sdk_audio_playback_available(void)
+{
+    desk_hardware_audio_status_t status = {0};
+    return desk_hardware_audio_get_status(&status) == DESK_HW_OK && status.ready;
+}
+
+static int desk_sdk_build_capabilities_json(char *out, size_t out_len)
+{
+    if (!out || out_len < 3) return -1;
+    const char *capabilities[8];
+    size_t count = 0;
+    capabilities[count++] = DESK_SDK_CAP_MOTION;
+    capabilities[count++] = DESK_SDK_CAP_CAMERA;
+    capabilities[count++] = DESK_SDK_CAP_EXPRESSION;
+    capabilities[count++] = DESK_SDK_CAP_EXPRESSION_ALT;
+    capabilities[count++] = DESK_SDK_CAP_MCP_TOOLS;
+    capabilities[count++] = DESK_SDK_CAP_INPUTS;
+    if (desk_sdk_camera_stream_available())
+        capabilities[count++] = DESK_SDK_CAP_CAMERA_STREAM;
+    if (desk_sdk_audio_playback_available())
+        capabilities[count++] = DESK_SDK_CAP_AUDIO_STREAM;
+
+    size_t used = 0;
+    int n = snprintf(out, out_len, "[");
+    if (n < 0 || (size_t)n >= out_len) return -1;
+    used = (size_t)n;
+    for (size_t i = 0; i < count; ++i) {
+        n = snprintf(out + used, out_len - used, "%s\"%s\"", i ? "," : "",
+                     capabilities[i]);
+        if (n < 0 || (size_t)n >= out_len - used) return -1;
+        used += (size_t)n;
+    }
+    n = snprintf(out + used, out_len - used, "]");
+    return n >= 0 && (size_t)n < out_len - used ? 0 : -1;
+}
+
+#define DESK_SDK_AUDIO_STOP_TIMEOUT_MS 1500U
+typedef struct {
+    pthread_mutex_t mutex;
+    bool active;
+    bool hash_ready;
+    bool last_seen;
+    bool terminal_sent;
+    bool initial_flow_sent;
+    bool cancel_requested;
+    bool digest_mismatch;
+    uint64_t handle;
+    uint32_t generation;
+    uint32_t stream_id;
+    uint32_t total_bytes;
+    uint32_t received_bytes;
+    uint32_t expected_sequence;
+    uint8_t expected_digest[32];
+    char expected_digest_hex[65];
+    char actual_digest_hex[65];
+    char terminal_reason[32];
+#ifdef ESP_PLATFORM
+    mbedtls_sha256_context hash;
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    EVP_MD_CTX *hash;
+#else
+    void *hash;
+#endif
+} desk_sdk_audio_stream_t;
+static desk_sdk_audio_stream_t s_sdk_audio = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+static atomic_uint_fast64_t s_sdk_audio_handle = ATOMIC_VAR_INIT(1);
+
+static int desk_sdk_audio_hash_begin_locked(void)
+{
+#ifdef ESP_PLATFORM
+    mbedtls_sha256_init(&s_sdk_audio.hash);
+    if (mbedtls_sha256_starts_ret(&s_sdk_audio.hash, 0) != 0) return -1;
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    s_sdk_audio.hash = EVP_MD_CTX_new();
+    if (!s_sdk_audio.hash || EVP_DigestInit_ex(s_sdk_audio.hash, EVP_sha256(), NULL) != 1) return -1;
+#else
+    return -1;
+#endif
+    s_sdk_audio.hash_ready = true;
+    return 0;
+}
+
+static int desk_sdk_audio_hash_update_locked(const uint8_t *data, size_t len)
+{
+    if (!s_sdk_audio.hash_ready || !data || !len) return -1;
+#ifdef ESP_PLATFORM
+    return mbedtls_sha256_update_ret(&s_sdk_audio.hash, data, len) == 0 ? 0 : -1;
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    return EVP_DigestUpdate(s_sdk_audio.hash, data, len) == 1 ? 0 : -1;
+#else
+    return -1;
+#endif
+}
+
+static void desk_sdk_audio_hash_free_locked(void)
+{
+    if (!s_sdk_audio.hash_ready) return;
+#ifdef ESP_PLATFORM
+    mbedtls_sha256_free(&s_sdk_audio.hash);
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    EVP_MD_CTX_free(s_sdk_audio.hash);
+    s_sdk_audio.hash = NULL;
+#endif
+    s_sdk_audio.hash_ready = false;
+}
+
+static int desk_sdk_audio_hash_finish_locked(uint8_t digest[32])
+{
+    if (!s_sdk_audio.hash_ready || !digest) return -1;
+#ifdef ESP_PLATFORM
+    int rc = mbedtls_sha256_finish_ret(&s_sdk_audio.hash, digest);
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    unsigned int digest_len = 0;
+    int rc = EVP_DigestFinal_ex(s_sdk_audio.hash, digest, &digest_len) == 1 && digest_len == 32 ? 0 : -1;
+#else
+    int rc = -1;
+#endif
+    desk_sdk_audio_hash_free_locked();
+    return rc == 0 ? 0 : -1;
+}
+
+static int desk_sdk_audio_hex_decode(const char *hex, uint8_t out[32])
+{
+    if (!desk_sdk_is_lower_hex_64(hex) || !out) return -1;
+    for (size_t i = 0; i < 32; ++i) {
+        unsigned hi = hex[i * 2] <= '9' ? (unsigned)(hex[i * 2] - '0') : (unsigned)(hex[i * 2] - 'a' + 10);
+        unsigned lo = hex[i * 2 + 1] <= '9' ? (unsigned)(hex[i * 2 + 1] - '0') : (unsigned)(hex[i * 2 + 1] - 'a' + 10);
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+static void desk_sdk_audio_hex_encode(const uint8_t digest[32], char out[65])
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
 
 #ifdef DESK_SDK_TESTING
 void desk_sdk_test_prepare_log_pair(void)
@@ -1762,6 +1922,21 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
+    /* The legacy TCP line server has no authenticated WebSocket identity or
+     * connection generation. Audio playback can only enter through the
+     * generation-bound WebSocket receive dispatcher below. */
+    if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0 ||
+        strcmp(msg_type, "ctrl.audio.stop") == 0) {
+        char rid_scratch[128];
+        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                 "\"code\":\"WEBSOCKET_SESSION_REQUIRED\","
+                 "\"message\":\"Audio playback commands require the authenticated WebSocket session\"}}",
+                 rid);
+        return 0;
+    }
+
     /* Handshake: sys.client.hello */
     if (strcmp(msg_type, "sys.client.hello") == 0) {
         char provided_token[128] = "";
@@ -1807,23 +1982,15 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
             return 0;
         }
 
-        /* Standard SDK / desktop hello response */
-        if (desk_sdk_camera_stream_available()) {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS,
-                     DESK_SDK_CAP_INPUTS, DESK_SDK_CAP_CAMERA_STREAM);
-        } else {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS, DESK_SDK_CAP_INPUTS);
-        }
+        /* Standard SDK / desktop hello response. Re-query A1 readiness for
+         * each response so late init or readiness loss is reflected. */
+        char capabilities[256];
+        if (desk_sdk_build_capabilities_json(capabilities, sizeof(capabilities)) != 0)
+            return -1;
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
+                 "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":%s}}",
+                 capabilities);
         return 0;
     }
 
@@ -1831,22 +1998,13 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     else if (strcmp(msg_type, "sys.sdk.ready.get") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        if (desk_sdk_camera_stream_available()) {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     rid, DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS,
-                     DESK_SDK_CAP_INPUTS, DESK_SDK_CAP_CAMERA_STREAM);
-        } else {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     rid, DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS, DESK_SDK_CAP_INPUTS);
-        }
+        char capabilities[256];
+        if (desk_sdk_build_capabilities_json(capabilities, sizeof(capabilities)) != 0)
+            return -1;
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
+                 "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":%s}}",
+                 rid, capabilities);
         return 0;
     }
 
@@ -2086,18 +2244,16 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
-    /* Audio transport is unsupported until both directions have real media
-     * paths and the capture owner can be negotiated without stopping TClaw. */
-    else if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0 ||
-             strcmp(msg_type, "ctrl.audio.stop") == 0 ||
-             strcmp(msg_type, "ctrl.microphone.open") == 0 ||
+    /* Microphone is a separate unsupported uplink direction until the A1
+     * capture owner, Opus packetizer and WSPK return path are implemented. */
+    else if (strcmp(msg_type, "ctrl.microphone.open") == 0 ||
              strcmp(msg_type, "ctrl.microphone.close") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.nack\",%s\"code\":501,\"error\":{"
                  "\"code\":\"UNSUPPORTED_OPERATION\","
-                 "\"message\":\"SDK audio transport is not implemented on this device\"}}",
+                 "\"message\":\"SDK microphone uplink is not implemented on this device\"}}",
                  rid);
         return 0;
     }
@@ -3482,7 +3638,336 @@ static bool desk_log_component_filter_valid(const char *raw, uint8_t *component_
 
 /* This is deliberately called only by the WebSocket receive loop. The legacy
  * TCP line server continues to use desk_sdk_bridge_process_command(). */
+static void desk_sdk_audio_emit(const desk_audio_stream_status_t *status,
+                                const char *reason, const char *digest)
+{
+    if (!status || !reason || !desk_sdk_ws_client_is_connected()) return;
+    char json[512];
+    int n = snprintf(json, sizeof(json),
+        "{\"type\":\"evt.audio.buffer_status\",\"code\":0,\"data\":{"
+        "\"stream_id\":%u,\"reason\":\"%s\",\"free_frames\":%u,"
+        "\"pending_frames\":%u,\"queue_depth\":%u,\"start_buffer_frames\":%u,\"playing\":%s"
+        "%s%s%s}}",
+        (unsigned)status->stream_id, reason, (unsigned)status->free_frames,
+        (unsigned)status->pending_frames, (unsigned)status->queue_depth,
+        (unsigned)status->start_buffer_frames, status->playing ? "true" : "false",
+        digest ? ",\"audio_sha256\":\"" : "", digest ? digest : "", digest ? "\"" : "");
+    if (n > 0 && (size_t)n < sizeof(json)) (void)desk_sdk_ws_client_send_text(json);
+}
+
+static void desk_sdk_audio_mark_cancel_locked(const char *reason)
+{
+    if (!s_sdk_audio.active || s_sdk_audio.cancel_requested) return;
+    snprintf(s_sdk_audio.terminal_reason, sizeof(s_sdk_audio.terminal_reason), "%s",
+             reason ? reason : "playback_write_failed");
+    s_sdk_audio.cancel_requested = true;
+    (void)desk_hardware_audio_stream_stop(s_sdk_audio.handle, DESK_SDK_AUDIO_STOP_TIMEOUT_MS);
+}
+
+static void desk_sdk_audio_poll_locked(uint32_t connection_generation,
+                                       desk_audio_stream_status_t *emit_status,
+                                       char emit_reason[32], char emit_digest[65],
+                                       bool *should_emit)
+{
+    *should_emit = false;
+    if (!s_sdk_audio.active) return;
+    if (s_sdk_audio.generation != connection_generation ||
+        !desk_sdk_ws_client_is_connected()) {
+        desk_sdk_audio_mark_cancel_locked("aborted");
+    }
+
+    desk_audio_stream_status_t status;
+    if (desk_hardware_audio_stream_get_status(s_sdk_audio.handle, &status) != DESK_HW_OK) return;
+    /* The SDK sender waits for its first buffer_status credit before sending
+     * any WSPK payload. Emit the HAL's current free-frame count immediately
+     * after the begin ACK (the WebSocket poller calls us after ACK send). */
+    if (!s_sdk_audio.initial_flow_sent &&
+        s_sdk_audio.generation == connection_generation &&
+        desk_sdk_ws_client_is_connected()) {
+        *emit_status = status;
+        snprintf(emit_reason, 32, "running");
+        emit_digest[0] = '\0';
+        *should_emit = true;
+        s_sdk_audio.initial_flow_sent = true;
+    }
+    if (!status.tx_drained) return;
+
+    const char *reason = s_sdk_audio.terminal_reason;
+    if (!reason[0]) {
+        if (status.state == DESK_AUDIO_STREAM_COMPLETE) reason = "complete";
+        else if (status.state == DESK_AUDIO_STREAM_CANCELED) reason = "aborted";
+        else reason = "playback_write_failed";
+    }
+    if (!s_sdk_audio.terminal_sent && s_sdk_audio.generation == connection_generation &&
+        desk_sdk_ws_client_is_connected()) {
+        *emit_status = status;
+        snprintf(emit_reason, 32, "%s", reason);
+        if (s_sdk_audio.digest_mismatch)
+            snprintf(emit_digest, 65, "%s", s_sdk_audio.actual_digest_hex);
+        else if (strcmp(reason, "complete") == 0)
+            snprintf(emit_digest, 65, "%s", s_sdk_audio.expected_digest_hex);
+        else emit_digest[0] = '\0';
+        *should_emit = true;
+    }
+    s_sdk_audio.terminal_sent = true;
+    desk_sdk_audio_hash_free_locked();
+    s_sdk_audio.active = false;
+}
+
+void desk_sdk_bridge_audio_poll(uint32_t connection_generation)
+{
+    desk_audio_stream_status_t status;
+    char reason[32] = {0}, digest[65] = {0};
+    bool emit = false;
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    desk_sdk_audio_poll_locked(connection_generation, &status, reason, digest, &emit);
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    if (emit) desk_sdk_audio_emit(&status, reason, digest[0] ? digest : NULL);
+}
+
+void desk_sdk_bridge_audio_session_closed(uint32_t connection_generation)
+{
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (s_sdk_audio.active && s_sdk_audio.generation == connection_generation)
+        desk_sdk_audio_mark_cancel_locked("aborted");
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    desk_sdk_bridge_audio_poll(desk_sdk_ws_client_generation());
+}
+
+int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
+                                           uint32_t connection_generation)
+{
+    desk_wspk_header_t header;
+    if (!frame || len < DESK_WSPK_HEADER_SIZE ||
+        desk_wspk_unpack_header(frame, len, &header) != 0 ||
+        header.frame_type != DESK_WSPK_TYPE_AUDIO ||
+        header.payload_size != len - DESK_WSPK_HEADER_SIZE ||
+        header.payload_size < 2 || header.payload_size > DESK_AUDIO_STREAM_CHUNK_BYTES ||
+        (header.payload_size & 1u) || (header.flags & (uint8_t)~0x03u) != 0) return -1;
+
+    desk_audio_stream_status_t status;
+    bool emit_flow = false;
+    bool cancel = false;
+    bool stale_generation = false;
+    const char *failure_reason = "playback_write_failed";
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (!s_sdk_audio.active) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        return -1;
+    }
+    if (s_sdk_audio.generation != connection_generation ||
+        s_sdk_audio.stream_id != header.stream_id) {
+        failure_reason = "stale_frame";
+        cancel = true;
+        stale_generation = s_sdk_audio.generation != connection_generation;
+    } else if (s_sdk_audio.last_seen ||
+               header.sequence != s_sdk_audio.expected_sequence ||
+               ((s_sdk_audio.expected_sequence == 0) != ((header.flags & 0x01u) != 0)) ||
+               (s_sdk_audio.expected_sequence != 0 && (header.flags & 0x01u)) ||
+               (s_sdk_audio.received_bytes > s_sdk_audio.total_bytes ||
+                header.payload_size > s_sdk_audio.total_bytes - s_sdk_audio.received_bytes) ||
+               (((s_sdk_audio.received_bytes + header.payload_size) == s_sdk_audio.total_bytes) !=
+                    ((header.flags & 0x02u) != 0))) {
+        failure_reason = "sequence_gap";
+        cancel = true;
+    } else {
+        int rc = desk_hardware_audio_stream_write(s_sdk_audio.handle,
+            s_sdk_audio.generation, s_sdk_audio.stream_id, header.sequence,
+            frame + DESK_WSPK_HEADER_SIZE, header.payload_size, &status);
+        if (rc != DESK_HW_OK) {
+            failure_reason = rc == DESK_HW_ERR_BUSY ? "enqueue_timeout" : "playback_write_failed";
+            cancel = true;
+        } else if (desk_sdk_audio_hash_update_locked(frame + DESK_WSPK_HEADER_SIZE,
+                                                    header.payload_size) != 0) {
+            failure_reason = "playback_write_failed";
+            cancel = true;
+        } else {
+            s_sdk_audio.received_bytes += header.payload_size;
+            ++s_sdk_audio.expected_sequence;
+            emit_flow = true;
+            if (header.flags & 0x02u) {
+                uint8_t actual[32];
+                if (s_sdk_audio.received_bytes != s_sdk_audio.total_bytes ||
+                    desk_sdk_audio_hash_finish_locked(actual) != 0) {
+                    failure_reason = "playback_write_failed";
+                    cancel = true;
+                } else {
+                    desk_sdk_audio_hex_encode(actual, s_sdk_audio.actual_digest_hex);
+                    if (memcmp(actual, s_sdk_audio.expected_digest, sizeof(actual)) != 0) {
+                        s_sdk_audio.digest_mismatch = true;
+                        snprintf(s_sdk_audio.terminal_reason, sizeof(s_sdk_audio.terminal_reason), "complete");
+                        desk_sdk_audio_mark_cancel_locked("complete");
+                    } else if (desk_hardware_audio_stream_finish(s_sdk_audio.handle) != DESK_HW_OK) {
+                        failure_reason = "playback_write_failed";
+                        cancel = true;
+                    } else {
+                        s_sdk_audio.last_seen = true;
+                    }
+                }
+            }
+        }
+    }
+    if (cancel) desk_sdk_audio_mark_cancel_locked(failure_reason);
+    if (emit_flow && desk_hardware_audio_stream_get_status(s_sdk_audio.handle, &status) != DESK_HW_OK)
+        emit_flow = false;
+    uint32_t stream_id = s_sdk_audio.stream_id;
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+
+    if (emit_flow) desk_sdk_audio_emit(&status, "running", NULL);
+    desk_sdk_bridge_audio_poll(connection_generation);
+    (void)stream_id;
+    return stale_generation ? -1 : 0;
+}
+
+static int desk_sdk_audio_stream_begin_command(const char *json_in,
+                                               char *out_buf, size_t max_out_len,
+                                               uint32_t connection_generation)
+{
+    char rid_scratch[128];
+    const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+    char data[512], digest[65] = {0};
+    if (!json_extract_subobject(json_in, "data", data, sizeof(data))) data[0] = '\0';
+    int32_t stream_id = json_parse_int(data, "stream_id", -1);
+    int32_t total_bytes = json_parse_int(data, "total_bytes", -1);
+    int32_t sample_rate = json_parse_int(data, "sample_rate_hz", -1);
+    int32_t channels = json_parse_int(data, "channels", -1);
+    int32_t sample_width = json_parse_int(data, "sample_width_bytes", -1);
+    if (stream_id < 1 || stream_id > 65535 || total_bytes < 2 ||
+        (uint32_t)total_bytes > DESK_AUDIO_STREAM_MAX_BYTES || (total_bytes & 1) ||
+        sample_rate != 24000 || channels != 1 || sample_width != 2 ||
+        !json_parse_str(data, "audio_sha256", digest, sizeof(digest)) ||
+        !desk_sdk_is_lower_hex_64(digest)) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":400,\"error\":{"
+            "\"code\":\"INVALID_AUDIO_STREAM\",\"message\":\"Invalid PCM stream metadata\"}}", rid);
+        return 0;
+    }
+
+    uint8_t expected_digest[32];
+    if (desk_sdk_audio_hex_decode(digest, expected_digest) != 0) return -1;
+    uint32_t generation = desk_sdk_ws_client_generation();
+    if (!connection_generation || generation != connection_generation ||
+        !desk_sdk_ws_client_is_authenticated()) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
+            "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stream requires an authenticated SDK session\"}}", rid);
+        return 0;
+    }
+
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (s_sdk_audio.active) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
+            "\"code\":\"RESOURCE_BUSY\",\"message\":\"Another audio stream is active\"}}", rid);
+        return 0;
+    }
+    uint64_t counter = atomic_fetch_add(&s_sdk_audio_handle, 1);
+    uint64_t handle = ((uint64_t)generation << 32) | (counter & 0xffffffffu);
+    if (!handle) handle = atomic_fetch_add(&s_sdk_audio_handle, 1);
+    if (desk_sdk_audio_hash_begin_locked() != 0) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":500,\"error\":{"
+            "\"code\":\"AUDIO_HASH_UNAVAILABLE\",\"message\":\"Cannot initialize audio integrity check\"}}", rid);
+        return 0;
+    }
+    int rc = desk_hardware_audio_stream_begin(handle, generation, (uint32_t)stream_id,
+        (uint32_t)sample_rate, (uint8_t)channels, (uint8_t)sample_width, (uint32_t)total_bytes);
+    if (rc != DESK_HW_OK) {
+        desk_sdk_audio_hash_free_locked();
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        const char *err = rc == DESK_HW_ERR_BUSY ? "RESOURCE_BUSY" :
+                          rc == DESK_HW_ERR_UNAVAILABLE ? "AUDIO_UNAVAILABLE" : "INVALID_AUDIO_STREAM";
+        int code = rc == DESK_HW_ERR_BUSY ? 409 : rc == DESK_HW_ERR_UNAVAILABLE ? 503 : 400;
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":%d,\"error\":{"
+            "\"code\":\"%s\",\"message\":\"Audio HAL rejected stream begin\"}}", rid, code, err);
+        return 0;
+    }
+    s_sdk_audio.active = true;
+    s_sdk_audio.handle = handle;
+    s_sdk_audio.generation = generation;
+    s_sdk_audio.stream_id = (uint32_t)stream_id;
+    s_sdk_audio.total_bytes = (uint32_t)total_bytes;
+    s_sdk_audio.received_bytes = 0;
+    s_sdk_audio.expected_sequence = 0;
+    s_sdk_audio.last_seen = false;
+    s_sdk_audio.terminal_sent = false;
+    s_sdk_audio.initial_flow_sent = false;
+    s_sdk_audio.cancel_requested = false;
+    s_sdk_audio.digest_mismatch = false;
+    s_sdk_audio.terminal_reason[0] = '\0';
+    memcpy(s_sdk_audio.expected_digest, expected_digest, sizeof(expected_digest));
+    memcpy(s_sdk_audio.expected_digest_hex, digest, sizeof(s_sdk_audio.expected_digest_hex));
+    s_sdk_audio.actual_digest_hex[0] = '\0';
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"stream_id\":%u,\"accepted\":true}}",
+        rid, (unsigned)stream_id);
+    return 0;
+}
+
+static int desk_sdk_audio_stop_command(const char *json_in,
+                                       char *out_buf, size_t max_out_len,
+                                       uint32_t connection_generation)
+{
+    char rid_scratch[128], data[256];
+    const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+    if (!json_extract_subobject(json_in, "data", data, sizeof(data))) data[0] = '\0';
+    int32_t requested_id = json_parse_int(data, "stream_id", -1);
+    uint32_t current_generation = desk_sdk_ws_client_generation();
+    if (!connection_generation || current_generation != connection_generation ||
+        !desk_sdk_ws_client_is_authenticated()) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
+            "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stop requires an authenticated SDK session\"}}", rid);
+        return 0;
+    }
+    if (requested_id < 1 || requested_id > UINT16_MAX) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":400,\"error\":{"
+            "\"code\":\"INVALID_ARGUMENTS\",\"message\":\"Audio stop requires the active stream_id\"}}", rid);
+        return 0;
+    }
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (!s_sdk_audio.active || s_sdk_audio.generation != connection_generation ||
+        (uint32_t)requested_id != s_sdk_audio.stream_id) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":404,\"error\":{"
+            "\"code\":\"AUDIO_STREAM_NOT_FOUND\",\"message\":\"No matching audio stream is active\"}}", rid);
+        return 0;
+    }
+    snprintf(s_sdk_audio.terminal_reason, sizeof(s_sdk_audio.terminal_reason), "aborted");
+    s_sdk_audio.cancel_requested = true;
+    int rc = desk_hardware_audio_stream_stop(s_sdk_audio.handle, DESK_SDK_AUDIO_STOP_TIMEOUT_MS);
+    desk_audio_stream_status_t status;
+    bool drained = desk_hardware_audio_stream_get_status(s_sdk_audio.handle, &status) == DESK_HW_OK && status.tx_drained;
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    if (rc != DESK_HW_OK || !drained) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":504,\"error\":{"
+            "\"code\":\"AUDIO_DRAIN_TIMEOUT\",\"message\":\"Audio stop did not confirm DMA drain\"}}", rid);
+        return 0;
+    }
+    snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"stopped\":true}}", rid);
+    return 0;
+}
+
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len)
+{
+    /* Compatibility entry point for non-audio WebSocket contract helpers.
+     * Audio commands require an explicit receive-loop generation below. */
+    return desk_sdk_bridge_process_ws_command_for_generation(json_in, out_buf,
+                                                               max_out_len, 0);
+}
+
+int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
+                                                       char *out_buf,
+                                                       size_t max_out_len,
+                                                       uint32_t connection_generation)
 {
     char type_raw[96] = "", code_raw[16] = "";
     char data[3072] = "";
@@ -3491,6 +3976,26 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
     if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1) return -1;
     char type[64] = "";
     if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "ctrl.audio.stream.begin") == 0 ||
+        strcmp(type, "ctrl.audio.stop") == 0) {
+        if (!desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete() ||
+            !desk_sdk_ws_client_audio_command_acquire(connection_generation)) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
+                     "\"code\":\"AUTH_FAILED\",\"message\":\"Audio command is not bound to the authenticated WebSocket generation\"}}",
+                     rid);
+            return 0;
+        }
+        int audio_rc = strcmp(type, "ctrl.audio.stream.begin") == 0
+            ? desk_sdk_audio_stream_begin_command(json_in, out_buf, max_out_len,
+                                                  connection_generation)
+            : desk_sdk_audio_stop_command(json_in, out_buf, max_out_len,
+                                          connection_generation);
+        desk_sdk_ws_client_audio_command_release();
+        return audio_rc;
+    }
     if (strcmp(type, "ctrl.camera.stream.start") == 0 ||
         strcmp(type, "ctrl.camera.stream.stop") == 0 ||
         strcmp(type, "ctrl.camera.clock.ping") == 0) {

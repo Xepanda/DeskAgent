@@ -4,7 +4,7 @@
  *
  * Implements standard WatcheRobot device protocol endpoints:
  * - sys.client.hello / sys.ack handshake and capabilities negotiation
- * - WSPK binary framing for image media (SDK audio transport is not advertised)
+ * - WSPK binary framing for image media and HAL-ready PCM playback
  * - Inputs event notifications (backtouch, screentouch, roller)
  * - Motion & Camera commands with strict resource arbitration
  * - Bidirectional RequestEnvelope / ResponseEnvelope tool routing
@@ -30,6 +30,7 @@ extern "C" {
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
 #define DESK_SDK_CAP_CAMERA_STREAM "camera.stream.mjpeg.wspk.v1"
+#define DESK_SDK_CAP_AUDIO_STREAM  "audio.stream"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
 #define DESK_SDK_CAP_EXPRESSION_ALT "expression"
 #define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"
@@ -273,6 +274,10 @@ typedef enum {
 } desk_sdk_ws_state_t;
 int desk_sdk_ws_client_connect_paired(void);
 int desk_sdk_ws_client_poll(int timeout_ms);
+uint32_t desk_sdk_ws_client_generation(void);
+/* Pins a validated audio command to the live paired WebSocket lifecycle until release. */
+bool desk_sdk_ws_client_audio_command_acquire(uint32_t connection_generation);
+void desk_sdk_ws_client_audio_command_release(void);
 int desk_sdk_ws_client_send_text(const char *text);
 /* Queues the start ACK with a writer completion callback before live media. */
 int desk_sdk_ws_client_send_camera_start_ack(const char *text);
@@ -331,12 +336,23 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
  * - ctrl.motion.move / ctrl.motion.stop -> sys.ack with CR-002 ACK-only semantics
  *   (status="accepted", accepted=true, state_confirmed=false)
  * - ctrl.camera.acquire / ctrl.camera.release / ctrl.camera.capture
- * - SDK audio transport controls currently return UNSUPPORTED_OPERATION
+ * - Audio playback controls are denied here and only dispatched on the
+ *   authenticated, generation-bound WebSocket receive path
  * - ctrl.expression.play / ctrl.expression.set / ctrl.expression.audio_follow
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
 /* WebSocket-only dispatch. Never use this entry point for the legacy TCP server. */
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len);
+/* Receive-loop dispatch binds commands to the lifecycle generation that read the frame. */
+int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
+                                                       char *out_buf,
+                                                       size_t max_out_len,
+                                                       uint32_t connection_generation);
+/* Internal A2 media hooks called by the authenticated WebSocket receive loop. */
+int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
+                                           uint32_t connection_generation);
+void desk_sdk_bridge_audio_poll(uint32_t connection_generation);
+void desk_sdk_bridge_audio_session_closed(uint32_t connection_generation);
 #define desk_sdk_bridge_process_line desk_sdk_bridge_process_command
 
 /**

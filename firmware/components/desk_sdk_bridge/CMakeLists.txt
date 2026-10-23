@@ -9,4 +9,5 @@ idf_component_register(
         desk_hardware
         desk_tclaw
         lwip
+        mbedtls
 )
