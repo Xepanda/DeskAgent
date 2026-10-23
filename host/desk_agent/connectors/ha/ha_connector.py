@@ -80,6 +80,7 @@ DEFAULT_ALLOWED_SERVICES = frozenset({
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 SERVICE_ACTION_REGEX = re.compile(r"^[a-z0-9_]{1,64}$")
 MAX_STATE_CONFIRMATION_TIMEOUT_MS = 30_000
+MIN_STATE_POLL_INTERVAL_SEC = 1.0
 MAX_STATE_POLL_INTERVAL_SEC = 300.0
 # HA service payloads can select targets through fields other than entity_id.
 # Those selectors can widen an entity-scoped request to devices, areas, floors,
@@ -101,9 +102,14 @@ def _normalize_confirmation_timeout_ms(value: Any) -> float:
 
 
 def _normalize_state_poll_interval_sec(value: Any) -> float:
-    """Reject invalid polling intervals and cap waits to a practical recovery bound."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        raise ValueError("interval_sec must be a finite, positive number")
+    """Keep full-state REST fallback between 1 second and a practical recovery bound."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < MIN_STATE_POLL_INTERVAL_SEC
+    ):
+        raise ValueError(f"interval_sec must be finite and at least {MIN_STATE_POLL_INTERVAL_SEC:g} second")
     return min(float(value), MAX_STATE_POLL_INTERVAL_SEC)
 
 
