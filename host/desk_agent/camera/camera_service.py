@@ -554,6 +554,7 @@ class CameraViewerService:
                 raise CameraStreamCapacityError("STREAM_CAPACITY")
             if error is None:
                 self._active_stream_owners.add(client_id)
+                lease_generation = self._capture_generation
             last_seq = self._frame_seq
         if owner:
             self.pipeline.stop_if_generation(pipeline_generation)
@@ -574,13 +575,19 @@ class CameraViewerService:
                 if not self.is_lease_valid():
                     return
                 with self._frame_changed:
-                    if self._active_lease_owner != client_id:
+                    if (
+                        self._active_lease_owner != client_id
+                        or self._capture_generation != lease_generation
+                    ):
                         return
                     deadline = time.monotonic() + max(0.05, min(1.0, wait_timeout))
                     frame = None
                     lease_expired = False
                     while True:
-                        if self._active_lease_owner != client_id:
+                        if (
+                            self._active_lease_owner != client_id
+                            or self._capture_generation != lease_generation
+                        ):
                             return
                         if time.time() >= self._lease_expires_at:
                             lease_expired = True
