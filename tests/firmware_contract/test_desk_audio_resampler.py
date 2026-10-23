@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import subprocess
 import tempfile
@@ -16,6 +17,8 @@ class ResamplerState(ctypes.Structure):
         ("input_samples", ctypes.c_uint64),
         ("output_samples", ctypes.c_uint64),
         ("finished", ctypes.c_bool),
+        ("fir_history", ctypes.c_int16 * 19),
+        ("fir_position", ctypes.c_uint8),
     ]
 
 
@@ -74,6 +77,22 @@ class TestDeskAudioResampler(unittest.TestCase):
         self.assertEqual(state.output_samples, len(result))
         return result
 
+    def convert_tone(self, frequency_hz: int, sample_count: int = 24000) -> list[int]:
+        samples = [round(12000 * math.sin(2 * math.pi * frequency_hz * i / 24000))
+                   for i in range(sample_count)]
+        return self.convert([samples[i:i + 2400] for i in range(0, sample_count, 2400)])
+
+    @staticmethod
+    def tone_peak(samples: list[int], frequency_hz: int, sample_rate_hz: int = 16000) -> float:
+        # Omit both ends so a causal FIR's startup and finite-stream tail do not
+        # dominate the steady-state frequency-response measurement.
+        steady = samples[300:-300]
+        real = sum(sample * math.cos(2 * math.pi * frequency_hz * i / sample_rate_hz)
+                   for i, sample in enumerate(steady))
+        imag = sum(sample * math.sin(2 * math.pi * frequency_hz * i / sample_rate_hz)
+                   for i, sample in enumerate(steady))
+        return 2 * math.hypot(real, imag) / len(steady)
+
     def test_chunk_boundaries_do_not_change_output_or_lose_duration(self) -> None:
         samples = [((index * 733) % 30000) - 15000 for index in range(6001)]
         whole = self.convert([samples])
@@ -81,8 +100,11 @@ class TestDeskAudioResampler(unittest.TestCase):
         self.assertEqual(split, whole)
         self.assertEqual(len(whole), (2 * len(samples) + 1) // 3)
 
-    def test_three_input_samples_produce_two_output_samples_with_expected_interpolation(self) -> None:
-        self.assertEqual(self.convert([[0, 300, 900]]), [0, 600])
+    def test_three_input_samples_produce_two_filtered_output_samples(self) -> None:
+        whole = self.convert([[0, 300, 900]])
+        split = self.convert([[0], [300], [900]])
+        self.assertEqual(len(whole), 2)
+        self.assertEqual(split, whole)
 
     def test_empty_and_repeated_finish_are_safe(self) -> None:
         self.assertEqual(self.convert([[], []]), [])
@@ -100,11 +122,20 @@ class TestDeskAudioResampler(unittest.TestCase):
         self.assertEqual(state.input_samples, 0)
         self.assertEqual(written.value, 0)
 
-    def test_12khz_input_is_not_antialias_filtered_and_aliases_into_output_band(self) -> None:
-        """Pin the documented limitation: this duration converter is not a low-pass filter."""
-        source = [12000 if index % 2 == 0 else -12000 for index in range(12)]
-        converted = self.convert([source[:5], source[5:]])
-        self.assertEqual(converted, [12000, 0, -12000, 0, 12000, 0, -12000, 0])
+    def test_12khz_nyquist_input_is_suppressed(self) -> None:
+        converted = self.convert_tone(12000)
+        self.assertLess(self.tone_peak(converted, 4000), 500)
+
+    def test_antialias_filter_retains_passband_and_suppresses_folded_tones(self) -> None:
+        pass_1khz = self.tone_peak(self.convert_tone(1000), 1000)
+        pass_6khz = self.tone_peak(self.convert_tone(6000), 6000)
+        alias_9khz = self.tone_peak(self.convert_tone(9000), 7000)
+        alias_10khz = self.tone_peak(self.convert_tone(10000), 6000)
+
+        self.assertGreater(pass_1khz, 11400)
+        self.assertGreater(pass_6khz, 8000)
+        self.assertLess(alias_9khz, pass_6khz * 0.15)
+        self.assertLess(alias_10khz, pass_6khz * 0.03)
 
 
 if __name__ == "__main__":

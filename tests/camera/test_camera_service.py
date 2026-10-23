@@ -59,18 +59,22 @@ class TestCameraService(unittest.TestCase):
         unblock_source = threading.Event()
         active_calls = 0
         max_active_calls = 0
+        source_calls = 0
         calls_lock = threading.Lock()
 
         def blocked_source():
-            nonlocal active_calls, max_active_calls
+            nonlocal active_calls, max_active_calls, source_calls
             with calls_lock:
+                source_calls += 1
+                call_number = source_calls
                 active_calls += 1
                 max_active_calls = max(max_active_calls, active_calls)
             entered_source.set()
-            unblock_source.wait(2.0)
+            if call_number == 1:
+                unblock_source.wait(2.0)
             with calls_lock:
                 active_calls -= 1
-            return TEST_JPEG
+            return TEST_JPEG if call_number == 1 else b"\xff\xd8new-session-frame\xff\xd9"
 
         cam = CameraViewerService(auto_start_pipeline=True)
         cam.set_hardware_frame_source(blocked_source)
@@ -93,6 +97,109 @@ class TestCameraService(unittest.TestCase):
         self.assertIsNotNone(cam.get_latest_frame("sdk-owner"))
         cam.release_lease("sdk-owner")
         cam.stop_capture()
+
+    def test_late_capture_from_disconnected_lease_is_not_published_after_reacquire(self) -> None:
+        first_capture_entered = threading.Event()
+        release_first_capture = threading.Event()
+        second_capture_entered = threading.Event()
+        release_second_capture = threading.Event()
+        calls = 0
+        stale_jpeg = b"\xff\xd8stale-before-disconnect\xff\xd9"
+        fresh_jpeg = b"\xff\xd8fresh-after-reconnect\xff\xd9"
+
+        def source():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_capture_entered.set()
+                release_first_capture.wait(2.0)
+                return stale_jpeg
+            second_capture_entered.set()
+            release_second_capture.wait(2.0)
+            return fresh_jpeg
+
+        cam = CameraViewerService(auto_start_pipeline=True)
+        cam.set_hardware_frame_source(source)
+        cam.acquire_lease("sdk-owner", lease_ms=5000)
+        self.assertTrue(first_capture_entered.wait(1.0))
+        self.assertTrue(cam.invalidate_owner_on_upstream_disconnect("sdk-owner"))
+
+        # The same viewer may reconnect while the non-reentrant source callback
+        # from its old session is still unwinding.
+        cam.acquire_lease("sdk-owner", lease_ms=5000)
+        release_first_capture.set()
+        try:
+            self.assertTrue(second_capture_entered.wait(1.0))
+            self.assertIsNone(
+                cam.get_latest_frame("sdk-owner"),
+                "a frame captured before disconnect must not become the new session's first frame",
+            )
+        finally:
+            release_second_capture.set()
+
+        deadline = time.monotonic() + 1.0
+        frame = None
+        while time.monotonic() < deadline:
+            frame = cam.get_latest_frame("sdk-owner")
+            if frame is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame["jpeg_data"], fresh_jpeg)
+        cam.release_lease("sdk-owner")
+        cam.stop_capture()
+
+    def _assert_stale_stop_cannot_stop_reacquired_pipeline(self, *, expire: bool) -> None:
+        cam = CameraViewerService(auto_start_pipeline=True)
+        initial_lease_ms = 35 if expire else 5000
+        cam.acquire_lease("viewer", lease_ms=initial_lease_ms)
+        old_capture_generation = cam._capture_generation
+        old_pipeline_generation = cam._pipeline_generation
+        self.assertIsNotNone(old_pipeline_generation)
+        self.assertTrue(cam.pipeline._running)
+
+        stop_entered = threading.Event()
+        allow_old_stop = threading.Event()
+        original_stop = cam.pipeline.stop_if_generation
+
+        def delayed_stop(generation):
+            if generation == old_pipeline_generation:
+                stop_entered.set()
+                self.assertTrue(allow_old_stop.wait(1.0), "test must release the delayed stop")
+            return original_stop(generation)
+
+        cam.pipeline.stop_if_generation = delayed_stop
+        if expire:
+            time.sleep(0.05)
+            invalidator = threading.Thread(target=cam.is_lease_valid)
+        else:
+            invalidator = threading.Thread(target=lambda: cam.release_lease("viewer"))
+        invalidator.start()
+        try:
+            self.assertTrue(stop_entered.wait(1.0), "old lease cleanup must reach the blocked stop")
+            reacquired = cam.acquire_lease("viewer", lease_ms=5000)
+            self.assertTrue(reacquired["granted"])
+        finally:
+            allow_old_stop.set()
+            invalidator.join(1.0)
+
+        self.assertFalse(invalidator.is_alive())
+        self.assertEqual(cam._active_lease_owner, "viewer")
+        self.assertTrue(cam.pipeline._running, "stopping an old generation must preserve the new lease's worker")
+        cam.push_frame(
+            b"\xff\xd8late-old-lease-frame\xff\xd9",
+            is_hardware=True,
+            capture_generation=old_capture_generation,
+        )
+        self.assertIsNone(cam.get_latest_frame("viewer"), "the old lease must remain unable to publish a JPEG")
+        cam.release_lease("viewer")
+        cam.stop_capture()
+
+    def test_release_stop_cannot_stop_pipeline_started_by_same_owner_reacquire(self) -> None:
+        self._assert_stale_stop_cannot_stop_reacquired_pipeline(expire=False)
+
+    def test_expiry_stop_cannot_stop_pipeline_started_by_same_owner_reacquire(self) -> None:
+        self._assert_stale_stop_cannot_stop_reacquired_pipeline(expire=True)
 
     def test_release_and_reacquire_does_not_start_second_blocked_capture_worker(self) -> None:
         entered_source = threading.Event()

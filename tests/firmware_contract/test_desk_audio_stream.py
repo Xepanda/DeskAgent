@@ -25,6 +25,8 @@ class ResamplerState(ctypes.Structure):
         ("input_samples", ctypes.c_uint64),
         ("output_samples", ctypes.c_uint64),
         ("finished", ctypes.c_bool),
+        ("fir_history", ctypes.c_int16 * 19),
+        ("fir_position", ctypes.c_uint8),
     ]
 
 
