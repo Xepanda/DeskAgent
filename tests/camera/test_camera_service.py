@@ -31,7 +31,7 @@ class TestCameraService(unittest.TestCase):
 
         cam = CameraViewerService(
             auto_start_pipeline=True,
-            on_lease_released=lambda owner, reason: teardown_events.append((owner, reason)),
+            on_lease_released=lambda owner, reason, generation: teardown_events.append((owner, reason, generation)),
         )
         cam.set_hardware_frame_source(blocked_source)
         cam.acquire_lease("sdk-owner", lease_ms=5000)
@@ -343,38 +343,93 @@ class TestCameraService(unittest.TestCase):
         self.assertFalse(second["granted"])
         self.assertEqual(second["reason"], "RESOURCE_BUSY")
         self.assertTrue(renewed["granted"])
+        self.assertGreater(first["lease_generation"], 0)
+        self.assertEqual(renewed["lease_generation"], first["lease_generation"])
         self.assertIsNone(cam.get_latest_frame("client-B"))
         cam.release_lease("client-A")
 
     def test_release_clears_frame_and_calls_teardown_once(self) -> None:
         events = []
-        cam = CameraViewerService(on_lease_released=lambda owner, reason: events.append((owner, reason)))
-        cam.acquire_lease("viewer", lease_ms=1000)
+        cam = CameraViewerService(on_lease_released=lambda owner, reason, generation: events.append((owner, reason, generation)))
+        lease = cam.acquire_lease("viewer", lease_ms=1000)
         cam.ingest_robot_frame(TEST_JPEG)
         self.assertTrue(cam.release_lease("viewer"))
         self.assertFalse(cam.release_lease("viewer"))
         self.assertIsNone(cam.get_latest_frame("viewer"))
-        self.assertEqual(events, [("viewer", "explicit_release")])
+        self.assertEqual(events, [("viewer", "explicit_release", lease["lease_generation"])])
 
     def test_expiry_clears_data_and_reacquiring_same_client_does_not_reuse_it(self) -> None:
         events = []
-        cam = CameraViewerService(on_lease_released=lambda owner, reason: events.append((owner, reason)))
-        cam.acquire_lease("viewer", lease_ms=35)
+        cam = CameraViewerService(on_lease_released=lambda owner, reason, generation: events.append((owner, reason, generation)))
+        first = cam.acquire_lease("viewer", lease_ms=35)
         cam.ingest_robot_frame(TEST_JPEG)
         time.sleep(0.05)
 
         renewed = cam.acquire_lease("viewer", lease_ms=1000)
         self.assertTrue(renewed["granted"])
+        self.assertGreater(renewed["lease_generation"], first["lease_generation"])
         self.assertIsNone(cam.get_latest_frame("viewer"), "An expired lease must not carry its previous frame into renewal")
-        self.assertEqual(events, [("viewer", "expired")])
+        self.assertEqual(events, [("viewer", "expired", first["lease_generation"])])
         cam.release_lease("viewer")
+
+    def test_delayed_old_generation_teardown_cannot_release_same_owner_reacquire(self) -> None:
+        callback_entered = threading.Event()
+        allow_callback_cleanup = threading.Event()
+        events = []
+        stale_invalidation_results = []
+        cam = None
+
+        def delayed_teardown(owner, reason, released_generation):
+            events.append((owner, reason, released_generation))
+            callback_entered.set()
+            self.assertTrue(allow_callback_cleanup.wait(1.0), "test must release delayed teardown")
+            stale_invalidation_results.append(
+                cam.invalidate_owner_on_upstream_disconnect(
+                    owner,
+                    expected_generation=released_generation,
+                )
+            )
+
+        cam = CameraViewerService(on_lease_released=delayed_teardown)
+        first = cam.acquire_lease("sdk-owner", lease_ms=5000)
+        cam.ingest_robot_frame(b"\xff\xd8old-generation-frame\xff\xd9")
+        release_result = []
+        releaser = threading.Thread(
+            target=lambda: release_result.append(
+                cam.release_lease("sdk-owner", expected_generation=first["lease_generation"])
+            )
+        )
+        releaser.start()
+        try:
+            self.assertTrue(callback_entered.wait(1.0), "old release must reach its delayed teardown callback")
+            second = cam.acquire_lease("sdk-owner", lease_ms=5000)
+            self.assertGreater(second["lease_generation"], first["lease_generation"])
+            new_frame = b"\xff\xd8new-generation-frame\xff\xd9"
+            cam.ingest_robot_frame(new_frame)
+        finally:
+            allow_callback_cleanup.set()
+            releaser.join(1.0)
+
+        self.assertFalse(releaser.is_alive())
+        self.assertEqual(release_result, [True])
+        self.assertEqual(events, [("sdk-owner", "explicit_release", first["lease_generation"])])
+        self.assertEqual(stale_invalidation_results, [False])
+        self.assertEqual(cam._active_lease_owner, "sdk-owner")
+        self.assertEqual(cam._active_lease_generation, second["lease_generation"])
+        self.assertEqual(cam.get_latest_frame("sdk-owner")["jpeg_data"], new_frame)
+        self.assertFalse(
+            cam.release_lease("sdk-owner", expected_generation=first["lease_generation"]),
+            "a delayed release carrying the old generation must be a no-op",
+        )
+        self.assertTrue(cam.is_lease_valid())
+        self.assertTrue(cam.release_lease("sdk-owner", expected_generation=second["lease_generation"]))
 
     def test_ephemeral_snapshot_lease_is_released_even_without_a_frame(self) -> None:
         events = []
-        cam = CameraViewerService(on_lease_released=lambda owner, reason: events.append((owner, reason)))
+        cam = CameraViewerService(on_lease_released=lambda owner, reason, generation: events.append((owner, reason, generation)))
         self.assertIsNone(cam.get_snapshot())
         self.assertFalse(cam.is_lease_valid())
-        self.assertEqual(events, [("snapshot-viewer", "explicit_release")])
+        self.assertEqual(events, [("snapshot-viewer", "explicit_release", 1)])
 
     def test_snapshot_uses_real_source_and_releases_ephemeral_lease(self) -> None:
         cam = CameraViewerService(auto_start_pipeline=True, allow_synthetic=True)
@@ -518,9 +573,9 @@ class TestCameraService(unittest.TestCase):
         events = []
         cam = CameraViewerService(
             stale_threshold_ms=1000,
-            on_lease_released=lambda owner, reason: events.append((owner, reason)),
+            on_lease_released=lambda owner, reason, generation: events.append((owner, reason, generation)),
         )
-        cam.acquire_lease("viewer", lease_ms=80)
+        lease = cam.acquire_lease("viewer", lease_ms=80)
         stream = cam.iter_mjpeg("viewer", wait_timeout=0.5)
 
         import threading
@@ -535,7 +590,7 @@ class TestCameraService(unittest.TestCase):
         self.assertIsNone(cam._active_lease_owner)
         self.assertIsNone(cam._latest_jpeg)
         self.assertNotIn("viewer", cam._active_stream_owners)
-        self.assertEqual(events, [("viewer", "expired")])
+        self.assertEqual(events, [("viewer", "expired", lease["lease_generation"])])
 
     def test_mjpeg_stream_admission_limits_owner_and_global_subscribers(self) -> None:
         cam = CameraViewerService()
