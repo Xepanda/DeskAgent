@@ -74,6 +74,9 @@ static uint32_t s_ws_hello_pending_generation = 0;
 /* Serializes only the ACK latch and its generation. It is never held while
  * taking the pairing mutex or doing network I/O. */
 static pthread_mutex_t s_ws_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_ws_lifecycle_cond = PTHREAD_COND_INITIALIZER;
+static bool s_ws_lifecycle_closing = false;
+static unsigned s_ws_audio_commands_inflight = 0;
 static pthread_mutex_t s_ws_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_ws_generation = 0;
 static desk_sdk_ws_state_t s_ws_state = DESK_SDK_WS_OFFLINE;
@@ -415,10 +418,17 @@ static void ws_schedule_reconnect(void)
 static bool ws_transport_close_for_generation(uint32_t expected_generation, bool check_generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    while (s_ws_lifecycle_closing)
+        pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex);
     if (check_generation && expected_generation != s_ws_generation) {
         pthread_mutex_unlock(&s_ws_lifecycle_mutex);
         return false;
     }
+    /* Block new audio commands and wait for the bounded HAL operation that
+     * already owns this generation before invalidating its identity. */
+    s_ws_lifecycle_closing = true;
+    while (s_ws_audio_commands_inflight != 0)
+        pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex);
     uint32_t closed_generation = s_ws_generation;
     ++s_ws_generation;
     s_ws_ready = false;
@@ -433,6 +443,8 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     }
     s_ws_state = DESK_SDK_WS_OFFLINE;
     s_ws_rx_len = 0;
+    s_ws_lifecycle_closing = false;
+    pthread_cond_broadcast(&s_ws_lifecycle_cond);
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
     if (fd >= 0 && pthread_mutex_trylock(&s_ws_socket_write_mutex) == 0) {
         pthread_mutex_lock(&s_ws_lifecycle_mutex);
@@ -654,7 +666,7 @@ static bool ws_hardware_hello_ack_valid(const char *json)
 static bool ws_commit_hardware_hello_ack(uint32_t generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
-    bool current = generation == s_ws_generation && s_ws_hello_pending &&
+    bool current = !s_ws_lifecycle_closing && generation == s_ws_generation && s_ws_hello_pending &&
                    s_ws_hello_pending_generation == generation && !s_ws_ready &&
                    s_ws_state == DESK_SDK_WS_HELLO_SENT;
     if (current) {
@@ -871,6 +883,25 @@ bool desk_sdk_ws_client_is_authenticated(void)
 }
 desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void) { return s_ws_state; }
 uint32_t desk_sdk_ws_client_generation(void) { return ws_lifecycle_generation(); }
+
+bool desk_sdk_ws_client_audio_command_acquire(uint32_t connection_generation)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool valid = !s_ws_lifecycle_closing && connection_generation != 0 &&
+                 connection_generation == s_ws_generation && s_ws_ready && s_ws_authenticated;
+    if (valid) ++s_ws_audio_commands_inflight;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return valid;
+}
+
+void desk_sdk_ws_client_audio_command_release(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    if (s_ws_audio_commands_inflight > 0) --s_ws_audio_commands_inflight;
+    if (s_ws_audio_commands_inflight == 0)
+        pthread_cond_broadcast(&s_ws_lifecycle_cond);
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+}
 
 int desk_sdk_ws_client_send_text(const char *text)
 {

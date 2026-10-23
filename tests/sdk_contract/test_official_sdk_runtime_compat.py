@@ -136,8 +136,13 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 's_ws_ready = true; s_ws_authenticated = true; s_ws_state = DESK_SDK_WS_CONNECTED; '
                 'pthread_mutex_unlock(&s_ws_lifecycle_mutex); }\n'
                 'uint32_t desk_sdk_test_advance_ws_generation(void) { '
-                'pthread_mutex_lock(&s_ws_lifecycle_mutex); ++s_ws_generation; '
-                'uint32_t generation = s_ws_generation; pthread_mutex_unlock(&s_ws_lifecycle_mutex); '
+                'pthread_mutex_lock(&s_ws_lifecycle_mutex); while (s_ws_lifecycle_closing) '
+                'pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex); '
+                's_ws_lifecycle_closing = true; while (s_ws_audio_commands_inflight != 0) '
+                'pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex); '
+                '++s_ws_generation; uint32_t generation = s_ws_generation; '
+                's_ws_lifecycle_closing = false; pthread_cond_broadcast(&s_ws_lifecycle_cond); '
+                'pthread_mutex_unlock(&s_ws_lifecycle_mutex); '
                 'return generation; }\n'
                 'void desk_sdk_test_disconnect_ws_generation(uint32_t generation) { '
                 'ws_disconnect_generation_and_schedule(generation); }\n'
@@ -157,14 +162,38 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'static desk_audio_stream_status_t test_audio_status;\n'
                 'static uint32_t test_audio_free_frames = 8; static int test_audio_active; static unsigned test_audio_drain_checks; '
                 'static unsigned test_audio_begin_calls; static unsigned test_audio_stop_calls;\n'
+                'static unsigned test_audio_stale_begin_calls; static unsigned test_audio_stale_stop_calls;\n'
                 'static int test_audio_hold_stop_drain;\n'
                 'static int test_audio_hal_ready;\n'
+                'static pthread_mutex_t test_audio_gate_mutex = PTHREAD_MUTEX_INITIALIZER; '
+                'static pthread_cond_t test_audio_gate_cond = PTHREAD_COND_INITIALIZER; '
+                'static int test_audio_pause_begin, test_audio_begin_paused, test_audio_release_begin; '
+                'static int test_audio_pause_stop, test_audio_stop_paused, test_audio_release_stop;\n'
                 'void desk_sdk_test_audio_reset(void) { memset(&test_audio_status, 0, sizeof(test_audio_status)); '
                 'test_audio_free_frames = 8; test_audio_active = 0; test_audio_drain_checks = 0; test_audio_hold_stop_drain = 0; '
-                'test_audio_hal_ready = 0; test_audio_begin_calls = 0; test_audio_stop_calls = 0; }\n'
+                'test_audio_hal_ready = 0; test_audio_begin_calls = 0; test_audio_stop_calls = 0; '
+                'test_audio_stale_begin_calls = 0; test_audio_stale_stop_calls = 0; }\n'
                 'int desk_sdk_test_audio_is_active(void) { return test_audio_active; }\n'
                 'unsigned desk_sdk_test_audio_begin_calls(void) { return test_audio_begin_calls; }\n'
                 'unsigned desk_sdk_test_audio_stop_calls(void) { return test_audio_stop_calls; }\n'
+                'unsigned desk_sdk_test_audio_stale_begin_calls(void) { return test_audio_stale_begin_calls; }\n'
+                'unsigned desk_sdk_test_audio_stale_stop_calls(void) { return test_audio_stale_stop_calls; }\n'
+                'void desk_sdk_test_audio_pause_next_begin(void) { pthread_mutex_lock(&test_audio_gate_mutex); '
+                'test_audio_pause_begin = 1; test_audio_begin_paused = 0; test_audio_release_begin = 0; '
+                'pthread_mutex_unlock(&test_audio_gate_mutex); }\n'
+                'int desk_sdk_test_audio_begin_is_paused(void) { pthread_mutex_lock(&test_audio_gate_mutex); '
+                'int paused = test_audio_begin_paused; pthread_mutex_unlock(&test_audio_gate_mutex); return paused; }\n'
+                'void desk_sdk_test_audio_release_begin(void) { pthread_mutex_lock(&test_audio_gate_mutex); '
+                'test_audio_release_begin = 1; pthread_cond_broadcast(&test_audio_gate_cond); '
+                'pthread_mutex_unlock(&test_audio_gate_mutex); }\n'
+                'void desk_sdk_test_audio_pause_next_stop(void) { pthread_mutex_lock(&test_audio_gate_mutex); '
+                'test_audio_pause_stop = 1; test_audio_stop_paused = 0; test_audio_release_stop = 0; '
+                'pthread_mutex_unlock(&test_audio_gate_mutex); }\n'
+                'int desk_sdk_test_audio_stop_is_paused(void) { pthread_mutex_lock(&test_audio_gate_mutex); '
+                'int paused = test_audio_stop_paused; pthread_mutex_unlock(&test_audio_gate_mutex); return paused; }\n'
+                'void desk_sdk_test_audio_release_stop(void) { pthread_mutex_lock(&test_audio_gate_mutex); '
+                'test_audio_release_stop = 1; pthread_cond_broadcast(&test_audio_gate_cond); '
+                'pthread_mutex_unlock(&test_audio_gate_mutex); }\n'
                 'void desk_sdk_test_audio_set_hal_ready(int ready) { test_audio_hal_ready = ready; }\n'
                 'int __wrap_desk_hardware_audio_get_status(desk_hardware_audio_status_t *status) { '
                 'if (!status) return DESK_HW_ERR_INVALID_ARG; memset(status, 0, sizeof(*status)); '
@@ -177,6 +206,11 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'return desk_sdk_bridge_process_ws_audio_frame(frame, len, generation); }\n'
                 'int __wrap_desk_hardware_audio_stream_begin(uint64_t handle, uint32_t generation, uint32_t stream_id, '
                 'uint32_t rate, uint8_t channels, uint8_t width, uint32_t total) { '
+                'pthread_mutex_lock(&test_audio_gate_mutex); if (test_audio_pause_begin) { '
+                'test_audio_begin_paused = 1; pthread_cond_broadcast(&test_audio_gate_cond); '
+                'while (!test_audio_release_begin) pthread_cond_wait(&test_audio_gate_cond, &test_audio_gate_mutex); '
+                'test_audio_pause_begin = 0; } pthread_mutex_unlock(&test_audio_gate_mutex); '
+                'if (generation != ws_lifecycle_generation()) test_audio_stale_begin_calls++; '
                 'test_audio_begin_calls++; if (test_audio_active || rate != 24000 || channels != 1 || width != 2 || total < 2) return DESK_HW_ERR_BUSY; '
                 'memset(&test_audio_status, 0, sizeof(test_audio_status)); test_audio_status.handle = handle; '
                 'test_audio_status.connection_generation = generation; test_audio_status.stream_id = stream_id; '
@@ -196,6 +230,11 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'test_audio_status.state = DESK_AUDIO_STREAM_DRAINING; test_audio_status.tx_drained = false; '
                 'test_audio_drain_checks = 0; return DESK_HW_OK; }\n'
                 'int __wrap_desk_hardware_audio_stream_stop(uint64_t handle, uint32_t timeout_ms) { (void)timeout_ms; test_audio_stop_calls++; '
+                'pthread_mutex_lock(&test_audio_gate_mutex); if (test_audio_pause_stop) { '
+                'test_audio_stop_paused = 1; pthread_cond_broadcast(&test_audio_gate_cond); '
+                'while (!test_audio_release_stop) pthread_cond_wait(&test_audio_gate_cond, &test_audio_gate_mutex); '
+                'test_audio_pause_stop = 0; } pthread_mutex_unlock(&test_audio_gate_mutex); '
+                'if (test_audio_status.connection_generation != ws_lifecycle_generation()) test_audio_stale_stop_calls++; '
                 'if (test_audio_status.handle != handle) return DESK_HW_ERR_INVALID_ARG; '
                 'if (test_audio_hold_stop_drain) { test_audio_status.state = DESK_AUDIO_STREAM_CANCELED; '
                 'test_audio_status.tx_drained = false; return DESK_HW_ERR_TIMEOUT; } '
@@ -353,6 +392,18 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.lib.desk_sdk_test_audio_begin_calls.argtypes = []
         cls.lib.desk_sdk_test_audio_stop_calls.restype = ctypes.c_uint
         cls.lib.desk_sdk_test_audio_stop_calls.argtypes = []
+        cls.lib.desk_sdk_test_audio_stale_begin_calls.restype = ctypes.c_uint
+        cls.lib.desk_sdk_test_audio_stale_begin_calls.argtypes = []
+        cls.lib.desk_sdk_test_audio_stale_stop_calls.restype = ctypes.c_uint
+        cls.lib.desk_sdk_test_audio_stale_stop_calls.argtypes = []
+        for name in ("pause_next_begin", "release_begin", "pause_next_stop", "release_stop"):
+            fn = getattr(cls.lib, f"desk_sdk_test_audio_{name}")
+            fn.restype = None
+            fn.argtypes = []
+        for name in ("begin_is_paused", "stop_is_paused"):
+            fn = getattr(cls.lib, f"desk_sdk_test_audio_{name}")
+            fn.restype = ctypes.c_int
+            fn.argtypes = []
         cls.lib.desk_sdk_test_prepare_log_pair.restype = None
         cls.lib.desk_sdk_test_prepare_log_pair.argtypes = []
 
@@ -2342,6 +2393,91 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(json.loads(stale_out.value)["type"], "sys.nack")
         self.assertEqual(self.lib.desk_sdk_test_audio_stop_calls(), 1)
         self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 1)
+
+    def test_audio_begin_generation_guard_is_atomic_with_disconnect(self) -> None:
+        """Disconnect cannot advance the generation between begin validation and HAL entry."""
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_advance_ws_generation()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        generation_before = self.lib.desk_sdk_test_ws_generation()
+        command = {"type": "ctrl.audio.stream.begin", "code": 0,
+                   "request_id": "audio-begin-race", "data": {
+                       "stream_id": 806, "total_bytes": 320,
+                       "sample_rate_hz": 24000, "channels": 1,
+                       "sample_width_bytes": 2, "audio_sha256": "0" * 64}}
+        out = ctypes.create_string_buffer(1024)
+        command_rc: list[int] = []
+        self.lib.desk_sdk_test_audio_pause_next_begin()
+        command_thread = threading.Thread(target=lambda: command_rc.append(
+            self._process_ws_command(json.dumps(command).encode(), out)))
+        command_thread.start()
+        deadline = time.monotonic() + 3.0
+        while not self.lib.desk_sdk_test_audio_begin_is_paused() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(self.lib.desk_sdk_test_audio_begin_is_paused(), "begin did not reach HAL gate")
+
+        generation_advanced = threading.Event()
+        advance_thread = threading.Thread(target=lambda: (
+            self.lib.desk_sdk_test_advance_ws_generation(), generation_advanced.set()))
+        advance_thread.start()
+        try:
+            time.sleep(0.05)
+            advanced_while_hal_paused = generation_advanced.is_set()
+        finally:
+            self.lib.desk_sdk_test_audio_release_begin()
+        command_thread.join(timeout=3.0)
+        advance_thread.join(timeout=3.0)
+        self.assertFalse(command_thread.is_alive(), "audio begin did not release its lifecycle guard")
+        self.assertFalse(advance_thread.is_alive(), "disconnect did not complete after HAL begin")
+        self.assertFalse(advanced_while_hal_paused, "generation advanced while the guarded HAL call was in flight")
+        self.assertEqual(command_rc, [0])
+        self.assertEqual(self.lib.desk_sdk_test_audio_stale_begin_calls(), 0)
+        self.assertEqual(self.lib.desk_sdk_test_ws_generation(), generation_before + 1)
+
+    def test_audio_stop_generation_guard_is_atomic_with_disconnect(self) -> None:
+        """Disconnect cannot replace the owner between stop validation and HAL entry."""
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_advance_ws_generation()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        begin = {"type": "ctrl.audio.stream.begin", "code": 0,
+                 "request_id": "audio-stop-race-begin", "data": {
+                     "stream_id": 807, "total_bytes": 320,
+                     "sample_rate_hz": 24000, "channels": 1,
+                     "sample_width_bytes": 2, "audio_sha256": "0" * 64}}
+        begin_out = ctypes.create_string_buffer(1024)
+        self.assertEqual(self._process_ws_command(json.dumps(begin).encode(), begin_out), 0)
+        self.assertEqual(json.loads(begin_out.value)["type"], "sys.ack")
+        generation_before = self.lib.desk_sdk_test_ws_generation()
+        stop = {"type": "ctrl.audio.stop", "code": 0,
+                "request_id": "audio-stop-race", "data": {"stream_id": 807}}
+        stop_out = ctypes.create_string_buffer(1024)
+        stop_rc: list[int] = []
+        self.lib.desk_sdk_test_audio_pause_next_stop()
+        stop_thread = threading.Thread(target=lambda: stop_rc.append(
+            self._process_ws_command(json.dumps(stop).encode(), stop_out)))
+        stop_thread.start()
+        deadline = time.monotonic() + 3.0
+        while not self.lib.desk_sdk_test_audio_stop_is_paused() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(self.lib.desk_sdk_test_audio_stop_is_paused(), "stop did not reach HAL gate")
+
+        generation_advanced = threading.Event()
+        advance_thread = threading.Thread(target=lambda: (
+            self.lib.desk_sdk_test_advance_ws_generation(), generation_advanced.set()))
+        advance_thread.start()
+        try:
+            time.sleep(0.05)
+            advanced_while_hal_paused = generation_advanced.is_set()
+        finally:
+            self.lib.desk_sdk_test_audio_release_stop()
+        stop_thread.join(timeout=3.0)
+        advance_thread.join(timeout=3.0)
+        self.assertFalse(stop_thread.is_alive(), "audio stop did not release its lifecycle guard")
+        self.assertFalse(advance_thread.is_alive(), "disconnect did not complete after HAL stop")
+        self.assertFalse(advanced_while_hal_paused, "generation advanced while the guarded HAL call was in flight")
+        self.assertEqual(stop_rc, [0])
+        self.assertEqual(self.lib.desk_sdk_test_audio_stale_stop_calls(), 0)
+        self.assertEqual(self.lib.desk_sdk_test_ws_generation(), generation_before + 1)
 
     def test_audio_playback_stream_runs_over_pinned_runtime_loopback(self) -> None:
         """Exercise begin, multi-frame WSPK, HAL-backed credit, completion and cancel."""

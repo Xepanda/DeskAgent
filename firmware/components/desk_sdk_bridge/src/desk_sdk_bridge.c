@@ -3847,7 +3847,7 @@ static int desk_sdk_audio_stream_begin_command(const char *json_in,
     if (desk_sdk_audio_hex_decode(digest, expected_digest) != 0) return -1;
     uint32_t generation = desk_sdk_ws_client_generation();
     if (!connection_generation || generation != connection_generation ||
-        !desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete()) {
+        !desk_sdk_ws_client_is_authenticated()) {
         snprintf(out_buf, max_out_len,
             "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
             "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stream requires an authenticated SDK session\"}}", rid);
@@ -3918,7 +3918,7 @@ static int desk_sdk_audio_stop_command(const char *json_in,
     int32_t requested_id = json_parse_int(data, "stream_id", -1);
     uint32_t current_generation = desk_sdk_ws_client_generation();
     if (!connection_generation || current_generation != connection_generation ||
-        !desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete()) {
+        !desk_sdk_ws_client_is_authenticated()) {
         snprintf(out_buf, max_out_len,
             "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
             "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stop requires an authenticated SDK session\"}}", rid);
@@ -3978,9 +3978,8 @@ int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
     if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
     if (strcmp(type, "ctrl.audio.stream.begin") == 0 ||
         strcmp(type, "ctrl.audio.stop") == 0) {
-        if (!connection_generation ||
-            connection_generation != desk_sdk_ws_client_generation() ||
-            !desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete()) {
+        if (!desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete() ||
+            !desk_sdk_ws_client_audio_command_acquire(connection_generation)) {
             char rid_scratch[128];
             const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
             snprintf(out_buf, max_out_len,
@@ -3989,11 +3988,13 @@ int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
                      rid);
             return 0;
         }
-        if (strcmp(type, "ctrl.audio.stream.begin") == 0)
-            return desk_sdk_audio_stream_begin_command(json_in, out_buf, max_out_len,
-                                                       connection_generation);
-        return desk_sdk_audio_stop_command(json_in, out_buf, max_out_len,
-                                            connection_generation);
+        int audio_rc = strcmp(type, "ctrl.audio.stream.begin") == 0
+            ? desk_sdk_audio_stream_begin_command(json_in, out_buf, max_out_len,
+                                                  connection_generation)
+            : desk_sdk_audio_stop_command(json_in, out_buf, max_out_len,
+                                          connection_generation);
+        desk_sdk_ws_client_audio_command_release();
+        return audio_rc;
     }
     if (strcmp(type, "ctrl.camera.stream.start") == 0 ||
         strcmp(type, "ctrl.camera.stream.stop") == 0 ||
