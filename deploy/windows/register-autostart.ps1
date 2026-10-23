@@ -41,7 +41,14 @@ $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -WorkingDirectory $PSScriptRoot
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 0)
+# Task Scheduler applies RestartCount only after a failed task result (non-zero exit).
+# A normal Companion exit therefore is not restarted. Keep recovery finite and spaced out.
+$restartCount = 3
+$restartInterval = New-TimeSpan -Minutes 1
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Days 0) `
+    -RestartCount $restartCount `
+    -RestartInterval $restartInterval
 
 try {
     # Check if task already exists
@@ -57,14 +64,22 @@ try {
         -Settings $settings `
         -Description "Desk Agent R1 Windows Codex Companion Daemon" | Out-Null
 
+    # Verify what Task Scheduler actually stored, rather than trusting registration output.
+    $registeredCompanion = Get-ScheduledTask -TaskName $companionTaskName -ErrorAction Stop
+    $registeredRestartInterval = $registeredCompanion.Settings.RestartInterval
+    if ($registeredRestartInterval -isnot [TimeSpan]) {
+        $registeredRestartInterval = [System.Xml.XmlConvert]::ToTimeSpan([string]$registeredRestartInterval)
+    }
+    if ([int]$registeredCompanion.Settings.RestartCount -ne $restartCount -or
+        $registeredRestartInterval -ne $restartInterval) {
+        throw "Task Scheduler did not retain the requested failure recovery policy (count=$($registeredCompanion.Settings.RestartCount), interval=$registeredRestartInterval)."
+    }
+
     Write-Host "[SUCCESS] Registered '$companionTaskName' to start on logon." -ForegroundColor Green
 } catch {
     Write-Host "[ERROR] Failed to register Scheduled Task: $_" -ForegroundColor Red
-    Write-Host "        Falling back to Registry Run Key (HKCU:\Software\Microsoft\Windows\CurrentVersion\Run)..." -ForegroundColor Yellow
-    $regKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-    $regCmd = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Minimized -File `"$startCompanionScript`" -ConfigPath `"$CompanionConfig`""
-    Set-ItemProperty -Path $regKey -Name $companionTaskName -Value $regCmd
-    Write-Host "[SUCCESS] Registered '$companionTaskName' via Registry Run Key." -ForegroundColor Green
+    Write-Host "        Registry Run is not used because it cannot provide bounded crash recovery. Registration was attempted, but the Companion task's final state could not be verified; it may already exist." -ForegroundColor Yellow
+    throw
 }
 
 # 4. Optionally register Host service if requested
@@ -85,12 +100,23 @@ if ($IncludeHost) {
             -Trigger $trigger `
             -Settings $settings `
             -Description "Desk Agent R1 Host Application Daemon" | Out-Null
+
+        # Verify the finite failure recovery policy Task Scheduler actually stored.
+        $registeredHost = Get-ScheduledTask -TaskName $hostTaskName -ErrorAction Stop
+        $registeredHostRestartInterval = $registeredHost.Settings.RestartInterval
+        if ($registeredHostRestartInterval -isnot [TimeSpan]) {
+            $registeredHostRestartInterval = [System.Xml.XmlConvert]::ToTimeSpan([string]$registeredHostRestartInterval)
+        }
+        if ([int]$registeredHost.Settings.RestartCount -ne $restartCount -or
+            $registeredHostRestartInterval -ne $restartInterval) {
+            throw "Task Scheduler did not retain the Host task's requested failure recovery policy (count=$($registeredHost.Settings.RestartCount), interval=$registeredHostRestartInterval)."
+        }
+
         Write-Host "[SUCCESS] Registered '$hostTaskName' to start on logon." -ForegroundColor Green
     } catch {
-        $regKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-        $regCmd = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Minimized -File `"$runHostScript`" -ConfigPath `"$HostConfig`""
-        Set-ItemProperty -Path $regKey -Name $hostTaskName -Value $regCmd
-        Write-Host "[SUCCESS] Registered '$hostTaskName' via Registry Run Key." -ForegroundColor Green
+        Write-Host "[ERROR] Failed to register Host Scheduled Task: $_" -ForegroundColor Red
+        Write-Host "        Registry Run is not used because it cannot provide bounded crash recovery." -ForegroundColor Yellow
+        throw
     }
 }
 
