@@ -31,7 +31,6 @@ def source_snapshot(repo: Path, sdk: Path, staged_firmware: Path) -> dict[str, o
         for item in listing.stdout.split(b"\0") if item
     }
     files = {item for item in files if not item.startswith(excluded)}
-    files.add("firmware/.build/build/build_param.json")
     files.update(("tools/build_watcher_firmware.ps1", "tools/build_watcher_tuyaopen.py"))
     records = []
     aggregate = hashlib.sha256()
@@ -45,7 +44,7 @@ def source_snapshot(repo: Path, sdk: Path, staged_firmware: Path) -> dict[str, o
         aggregate.update(b"\0")
         aggregate.update(record["sha256"].encode("ascii"))
         aggregate.update(b"\n")
-        if relative.startswith("firmware/") and relative != "firmware/.build/build/build_param.json":
+        if relative.startswith("firmware/"):
             staged_input = staged_firmware / Path(relative).relative_to("firmware")
             if not staged_input.is_file() or _sha256(staged_input) != record["sha256"]:
                 raise RuntimeError(f"Staged firmware input differs from repository source: {relative}")

@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -25,12 +24,6 @@ from datetime import datetime, timezone
 EXCLUDED_FIRMWARE_DIRS = {
     ".build", "build", "dist", ".target_logging", "__pycache__",
 }
-STAGED_SDK_INPUT_DIRS = (
-    "boards",
-    "tools",
-    "platform/ESP32/esp-idf",
-    "platform/ESP32/.espressif",
-)
 IDF_VERSION = "5.4"
 IDF_TARGET = "esp32s3"
 
@@ -194,57 +187,6 @@ def _copy_firmware(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, ignore=ignore, symlinks=False)
 
 
-def _is_link_or_reparse_point(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    is_junction = getattr(path, "is_junction", None)
-    if is_junction is not None and is_junction():
-        return True
-    attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
-
-
-def _plain_directory_snapshot(root: Path) -> dict[str, object]:
-    """Hash a staged directory tree and refuse links/reparse points anywhere in it."""
-    if _is_link_or_reparse_point(root):
-        raise RuntimeError(f"Staged SDK input is a link or reparse point: {root}")
-    digest = hashlib.sha256()
-    file_count = 0
-    byte_count = 0
-    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
-        current = Path(directory)
-        names.sort()
-        files.sort()
-        for name in list(names):
-            child = current / name
-            if _is_link_or_reparse_point(child):
-                raise RuntimeError(f"SDK input contains a link or reparse point: {child}")
-            relative = child.relative_to(root).as_posix()
-            digest.update(b"D\0" + relative.encode("utf-8", errors="surrogateescape") + b"\n")
-        for name in files:
-            child = current / name
-            if _is_link_or_reparse_point(child):
-                raise RuntimeError(f"SDK input contains a link or reparse point: {child}")
-            metadata = child.stat()
-            if not stat.S_ISREG(metadata.st_mode):
-                raise RuntimeError(f"SDK input contains a non-regular file: {child}")
-            file_hash = sha256_file(child)
-            relative = child.relative_to(root).as_posix()
-            digest.update(
-                b"F\0" + relative.encode("utf-8", errors="surrogateescape") + b"\0"
-                + str(metadata.st_size).encode("ascii") + b"\0"
-                + file_hash.encode("ascii") + b"\n"
-            )
-            file_count += 1
-            byte_count += metadata.st_size
-    return {
-        "file_count": file_count,
-        "byte_count": byte_count,
-        "tree_sha256": digest.hexdigest().upper(),
-        "reparse_points": 0,
-    }
-
-
 def _idf_repo_version(idf_root: Path) -> str:
     version_header = idf_root / "components" / "esp_common" / "include" / "esp_idf_version.h"
     try:
@@ -341,117 +283,21 @@ def validate_managed_component_lock(lock_path: Path, managed_root: Path) -> list
 
 
 def stage_sdk(sdk_source: Path, stage_root: Path, *, dependency_lock: Path | None = None) -> Path:
-    """Create an isolated TuyaOpen source view without SDK build/config state."""
-    sdk_source = sdk_source.resolve()
-    stage_root.mkdir(parents=True, exist_ok=False)
-    for filename in ("CMakeLists.txt", "tos.py"):
-        shutil.copy2(sdk_source / filename, stage_root / filename)
+    """Fail closed until tracked SDK source and toolchain manifests exist.
 
-    # TuyaOpen derives include paths from OPEN_HEADER_DIR and CMake retains the
-    # lexical staging path. Copy src so Path.resolve() does not collapse those
-    # generated paths back into the external checkout.
-    shutil.copytree(sdk_source / "src", stage_root / "src")
-    for relative in ("boards", "tools"):
-        source = sdk_source / relative
-        if _is_link_or_reparse_point(source):
-            raise RuntimeError(f"SDK input directory must not be a link or junction: {source}")
-        shutil.copytree(source, stage_root / relative, symlinks=False)
-
-    (stage_root / "platform").mkdir()
-    shutil.copy2(sdk_source / "platform" / "platform_config.yaml",
-                 stage_root / "platform" / "platform_config.yaml")
-    source_platform = sdk_source / "platform" / "ESP32"
-    staged_platform = stage_root / "platform" / "ESP32"
-
-    def ignore_platform(directory: str, names: list[str]) -> set[str]:
-        excluded = {".git", ".espressif", "esp-idf", "tuya_open_sdk"}
-        return {name for name in names if name in excluded}
-
-    shutil.copytree(source_platform, staged_platform, ignore=ignore_platform)
-    source_idf = source_platform / "esp-idf"
-    staged_idf_source = staged_platform / "esp-idf"
-    if _is_link_or_reparse_point(source_idf):
-        raise RuntimeError(f"SDK input directory must not be a link or junction: {source_idf}")
-    shutil.copytree(source_idf, staged_idf_source, symlinks=False)
-
-    # Copy only toolchain runtimes and the public constraint input. The local
-    # idf-env registry is generated in this archive; other machine-local files
-    # under .espressif are intentionally outside the build input boundary.
-    source_espressif = source_platform / ".espressif"
-    staged_espressif = staged_platform / ".espressif"
-    staged_espressif.mkdir()
-    for relative in ("python_env", "tools"):
-        source = source_espressif / relative
-        if source.exists():
-            if _is_link_or_reparse_point(source):
-                raise RuntimeError(f"SDK toolchain input must not be a link or junction: {source}")
-            shutil.copytree(source, staged_espressif / relative, symlinks=False)
-    constraints = source_espressif / "espidf.constraints.v5.4.txt"
-    if constraints.is_file():
-        shutil.copy2(constraints, staged_espressif / constraints.name)
-    (staged_espressif / "idf-env.json").write_text('{"idfInstalled": {}}\n', encoding="utf-8")
-
-    source_project = source_platform / "tuya_open_sdk"
-    staged_project = staged_platform / "tuya_open_sdk"
-    source_managed = source_project / "managed_components"
+    The local TuyaOpen checkout contains generated component, IDF, and tool
+    installation trees. Copying or hashing those trees is not an approved
+    source of build inputs, so this runner deliberately refuses to stage them.
+    """
+    source_managed = sdk_source / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components"
     if source_managed.exists():
         if dependency_lock is None:
             raise RuntimeError("A tracked dependency lock is required before staging managed components.")
         validate_managed_component_lock(dependency_lock, source_managed)
-
-    def ignore_project(directory: str, names: list[str]) -> set[str]:
-        excluded = {"build", "managed_components", ".git"}
-        return {name for name in names if name in excluded or name.startswith("sdkconfig")}
-
-    shutil.copytree(source_project, staged_project, ignore=ignore_project)
-    # Managed dependencies are substantial but contain input sources only. Copy
-    # them into the archive so the build cannot regenerate anything in the SDK.
-    if source_managed.exists():
-        shutil.copytree(source_managed, staged_project / "managed_components")
-    # Keep the existing prepare marker: this makes build_setup use the already
-    # installed SDK-local tools and prevents its installer/network fallback.
-    prepare_marker = source_platform / ".prepare"
-    if not prepare_marker.is_file() or prepare_marker.read_text(encoding="utf-8").strip() != "esp32s3":
-        raise RuntimeError("SDK ESP32 .prepare marker is absent or not esp32s3; refusing any install/setup fallback.")
-    shutil.copy2(prepare_marker, staged_platform / ".prepare")
-
-    staged_idf = staged_platform / "esp-idf"
-    staged_espressif = staged_platform / ".espressif"
-    idf_registration = register_staged_idf_target(staged_idf, staged_espressif, IDF_TARGET)
-    if assert_staged_idf_target(staged_idf, staged_espressif, IDF_TARGET) != idf_registration:
-        raise RuntimeError("Staged ESP-IDF target registration did not round-trip")
-
-    directories: dict[str, dict[str, object]] = {}
-    aggregate = hashlib.sha256()
-    for relative in STAGED_SDK_INPUT_DIRS:
-        source = sdk_source / Path(relative)
-        staged = stage_root / Path(relative)
-        if os.path.samefile(source, staged):
-            raise RuntimeError(f"Staged SDK input still aliases its external source: {relative}")
-        snapshot = _plain_directory_snapshot(staged)
-        directories[relative] = {
-            "source": str(source),
-            "staged": str(staged),
-            "samefile_source": False,
-            **snapshot,
-        }
-        aggregate.update(relative.encode("utf-8") + b"\0")
-        aggregate.update(str(snapshot["tree_sha256"]).encode("ascii") + b"\n")
-    manifest = {
-        "schema_version": 1,
-        "sdk_source": str(sdk_source),
-        "staged_sdk": str(stage_root),
-        "idf_target_registration": {
-            "repo_id": f"{idf_registration['path']}-v{idf_registration['version']}",
-            **idf_registration,
-        },
-        "directories": directories,
-        "aggregate_sha256": aggregate.hexdigest().upper(),
-    }
-    (stage_root.parent / "staged-sdk-inputs.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    return stage_root
-
+    raise RuntimeError(
+        "BLOCKED: no tracked provenance-verified TuyaOpen/ESP-IDF source and toolchain allowlist is available; "
+        "refusing to traverse, copy, or hash shared SDK trees."
+    )
 
 def install_reviewed_sdkconfig_defaults(firmware_root: Path, staged_project: Path) -> Path:
     """Seed a fresh stage config from the reviewed tracked project defaults only."""
