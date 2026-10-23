@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""Build DeskAgent firmware with all writable project state under .target_logging.
+
+The TuyaOpen checkout supplies source and its preinstalled ESP-IDF toolchain.
+The project, ESP32 platform metadata, managed components, sdkconfig and all
+build trees are staged inside a new archive directory before invoking IDF.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import hashlib
+import json
+import ntpath
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+
+EXCLUDED_FIRMWARE_DIRS = {
+    ".build", "build", "dist", ".target_logging", "__pycache__",
+}
+STAGED_SDK_INPUT_DIRS = (
+    "boards",
+    "tools",
+    "platform/ESP32/esp-idf",
+    "platform/ESP32/.espressif",
+)
+IDF_VERSION = "5.4"
+IDF_TARGET = "esp32s3"
+
+
+def is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+SUBST_CANDIDATES = tuple("ZYXWVUTSQPONMLKJIHGFECBA")
+
+
+def _drive_letter_available(letter: str) -> bool:
+    if os.name != "nt":
+        return False
+    import ctypes
+    mask = ctypes.windll.kernel32.GetLogicalDrives()
+    return not bool(mask & (1 << (ord(letter.upper()) - ord("A"))))
+
+
+def _normalized_windows_path(path: str | Path) -> str:
+    return ntpath.normcase(ntpath.normpath(str(path))).rstrip("\\/")
+
+
+def _subst_targets(runner=subprocess.run) -> dict[str, str]:
+    result = runner(["subst"], check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode:
+        raise RuntimeError(f"Could not inspect temporary subst mappings: {result.stderr or result.stdout}")
+    targets: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s*([A-Za-z]):\\:\s*=>\s*(.*?)\s*$", line)
+        if match:
+            targets[match.group(1).upper()] = match.group(2)
+    return targets
+
+
+def _remove_archive_subst(letter: str, archive: Path, runner=subprocess.run) -> None:
+    target = _subst_targets(runner).get(letter.upper())
+    if target is None:
+        return
+    if _normalized_windows_path(target) != _normalized_windows_path(archive):
+        raise RuntimeError(f"Temporary subst drive {letter}: changed to another target; leaving it untouched: {target}")
+    removed = runner(["subst", f"{letter.upper()}:", "/D"], check=False,
+                     capture_output=True, text=True, encoding="utf-8", errors="replace")
+    remaining = _subst_targets(runner).get(letter.upper())
+    if removed.returncode or remaining is not None:
+        raise RuntimeError(f"Could not remove temporary subst drive {letter}: (exit={removed.returncode}, remaining={remaining})")
+
+
+@contextmanager
+def temporary_archive_mount(
+    archive: Path,
+    *,
+    runner=subprocess.run,
+    drive_available=None,
+    candidates: tuple[str, ...] = SUBST_CANDIDATES,
+):
+    """Expose a single run archive through a temporary short drive and always unmount it."""
+    if os.name != "nt" and drive_available is None:
+        raise RuntimeError("Temporary archive subst mounts are supported only on Windows.")
+    available = drive_available or _drive_letter_available
+    letter = next((candidate.upper() for candidate in candidates if available(candidate.upper())), None)
+    if letter is None:
+        raise RuntimeError("No free drive letter is available for the isolated archive subst mount.")
+    archive = Path(os.path.abspath(str(archive)))
+    mounted = runner(["subst", f"{letter}:", str(archive)], check=False,
+                     capture_output=True, text=True, encoding="utf-8", errors="replace")
+    current_target = _subst_targets(runner).get(letter)
+    expected_target = _normalized_windows_path(archive)
+    if mounted.returncode:
+        if current_target is not None and _normalized_windows_path(current_target) == expected_target:
+            _remove_archive_subst(letter, archive, runner)
+        raise RuntimeError(f"Could not create temporary subst drive {letter}: (exit={mounted.returncode}, {mounted.stderr or mounted.stdout})")
+    if current_target is None or _normalized_windows_path(current_target) != expected_target:
+        if current_target is not None and _normalized_windows_path(current_target) == expected_target:
+            _remove_archive_subst(letter, archive, runner)
+        raise RuntimeError(f"Temporary subst drive {letter}: does not map to the requested archive: {current_target}")
+    try:
+        yield Path(f"{letter}:\\")
+    finally:
+        _remove_archive_subst(letter, archive, runner)
+
+
+def archive_stage_paths(mount_root: Path) -> dict[str, Path]:
+    stage = mount_root / "stage"
+    return {"archive": mount_root, "stage": stage, "sdk": stage / "sdk", "app": stage / "app"}
+
+
+def mounted_bridge_wrapper_source() -> str:
+    """Keep staged paths lexical when the existing bridge resolves Windows paths."""
+    return '''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import runpy
+import sys
+
+bridge_path = Path(sys.argv[1])
+mount_root = Path(os.path.abspath(sys.argv[2]))
+bridge_args = sys.argv[3:]
+_path_resolve = Path.resolve
+_realpath = os.path.realpath
+
+def _under_mount(path):
+    try:
+        Path(os.path.abspath(os.fspath(path))).relative_to(mount_root)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+def _resolve(path, *args, **kwargs):
+    if _under_mount(path):
+        return Path(os.path.abspath(os.fspath(path)))
+    return _path_resolve(path, *args, **kwargs)
+
+def _resolve_realpath(path, *args, **kwargs):
+    if _under_mount(path):
+        return os.path.abspath(os.fspath(path))
+    return _realpath(path, *args, **kwargs)
+
+Path.resolve = _resolve
+os.path.realpath = _resolve_realpath
+sys.argv = [str(bridge_path), *bridge_args]
+namespace = runpy.run_path(str(bridge_path), run_name="_deskagent_mounted_bridge")
+raise SystemExit(namespace["main"]())
+'''
+
+
+def mounted_bridge_command(
+    python: Path,
+    wrapper: Path,
+    bridge: Path,
+    mount_root: Path,
+    repo: Path,
+    source_sdk: Path,
+) -> list[str]:
+    paths = archive_stage_paths(mount_root)
+    return [
+        str(python), str(wrapper), str(bridge), str(mount_root),
+        str(paths["sdk"]), str(paths["app"]), str(paths["archive"]),
+        "--repo", str(repo), "--source-sdk", str(source_sdk),
+    ]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
+def _copy_firmware(source: Path, destination: Path) -> None:
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = {name for name in names if name in EXCLUDED_FIRMWARE_DIRS}
+        ignored.update(name for name in names if name.endswith(".pyc"))
+        return ignored
+
+    shutil.copytree(source, destination, ignore=ignore, symlinks=False)
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _plain_directory_snapshot(root: Path) -> dict[str, object]:
+    """Hash a staged directory tree and refuse links/reparse points anywhere in it."""
+    if _is_link_or_reparse_point(root):
+        raise RuntimeError(f"Staged SDK input is a link or reparse point: {root}")
+    digest = hashlib.sha256()
+    file_count = 0
+    byte_count = 0
+    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+        current = Path(directory)
+        names.sort()
+        files.sort()
+        for name in list(names):
+            child = current / name
+            if _is_link_or_reparse_point(child):
+                raise RuntimeError(f"SDK input contains a link or reparse point: {child}")
+            relative = child.relative_to(root).as_posix()
+            digest.update(b"D\0" + relative.encode("utf-8", errors="surrogateescape") + b"\n")
+        for name in files:
+            child = current / name
+            if _is_link_or_reparse_point(child):
+                raise RuntimeError(f"SDK input contains a link or reparse point: {child}")
+            metadata = child.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError(f"SDK input contains a non-regular file: {child}")
+            file_hash = sha256_file(child)
+            relative = child.relative_to(root).as_posix()
+            digest.update(
+                b"F\0" + relative.encode("utf-8", errors="surrogateescape") + b"\0"
+                + str(metadata.st_size).encode("ascii") + b"\0"
+                + file_hash.encode("ascii") + b"\n"
+            )
+            file_count += 1
+            byte_count += metadata.st_size
+    return {
+        "file_count": file_count,
+        "byte_count": byte_count,
+        "tree_sha256": digest.hexdigest().upper(),
+        "reparse_points": 0,
+    }
+
+
+def _idf_repo_version(idf_root: Path) -> str:
+    version_header = idf_root / "components" / "esp_common" / "include" / "esp_idf_version.h"
+    try:
+        contents = version_header.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read staged ESP-IDF version header: {version_header}") from exc
+    major = re.search(r"(?m)^#define\s+ESP_IDF_VERSION_MAJOR\s+(\d+)\b", contents)
+    minor = re.search(r"(?m)^#define\s+ESP_IDF_VERSION_MINOR\s+(\d+)\b", contents)
+    if major is None or minor is None:
+        raise RuntimeError(f"Staged ESP-IDF version is not identifiable from {version_header}")
+    return f"{major.group(1)}.{minor.group(1)}"
+
+
+def canonical_idf_registry_path(idf_root: Path) -> Path:
+    """Match ESP-IDF activate.py, which canonicalizes its own script directory."""
+    lexical_path = os.path.abspath(str(idf_root))
+    return Path(os.path.realpath(lexical_path))
+
+
+def register_staged_idf_target(idf_root: Path, espressif_root: Path, target: str) -> dict[str, object]:
+    """Register this staged ESP-IDF repo in its staged-only idf-env.json."""
+    idf_path = canonical_idf_registry_path(idf_root)
+    idf_io_path = Path(os.path.abspath(str(idf_root)))
+    espressif_path = Path(os.path.abspath(str(espressif_root)))
+    version = _idf_repo_version(idf_io_path)
+    if version != IDF_VERSION:
+        raise RuntimeError(f"Expected staged ESP-IDF {IDF_VERSION}, found {version} at {idf_path}")
+    if target != IDF_TARGET:
+        raise RuntimeError(f"Only {IDF_TARGET} is supported by this isolated firmware runner, got {target}")
+
+    env_path = espressif_path / "idf-env.json"
+    try:
+        payload = json.loads(env_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Cannot read staged ESP-IDF environment registry: {env_path}") from exc
+    installed = payload.get("idfInstalled") if isinstance(payload, dict) else None
+    if not isinstance(installed, dict):
+        raise RuntimeError(f"Staged ESP-IDF registry has no idfInstalled object: {env_path}")
+
+    repo_id = f"{idf_path}-v{version}"
+    record = {
+        "version": version,
+        "path": str(idf_path),
+        "features": ["core"],
+        "targets": [target],
+    }
+    installed[repo_id] = record
+    temporary = env_path.with_suffix(env_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=4) + "\n", encoding="utf-8")
+    temporary.replace(env_path)
+    return record
+
+
+def assert_staged_idf_target(idf_root: Path, espressif_root: Path, target: str) -> dict[str, object]:
+    """Fail closed before activation unless the exact staged repo target is registered."""
+    idf_path = canonical_idf_registry_path(idf_root)
+    idf_io_path = Path(os.path.abspath(str(idf_root)))
+    version = _idf_repo_version(idf_io_path)
+    if version != IDF_VERSION or target != IDF_TARGET:
+        raise RuntimeError(f"Unexpected ESP-IDF activation request: version={version}, target={target}")
+    env_path = Path(os.path.abspath(str(espressif_root))) / "idf-env.json"
+    try:
+        payload = json.loads(env_path.read_text(encoding="utf-8"))
+        record = payload["idfInstalled"][f"{idf_path}-v{version}"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Staged ESP-IDF {idf_path} has no valid registration for {target}: {env_path}") from exc
+    expected = {
+        "version": version,
+        "path": str(idf_path),
+        "features": ["core"],
+        "targets": [target],
+    }
+    if record != expected:
+        raise RuntimeError(f"Staged ESP-IDF registration mismatch for {target}: expected {expected}, got {record}")
+    return record
+
+
+def stage_sdk(sdk_source: Path, stage_root: Path) -> Path:
+    """Create an isolated TuyaOpen source view without SDK build/config state."""
+    sdk_source = sdk_source.resolve()
+    stage_root.mkdir(parents=True, exist_ok=False)
+    for filename in ("CMakeLists.txt", "tos.py"):
+        shutil.copy2(sdk_source / filename, stage_root / filename)
+
+    # TuyaOpen derives include paths from OPEN_HEADER_DIR and CMake retains the
+    # lexical staging path. Copy src so Path.resolve() does not collapse those
+    # generated paths back into the external checkout.
+    shutil.copytree(sdk_source / "src", stage_root / "src")
+    for relative in ("boards", "tools"):
+        source = sdk_source / relative
+        if _is_link_or_reparse_point(source):
+            raise RuntimeError(f"SDK input directory must not be a link or junction: {source}")
+        shutil.copytree(source, stage_root / relative, symlinks=False)
+
+    (stage_root / "platform").mkdir()
+    shutil.copy2(sdk_source / "platform" / "platform_config.yaml",
+                 stage_root / "platform" / "platform_config.yaml")
+    source_platform = sdk_source / "platform" / "ESP32"
+    staged_platform = stage_root / "platform" / "ESP32"
+
+    def ignore_platform(directory: str, names: list[str]) -> set[str]:
+        excluded = {".git", ".espressif", "esp-idf", "tuya_open_sdk"}
+        return {name for name in names if name in excluded}
+
+    shutil.copytree(source_platform, staged_platform, ignore=ignore_platform)
+    for relative in ("esp-idf", ".espressif"):
+        source = source_platform / relative
+        destination = staged_platform / relative
+        if _is_link_or_reparse_point(source):
+            raise RuntimeError(f"SDK input directory must not be a link or junction: {source}")
+        shutil.copytree(source, destination, symlinks=False)
+
+    source_project = source_platform / "tuya_open_sdk"
+    staged_project = staged_platform / "tuya_open_sdk"
+
+    def ignore_project(directory: str, names: list[str]) -> set[str]:
+        excluded = {"build", "managed_components", ".git"}
+        return {name for name in names if name in excluded}
+
+    shutil.copytree(source_project, staged_project, ignore=ignore_project)
+    # Managed dependencies are substantial but contain input sources only. Copy
+    # them into the archive so the build cannot regenerate anything in the SDK.
+    shutil.copytree(source_project / "managed_components",
+                    staged_project / "managed_components")
+    # Keep the existing prepare marker: this makes build_setup use the already
+    # installed SDK-local tools and prevents its installer/network fallback.
+    prepare_marker = source_platform / ".prepare"
+    if not prepare_marker.is_file() or prepare_marker.read_text(encoding="utf-8").strip() != "esp32s3":
+        raise RuntimeError("SDK ESP32 .prepare marker is absent or not esp32s3; refusing any install/setup fallback.")
+    shutil.copy2(prepare_marker, staged_platform / ".prepare")
+
+    staged_idf = staged_platform / "esp-idf"
+    staged_espressif = staged_platform / ".espressif"
+    idf_registration = register_staged_idf_target(staged_idf, staged_espressif, IDF_TARGET)
+    if assert_staged_idf_target(staged_idf, staged_espressif, IDF_TARGET) != idf_registration:
+        raise RuntimeError("Staged ESP-IDF target registration did not round-trip")
+
+    directories: dict[str, dict[str, object]] = {}
+    aggregate = hashlib.sha256()
+    for relative in STAGED_SDK_INPUT_DIRS:
+        source = sdk_source / Path(relative)
+        staged = stage_root / Path(relative)
+        if os.path.samefile(source, staged):
+            raise RuntimeError(f"Staged SDK input still aliases its external source: {relative}")
+        snapshot = _plain_directory_snapshot(staged)
+        directories[relative] = {
+            "source": str(source),
+            "staged": str(staged),
+            "samefile_source": False,
+            **snapshot,
+        }
+        aggregate.update(relative.encode("utf-8") + b"\0")
+        aggregate.update(str(snapshot["tree_sha256"]).encode("ascii") + b"\n")
+    manifest = {
+        "schema_version": 1,
+        "sdk_source": str(sdk_source),
+        "staged_sdk": str(stage_root),
+        "idf_target_registration": {
+            "repo_id": f"{idf_registration['path']}-v{idf_registration['version']}",
+            **idf_registration,
+        },
+        "directories": directories,
+        "aggregate_sha256": aggregate.hexdigest().upper(),
+    }
+    (stage_root.parent / "staged-sdk-inputs.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return stage_root
+
+
+def git_output(repo: Path, *args: str) -> bytes:
+    return subprocess.run(["git", *args], cwd=repo, check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+
+def source_provenance(repo: Path) -> dict[str, object]:
+    tracked_diff = git_output(repo, "diff", "--binary", "HEAD", "--", "firmware")
+    staged_diff = git_output(repo, "diff", "--binary", "--cached", "HEAD", "--", "firmware")
+    return {
+        "source_head": git_output(repo, "rev-parse", "HEAD").decode().strip(),
+        "firmware_worktree_diff_sha256": hashlib.sha256(tracked_diff).hexdigest().upper(),
+        "firmware_index_diff_sha256": hashlib.sha256(staged_diff).hexdigest().upper(),
+        "firmware_status": git_output(repo, "status", "--short", "--", "firmware").decode(errors="replace"),
+    }
+
+
+def find_idf_python(sdk_root: Path) -> tuple[Path, Path]:
+    env_root = sdk_root / "platform" / "ESP32" / ".espressif" / "python_env"
+    candidates = sorted(env_root.glob(f"idf{IDF_VERSION}_py*_env"),
+                        key=lambda item: ("py3.12" not in item.name, item.name))
+    for candidate in candidates:
+        python = candidate / "Scripts" / "python.exe"
+        version = candidate / "idf_version.txt"
+        if not python.is_file() or not version.is_file() or version.read_text().strip() != IDF_VERSION:
+            continue
+        check = subprocess.run([str(python), "-c", "import rich"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if check.returncode == 0:
+            return python, candidate / "Scripts"
+    raise RuntimeError(f"No existing ESP-IDF {IDF_VERSION} Python env with rich under {env_root}; no install attempted.")
+
+
+def staged_idf_tool_paths(sdk_root: Path, staged_sdk: Path, python: Path, scripts: Path) -> tuple[Path, Path]:
+    """Map SDK IDF tool paths to the copied staging .espressif tree."""
+    source_tools_root = sdk_root.resolve() / "platform" / "ESP32" / ".espressif"
+    staged_tools_root = staged_sdk / "platform" / "ESP32" / ".espressif"
+    try:
+        staged_python = staged_tools_root / python.relative_to(source_tools_root)
+        staged_scripts = staged_tools_root / scripts.relative_to(source_tools_root)
+    except ValueError as exc:
+        raise RuntimeError(f"IDF Python paths are outside the SDK .espressif tree: {exc}") from exc
+    if not staged_python.is_file() or not staged_scripts.is_dir():
+        raise RuntimeError(f"Staged IDF Python paths are unavailable: {staged_python}, {staged_scripts}")
+    return staged_tools_root, staged_scripts
+
+
+def gitpython_site_packages(sdk_root: Path) -> Path:
+    """Locate existing SDK GitPython packages without changing any environment."""
+    site_packages = sdk_root.resolve() / ".venv" / "Lib" / "site-packages"
+    if not (site_packages / "git" / "__init__.py").is_file() or not (site_packages / "gitdb" / "__init__.py").is_file():
+        raise RuntimeError(f"GitPython and GitDB are not available in SDK venv site-packages: {site_packages}")
+    return site_packages.resolve()
+
+
+def idf_export_prefix(idf_tools_root: Path, python_scripts: Path, export_bat: Path) -> str:
+    """Build IDF activation commands without injecting third-party PYTHONPATH."""
+    return (
+        f'set "IDF_TOOLS_PATH={idf_tools_root}" && '
+        f'set "PYTHONDONTWRITEBYTECODE=1" && '
+        f'set "PATH={python_scripts};%PATH%" && '
+        f'call "{export_bat}" && where idf.py'
+    )
+
+
+def configure_staged_partition_config(config_path: Path, csv_path: Path) -> None:
+    """Restore the repository CSV after IDF set-target rewrites sdkconfig."""
+    import re
+    text = config_path.read_text(encoding="utf-8")
+    text = re.sub(r'(?m)^CONFIG_PARTITION_TABLE_(?:CUSTOM_FILENAME|FILENAME)=.*\r?\n?', "", text)
+    value = Path(os.path.abspath(str(csv_path))).as_posix()
+    text += (f'CONFIG_PARTITION_TABLE_CUSTOM=y\n'
+             f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{value}"\n'
+             f'CONFIG_PARTITION_TABLE_FILENAME="{value}"\n')
+    config_path.write_text(text, encoding="utf-8")
+
+
+def _run_mounted_build(
+    repo: Path,
+    sdk_root: Path,
+    archive: Path,
+    mount_root: Path,
+    python: Path,
+    idf_python_scripts: Path,
+) -> int:
+    initial = source_provenance(repo)
+    paths = archive_stage_paths(mount_root)
+    stage = paths["stage"]
+    staged_sdk = paths["sdk"]
+    staged_app = paths["app"]
+    stage.mkdir()
+    _copy_firmware(repo / "firmware", staged_app)
+    stage_sdk(sdk_root, staged_sdk)
+    idf_tools_root, idf_python_scripts = staged_idf_tool_paths(
+        sdk_root, staged_sdk, python, idf_python_scripts
+    )
+    staged_target_registration = assert_staged_idf_target(
+        staged_sdk / "platform" / "ESP32" / "esp-idf",
+        staged_sdk / "platform" / "ESP32" / ".espressif",
+        IDF_TARGET,
+    )
+
+    # The old builder writes generated target config into this project's
+    # sdkconfig. Do so only in the staged project and bind the repository CSV
+    # copied into the staged app.
+    staged_project = staged_sdk / "platform" / "ESP32" / "tuya_open_sdk"
+    native_config = staged_project / "sdkconfig"
+    if not native_config.is_file():
+        raise RuntimeError("SDK source sdkconfig is missing; refusing target setup.")
+    config_bytes = native_config.read_bytes()
+    project_csv = (staged_app / "partitions.csv").as_posix()
+    text = config_bytes.decode("utf-8")
+    import re
+    text = re.sub(r'(?m)^(?:# )?CONFIG_ESPTOOLPY_FLASHSIZE(?:_(?:1|2|4|8|16|32|64|128)MB)?(?:=.*| is not set)\r?\n?', "", text)
+    text = re.sub(r'(?m)^(?:# )?CONFIG_PARTITION_TABLE_(?:CUSTOM_FILENAME|FILENAME)(?:=.*| is not set)\r?\n?', "", text)
+    text += (f'\nCONFIG_ESPTOOLPY_FLASHSIZE_32MB=y\nCONFIG_ESPTOOLPY_FLASHSIZE="32MB"\n'
+             f'CONFIG_PARTITION_TABLE_CUSTOM=y\nCONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{project_csv}"\n'
+             f'CONFIG_PARTITION_TABLE_FILENAME="{project_csv}"\n')
+    native_config.write_text(text, encoding="utf-8")
+    (staged_project / "partitions.csv").write_bytes((staged_app / "partitions.csv").read_bytes())
+
+    bridge = repo / "tools" / "verification" / "run_isolated_tuyaopen_bridge.py"
+    idf_export = staged_sdk / "platform" / "ESP32" / "esp-idf" / "export.bat"
+    sdkconfig_provenance = {
+        "sdkconfig_path": str(native_config),
+        "sdkconfig_sha256_before": hashlib.sha256(config_bytes).hexdigest().upper(),
+        "staged_sdkconfig_sha256": sha256_file(native_config),
+        "partition_csv": str(staged_app / "partitions.csv"),
+        "external_sdk_writes": "none intended; project/build/config state is staged under this archive",
+    }
+    (archive / "sdkconfig-provenance.json").write_text(
+        json.dumps(sdkconfig_provenance, indent=2) + "\n", encoding="utf-8")
+
+    config_helper_command = (
+        f'"{python}" "{Path(__file__).resolve()}" --configure-partition '
+        f'"{native_config}" "{staged_app / "partitions.csv"}"'
+    )
+    wrapper = paths["archive"] / "run-isolated-bridge-mounted.py"
+    wrapper.write_text(mounted_bridge_wrapper_source(), encoding="utf-8")
+    bridge_command = mounted_bridge_command(python, wrapper, bridge, mount_root, repo, sdk_root)
+    command = (
+        f'{idf_export_prefix(idf_tools_root, idf_python_scripts, idf_export)} && '
+        f'idf.py -C "{staged_project}" set-target esp32s3 && '
+        f'{config_helper_command} && '
+        f'idf.py -C "{staged_project}" reconfigure && '
+        + subprocess.list2cmdline(bridge_command)
+    )
+    result = subprocess.run(command, shell=True, cwd=repo,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    log = result.stdout.decode("utf-8", errors="replace")
+    (archive / "build-console.log").write_text(
+        f"COMMAND: {command}\nEXIT_CODE: {result.returncode}\n\n{log}", encoding="utf-8")
+
+    final = source_provenance(repo)
+    staged_sdk_manifest_path = stage / "staged-sdk-inputs.json"
+    staged_sdk_manifest = json.loads(staged_sdk_manifest_path.read_text(encoding="utf-8"))
+    provenance = {
+        "captured_utc": datetime.now(timezone.utc).isoformat(),
+        "source_before": initial,
+        "source_after": final,
+        "source_unchanged": initial == final,
+        "staged_sdk": str(staged_sdk),
+        "staged_sdk_inputs_manifest": str(staged_sdk_manifest_path),
+        "staged_sdk_inputs_aggregate_sha256": staged_sdk_manifest["aggregate_sha256"],
+        "idf_target_registration": {
+            "repo_id": f"{staged_target_registration['path']}-v{staged_target_registration['version']}",
+            **staged_target_registration,
+        },
+        "staged_app": str(staged_app),
+        "project_build_outputs_staged_under_archive": True,
+    }
+    (archive / "checkout-provenance.json").write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+    print(f"archive={archive}")
+    print(f"build_exit_code={result.returncode}")
+    print(f"source_unchanged={provenance['source_unchanged']}")
+    return result.returncode
+
+
+def run_build(repo: Path, sdk_root: Path, archive: Path) -> int:
+    archive_base = (repo / "firmware" / ".target_logging").resolve()
+    archive = archive.resolve()
+    if not is_within(archive, archive_base) or archive == archive_base:
+        raise ValueError("Archive path must be a unique child of firmware/.target_logging.")
+    if archive.exists():
+        raise FileExistsError(f"Refusing to reuse existing archive: {archive}")
+    free_bytes = shutil.disk_usage(archive_base).free
+    if free_bytes < 8 * 1024 * 1024 * 1024:
+        raise RuntimeError(f"Need at least 8 GiB free for isolated target artifacts; found {free_bytes} bytes.")
+    python, idf_python_scripts = find_idf_python(sdk_root)
+    gitpython_site_packages(sdk_root)
+    archive.mkdir(parents=True)
+    mount_evidence: dict[str, object] = {
+        "archive": str(archive),
+        "archive_mount": None,
+        "cleanup_verified": False,
+    }
+    try:
+        with temporary_archive_mount(archive) as mount_root:
+            mount_evidence["archive_mount"] = str(mount_root)
+            mount_evidence["mount_target"] = str(archive)
+            result = _run_mounted_build(repo, sdk_root, archive, mount_root, python, idf_python_scripts)
+        mount_evidence["cleanup_verified"] = True
+        return result
+    except BaseException as exc:
+        mount_evidence["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        (archive / "archive-mount.json").write_text(
+            json.dumps(mount_evidence, indent=2) + "\n", encoding="utf-8")
+
+
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--configure-partition", nargs=2, metavar=("SDKCONFIG", "CSV"))
+    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--sdk", type=Path, default=Path.home() / "TuyaOpenIDE" / "TuyaOpenSDK")
+    parser.add_argument("--archive", type=Path)
+    args = parser.parse_args(argv)
+    if not args.configure_partition and args.archive is None:
+        parser.error("--archive is required for a firmware build")
+    return args
+
+
+def main() -> int:
+    args = parse_arguments()
+    if args.configure_partition:
+        configure_staged_partition_config(Path(args.configure_partition[0]), Path(args.configure_partition[1]))
+        return 0
+    try:
+        return run_build(args.repo.resolve(), args.sdk.resolve(), args.archive)
+    except Exception as exc:
+        print(f"isolated firmware build refused/failed before completion: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
