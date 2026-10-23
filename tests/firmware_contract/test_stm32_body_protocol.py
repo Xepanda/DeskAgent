@@ -135,6 +135,20 @@ class TestSTM32BodyProtocol(unittest.TestCase):
 
         cls.lib = ctypes.CDLL(cls.so_path)
 
+        class MCUHelloPeerInfo(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint8) for name in (
+                "fw_major", "fw_minor", "fw_patch", "hw_version",
+                "capability_bitmap", "sensor_bitmap", "default_stream_profile")]
+        cls.MCUHelloPeerInfo = MCUHelloPeerInfo
+        cls.lib.desk_watcher_motion_pack_hello_req.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_pack_hello_req.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t)]
+        cls.lib.desk_watcher_motion_parse_hello_rsp.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_parse_hello_rsp.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint32,
+            ctypes.POINTER(MCUHelloPeerInfo)]
+
         # Function bindings
         cls.lib.desk_hardware_init.restype = ctypes.c_int
         cls.lib.desk_hardware_init.argtypes = []
@@ -370,6 +384,75 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         # Wire serialization check: Little-Endian [0xB1, 0x29]
         le_bytes = [c_crc & 0xFF, (c_crc >> 8) & 0xFF]
         self.assertEqual(le_bytes, [0xB1, 0x29])
+
+    def test_official_hello_wire_and_response(self) -> None:
+        seq = 0x12345678
+        tx = (ctypes.c_uint8 * 32)()
+        tx_len = ctypes.c_size_t()
+        self.assertEqual(self.lib.desk_watcher_motion_pack_hello_req(
+            seq, tx, len(tx), ctypes.byref(tx_len)), DESK_HW_OK)
+        wire = bytes(tx[:tx_len.value])
+        self.assertEqual(wire[-1], 0)
+        raw = self._cobs_decode(wire[:-1])
+        self.assertEqual(raw[:6], bytes([0xA5, 0x5A, 1, 1, 1, 1]))
+        self.assertEqual(struct.unpack_from("<I", raw, 6)[0], seq)
+        self.assertEqual(struct.unpack_from("<H", raw, 10)[0], 0)
+        self.assertEqual(len(raw), 14)
+        self.assertEqual(struct.unpack_from("<H", raw, 12)[0], python_crc16_ccitt(raw[:12]))
+
+        payload = bytes([0, 2, 7, 9, 3, 0x21, 0x05, 0, 1])
+        rsp_raw = bytearray([0xA5, 0x5A, 1, 1, 2, 6]) + bytearray(struct.pack("<I", seq))
+        rsp_raw.extend(struct.pack("<H", len(payload)))
+        rsp_raw.extend(payload)
+        rsp_raw.extend(struct.pack("<H", python_crc16_ccitt(rsp_raw)))
+        rsp_wire = self._cobs_encode(bytes(rsp_raw)) + b"\x00"
+        frame = (ctypes.c_uint8 * len(rsp_wire)).from_buffer_copy(rsp_wire)
+        info = self.MCUHelloPeerInfo()
+        parse = self.lib.desk_watcher_motion_parse_hello_rsp
+        self.assertEqual(parse(frame, len(rsp_wire), seq, ctypes.byref(info)), DESK_HW_OK)
+        self.assertEqual((info.fw_major, info.fw_minor, info.fw_patch, info.hw_version), (2, 7, 9, 3))
+        self.assertEqual((info.capability_bitmap, info.sensor_bitmap, info.default_stream_profile), (0x21, 0x05, 1))
+        self.assertNotEqual(parse(frame, len(rsp_wire), seq + 1, ctypes.byref(info)), DESK_HW_OK)
+        corrupt_wire = bytearray(rsp_wire)
+        corrupt_wire[-3] ^= 1
+        corrupt = (ctypes.c_uint8 * len(corrupt_wire)).from_buffer_copy(corrupt_wire)
+        self.assertNotEqual(parse(corrupt, len(corrupt_wire), seq, ctypes.byref(info)), DESK_HW_OK)
+
+    @staticmethod
+    def _cobs_encode(raw: bytes) -> bytes:
+        out = bytearray([0])
+        code_index, code = 0, 1
+        for byte in raw:
+            if byte == 0:
+                out[code_index] = code
+                code_index = len(out)
+                out.append(0)
+                code = 1
+            else:
+                out.append(byte)
+                code += 1
+                if code == 0xFF:
+                    out[code_index] = code
+                    code_index = len(out)
+                    out.append(0)
+                    code = 1
+        out[code_index] = code
+        return bytes(out)
+
+    @staticmethod
+    def _cobs_decode(encoded: bytes) -> bytes:
+        out = bytearray()
+        i = 0
+        while i < len(encoded):
+            code = encoded[i]
+            i += 1
+            if code == 0 or i + code - 1 > len(encoded):
+                raise ValueError("invalid COBS")
+            out.extend(encoded[i:i + code - 1])
+            i += code - 1
+            if code != 0xFF and i < len(encoded):
+                out.append(0)
+        return bytes(out)
 
     # ------------------------------------------------------------------
     # Test 2: SERVO_MOVE Golden Test Vector

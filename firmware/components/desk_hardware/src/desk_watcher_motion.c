@@ -198,7 +198,7 @@ int desk_watcher_motion_init(void)
 
 int desk_watcher_motion_cobs_encode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len, size_t *out_len)
 {
-    /* Retained as a standalone compatibility utility; UART transactions use raw frames. */
+    /* Official MCU-link wire encoding: COBS, followed by the 0x00 delimiter. */
     if (!src || !dst || !out_len) return -1;
     if (dst_len < src_len + (src_len / 254u) + 1u) return -2;
 
@@ -230,7 +230,7 @@ int desk_watcher_motion_cobs_encode(const uint8_t *src, size_t src_len, uint8_t 
 
 int desk_watcher_motion_cobs_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len, size_t *out_len)
 {
-    /* Retained as a standalone compatibility utility; UART transactions use raw frames. */
+    /* Official MCU-link wire decoding consumes COBS bytes. */
     if (!src || !dst || !out_len) return -1;
     size_t read_idx = 0;
     size_t write_idx = 0;
@@ -254,7 +254,7 @@ int desk_watcher_motion_cobs_decode(const uint8_t *src, size_t src_len, uint8_t 
 
 int desk_watcher_motion_wire_encode(const uint8_t *raw, size_t raw_len, uint8_t *wire, size_t wire_len, size_t *out_len)
 {
-    /* Legacy helper only. The ratified STM32 UART protocol has no COBS delimiter. */
+    /* Official MCU-link wire encoding: COBS, followed by the 0x00 delimiter. */
     if (!raw || !wire || !out_len || wire_len < raw_len + 2) return -1;
     size_t cobs_len = 0;
     int err = desk_watcher_motion_cobs_encode(raw, raw_len, wire, wire_len - 1, &cobs_len);
@@ -266,10 +266,62 @@ int desk_watcher_motion_wire_encode(const uint8_t *raw, size_t raw_len, uint8_t 
 
 int desk_watcher_motion_wire_decode(const uint8_t *wire, size_t wire_len, uint8_t *raw, size_t raw_len, size_t *out_len)
 {
-    /* Legacy helper only. The ratified STM32 UART protocol has no COBS delimiter. */
+    /* Official MCU-link wire decoding removes the trailing 0x00 delimiter. */
     if (!wire || !raw || !out_len || wire_len < 2) return -1;
     if (wire[wire_len - 1] != 0x00) return -1;
     return desk_watcher_motion_cobs_decode(wire, wire_len - 1, raw, raw_len, out_len);
+}
+
+int desk_watcher_motion_pack_hello_req(uint32_t seq, uint8_t *out_wire, size_t wire_capacity, size_t *out_len)
+{
+    if (!out_wire || !out_len) return DESK_HW_ERR_INVALID_ARG;
+    uint8_t raw[14] = {
+        MCU_FRAME_MAGIC0, MCU_FRAME_MAGIC1, MCU_FRAME_PROTO_VERSION,
+        MCU_FRAME_CLASS_SYS,
+        MCU_SYS_MSG_HELLO_REQ,
+        MCU_FRAME_FLAG_ACK_REQ,
+        (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24),
+        0u, 0u, 0u, 0u,
+    };
+    uint16_t crc = motion_calc_crc16(raw, 12u);
+    raw[12] = (uint8_t)crc;
+    raw[13] = (uint8_t)(crc >> 8);
+    return desk_watcher_motion_wire_encode(raw, sizeof(raw), out_wire, wire_capacity, out_len) == 0
+               ? DESK_HW_OK : DESK_HW_ERR_INVALID_ARG;
+}
+
+int desk_watcher_motion_parse_hello_rsp(const uint8_t *wire, size_t wire_len, uint32_t expected_seq,
+                                        desk_watcher_motion_peer_info_t *out)
+{
+    uint8_t raw[160];
+    size_t raw_len = 0;
+    if (!wire || !out || wire_len < 2u || wire_len > 160u) return DESK_HW_ERR_INVALID_ARG;
+    if (desk_watcher_motion_wire_decode(wire, wire_len, raw, sizeof(raw), &raw_len) != 0 || raw_len < 14u)
+        return DESK_HW_ERR_IO;
+
+    uint16_t payload_len = (uint16_t)raw[10] | ((uint16_t)raw[11] << 8);
+    if (raw[0] != MCU_FRAME_MAGIC0 || raw[1] != MCU_FRAME_MAGIC1 ||
+        raw[2] != MCU_FRAME_PROTO_VERSION || raw[3] != MCU_FRAME_CLASS_SYS ||
+        raw[4] != MCU_SYS_MSG_HELLO_RSP || (raw[5] & MCU_FRAME_FLAG_RESPONSE) == 0u ||
+        raw_len != (size_t)(14u + payload_len) || payload_len < 9u)
+        return DESK_HW_ERR_IO;
+
+    uint32_t seq = (uint32_t)raw[6] | ((uint32_t)raw[7] << 8) |
+                   ((uint32_t)raw[8] << 16) | ((uint32_t)raw[9] << 24);
+    if (seq != expected_seq) return DESK_HW_ERR_BUSY;
+    uint16_t received_crc = (uint16_t)raw[12u + payload_len] |
+                            ((uint16_t)raw[13u + payload_len] << 8);
+    if (motion_calc_crc16(raw, 12u + payload_len) != received_crc) return DESK_HW_ERR_IO;
+    if (raw[12u + 8u] != 0x01u) return DESK_HW_ERR_UNAVAILABLE;
+
+    out->fw_major = raw[13];
+    out->fw_minor = raw[14];
+    out->fw_patch = raw[15];
+    out->hw_version = raw[16];
+    out->capability_bitmap = raw[17];
+    out->sensor_bitmap = raw[18];
+    out->default_stream_profile = raw[20];
+    return DESK_HW_OK;
 }
 
 int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
@@ -535,6 +587,74 @@ int desk_watcher_motion_deinit(void)
 bool desk_watcher_motion_is_ready(void)
 {
     return s_motion_initialized;
+}
+
+int desk_watcher_motion_probe(desk_watcher_motion_peer_info_t *out, uint32_t timeout_ms)
+{
+    if (!out || timeout_ms == 0u) return DESK_HW_ERR_INVALID_ARG;
+#ifdef ESP_PLATFORM
+    if (!s_motion_initialized || !uart_is_driver_installed(UART_NUM_2)) {
+        atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_UART_UNAVAILABLE, memory_order_relaxed);
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    if (!s_motion_mutex || xSemaphoreTake(s_motion_mutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_UART_BUSY, memory_order_relaxed);
+        return DESK_HW_ERR_BUSY;
+    }
+
+    uint32_t seq = motion_next_sequence();
+    uint8_t tx[32];
+    size_t tx_len = 0;
+    int rc = desk_watcher_motion_pack_hello_req(seq, tx, sizeof(tx), &tx_len);
+    if (rc != DESK_HW_OK) {
+        xSemaphoreGive(s_motion_mutex);
+        return rc;
+    }
+    uart_flush_input(UART_NUM_2);
+    int written = uart_write_bytes(UART_NUM_2, (const char *)tx, tx_len);
+    if (written > 0) atomic_fetch_add_explicit(&s_diag_tx_bytes, (uint32_t)written, memory_order_relaxed);
+    if (written != (int)tx_len) {
+        atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_TX_IO, memory_order_relaxed);
+        xSemaphoreGive(s_motion_mutex);
+        return DESK_HW_ERR_IO;
+    }
+
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
+    uint8_t rx[160];
+    size_t rx_len = 0;
+    int result = DESK_HW_ERR_TIMEOUT;
+    while (esp_timer_get_time() < deadline_us) {
+        uint8_t byte = 0;
+        int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) break;
+        uint32_t remaining_ms = (uint32_t)((remaining_us + 999LL) / 1000LL);
+        TickType_t wait_ticks = pdMS_TO_TICKS(remaining_ms > 10u ? 10u : remaining_ms);
+        if (wait_ticks == 0) wait_ticks = 1;
+        int received = uart_read_bytes(UART_NUM_2, &byte, 1, wait_ticks);
+        if (received <= 0) continue;
+        atomic_fetch_add_explicit(&s_diag_rx_bytes, (uint32_t)received, memory_order_relaxed);
+        if (byte == 0u) {
+            if (rx_len == sizeof(rx)) rx_len = 0;
+            rx[rx_len++] = 0u;
+            result = desk_watcher_motion_parse_hello_rsp(rx, rx_len, seq, out);
+            break;
+        }
+        if (rx_len < sizeof(rx) - 1u) rx[rx_len++] = byte;
+        else rx_len = 0;
+    }
+    atomic_store_explicit(&s_diag_last_error,
+                          result == DESK_HW_OK ? DESK_WATCHER_MOTION_ERROR_NONE :
+                          result == DESK_HW_ERR_TIMEOUT ? DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT :
+                          DESK_WATCHER_MOTION_ERROR_INVALID_RESPONSE,
+                          memory_order_relaxed);
+    if (result == DESK_HW_ERR_TIMEOUT)
+        atomic_fetch_add_explicit(&s_diag_timeout_count, 1U, memory_order_relaxed);
+    xSemaphoreGive(s_motion_mutex);
+    return result;
+#else
+    (void)timeout_ms;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
 }
 
 void desk_watcher_motion_get_diagnostics(desk_watcher_motion_diagnostics_t *out)

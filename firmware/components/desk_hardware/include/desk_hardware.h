@@ -140,11 +140,15 @@ typedef void (*desk_hardware_audio_play_cb_t)(const int16_t *pcm_buf,
                                               void *user_data);
 int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void *user_data);
 
-/* STM32 Coprocessor MCU Frame Definitions (R3a Ratified) */
+/* STM32 coprocessor frame constants. SYS HELLO IDs follow WatcheRobot mcu_link;
+ * legacy motion constants remain isolated until a valid HELLO peer is observed. */
 #define MCU_FRAME_MAGIC0          0xA5u
 #define MCU_FRAME_MAGIC1          0x5Au
 #define MCU_FRAME_PROTO_VERSION   0x01u
+#define MCU_FRAME_CLASS_SYS       0x01u
 #define MCU_FRAME_CLASS_MOTION    0x02u
+#define MCU_SYS_MSG_HELLO_REQ     0x01u
+#define MCU_SYS_MSG_HELLO_RSP     0x02u
 
 /* MCU Message IDs */
 #define MCU_MOTION_MSG_ACK        0x00u
@@ -155,6 +159,7 @@ int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void 
 /* MCU Frame Flags */
 #define MCU_FRAME_FLAG_ACK_REQ    0x01u
 #define MCU_FRAME_FLAG_ACK_RESP   0x02u
+#define MCU_FRAME_FLAG_RESPONSE   0x02u
 #define MCU_FRAME_FLAG_NACK_RESP  0x04u
 
 /* Timing, Retry & Safety Contracts */
