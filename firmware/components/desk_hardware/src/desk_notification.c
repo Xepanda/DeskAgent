@@ -426,7 +426,11 @@ int desk_hardware_notification_process_pending(void)
             tone[sample] = tone_lut[sample % 16];
         int audio_rc = desk_hardware_audio_play_pcm(tone, NOTIFICATION_SOUND_SAMPLES,
                                                      NOTIFICATION_SOUND_RATE);
-        desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
+        /* A successful Watcher call has passed the TX EOF fence. Keep the
+         * shared SDK owner on any write/drain failure; releasing early could
+         * overlap audio that remains in DMA. */
+        if (audio_rc == DESK_HW_OK)
+            desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
         entry->pending = 0;
         entry->status = audio_rc == DESK_HW_OK ? DESK_NOTIFICATION_UNKNOWN : DESK_NOTIFICATION_FAILED;
         entry->error_code = audio_rc == DESK_HW_OK ? DESK_HW_ERR_UNAVAILABLE : audio_rc;

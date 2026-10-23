@@ -66,10 +66,21 @@ typedef struct {
     bool active;
 } desk_camera_lease_t;
 
+/** Backend callback required before a higher-priority owner can take a resource. */
+typedef bool (*desk_arbiter_preempt_cb_t)(desk_resource_type_t resource,
+                                          desk_resource_owner_t current_owner,
+                                          desk_resource_owner_t requester,
+                                          uint32_t timeout_ms,
+                                          void *user_data);
+
 /**
  * @brief Initialize the unified resource arbiter.
  */
 desk_arbiter_status_t desk_arbiter_init(void);
+
+/** Register an optional quiescence hook; pass NULL to clear it. */
+desk_arbiter_status_t desk_arbiter_register_preempt_handler(
+    desk_resource_type_t resource, desk_arbiter_preempt_cb_t callback, void *user_data);
 
 /**
  * @brief Request exclusive or prioritized ownership of a hardware resource.

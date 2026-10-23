@@ -3,6 +3,8 @@ idf_component_register(
     SRCS
         "src/desk_hardware.c"
         "src/desk_arbiter.c"
+        "src/desk_audio_resampler.c"
+        "src/desk_audio_stream.c"
         "src/desk_watcher_board.c"
         "src/desk_watcher_audio.c"
         "src/desk_watcher_motion.c"
