@@ -309,6 +309,7 @@ static void cmd_sys_version(int argc, char *argv[])
 }
 
 extern uint32_t desk_app_task_stack_hwm(void);
+extern bool desk_app_task_stack_hwm_read(uint32_t *bytes);
 static void cmd_sys_heap(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -322,9 +323,15 @@ static void cmd_sys_heap(int argc, char *argv[])
            (unsigned long)total_free, (unsigned long)free_sram,
            (unsigned long)largest_sram, (unsigned long)min_sram,
            (unsigned long)free_psram);
-    printf("Task Stack Min Remaining: app_task=%lu B, poll_worker=%lu B\r\n",
-           (unsigned long)desk_app_task_stack_hwm(),
-           (unsigned long)desk_firmware_background_task_stack_hwm());
+    uint32_t app_task_hwm = 0U;
+    if (desk_app_task_stack_hwm_read(&app_task_hwm)) {
+        printf("Task Stack Min Remaining: app_task=%lu B (cached self-sample), poll_worker=%lu B\r\n",
+               (unsigned long)app_task_hwm,
+               (unsigned long)desk_firmware_background_task_stack_hwm());
+    } else {
+        printf("Task Stack Min Remaining: app_task=UNKNOWN (no cached self-sample), poll_worker=%lu B\r\n",
+               (unsigned long)desk_firmware_background_task_stack_hwm());
+    }
 #else
     printf("Free Heap: Host Simulation (SRAM: OK, PSRAM: OK)\r\n");
 #endif
