@@ -1217,21 +1217,86 @@ int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_
             return -1;
         }
     }
-    if (s_audio_play_cb && pcm_buf && samples > 0) {
-        s_audio_play_cb(pcm_buf, samples, sample_rate_hz, s_audio_play_user_data);
-    }
     if (s_board_driver_ops && s_board_driver_ops->audio_play_pcm && pcm_buf && samples > 0) {
         int rc = s_board_driver_ops->audio_play_pcm(pcm_buf, samples, sample_rate_hz);
         if (rc != DESK_HW_OK) return rc;
+    }
+    if (s_audio_play_cb && pcm_buf && samples > 0) {
+        s_audio_play_cb(pcm_buf, samples, sample_rate_hz, s_audio_play_user_data);
     }
     return 0;
 }
 
 int desk_hardware_audio_play_stop(void)
 {
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_play_stop();
+#else
     desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
     desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
     return 0;
+#endif
+}
+
+int desk_hardware_audio_stream_begin(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sample_rate_hz,
+                                     uint8_t channels, uint8_t sample_width_bytes,
+                                     uint32_t total_bytes)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_begin(handle, connection_generation, stream_id,
+        sample_rate_hz, channels, sample_width_bytes, total_bytes);
+#else
+    (void)handle; (void)connection_generation; (void)stream_id;
+    (void)sample_rate_hz; (void)channels; (void)sample_width_bytes; (void)total_bytes;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_write(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sequence,
+                                     const uint8_t *pcm, size_t bytes,
+                                     desk_audio_stream_status_t *out_status)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_write(handle, connection_generation, stream_id,
+        sequence, pcm, bytes, out_status);
+#else
+    (void)handle; (void)connection_generation; (void)stream_id;
+    (void)sequence; (void)pcm; (void)bytes; (void)out_status;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_finish(uint64_t handle)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_finish(handle);
+#else
+    (void)handle;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_stop(uint64_t handle, uint32_t timeout_ms)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_stop(handle, timeout_ms);
+#else
+    (void)handle; (void)timeout_ms;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_get_status(uint64_t handle,
+                                          desk_audio_stream_status_t *out_status)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_get_status(handle, out_status);
+#else
+    (void)handle; (void)out_status;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
 }
 
 /* Motion / Gimbal API */

@@ -96,6 +96,11 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         cls.lib.desk_arbiter_get_owner.restype = ctypes.c_int
         cls.lib.desk_arbiter_get_owner.argtypes = [ctypes.c_int]
 
+        PREEMPT_CB = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p)
+        cls.PREEMPT_CB = PREEMPT_CB
+        cls.lib.desk_arbiter_register_preempt_handler.restype = ctypes.c_int
+        cls.lib.desk_arbiter_register_preempt_handler.argtypes = [ctypes.c_int, PREEMPT_CB, ctypes.c_void_p]
+
         cls.lib.desk_arbiter_camera_acquire_lease.restype = ctypes.c_int
         cls.lib.desk_arbiter_camera_acquire_lease.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
 
@@ -257,6 +262,36 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         # Release
         self.lib.desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SYSTEM_ALERT)
         self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_NONE)
+
+    def test_audio_preemption_requires_owner_quiescence_confirmation(self) -> None:
+        """A registered audio backend must confirm stop/drain before an owner changes."""
+        calls = []
+        allow = False
+
+        def on_preempt(resource, owner, requester, timeout_ms, user_data):
+            calls.append((resource, owner, requester, timeout_ms))
+            return allow
+
+        callback = self.PREEMPT_CB(on_preempt)
+        self.assertEqual(self.lib.desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK,
+                                                      DESK_OWNER_SDK_REMOTE, 0), DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, callback, None), DESK_ARBITER_OK)
+
+        denied = self.lib.desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK,
+                                               DESK_OWNER_SYSTEM_ALERT, 37)
+        self.assertEqual(denied, DESK_ARBITER_ERR_BUSY)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_SDK_REMOTE)
+        self.assertEqual(calls, [(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE,
+                                  DESK_OWNER_SYSTEM_ALERT, 37)])
+
+        allow = True
+        granted = self.lib.desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK,
+                                                DESK_OWNER_SYSTEM_ALERT, 41)
+        self.assertEqual(granted, DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_SYSTEM_ALERT)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, self.PREEMPT_CB(), None), DESK_ARBITER_OK)
 
     def test_camera_lease_locks_tclaw_motion_tracking(self) -> None:
         """Verifies active camera viewing lease locks out automatic TClaw gimbal tracking."""

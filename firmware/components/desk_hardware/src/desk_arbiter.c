@@ -23,6 +23,8 @@ typedef struct {
 } desk_arbiter_entry_t;
 
 static desk_arbiter_entry_t s_resources[DESK_RES_MAX];
+static desk_arbiter_preempt_cb_t s_preempt_cb[DESK_RES_MAX];
+static void *s_preempt_user_data[DESK_RES_MAX];
 static desk_camera_lease_t s_camera_lease;
 static bool s_initialized = false;
 #ifdef ESP_PLATFORM
@@ -75,8 +77,19 @@ desk_arbiter_status_t desk_arbiter_init(void)
         s_resources[i].current_owner = DESK_OWNER_NONE;
         s_resources[i].priority = 0;
     }
+    memset(s_preempt_cb, 0, sizeof(s_preempt_cb));
+    memset(s_preempt_user_data, 0, sizeof(s_preempt_user_data));
     memset(&s_camera_lease, 0, sizeof(s_camera_lease));
     s_initialized = true;
+    return DESK_ARBITER_OK;
+}
+
+desk_arbiter_status_t desk_arbiter_register_preempt_handler(
+    desk_resource_type_t resource, desk_arbiter_preempt_cb_t callback, void *user_data)
+{
+    if (!s_initialized || resource >= DESK_RES_MAX) return DESK_ARBITER_ERR_INVALID;
+    s_preempt_cb[resource] = callback;
+    s_preempt_user_data[resource] = callback ? user_data : NULL;
     return DESK_ARBITER_OK;
 }
 
@@ -118,6 +131,23 @@ desk_arbiter_status_t desk_arbiter_acquire(desk_resource_type_t resource,
     if (resource == DESK_RES_AUDIO_PLAYBACK || resource == DESK_RES_AUDIO_RECORD) {
         if (s_resources[resource].current_owner == DESK_OWNER_TCLAW_VOICE &&
             requester == DESK_OWNER_SDK_REMOTE) {
+            return DESK_ARBITER_ERR_BUSY;
+        }
+    }
+
+    /* A registered backend must quiesce hardware before ownership can change. */
+    desk_resource_owner_t current_owner = s_resources[resource].current_owner;
+    if (current_owner != DESK_OWNER_NONE && current_owner != requester &&
+        req_prio > curr_prio && s_preempt_cb[resource]) {
+        uint32_t quiesce_timeout = timeout_ms ? timeout_ms : 1000u;
+        if (!s_preempt_cb[resource](resource, current_owner, requester, quiesce_timeout,
+                                    s_preempt_user_data[resource])) {
+            return DESK_ARBITER_ERR_BUSY;
+        }
+        /* Do not overwrite a concurrent owner transition performed by the hook. */
+        if (s_resources[resource].current_owner != current_owner &&
+            s_resources[resource].current_owner != DESK_OWNER_NONE &&
+            s_resources[resource].current_owner != requester) {
             return DESK_ARBITER_ERR_BUSY;
         }
     }

@@ -19,6 +19,7 @@ extern "C" {
 #include <stdint.h>
 #include <stddef.h>
 #include "desk_arbiter.h"
+#include "desk_audio_stream.h"
 
 /* Standard Hardware Error Codes */
 #define DESK_HW_OK                  0
@@ -119,6 +120,19 @@ int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status);
 bool desk_hardware_publish_audio_driver_state_snapshot(void);
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
 int desk_hardware_audio_play_stop(void);
+/* Host-to-device PCM session. Queue credits reflect the fixed HAL queue. */
+int desk_hardware_audio_stream_begin(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sample_rate_hz,
+                                     uint8_t channels, uint8_t sample_width_bytes,
+                                     uint32_t total_bytes);
+int desk_hardware_audio_stream_write(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sequence,
+                                     const uint8_t *pcm, size_t bytes,
+                                     desk_audio_stream_status_t *out_status);
+int desk_hardware_audio_stream_finish(uint64_t handle);
+int desk_hardware_audio_stream_stop(uint64_t handle, uint32_t timeout_ms);
+int desk_hardware_audio_stream_get_status(uint64_t handle,
+                                          desk_audio_stream_status_t *out_status);
 
 typedef void (*desk_hardware_audio_play_cb_t)(const int16_t *pcm_buf,
                                               size_t samples,
