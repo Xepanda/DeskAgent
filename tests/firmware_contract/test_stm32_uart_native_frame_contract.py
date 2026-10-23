@@ -1,4 +1,4 @@
-"""Source contract for the ratified raw STM32 UART framing."""
+"""Source contract for the official COBS-delimited STM32 MCU-link framing."""
 
 from pathlib import Path
 import unittest
@@ -17,7 +17,7 @@ class TestStm32UartNativeFrameContract(unittest.TestCase):
         )[0]
         self.assertIn("atomic_fetch_add_explicit(&s_mcu_sequence", allocator)
         self.assertNotRegex(source, r"\+\+s_mcu_sequence")
-        self.assertEqual(source.count("motion_next_sequence()"), 3)
+        self.assertEqual(source.count("motion_next_sequence()"), 4)  # MOVE, STOP, recovery STOP, HELLO
 
     def test_ambiguous_move_failure_sends_one_new_sequence_stop_without_retry(self) -> None:
         source = MOTION_C.read_text(encoding="utf-8")
@@ -33,11 +33,11 @@ class TestStm32UartNativeFrameContract(unittest.TestCase):
         self.assertGreaterEqual(move.count("motion_next_sequence()"), 2)
         self.assertRegex(
             move,
-            r"motion_send_and_wait_ack\(\s*stop_buf, stop_len, stop_seq, false,",
+            r"motion_send_and_wait_ack\(\s*stop_buf, stop_len, stop_seq, MCU_MOTION_MSG_SERVO_STOP, false,",
         )
         self.assertIn("s_last_ambiguous_move_stop_result", move)
 
-    def test_uart_transaction_uses_raw_binary_frames(self) -> None:
+    def test_uart_transaction_decodes_cobs_delimited_frames(self) -> None:
         source = MOTION_C.read_text(encoding="utf-8")
         transaction = source.split("static int motion_send_and_wait_ack", 1)[1].split(
             "int desk_watcher_motion_move", 1
@@ -45,8 +45,9 @@ class TestStm32UartNativeFrameContract(unittest.TestCase):
 
         self.assertIn("uart_write_bytes(UART_NUM_2, (const char *)frame_data, frame_len)", transaction)
         self.assertIn("desk_watcher_motion_parse_ack", transaction)
-        self.assertNotIn("wire_encode", transaction)
-        self.assertNotIn("wire_decode", transaction)
+        self.assertIn("desk_watcher_motion_cobs_decode", transaction)
+        self.assertIn("discarding_frame", transaction)
+        self.assertIn("byte != 0u", transaction)
 
     def test_raw_ack_parser_checks_crc_sequence_and_ack_type(self) -> None:
         source = MOTION_C.read_text(encoding="utf-8")
@@ -54,9 +55,9 @@ class TestStm32UartNativeFrameContract(unittest.TestCase):
             "static int motion_send_and_wait_ack", 1
         )[0]
         self.assertIn("motion_calc_crc16(frame, 12 + payload_len)", parser)
-        self.assertIn("rx_seq != expected_seq", parser)
-        self.assertIn("MCU_FRAME_FLAG_ACK_RESP", parser)
-        self.assertIn("MCU_MOTION_MSG_ACK", parser)
+        self.assertIn("ref_seq != expected_seq", parser)
+        self.assertIn("MCU_FRAME_CLASS_SYS", parser)
+        self.assertIn("MCU_SYS_MSG_ACK", parser)
 
     def test_ack_parser_correlates_command_and_reports_nack_independently_of_code(self) -> None:
         source = MOTION_C.read_text(encoding="utf-8")
@@ -68,11 +69,12 @@ class TestStm32UartNativeFrameContract(unittest.TestCase):
         )[0]
 
         self.assertIn("expected_msg_id", parser)
-        self.assertIn("msg_id == expected_msg_id", parser)
-        self.assertIn("flags == MCU_FRAME_FLAG_ACK_RESP", parser)
-        self.assertIn("payload_len == 4", parser)
+        self.assertIn("msg_id == MCU_SYS_MSG_ACK", parser)
+        self.assertIn("msg_id == MCU_SYS_MSG_NACK", parser)
+        self.assertIn("payload_len < 6u", parser)
+        self.assertIn("payload_len < 8u", parser)
         self.assertIn("*out_is_nack = true", parser)
-        self.assertIn("frame_data[4]", transaction)
+        self.assertIn("expected_seq, expected_msg_id", transaction)
         self.assertIn("&& is_nack", transaction)
 
     def test_uart_driver_deinit_respects_install_ownership(self) -> None:

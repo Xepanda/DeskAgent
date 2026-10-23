@@ -2,9 +2,8 @@
  * @file desk_watcher_motion.c
  * @brief SenseCAP Watcher STM32 Body Coprocessor UART2 Motion Driver Implementation.
  *
- * Implements 0xA5 0x5A binary framing, 12-byte header, little-endian payload,
- * CRC16-CCITT (poly 0x1021, init 0xFFFF), 500ms timeout with up to 2 retries,
- * sequence preservation invariant, and physical limits clamping (Pan 0~180°, Tilt 100~140°).
+ * Implements the pinned MCU-link protocol: A5 5A frame + CRC16 wrapped by COBS
+ * and a 00 delimiter, with HELLO capability gating and correlated SYS ACK/NACK.
  *
  * Hardware interface:
  *   ESP32-S3 UART_NUM_2 (TX: GPIO 19, RX: GPIO 20, 921600 bps, 8-N-1).
@@ -40,6 +39,8 @@ static atomic_uint_least32_t s_diag_timeout_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_least32_t s_diag_retry_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_least32_t s_diag_hello_ignored_count = ATOMIC_VAR_INIT(0);
 static atomic_int s_diag_last_error = ATOMIC_VAR_INIT(DESK_WATCHER_MOTION_ERROR_NONE);
+/* Motion is enabled only after an actual official HELLO advertises capability. */
+static atomic_bool s_peer_motion_capable = ATOMIC_VAR_INIT(false);
 /* Local diagnostic for the one-shot STOP paired with the last ambiguous MOVE. */
 static atomic_int s_last_ambiguous_move_stop_result = ATOMIC_VAR_INIT(DESK_HW_ERR_UNAVAILABLE);
 /* UART2 may be shared with another initialized component. Only delete a
@@ -93,63 +94,54 @@ static size_t motion_pack_move(float pan, float tilt, uint32_t duration_ms, uint
     int16_t tilt_x10 = (int16_t)(tilt * 10.0f + 0.5f);
     uint16_t dur = (uint16_t)duration_ms;
 
-    out_buf[0] = MCU_FRAME_MAGIC0;        /* 0xA5 */
-    out_buf[1] = MCU_FRAME_MAGIC1;        /* 0x5A */
-    out_buf[2] = MCU_FRAME_PROTO_VERSION; /* 0x01 */
-    out_buf[3] = MCU_FRAME_CLASS_MOTION;  /* 0x02 */
-    out_buf[4] = MCU_MOTION_MSG_SERVO_MOVE; /* 0x01 */
-    out_buf[5] = MCU_FRAME_FLAG_ACK_REQ;  /* 0x01 */
-    out_buf[6] = (uint8_t)(seq & 0xFF);
-    out_buf[7] = (uint8_t)((seq >> 8) & 0xFF);
-    out_buf[8] = (uint8_t)((seq >> 16) & 0xFF);
-    out_buf[9] = (uint8_t)((seq >> 24) & 0xFF);
-    out_buf[10] = 0x09; /* payload_len low */
-    out_buf[11] = 0x00; /* payload_len high */
-
-    out_buf[12] = MCU_AXIS_MASK_PAN_TILT; /* 0x03 */
-    out_buf[13] = (uint8_t)(pan_x10 & 0xFF);
-    out_buf[14] = (uint8_t)((pan_x10 >> 8) & 0xFF);
-    out_buf[15] = (uint8_t)(tilt_x10 & 0xFF);
-    out_buf[16] = (uint8_t)((tilt_x10 >> 8) & 0xFF);
-    out_buf[17] = (uint8_t)(dur & 0xFF);
-    out_buf[18] = (uint8_t)((dur >> 8) & 0xFF);
-    out_buf[19] = 0x00; /* profile: smooth S-curve */
-    out_buf[20] = 0x01; /* source */
-
-    uint16_t crc = motion_calc_crc16(out_buf, 21);
-    out_buf[21] = (uint8_t)(crc & 0xFF);
-    out_buf[22] = (uint8_t)((crc >> 8) & 0xFF);
-    return 23;
+    uint8_t raw[23];
+    raw[0] = MCU_FRAME_MAGIC0;
+    raw[1] = MCU_FRAME_MAGIC1;
+    raw[2] = MCU_FRAME_PROTO_VERSION;
+    raw[3] = MCU_FRAME_CLASS_MOTION;
+    raw[4] = MCU_MOTION_MSG_SERVO_MOVE;
+    raw[5] = MCU_FRAME_FLAG_ACK_REQ;
+    raw[6] = (uint8_t)seq;
+    raw[7] = (uint8_t)(seq >> 8);
+    raw[8] = (uint8_t)(seq >> 16);
+    raw[9] = (uint8_t)(seq >> 24);
+    raw[10] = 9u;
+    raw[11] = 0u;
+    raw[12] = MCU_AXIS_MASK_PAN_TILT; /* X and Y axes */
+    raw[13] = (uint8_t)pan_x10;
+    raw[14] = (uint8_t)((uint16_t)pan_x10 >> 8);
+    raw[15] = (uint8_t)tilt_x10;
+    raw[16] = (uint8_t)((uint16_t)tilt_x10 >> 8);
+    raw[17] = (uint8_t)dur;
+    raw[18] = (uint8_t)(dur >> 8);
+    raw[19] = MCU_MOTION_PROFILE_EASE_IN_OUT;
+    raw[20] = MCU_MOTION_SOURCE_UNKNOWN;
+    uint16_t crc = motion_calc_crc16(raw, 21u);
+    raw[21] = (uint8_t)crc;
+    raw[22] = (uint8_t)(crc >> 8);
+    size_t wire_len = 0;
+    return desk_watcher_motion_wire_encode(raw, sizeof(raw), out_buf, 32u, &wire_len) == 0 ? wire_len : 0u;
 }
 
 static size_t motion_pack_stop(bool emergency, uint32_t seq, uint8_t *out_buf)
 {
-    out_buf[0] = MCU_FRAME_MAGIC0;        /* 0xA5 */
-    out_buf[1] = MCU_FRAME_MAGIC1;        /* 0x5A */
-    out_buf[2] = MCU_FRAME_PROTO_VERSION; /* 0x01 */
-    out_buf[3] = MCU_FRAME_CLASS_MOTION;  /* 0x02 */
-    out_buf[4] = MCU_MOTION_MSG_SERVO_STOP; /* 0x02 */
-    out_buf[5] = MCU_FRAME_FLAG_ACK_REQ;  /* 0x01 */
-    out_buf[6] = (uint8_t)(seq & 0xFF);
-    out_buf[7] = (uint8_t)((seq >> 8) & 0xFF);
-    out_buf[8] = (uint8_t)((seq >> 16) & 0xFF);
-    out_buf[9] = (uint8_t)((seq >> 24) & 0xFF);
-    out_buf[10] = 0x02; /* payload_len low */
-    out_buf[11] = 0x00; /* payload_len high */
-
-    out_buf[12] = emergency ? MCU_STOP_MODE_EMERGENCY : MCU_STOP_MODE_DECEL;
-    out_buf[13] = MCU_AXIS_MASK_CANCEL_ALL; /* 0x01 */
-
-    uint16_t crc = motion_calc_crc16(out_buf, 14);
-    out_buf[14] = (uint8_t)(crc & 0xFF);
-    out_buf[15] = (uint8_t)((crc >> 8) & 0xFF);
-    return 16;
+    (void)emergency; /* Official SERVO_STOP exposes all_pending, not stop modes. */
+    uint8_t raw[16] = {MCU_FRAME_MAGIC0, MCU_FRAME_MAGIC1, MCU_FRAME_PROTO_VERSION,
+                       MCU_FRAME_CLASS_MOTION, MCU_MOTION_MSG_SERVO_STOP, MCU_FRAME_FLAG_ACK_REQ,
+                       (uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24),
+                       2u, 0u, 1u, 0u, 0u, 0u};
+    uint16_t crc = motion_calc_crc16(raw, 14u);
+    raw[14] = (uint8_t)crc;
+    raw[15] = (uint8_t)(crc >> 8);
+    size_t wire_len = 0;
+    return desk_watcher_motion_wire_encode(raw, sizeof(raw), out_buf, 32u, &wire_len) == 0 ? wire_len : 0u;
 }
 
 int desk_watcher_motion_init(void)
 {
 #ifdef ESP_PLATFORM
     if (s_motion_initialized) return DESK_HW_OK;
+    atomic_store_explicit(&s_peer_motion_capable, false, memory_order_relaxed);
 
     if (!s_motion_mutex) {
         s_motion_mutex = xSemaphoreCreateMutex();
@@ -362,7 +354,7 @@ int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
     *out_nack_code = 0;
     *out_is_nack = false;
     if (frame[0] != MCU_FRAME_MAGIC0 || frame[1] != MCU_FRAME_MAGIC1 ||
-        frame[2] != MCU_FRAME_PROTO_VERSION || frame[3] != MCU_FRAME_CLASS_MOTION) {
+        frame[2] != MCU_FRAME_PROTO_VERSION || frame[3] != MCU_FRAME_CLASS_SYS) {
         return DESK_HW_ERR_IO;
     }
 
@@ -372,33 +364,25 @@ int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
     uint16_t rx_crc = (uint16_t)frame[12 + payload_len] | ((uint16_t)frame[13 + payload_len] << 8);
     if (calc_crc != rx_crc) return DESK_HW_ERR_IO;
 
-    uint32_t rx_seq = (uint32_t)frame[6] | ((uint32_t)frame[7] << 8) |
-                      ((uint32_t)frame[8] << 16) | ((uint32_t)frame[9] << 24);
-    if (rx_seq != expected_seq) return DESK_HW_ERR_BUSY;
-
-    uint8_t flags = frame[5];
+    /* Official SYS ACK/NACK correlation is payload.ref_seq, not response header.seq. */
     uint8_t msg_id = frame[4];
-    if ((flags & MCU_FRAME_FLAG_NACK_RESP) || msg_id == MCU_MOTION_MSG_NACK) {
-        if (msg_id != MCU_MOTION_MSG_NACK || flags != MCU_FRAME_FLAG_NACK_RESP ||
-            payload_len != 2 || frame[12] == 0) {
-            return DESK_HW_ERR_IO;
-        }
-        *out_nack_code = frame[12];
+    if (msg_id == MCU_SYS_MSG_NACK) {
+        if (payload_len < 8u) return DESK_HW_ERR_IO;
+        uint32_t ref_seq = (uint32_t)frame[12] | ((uint32_t)frame[13] << 8) |
+                           ((uint32_t)frame[14] << 16) | ((uint32_t)frame[15] << 24);
+        if (ref_seq != expected_seq) return DESK_HW_ERR_BUSY;
+        *out_nack_code = frame[18]; /* low byte of official u16 reason */
         *out_is_nack = true;
         return DESK_HW_ERR_IO;
     }
-    /* The frozen protocol permits a generic ACK ID or an echo of the
-     * acknowledged MOVE/STOP ID. Require command correlation and exact flags. */
-    if (flags == MCU_FRAME_FLAG_ACK_RESP && payload_len == 4 &&
-        (msg_id == MCU_MOTION_MSG_ACK || msg_id == expected_msg_id)) {
-        uint16_t pan_x10 = (uint16_t)frame[12] | ((uint16_t)frame[13] << 8);
-        uint16_t tilt_x10 = (uint16_t)frame[14] | ((uint16_t)frame[15] << 8);
-        if (pan_x10 > 1800U || tilt_x10 < 1000U || tilt_x10 > 1400U) {
-            return DESK_HW_ERR_IO;
-        }
+    if (msg_id == MCU_SYS_MSG_ACK) {
+        if (payload_len < 6u) return DESK_HW_ERR_IO;
+        uint32_t ref_seq = (uint32_t)frame[12] | ((uint32_t)frame[13] << 8) |
+                           ((uint32_t)frame[14] << 16) | ((uint32_t)frame[15] << 24);
+        if (ref_seq != expected_seq) return DESK_HW_ERR_BUSY;
         return DESK_HW_OK;
     }
-    /* Valid command echoes and unrelated messages do not satisfy the request. */
+    /* Valid unrelated SYS messages do not satisfy a motion request. */
     return DESK_HW_ERR_BUSY;
 }
 
@@ -413,7 +397,7 @@ size_t desk_watcher_motion_pack_stop(bool emergency, uint32_t seq, uint8_t *out_
 }
 
 static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
-                                    uint32_t expected_seq, bool allow_retries,
+                                    uint32_t expected_seq, uint8_t expected_msg_id, bool allow_retries,
                                     bool *out_may_have_sent)
 {
     if (out_may_have_sent) *out_may_have_sent = false;
@@ -455,7 +439,7 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         /* Wait up to MCU_ACK_TIMEOUT_MS (500ms) for ACK */
         uint8_t frame_rx[64];
         size_t frame_rx_len = 0;
-        size_t expected_frame_len = 0;
+        bool discarding_frame = false;
         int64_t start_time = esp_timer_get_time();
 
         while ((esp_timer_get_time() - start_time) < (int64_t)(MCU_ACK_TIMEOUT_MS * 1000)) {
@@ -464,36 +448,29 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
             if (r <= 0) continue;
             atomic_fetch_add_explicit(&s_diag_rx_bytes, (uint32_t)r, memory_order_relaxed);
 
-            /* Find the native 0xA5 0x5A frame sync, then consume its fixed header. */
-            if (frame_rx_len == 0 && byte != MCU_FRAME_MAGIC0) continue;
-            if (frame_rx_len == 1 && byte != MCU_FRAME_MAGIC1) {
-                frame_rx_len = byte == MCU_FRAME_MAGIC0 ? 1 : 0;
-                if (frame_rx_len == 1) frame_rx[0] = byte;
+            if (byte != 0u) {
+                if (discarding_frame) continue;
+                if (frame_rx_len < sizeof(frame_rx)) frame_rx[frame_rx_len++] = byte;
+                else discarding_frame = true;
                 continue;
             }
-            if (frame_rx_len >= sizeof(frame_rx)) {
+            if (discarding_frame) {
+                discarding_frame = false;
                 frame_rx_len = 0;
-                expected_frame_len = 0;
                 continue;
             }
-            frame_rx[frame_rx_len++] = byte;
-
-            if (frame_rx_len == 12) {
-                uint16_t payload_len = (uint16_t)frame_rx[10] | ((uint16_t)frame_rx[11] << 8);
-                expected_frame_len = 12 + payload_len + 2;
-                if (frame_rx[2] != MCU_FRAME_PROTO_VERSION ||
-                    frame_rx[3] != MCU_FRAME_CLASS_MOTION || expected_frame_len > sizeof(frame_rx)) {
-                    frame_rx_len = 0;
-                    expected_frame_len = 0;
-                    continue;
-                }
-            }
-
-            if (expected_frame_len && frame_rx_len == expected_frame_len) {
+            if (frame_rx_len != 0u) {
+                uint8_t raw[64];
+                size_t raw_len = 0;
+                int decode_rc = desk_watcher_motion_cobs_decode(frame_rx, frame_rx_len, raw, sizeof(raw), &raw_len);
+                frame_rx_len = 0;
+                if (decode_rc != 0 || raw_len < 14u) continue;
+                uint16_t payload_len = (uint16_t)raw[10] | ((uint16_t)raw[11] << 8);
+                if (payload_len > 48u || raw_len != (size_t)(14u + payload_len)) continue;
                 uint8_t nack_code = 0;
                 bool is_nack = false;
-                int ack_rc = desk_watcher_motion_parse_ack(frame_rx, frame_rx_len,
-                                                           expected_seq, frame_data[4],
+                int ack_rc = desk_watcher_motion_parse_ack(raw, raw_len,
+                                                           expected_seq, expected_msg_id,
                                                            &nack_code, &is_nack);
                 if (ack_rc == DESK_HW_OK) {
                     atomic_fetch_add_explicit(&s_diag_ack_count, 1U, memory_order_relaxed);
@@ -505,20 +482,23 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
                     atomic_fetch_add_explicit(&s_diag_nack_count, 1U, memory_order_relaxed);
                     atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_NACK, memory_order_relaxed);
                     xSemaphoreGive(s_motion_mutex);
-                    return (nack_code == MCU_NACK_ERR_OUT_OF_BOUNDS ||
-                            nack_code == MCU_NACK_ERR_INVALID_PARAM)
-                               ? DESK_HW_ERR_INVALID_ARG : DESK_HW_ERR_IO;
+                    (void)nack_code; /* Official NACK reason is a u16; no local mapping is asserted. */
+                    return DESK_HW_ERR_IO;
                 }
-                uint16_t rx_payload_len = (uint16_t)frame_rx[10] | ((uint16_t)frame_rx[11] << 8);
-                uint16_t rx_crc = (uint16_t)frame_rx[12 + rx_payload_len] |
-                                  ((uint16_t)frame_rx[13 + rx_payload_len] << 8);
-                if (motion_calc_crc16(frame_rx, 12 + rx_payload_len) != rx_crc) {
+                uint16_t rx_crc = (uint16_t)raw[12 + payload_len] |
+                                  ((uint16_t)raw[13 + payload_len] << 8);
+                if (motion_calc_crc16(raw, 12 + payload_len) != rx_crc) {
                     atomic_fetch_add_explicit(&s_diag_bad_crc_count, 1U, memory_order_relaxed);
                     atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_BAD_CRC, memory_order_relaxed);
                 } else {
-                    uint32_t rx_seq = (uint32_t)frame_rx[6] | ((uint32_t)frame_rx[7] << 8) |
-                                      ((uint32_t)frame_rx[8] << 16) | ((uint32_t)frame_rx[9] << 24);
-                    if (rx_seq != expected_seq) {
+                    uint32_t rx_ref_seq = payload_len >= 4u ?
+                        ((uint32_t)raw[12] | ((uint32_t)raw[13] << 8) |
+                         ((uint32_t)raw[14] << 16) | ((uint32_t)raw[15] << 24)) : 0u;
+                    if ((raw[3] == MCU_FRAME_CLASS_SYS &&
+                         (raw[4] == MCU_SYS_MSG_ACK || raw[4] == MCU_SYS_MSG_NACK) &&
+                         rx_ref_seq != expected_seq) ||
+                        raw[3] != MCU_FRAME_CLASS_SYS ||
+                        (raw[4] != MCU_SYS_MSG_ACK && raw[4] != MCU_SYS_MSG_NACK)) {
                         atomic_fetch_add_explicit(&s_diag_wrong_sequence_count, 1U, memory_order_relaxed);
                         atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_WRONG_SEQUENCE, memory_order_relaxed);
                     } else {
@@ -526,7 +506,6 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
                     }
                 }
                 frame_rx_len = 0;
-                expected_frame_len = 0;
             }
         }
     }
@@ -537,7 +516,7 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
     desk_hardware_record_mcu_ack_timeout();
     return DESK_HW_ERR_TIMEOUT;
 #else
-    (void)frame_data; (void)frame_len; (void)expected_seq; (void)allow_retries;
+    (void)frame_data; (void)frame_len; (void)expected_seq; (void)expected_msg_id; (void)allow_retries;
     return DESK_HW_OK;
 #endif
 }
@@ -549,6 +528,8 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
         tilt_deg < DESK_MOTION_TILT_MIN_DEG || tilt_deg > DESK_MOTION_TILT_MAX_DEG) {
         return DESK_HW_ERR_INVALID_ARG;
     }
+    if (!atomic_load_explicit(&s_peer_motion_capable, memory_order_relaxed))
+        return DESK_HW_ERR_UNAVAILABLE;
 
     uint8_t tx_buf[32];
     uint32_t seq = motion_next_sequence();
@@ -557,7 +538,7 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
     atomic_store_explicit(&s_last_ambiguous_move_stop_result,
                           DESK_HW_ERR_UNAVAILABLE, memory_order_relaxed);
     bool may_have_sent = false;
-    int result = motion_send_and_wait_ack(tx_buf, len, seq, true, &may_have_sent);
+    int result = motion_send_and_wait_ack(tx_buf, len, seq, MCU_MOTION_MSG_SERVO_MOVE, true, &may_have_sent);
     if (result != DESK_HW_OK && may_have_sent) {
         /* Keep this inside the MOVE driver call: its caller still holds the
          * gimbal owner. Allocate a distinct sequence and never retry STOP. */
@@ -566,7 +547,7 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
         size_t stop_len = motion_pack_stop(false, stop_seq, stop_buf);
         bool stop_may_have_sent = false;
         int stop_result = motion_send_and_wait_ack(
-            stop_buf, stop_len, stop_seq, false, &stop_may_have_sent);
+            stop_buf, stop_len, stop_seq, MCU_MOTION_MSG_SERVO_STOP, false, &stop_may_have_sent);
         atomic_store_explicit(&s_last_ambiguous_move_stop_result,
                               stop_result, memory_order_relaxed);
 #ifdef ESP_PLATFORM
@@ -580,10 +561,12 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
 
 int desk_watcher_motion_stop(bool emergency)
 {
+    if (!atomic_load_explicit(&s_peer_motion_capable, memory_order_relaxed))
+        return DESK_HW_ERR_UNAVAILABLE;
     uint8_t tx_buf[32];
     uint32_t seq = motion_next_sequence();
     size_t len = motion_pack_stop(emergency, seq, tx_buf);
-    return motion_send_and_wait_ack(tx_buf, len, seq, true, NULL);
+    return motion_send_and_wait_ack(tx_buf, len, seq, MCU_MOTION_MSG_SERVO_STOP, true, NULL);
 }
 
 int desk_watcher_motion_get_last_ambiguous_move_stop_result(void)
@@ -594,6 +577,7 @@ int desk_watcher_motion_get_last_ambiguous_move_stop_result(void)
 
 int desk_watcher_motion_deinit(void)
 {
+    atomic_store_explicit(&s_peer_motion_capable, false, memory_order_relaxed);
 #ifdef ESP_PLATFORM
     if (s_motion_initialized) {
         if (s_uart_installed_by_motion && uart_is_driver_installed(UART_NUM_2)) {
@@ -620,6 +604,7 @@ bool desk_watcher_motion_is_ready(void)
 int desk_watcher_motion_probe(desk_watcher_motion_peer_info_t *out, uint32_t timeout_ms)
 {
     if (!out || timeout_ms == 0u) return DESK_HW_ERR_INVALID_ARG;
+    atomic_store_explicit(&s_peer_motion_capable, false, memory_order_relaxed);
 #ifdef ESP_PLATFORM
     if (!s_motion_initialized || !uart_is_driver_installed(UART_NUM_2)) {
         atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_UART_UNAVAILABLE, memory_order_relaxed);
@@ -676,6 +661,9 @@ int desk_watcher_motion_probe(desk_watcher_motion_peer_info_t *out, uint32_t tim
                           memory_order_relaxed);
     if (result == DESK_HW_ERR_TIMEOUT)
         atomic_fetch_add_explicit(&s_diag_timeout_count, 1U, memory_order_relaxed);
+    atomic_store_explicit(&s_peer_motion_capable,
+                          result == DESK_HW_OK && (out->capability_bitmap & MCU_CAPABILITY_MOTION) != 0u,
+                          memory_order_relaxed);
     xSemaphoreGive(s_motion_mutex);
     return result;
 #else

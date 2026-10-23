@@ -58,9 +58,12 @@ MCU_FRAME_MAGIC1 = 0x5A
 MCU_FRAME_PROTO_VERSION = 0x01
 MCU_FRAME_CLASS_MOTION = 0x02
 
-MCU_MOTION_MSG_ACK = 0x00
 MCU_MOTION_MSG_SERVO_MOVE = 0x01
 MCU_MOTION_MSG_SERVO_STOP = 0x02
+MCU_SYS_MSG_ACK = 0x04
+MCU_SYS_MSG_NACK = 0x05
+# Legacy desk_hardware.c injection path only; not the UART2 peer protocol.
+MCU_MOTION_MSG_ACK = 0x00
 MCU_MOTION_MSG_NACK = 0xFF
 
 MCU_FRAME_FLAG_ACK_REQ = 0x01
@@ -844,65 +847,36 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         self.lib.desk_hardware_set_mcu_max_retries(MCU_MAX_RETRIES)
         self.lib.desk_hardware_set_mcu_timeout_ms(MCU_ACK_TIMEOUT_MS)
 
-    def test_06d_watcher_ack_parser_rejects_out_of_range_angle_echo(self) -> None:
-        frame = (ctypes.c_uint8 * 64)()
-        frame_len = ctypes.c_size_t()
-        self.assertEqual(
-            self.lib.desk_hardware_format_stm32_ack_packet(
-                123, 900, 1200, frame, len(frame), ctypes.byref(frame_len)
-            ),
-            DESK_HW_OK,
-        )
-        valid = bytearray(frame[:frame_len.value])
+    def test_06d_official_sys_ack_and_nack_use_payload_ref_seq(self) -> None:
+        def official_sys(msg_id: int, header_seq: int, payload: bytes) -> bytes:
+            raw = bytearray([0xA5, 0x5A, 1, 1, msg_id, 2])
+            raw.extend(struct.pack("<I", header_seq))
+            raw.extend(struct.pack("<H", len(payload)))
+            raw.extend(payload)
+            raw.extend(struct.pack("<H", python_crc16_ccitt(raw)))
+            return bytes(raw)
 
-        def parse(raw: bytearray) -> int:
-            crc_end = 12 + (raw[10] | (raw[11] << 8))
-            raw[crc_end:crc_end + 2] = struct.pack(
-                "<H", python_crc16_ccitt(bytes(raw[:crc_end]))
-            )
-            c_frame = (ctypes.c_uint8 * len(raw))(*raw)
+        def parse(raw: bytes, expected_seq: int = 123) -> tuple[int, int, bool]:
+            frame = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
             nack_code = ctypes.c_uint8()
             is_nack = ctypes.c_bool()
-            return self.lib.desk_watcher_motion_parse_ack(
-                c_frame, len(raw), 123, MCU_MOTION_MSG_SERVO_MOVE,
+            result = self.lib.desk_watcher_motion_parse_ack(
+                frame, len(raw), expected_seq, MCU_MOTION_MSG_SERVO_MOVE,
                 ctypes.byref(nack_code), ctypes.byref(is_nack),
             )
+            return result, nack_code.value, is_nack.value
 
-        self.assertEqual(parse(bytearray(valid)), DESK_HW_OK)
-        self.assertEqual(
-            self.lib.desk_watcher_motion_parse_ack(
-                frame, frame_len.value, 43, MCU_MOTION_MSG_SERVO_MOVE,
-                ctypes.byref(ctypes.c_uint8()), ctypes.byref(ctypes.c_bool()),
-            ),
-            DESK_HW_ERR_BUSY,
-        )
-        bad_pan = bytearray(valid)
-        bad_pan[12:16] = struct.pack("<hh", 1801, 1200)
-        self.assertEqual(parse(bad_pan), DESK_HW_ERR_IO)
-        bad_tilt = bytearray(valid)
-        bad_tilt[12:16] = struct.pack("<hh", 900, 1401)
-        self.assertEqual(parse(bad_tilt), DESK_HW_ERR_IO)
+        # The peer response header sequence is independent from the command's ref_seq.
+        ack = official_sys(MCU_SYS_MSG_ACK, 0xDEADBEEF, struct.pack("<IH", 123, 0))
+        self.assertEqual(parse(ack), (DESK_HW_OK, 0, False))
+        wrong_ref = official_sys(MCU_SYS_MSG_ACK, 123, struct.pack("<IH", 124, 0))
+        self.assertEqual(parse(wrong_ref)[0], DESK_HW_ERR_BUSY)
 
-        nack_frame = (ctypes.c_uint8 * 64)()
-        nack_len = ctypes.c_size_t()
-        self.assertEqual(
-            self.lib.desk_hardware_format_stm32_nack_packet(
-                123, MCU_NACK_ERR_BUSY, 0x10, nack_frame, len(nack_frame),
-                ctypes.byref(nack_len),
-            ),
-            DESK_HW_OK,
-        )
-        nack_code = ctypes.c_uint8()
-        is_nack = ctypes.c_bool()
-        self.assertEqual(
-            self.lib.desk_watcher_motion_parse_ack(
-                nack_frame, nack_len.value, 123, MCU_MOTION_MSG_SERVO_MOVE,
-                ctypes.byref(nack_code), ctypes.byref(is_nack),
-            ),
-            DESK_HW_ERR_IO,
-        )
-        self.assertTrue(is_nack.value)
-        self.assertEqual(nack_code.value, MCU_NACK_ERR_BUSY)
+        nack = official_sys(MCU_SYS_MSG_NACK, 0xAABBCCDD, struct.pack("<IHH", 123, 0, 0x1234))
+        self.assertEqual(parse(nack), (DESK_HW_ERR_IO, 0x34, True))
+        corrupted = bytearray(ack)
+        corrupted[-1] ^= 1
+        self.assertEqual(parse(bytes(corrupted))[0], DESK_HW_ERR_IO)
 
     def test_06c_motion_rejects_non_finite_angles(self) -> None:
         for pan, tilt in ((float("nan"), 120.0), (90.0, float("nan")),
