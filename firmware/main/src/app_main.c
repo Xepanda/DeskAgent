@@ -548,10 +548,15 @@ static void desk_app_task_stack_hwm_publish_self(void)
     desk_app_stack_hwm_cache_publish(&s_app_task_hwm_cache, bytes);
 }
 
+bool desk_app_task_stack_hwm_read(uint32_t *bytes)
+{
+    return desk_app_stack_hwm_cache_read(&s_app_task_hwm_cache, bytes);
+}
+
 uint32_t desk_app_task_stack_hwm(void)
 {
     uint32_t bytes = 0;
-    (void)desk_app_stack_hwm_cache_read(&s_app_task_hwm_cache, &bytes);
+    (void)desk_app_task_stack_hwm_read(&bytes);
     return bytes;
 }
 
@@ -568,6 +573,11 @@ static void desk_app_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 #else
+bool desk_app_task_stack_hwm_read(uint32_t *bytes)
+{
+    *bytes = 0U;
+    return false;
+}
 uint32_t desk_app_task_stack_hwm(void) { return 0; }
 #endif
 

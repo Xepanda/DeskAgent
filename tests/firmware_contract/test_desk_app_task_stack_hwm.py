@@ -22,7 +22,8 @@ class TestDeskAppTaskStackHwm(unittest.TestCase):
         create = source.split("int app_main(void)", 1)[1].split("#else", 1)[0]
         cli = CLI_C.read_text(encoding="utf-8")
 
-        self.assertIn("desk_app_stack_hwm_cache_read", getter)
+        self.assertIn("desk_app_task_stack_hwm_read", getter)
+        self.assertIn("bool desk_app_task_stack_hwm_read(uint32_t *bytes)", source)
         self.assertNotIn("uxTaskGetStackHighWaterMark", getter)
         self.assertNotIn("s_app_task_handle", source)
         self.assertIn("uxTaskGetStackHighWaterMark(NULL)", source)
@@ -30,7 +31,8 @@ class TestDeskAppTaskStackHwm(unittest.TestCase):
         self.assertIn("desk_app_task_stack_hwm_publish_self", loop)
         self.assertIn("desk_app_task_stack_hwm_publish_self", worker)
         self.assertIn("NULL, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT", create)
-        self.assertIn("cached self-sample", cli)
+        self.assertIn("app_task=%lu B (cached self-sample)", cli)
+        self.assertIn("desk_app_task_stack_hwm_read(&app_task_hwm)", cli)
         self.assertIn("UNKNOWN (no cached self-sample", cli)
 
     def test_c_harness_getter_never_queries_tcb_after_worker_exit(self):
@@ -65,15 +67,23 @@ static uint32_t getter(void) {
     return bytes;
 }
 
+static bool read_hwm(uint32_t *bytes) {
+    return desk_app_stack_hwm_cache_read(&cache, bytes);
+}
+
 int main(void) {
     uint32_t bytes = 123;
-    assert(!desk_app_stack_hwm_cache_read(&cache, &bytes));
+    assert(!read_hwm(&bytes));
     assert(bytes == 0); /* no task yet or synchronous creation fallback */
+    desk_app_stack_hwm_cache_publish(&cache, 0U);
+    assert(read_hwm(&bytes));
+    assert(bytes == 0U); /* a sampled zero is valid, not unavailable */
     publish_app_task_sample();
+    assert(read_hwm(&bytes));
     assert(getter() == 1024U);
     assert(tcb_queries == 1U);
     app_task_alive = false; /* task subsequently calls vTaskDelete(NULL) */
-    assert(getter() == 1024U); /* the cache remains readable after TCB deletion */
+    assert(read_hwm(&bytes) && bytes == 1024U); /* cache remains readable after TCB deletion */
     assert(tcb_queries == 1U); /* getter did not query a stale TaskHandle_t */
     return 0;
 }

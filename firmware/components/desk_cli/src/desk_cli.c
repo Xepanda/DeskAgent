@@ -309,6 +309,7 @@ static void cmd_sys_version(int argc, char *argv[])
 }
 
 extern uint32_t desk_app_task_stack_hwm(void);
+extern bool desk_app_task_stack_hwm_read(uint32_t *bytes);
 static void cmd_sys_heap(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -322,8 +323,8 @@ static void cmd_sys_heap(int argc, char *argv[])
            (unsigned long)total_free, (unsigned long)free_sram,
            (unsigned long)largest_sram, (unsigned long)min_sram,
            (unsigned long)free_psram);
-    uint32_t app_task_hwm = desk_app_task_stack_hwm();
-    if (app_task_hwm > 0U) {
+    uint32_t app_task_hwm = 0U;
+    if (desk_app_task_stack_hwm_read(&app_task_hwm)) {
         printf("Task Stack Min Remaining: app_task=%lu B (cached self-sample), poll_worker=%lu B\r\n",
                (unsigned long)app_task_hwm,
                (unsigned long)desk_firmware_background_task_stack_hwm());

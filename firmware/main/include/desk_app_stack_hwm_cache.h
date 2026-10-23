@@ -20,7 +20,7 @@ static inline void desk_app_stack_hwm_cache_publish(desk_app_stack_hwm_cache_t *
 {
     portENTER_CRITICAL(&cache->mux);
     cache->bytes = bytes;
-    cache->valid = true;
+    if (!cache->valid) cache->valid = true;
     portEXIT_CRITICAL(&cache->mux);
 }
 
