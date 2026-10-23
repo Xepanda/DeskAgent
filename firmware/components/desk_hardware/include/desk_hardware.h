@@ -208,7 +208,12 @@ void desk_hardware_reset_mcu_stats(void);
 
 /* Camera API */
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
-int desk_hardware_camera_stream_start(float target_fps, desk_camera_frame_cb_t cb, void *user_data);
+/** Start explicit-pump streaming bound to an already acquired camera lease owner. */
+int desk_hardware_camera_stream_start(const char *client_id, float target_fps,
+                                      desk_camera_frame_cb_t cb, void *user_data);
+/** True only after this stream has delivered a complete JPEG from the board capture hook. */
+bool desk_hardware_camera_stream_is_ready(void);
+/** Callbacks must not re-enter start/pump/stop. Stop drains the producer but leaves lease release to caller. */
 int desk_hardware_camera_stream_stop(void);
 int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, uint32_t timestamp_ms);
 int desk_hardware_camera_stream_pump(void);

@@ -158,7 +158,7 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         CAM_FRAME_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p)
         cls.CAM_FRAME_CB = CAM_FRAME_CB
         cls.lib.desk_hardware_camera_stream_start.restype = ctypes.c_int
-        cls.lib.desk_hardware_camera_stream_start.argtypes = [ctypes.c_float, CAM_FRAME_CB, ctypes.c_void_p]
+        cls.lib.desk_hardware_camera_stream_start.argtypes = [ctypes.c_char_p, ctypes.c_float, CAM_FRAME_CB, ctypes.c_void_p]
 
         cls.lib.desk_hardware_camera_stream_pump.restype = ctypes.c_int
         cls.lib.desk_hardware_camera_stream_pump.argtypes = []
@@ -396,29 +396,21 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.lib.desk_hardware_audio_play_stop()
 
     def test_camera_frame_injection_and_streaming(self) -> None:
-        """Verifies camera frame injection, stream dispatch callback, and JPEG capture."""
+        """Injected host frames cannot masquerade as a leased board stream producer."""
         stream_frames = []
         def on_frame(jpeg_ptr, jpeg_len, ts_ms, user_data):
             stream_frames.append((bytes(jpeg_ptr[:jpeg_len]), ts_ms))
 
         cb_holder = self.CAM_FRAME_CB(on_frame)
-        self.lib.desk_hardware_camera_stream_start(ctypes.c_float(15.0), cb_holder, None)
+        rc = self.lib.desk_hardware_camera_stream_start(b"viewer-a", ctypes.c_float(15.0), cb_holder, None)
+        self.assertEqual(rc, DESK_HW_ERR_UNAVAILABLE, "Default driver has no initialized real camera producer")
 
-        # Inject custom JPEG frame
+        # Native injection remains useful for single-frame L2 capture tests, but
+        # it must never feed the real board producer callback.
         fake_jpeg = b"\xFF\xD8\xFF\xE0TEST_JPEG_DATA\xFF\xD9"
         rc = self.lib.desk_hardware_camera_inject_frame(fake_jpeg, len(fake_jpeg), 5000)
         self.assertEqual(rc, 0)
-
-        # Stream callback was called on injection
-        self.assertEqual(len(stream_frames), 1)
-        self.assertEqual(stream_frames[0][0], fake_jpeg)
-        self.assertEqual(stream_frames[0][1], 5000)
-
-        # Stream pump advances timestamp and dispatches
-        rc = self.lib.desk_hardware_camera_stream_pump()
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(stream_frames), 2)
-        self.assertGreater(stream_frames[1][1], 5000)
+        self.assertEqual(stream_frames, [])
 
         # Capture JPEG returns latest frame
         cap_buf = ctypes.create_string_buffer(128)
@@ -427,7 +419,7 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(bytes(cap_buf.raw[:cap_len.value]), fake_jpeg)
 
-        self.lib.desk_hardware_camera_stream_stop()
+        self.assertEqual(self.lib.desk_hardware_camera_stream_stop(), DESK_HW_OK)
 
     def test_touch_event_subscription_and_injection(self) -> None:
         """Verifies touch inputs callback registration and dispatch."""

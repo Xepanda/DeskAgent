@@ -111,6 +111,8 @@ desk_arbiter_status_t desk_arbiter_camera_acquire_lease(const char *client_id, u
 desk_arbiter_status_t desk_arbiter_camera_renew_lease(const char *client_id, uint32_t lease_ms);
 void desk_arbiter_camera_release_lease(const char *client_id);
 bool desk_arbiter_camera_is_lease_active(void);
+/** Return true only when an unexpired lease is held by this exact client id. */
+bool desk_arbiter_camera_lease_matches(const char *client_id);
 
 #ifdef __cplusplus
 }

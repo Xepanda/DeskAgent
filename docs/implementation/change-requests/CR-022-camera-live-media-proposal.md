@@ -96,11 +96,12 @@
 
 当前 `desk_arbiter_camera_is_lease_active()` 只能回答是否存在有效租约，不能证明当前 `client_id` 是 owner；ESP 上 `desk_hardware_camera_stream_start/pump()` 又明确返回 `DESK_HW_ERR_UNAVAILABLE`。因此 A2 不得只依赖全局 active 标志向任意 command sender 开流或返回成功 ACK。A1 在 `firmware/components/desk_hardware/` 必须先交付以下接口语义：
 
-1. 以现有 `desk_hardware_camera_stream_start/pump/stop` 为基础实现真实 ESP 路径，并增加 `desk_hardware_camera_stream_is_ready()`：
+1. 以现有 `desk_hardware_camera_stream_start/pump/stop` 为基础实现真实 ESP 路径，并增加 `desk_hardware_camera_stream_is_ready()`；`start` 接收当前 `client_id` 并绑定整个 producer generation，pump 在采集前与 callback 前都必须复核该 owner：
    - `start()` 校验 callback/FPS、初始化并取得唯一 sensor/SPI owner；没有真实可用源、资源冲突或目标模式不支持时返回明确错误，绝不能启动合成/注入/mock producer。
    - `is_ready()` 只有在收到至少一张来自实际 HX PTL capture 的完整、通过 JPEG/长度检查的新帧后才返回 true；A2 在 ready 前不得 ACK start。每个 pump/callback 帧附实际采集时的 monotonic 毫秒时间戳，不能使用 Host 发送时间或模拟递增时间。
    - `pump()` 每次最多推进一个新物理采集，错误必须保留并向 A2 返回；它不能复用上一张 JPEG 充当下一帧。若按 15 FPS 调度做不到，保持失败并上报实际错误/耗时。
    - `stop()` 幂等；返回成功前须阻止新采集、等待 in-flight SPI/回调退出、关闭 producer mode 并释放 SPI、DMA/JPEG buffer 与 arbiter owner；返回后保证不再有 callback。stop 错误不得被忽略。
+   - HAL `start` 必须接收并绑定当前 `client_id` 到 producer generation；pump 在采集前与 callback 前复核精确 owner。stream.stop 只释放 producer/SPI/buffer 资源，**不得释放逻辑 camera viewing lease**；逻辑租约由独立 `ctrl.camera.release` 负责，release 必须先等 producer stop 成功。stop 同时须等待 start-in-progress 与 in-flight callback。
 2. 在 arbiter 提供 `desk_arbiter_camera_lease_matches(const char *client_id)`（或等价且同样原子的 owner 查询）：必须在同一调用中检查 active、expiry 和精确 owner；过期租约当场失效并释放其 arbiter 锁。空/过长/不匹配 owner 返回 false，不泄露 owner 字符串。
 3. A2 每次 start、每帧发送前及 stop/release 时都校验 `lease_matches(client_id)`。显式 release 必须先停流再 ACK release；lease 到期、owner 释放或 Device channel disconnect 必须停止 producer、阻止后续帧并清理 stream/session generation。若 stop 未确认，A2 不得 ACK stream.stop/release 成功，也不得允许第二个 producer 占用硬件；设备/Host 重启依赖 lease TTL 和启动时清理恢复。
 
