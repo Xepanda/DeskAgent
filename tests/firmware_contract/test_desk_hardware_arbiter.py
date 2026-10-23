@@ -11,6 +11,7 @@ import ctypes
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 
 # Owners matching desk_arbiter.h
@@ -292,6 +293,85 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_SYSTEM_ALERT)
         self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
             DESK_RES_AUDIO_PLAYBACK, self.PREEMPT_CB(), None), DESK_ARBITER_OK)
+
+    def test_higher_priority_preemption_reservation_blocks_concurrent_lower_request(self) -> None:
+        """A pending SYSTEM_ALERT transition cannot be stolen by a lower owner."""
+        callback_entered = threading.Event()
+        allow_alert_quiesce = threading.Event()
+        alert_result = []
+        callback_observed_owner = []
+
+        def on_preempt(resource, owner, requester, timeout_ms, user_data):
+            if requester == DESK_OWNER_SYSTEM_ALERT:
+                callback_observed_owner.append(self.lib.desk_arbiter_get_owner(resource))
+                callback_entered.set()
+                return allow_alert_quiesce.wait(2)
+            return True
+
+        callback = self.PREEMPT_CB(on_preempt)
+        self.assertEqual(self.lib.desk_arbiter_acquire(
+            DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE, 0), DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, callback, None), DESK_ARBITER_OK)
+
+        alert_thread = threading.Thread(target=lambda: alert_result.append(
+            self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SYSTEM_ALERT, 500)))
+        alert_thread.start()
+        try:
+            self.assertTrue(callback_entered.wait(2), "alert quiesce callback did not start")
+            lower_rc = self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 0)
+            self.assertEqual(lower_rc, DESK_ARBITER_ERR_BUSY)
+            self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                             DESK_OWNER_SDK_REMOTE)
+        finally:
+            allow_alert_quiesce.set()
+            alert_thread.join(2)
+
+        self.assertFalse(alert_thread.is_alive(), "alert acquisition did not finish")
+        self.assertEqual(callback_observed_owner, [DESK_OWNER_SDK_REMOTE])
+        self.assertEqual(alert_result, [DESK_ARBITER_OK])
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                         DESK_OWNER_SYSTEM_ALERT)
+
+    def test_higher_priority_request_supersedes_lower_in_flight_transition(self) -> None:
+        """A late lower callback cannot commit after SYSTEM_ALERT supersedes it."""
+        lower_callback_entered = threading.Event()
+        allow_lower_quiesce = threading.Event()
+        lower_result = []
+
+        def on_preempt(resource, owner, requester, timeout_ms, user_data):
+            if requester == DESK_OWNER_TCLAW_VOICE:
+                lower_callback_entered.set()
+                return allow_lower_quiesce.wait(2)
+            return True
+
+        callback = self.PREEMPT_CB(on_preempt)
+        self.assertEqual(self.lib.desk_arbiter_acquire(
+            DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE, 0), DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, callback, None), DESK_ARBITER_OK)
+
+        lower_thread = threading.Thread(target=lambda: lower_result.append(
+            self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 500)))
+        lower_thread.start()
+        try:
+            self.assertTrue(lower_callback_entered.wait(2), "lower quiesce callback did not start")
+            alert_rc = self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SYSTEM_ALERT, 500)
+            self.assertEqual(alert_rc, DESK_ARBITER_OK)
+            self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                             DESK_OWNER_SYSTEM_ALERT)
+        finally:
+            allow_lower_quiesce.set()
+            lower_thread.join(2)
+
+        self.assertFalse(lower_thread.is_alive(), "lower acquisition did not finish")
+        self.assertEqual(lower_result, [DESK_ARBITER_ERR_BUSY])
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                         DESK_OWNER_SYSTEM_ALERT)
 
     def test_camera_lease_locks_tclaw_motion_tracking(self) -> None:
         """Verifies active camera viewing lease locks out automatic TClaw gimbal tracking."""

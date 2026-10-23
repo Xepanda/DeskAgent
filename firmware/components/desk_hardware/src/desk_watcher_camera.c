@@ -71,6 +71,8 @@
 #define HX_MEDIA_MAGIC_0          0x57U /* 'W' */
 #define HX_MEDIA_MAGIC_1          0x52U /* 'R' */
 #define HX_MEDIA_VERSION          1U
+#define HX_MEDIA_SOURCE_PROFILE_MASK (3U << 4)
+#define HX_MEDIA_SOURCE_PROFILE_640X480 (2U << 4)
 
 #define WATCHER_HX_PTL_MAX_JPEG_SIZE (128U * 1024U)
 #define WATCHER_HX_PTL_BODY_CAPACITY (HX_MEDIA_HEADER_SIZE + WATCHER_HX_PTL_MAX_JPEG_SIZE)
@@ -514,6 +516,9 @@ int desk_watcher_camera_validate_frame(const uint8_t *body, size_t body_size, co
     /* Check Media Header magic 'W' 'R' */
     if (body[0] != HX_MEDIA_MAGIC_0 || body[1] != HX_MEDIA_MAGIC_1) return -2;
     if (body[2] != HX_MEDIA_VERSION) return -3;
+    /* Match the locked Watcher HX media protocol: only source profile 640x480
+     * is valid for the JPEG stream exported by this board adapter. */
+    if ((body[3] & HX_MEDIA_SOURCE_PROFILE_MASK) != HX_MEDIA_SOURCE_PROFILE_640X480) return -6;
 
     uint32_t expected_crc = (uint32_t)body[12] |
                             ((uint32_t)body[13] << 8) |

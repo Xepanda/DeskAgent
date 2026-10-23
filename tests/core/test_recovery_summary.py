@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timezone
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfoNotFoundError
@@ -152,6 +155,183 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertEqual(replay["outbox_id"], first["outbox_id"])
         self.assertEqual(len(self.service.get_pending_outbox_messages(now_iso="2026-10-23T12:05:00Z")), 1)
 
+    def test_rescheduling_summary_member_supersedes_batch_and_releases_all_occurrences_after_restart(self) -> None:
+        original_occurrence = self._reminder("rescheduled", "2026-10-23T11:00:00Z", "UTC")
+        sibling_occurrence = self._reminder("summary-sibling", "2026-10-23T11:30:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            original_batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.service.update_reminder(
+            "rescheduled", due_at="2026-10-23T13:00:00Z"
+        )
+
+        old_occurrences = self.service.get_all_occurrences("rescheduled")
+        self.assertEqual([item["state"] for item in old_occurrences], ["cancelled", "pending"])
+        self.assertEqual(old_occurrences[0]["occurrence_id"], original_occurrence)
+        new_occurrence = old_occurrences[-1]
+        self.assertNotEqual(new_occurrence["occurrence_id"], original_occurrence)
+        self.assertEqual(new_occurrence["scheduled_at"], "2026-10-23T13:00:00Z")
+
+        with self.service._get_connection() as conn:
+            batch_state = conn.execute(
+                "SELECT state FROM recovery_batches WHERE batch_id = ?", (original_batch["batch_id"],)
+            ).fetchone()["state"]
+            outbox_state = conn.execute(
+                "SELECT state FROM outbox WHERE outbox_id = ?", (original_batch["outbox_id"],)
+            ).fetchone()["state"]
+        self.assertEqual(batch_state, "cancelled")
+        self.assertEqual(outbox_state, "cancelled")
+
+        self.service.close()
+        self.service = LifeService(self.db_path)
+        self.assertFalse(
+            self.service.claim_recovery_summary_delivery(
+                original_batch["outbox_id"], original_batch["summary_id"], now_iso="2026-10-23T13:01:00Z"
+            )
+        )
+        due = self.service.get_due_occurrences("2026-10-23T13:01:00Z")
+        self.assertEqual(
+            {item["occurrence_id"] for item in due},
+            {new_occurrence["occurrence_id"], sibling_occurrence},
+        )
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            replacement_batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T13:01:00Z")
+        self.assertNotEqual(replacement_batch["batch_id"], original_batch["batch_id"])
+        self.assertEqual(
+            {item["occurrence_id"] for item in replacement_batch["payload"]["items"]},
+            {new_occurrence["occurrence_id"], sibling_occurrence},
+        )
+
+    def test_summary_delivery_claim_is_single_winner_and_recovered_after_restart(self) -> None:
+        self._reminder("claim-recovery", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        other_service = LifeService(self.db_path)
+        barrier = threading.Barrier(3)
+
+        def claim(service: LifeService) -> bool:
+            barrier.wait()
+            return service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:01:00Z"
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                claims = [
+                    pool.submit(claim, self.service),
+                    pool.submit(claim, other_service),
+                ]
+                barrier.wait()
+                self.assertCountEqual([future.result(timeout=5) for future in claims], [True, False])
+        finally:
+            other_service.close()
+        self.service.close()
+        self.service = LifeService(self.db_path)
+
+        pending = self.service.get_pending_outbox_messages(
+            now_iso="2026-10-23T12:02:00Z", include_delayed=True
+        )
+        self.assertEqual([item["outbox_id"] for item in pending], [batch["outbox_id"]])
+        self.assertTrue(
+            self.service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:02:00Z"
+            ),
+            "an active claimed summary must be retryable after process restart",
+        )
+
+    def test_completed_occurrence_invalidates_unclaimed_summary(self) -> None:
+        occurrence_id = self._reminder("completed-summary", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+        self.service.complete_reminder("completed-summary", occurrence_id)
+
+        self.assertFalse(
+            self.service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:01:00Z"
+            )
+        )
+        self.assertEqual(
+            self.service._get_connection().execute(
+                "SELECT state FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+            ).fetchone()["state"],
+            "cancelled",
+        )
+
+    def test_update_after_summary_claim_cancels_retry_without_claiming_to_retract_send(self) -> None:
+        self._reminder("claim-before-update", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.assertTrue(
+            self.service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:01:00Z"
+            )
+        )
+        # The CAS is the send-start boundary. A later edit cancels retries, but
+        # cannot promise to retract a transport call already started by caller.
+        self.service.update_reminder("claim-before-update", due_at="2026-10-23T13:00:00Z")
+        self.service.record_outbox_failure(
+            batch["outbox_id"], "send result unknown", keep_pending=True
+        )
+
+        outbox = self.service._get_connection().execute(
+            "SELECT state FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+        ).fetchone()
+        self.assertEqual(outbox["state"], "cancelled")
+
+    def test_ack_during_claimed_delivery_remains_terminal_after_inflight_failure(self) -> None:
+        self._reminder("ack-inflight", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.assertTrue(
+            self.service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:01:00Z"
+            )
+        )
+        # Model an ACK received while the adapter call is still in flight.
+        self.assertEqual(
+            self.service.record_recovery_summary_ack(
+                {"type": "notification.acknowledged", "summary_id": batch["summary_id"], "source": "button"},
+                now_iso="2026-10-23T12:01:01Z",
+            ),
+            "recorded",
+        )
+        self.service.record_outbox_failure(batch["outbox_id"], "inflight result unknown", keep_pending=True)
+
+        outbox = self.service._get_connection().execute(
+            "SELECT state, next_retry_at FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+        ).fetchone()
+        self.assertEqual(outbox["state"], "acknowledged")
+        self.assertIsNone(outbox["next_retry_at"])
+        self.assertEqual(
+            self.service.get_pending_outbox_messages(include_delayed=True),
+            [],
+            "an acknowledged summary must not be resurrected after in-flight failure",
+        )
+
+    def test_unacknowledged_claimed_summary_remains_retryable_after_send_failure(self) -> None:
+        self._reminder("retry-inflight", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.assertTrue(
+            self.service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:01:00Z"
+            )
+        )
+        self.service.record_outbox_failure(batch["outbox_id"], "temporary send failure", keep_pending=True)
+
+        outbox = self.service._get_connection().execute(
+            "SELECT state FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+        ).fetchone()
+        self.assertEqual(outbox["state"], "pending")
+        self.assertEqual(
+            [item["outbox_id"] for item in self.service.get_pending_outbox_messages(include_delayed=True)],
+            [batch["outbox_id"]],
+        )
+
     def test_summary_batch_has_deterministic_ids_and_exact_24_hour_ttl(self) -> None:
         self._reminder("identity", "2026-10-23T11:00:00Z")
 
@@ -194,8 +374,11 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertEqual(self.service.get_all_occurrences("ack")[0], before)
 
     def test_expired_summary_is_not_pending_and_late_ack_is_ignored(self) -> None:
-        self._reminder("ttl", "2026-10-23T11:00:00Z")
-        batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+        occurrence_id = self._reminder("ttl", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+        self.service.close()
+        self.service = LifeService(self.db_path)
 
         pending = self.service.get_pending_outbox_messages(now_iso="2026-10-24T12:00:00Z")
         late_ack = self.service.record_recovery_summary_ack(
@@ -207,6 +390,38 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertEqual(late_ack, "ignored")
         receipt = self.service.get_recovery_summary_receipt(batch["summary_id"])
         self.assertFalse(receipt["acknowledged"])
+        self.assertEqual(self.service.get_all_occurrences("ttl")[0]["state"], "expired")
+        self.assertEqual(self.service.get_reminder("ttl")["status"], "missed")
+        self.assertEqual(self.service.get_all_occurrences("ttl")[0]["occurrence_id"], occurrence_id)
+
+    def test_expired_summary_advances_recurring_reminder_past_offline_misses(self) -> None:
+        occurrence_id = self._reminder(
+            "repeat-ttl", "2026-10-23T11:00:00Z", "UTC"
+        )
+        self.service.update_reminder("repeat-ttl", repeat_rule="daily")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+        self.service.close()
+        self.service = LifeService(self.db_path)
+
+        self.service.get_pending_outbox_messages(now_iso="2026-10-24T12:00:00Z")
+        self.service.get_pending_outbox_messages(now_iso="2026-10-24T12:01:00Z")
+
+        occurrences = self.service.get_all_occurrences("repeat-ttl")
+        self.assertEqual(
+            [(item["occurrence_id"], item["state"], item["scheduled_at"]) for item in occurrences],
+            [
+                (occurrence_id, "expired", "2026-10-23T11:00:00Z"),
+                ("occ-repeat-ttl-1792926000", "pending", "2026-10-25T11:00:00Z"),
+            ],
+        )
+        self.assertEqual(self.service.get_reminder("repeat-ttl")["status"], "scheduled")
+        self.assertEqual(
+            self.service._get_connection().execute(
+                "SELECT state FROM recovery_batches WHERE batch_id = ?", (batch["batch_id"],)
+            ).fetchone()["state"],
+            "expired",
+        )
 
     def test_batch_membership_and_outbox_rollback_together_on_sqlite_failure(self) -> None:
         self._reminder("rollback", "2026-10-23T11:00:00Z")

@@ -522,6 +522,10 @@ class DeskAgentHostApp:
                                 keep_pending=True,
                             )
                             continue
+                        if not self.life_service.claim_recovery_summary_delivery(
+                            outbox_id, payload.get("summary_id")
+                        ):
+                            continue
                         try:
                             result = self.managed_notification_adapter.deliver_summary(payload)
                             backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))

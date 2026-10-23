@@ -97,6 +97,22 @@ class TestWatcherAudioTxDrainContract(unittest.TestCase):
         self.assertNotIn("desk_arbiter_release", tclaw_alert)
         self.assertIn("return false", tclaw_alert)
 
+    def test_stream_lock_timeout_fails_closed_without_one_shot_drain(self) -> None:
+        preempt = self.source.split("static bool audio_preempt_quiesce(", 1)[1].split(
+            "int desk_watcher_audio_play_stop", 1)[0]
+        sdk_remote = preempt.split("if (current_owner == DESK_OWNER_SDK_REMOTE)", 1)[1].split(
+            "if (current_owner == DESK_OWNER_TCLAW_VOICE", 1)[0]
+        self.assertRegex(
+            sdk_remote,
+            r"if\s*\(!s_stream_lock\s*\|\|\s*"
+            r"xSemaphoreTake\(s_stream_lock,\s*pdMS_TO_TICKS\(timeout_ms\)\)\s*!=\s*pdTRUE\)\s*"
+            r"(?:\{\s*)?return false;\s*\}?",
+        )
+        self.assertLess(sdk_remote.index("return false;"), sdk_remote.index("if (stream_active)"))
+        self.assertLess(sdk_remote.index("return false;"), sdk_remote.index("xSemaphoreTake(s_one_shot_lock"))
+        self.assertLess(sdk_remote.index("xSemaphoreTake(s_one_shot_lock"),
+                        sdk_remote.index("desk_watcher_audio_tx_drain(timeout_ms)"))
+
     def test_one_shot_public_playback_drains_before_return_and_notification_release(self) -> None:
         hardware = HARDWARE_SOURCE.read_text(encoding="utf-8")
         play = hardware.split("int desk_hardware_audio_play_pcm(", 1)[1].split(

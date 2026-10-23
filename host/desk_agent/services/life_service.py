@@ -465,6 +465,27 @@ class LifeService:
                     "UPDATE outbox SET state = ? WHERE outbox_id = ?",
                     (recovered_state, row["outbox_id"]),
                 )
+            # A process may exit after claiming a recovery summary but before
+            # recording its transport attempt. Requeue only summaries whose
+            # frozen batch is still active; cancelled/expired batches stay dead.
+            conn.execute(
+                """UPDATE outbox SET state = 'pending' WHERE event_type = 'notification.summary.deliver'
+                   AND state = 'dispatching'
+                   AND EXISTS (
+                       SELECT 1 FROM recovery_batches b
+                       WHERE b.summary_id = json_extract(outbox.payload_json, '$.summary_id')
+                         AND b.state = 'pending'
+                   )"""
+            )
+            conn.execute(
+                """UPDATE outbox SET state = 'cancelled' WHERE event_type = 'notification.summary.deliver'
+                   AND state = 'dispatching'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM recovery_batches b
+                       WHERE b.summary_id = json_extract(outbox.payload_json, '$.summary_id')
+                         AND b.state = 'pending'
+                   )"""
+            )
             conn.commit()
 
     @staticmethod
@@ -556,14 +577,60 @@ class LifeService:
 
             # If due_at changed, update the active pending occurrence schedule
             if due_at is not None and due_at != current["due_at"]:
-                conn.execute(
-                    """
-                    UPDATE occurrences
-                    SET scheduled_at = ?
-                    WHERE reminder_id = ? AND state = 'pending'
-                    """,
-                    (new_due, reminder_id),
-                )
+                pending = conn.execute(
+                    "SELECT occurrence_id FROM occurrences WHERE reminder_id = ? AND state = 'pending'",
+                    (reminder_id,),
+                ).fetchall()
+                pending_ids = [row["occurrence_id"] for row in pending]
+                if pending_ids:
+                    placeholders = ",".join("?" for _ in pending_ids)
+                    batches = conn.execute(
+                        f"SELECT DISTINCT batch_id FROM recovery_batch_items WHERE occurrence_id IN ({placeholders})",
+                        pending_ids,
+                    ).fetchall()
+                    for batch in batches:
+                        batch_id = batch["batch_id"]
+                        summary = conn.execute(
+                            "SELECT summary_id FROM recovery_batches WHERE batch_id = ?", (batch_id,)
+                        ).fetchone()
+                        if summary:
+                            conn.execute(
+                                "UPDATE outbox SET state = 'cancelled', next_retry_at = NULL "
+                                "WHERE event_type = 'notification.summary.deliver' "
+                                "AND json_extract(payload_json, '$.summary_id') = ? "
+                                "AND state IN ('pending', 'dispatching')",
+                                (summary["summary_id"],),
+                            )
+                        # A frozen summary is no longer valid after a member is
+                        # rescheduled. Release every member so the next scan can
+                        # build a fresh snapshot for the remaining pending items.
+                        conn.execute(
+                            "UPDATE recovery_batches SET state = 'cancelled' WHERE batch_id = ? "
+                            "AND state NOT IN ('expired', 'cancelled')",
+                            (batch_id,),
+                        )
+                        conn.execute("DELETE FROM recovery_batch_items WHERE batch_id = ?", (batch_id,))
+
+                    if batches:
+                        # A new occurrence identity prevents the replacement
+                        # schedule from colliding with the immutable summary's
+                        # deterministic member digest.
+                        conn.execute(
+                            "UPDATE occurrences SET state = 'cancelled' "
+                            f"WHERE occurrence_id IN ({placeholders})",
+                            pending_ids,
+                        )
+                        conn.execute(
+                            "INSERT INTO occurrences (occurrence_id, reminder_id, scheduled_at, state) "
+                            "VALUES (?, ?, ?, 'pending')",
+                            (f"occ-{reminder_id}-rescheduled-{uuid.uuid4().hex}", reminder_id, new_due),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE occurrences SET scheduled_at = ? "
+                            "WHERE reminder_id = ? AND state = 'pending'",
+                            (new_due, reminder_id),
+                        )
 
             conn.commit()
 
@@ -825,6 +892,129 @@ class LifeService:
             "payload": json.loads(row["payload_json"]),
         }
 
+    def claim_recovery_summary_delivery(
+        self,
+        outbox_id: str,
+        summary_id: str,
+        *,
+        now_iso: Optional[str] = None,
+    ) -> bool:
+        """Atomically claim only a current summary immediately before device send.
+
+        A successful pending->dispatching transition is the send-start
+        linearization point. Later reminder edits cannot promise to retract a
+        send already claimed by the delivery loop.
+        """
+        with self._lock:
+            conn = self._get_connection()
+            now_str = _normalize_utc_iso(now_iso) if now_iso else self._now_utc_str()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._expire_recovery_summaries(conn, now_str)
+                row = conn.execute(
+                    """SELECT o.state AS outbox_state, o.payload_json AS outbox_payload,
+                              b.batch_id, b.state AS batch_state, b.expires_at,
+                              b.payload_json AS batch_payload
+                       FROM outbox o JOIN recovery_batches b
+                         ON json_extract(o.payload_json, '$.summary_id') = b.summary_id
+                       WHERE o.outbox_id = ? AND o.event_type = 'notification.summary.deliver'
+                         AND b.summary_id = ?""",
+                    (outbox_id, summary_id),
+                ).fetchone()
+                valid = False
+                if row:
+                    try:
+                        outbox_payload = json.loads(row["outbox_payload"])
+                        batch_payload = json.loads(row["batch_payload"])
+                        visible_items = batch_payload.get("items", [])
+                        valid = (
+                            row["outbox_state"] == "pending"
+                            and row["batch_state"] == "pending"
+                            and row["expires_at"] > now_str
+                            and isinstance(outbox_payload, dict)
+                            and isinstance(batch_payload, dict)
+                            and outbox_payload == batch_payload
+                            and isinstance(visible_items, list)
+                        )
+                    except (TypeError, ValueError, AttributeError):
+                        valid = False
+
+                if valid:
+                    member_rows = conn.execute(
+                        """SELECT o.occurrence_id, o.reminder_id, o.scheduled_at, o.state,
+                                  r.title, r.timezone, r.status AS reminder_status
+                           FROM recovery_batch_items bi
+                           JOIN occurrences o ON o.occurrence_id = bi.occurrence_id
+                           JOIN reminders r ON r.reminder_id = o.reminder_id
+                           WHERE bi.batch_id = ?""",
+                        (row["batch_id"],),
+                    ).fetchall()
+                    omitted_count = batch_payload.get("omitted_count")
+                    valid = (
+                        isinstance(omitted_count, int)
+                        and not isinstance(omitted_count, bool)
+                        and omitted_count >= 0
+                        and len(member_rows) == len(visible_items) + omitted_count
+                        and all(
+                            member["state"] == "pending"
+                            and member["reminder_status"] not in {"completed", "cancelled", "archived"}
+                            for member in member_rows
+                        )
+                    )
+                    by_id = {member["occurrence_id"]: member for member in member_rows}
+                    for item in visible_items:
+                        if not isinstance(item, dict):
+                            valid = False
+                            break
+                        member = by_id.get(item.get("occurrence_id"))
+                        if not member or any(
+                            member[key] != item.get(payload_key)
+                            for key, payload_key in (
+                                ("reminder_id", "reminder_id"),
+                                ("scheduled_at", "scheduled_at"),
+                                ("title", "title"),
+                                ("timezone", "timezone"),
+                            )
+                        ):
+                            valid = False
+                            break
+
+                if not valid and row and row["batch_state"] == "pending" and row["outbox_state"] == "pending":
+                    conn.execute(
+                        "UPDATE recovery_batches SET state = 'cancelled' WHERE batch_id = ?",
+                        (row["batch_id"],),
+                    )
+                    conn.execute(
+                        "UPDATE outbox SET state = 'cancelled', next_retry_at = NULL "
+                        "WHERE outbox_id = ? AND state IN ('pending', 'dispatching')",
+                        (outbox_id,),
+                    )
+                    conn.execute(
+                        "DELETE FROM recovery_batch_items WHERE batch_id = ?", (row["batch_id"],)
+                    )
+                    conn.commit()
+                    return False
+
+                if not valid or not row:
+                    conn.commit()
+                    return False
+                cursor = conn.execute(
+                    """UPDATE outbox SET state = 'dispatching'
+                       WHERE outbox_id = ? AND event_type = 'notification.summary.deliver'
+                         AND state = 'pending'
+                         AND EXISTS (
+                           SELECT 1 FROM recovery_batches b
+                           WHERE b.summary_id = ? AND b.batch_id = ?
+                             AND b.state = 'pending' AND b.expires_at > ?
+                         )""",
+                    (outbox_id, summary_id, row["batch_id"], now_str),
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                conn.rollback()
+                raise
+
     def get_recovery_summary_receipt(self, summary_id: str) -> Optional[dict[str, Any]]:
         with self._lock, self._get_connection() as conn:
             row = conn.execute(
@@ -885,7 +1075,7 @@ class LifeService:
 
     @staticmethod
     def _expire_recovery_summaries(conn: sqlite3.Connection, now_iso: str) -> None:
-        """Stop pending summary delivery at the immutable summary TTL."""
+        """Stop expired summaries and resolve their still-pending occurrences."""
         conn.execute(
             "UPDATE recovery_batches SET state = 'expired' WHERE expires_at <= ? AND state = 'pending'",
             (now_iso,),
@@ -895,6 +1085,46 @@ class LifeService:
             "AND state IN ('pending', 'dispatching') AND json_extract(payload_json, '$.expires_at') <= ?",
             (now_iso,),
         )
+        overdue = conn.execute(
+            """SELECT o.occurrence_id, o.reminder_id, o.scheduled_at,
+                      r.repeat_rule, r.timezone
+               FROM recovery_batch_items bi
+               JOIN recovery_batches b ON b.batch_id = bi.batch_id
+               JOIN occurrences o ON o.occurrence_id = bi.occurrence_id
+               JOIN reminders r ON r.reminder_id = o.reminder_id
+               WHERE b.state = 'expired' AND b.expires_at <= ? AND o.state = 'pending'
+                 AND r.status NOT IN ('completed', 'cancelled', 'archived')""",
+            (now_iso,),
+        ).fetchall()
+        for row in overdue:
+            conn.execute(
+                "UPDATE occurrences SET state = 'expired' WHERE occurrence_id = ? AND state = 'pending'",
+                (row["occurrence_id"],),
+            )
+            next_due = (
+                _next_occurrence_after(row["scheduled_at"], row["repeat_rule"], now_iso, row["timezone"])
+                if row["repeat_rule"]
+                else None
+            )
+            if next_due:
+                next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
+                next_occurrence_id = f"occ-{row['reminder_id']}-{next_ts}"
+                conn.execute(
+                    "INSERT OR IGNORE INTO occurrences (occurrence_id, reminder_id, scheduled_at, state) "
+                    "VALUES (?, ?, ?, 'pending')",
+                    (next_occurrence_id, row["reminder_id"], next_due),
+                )
+                conn.execute(
+                    "UPDATE reminders SET due_at = ?, status = 'scheduled', updated_at = ? "
+                    "WHERE reminder_id = ? AND status NOT IN ('completed', 'cancelled', 'archived')",
+                    (next_due, now_iso, row["reminder_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE reminders SET status = 'missed', updated_at = ? "
+                    "WHERE reminder_id = ? AND status NOT IN ('completed', 'cancelled', 'archived')",
+                    (now_iso, row["reminder_id"]),
+                )
 
     def get_all_occurrences(self, reminder_id: str) -> list[dict[str, Any]]:
         """Returns all occurrences for a reminder ordered by scheduled_at."""
@@ -1607,6 +1837,12 @@ class LifeService:
                 return
             if row["state"] == "cancelled":
                 return
+            is_summary_delivery = row["event_type"] == "notification.summary.deliver"
+            if is_summary_delivery and row["state"] not in {"pending", "dispatching"}:
+                # Pre-claim availability failures may back off a pending item;
+                # post-claim adapter failures may back off a dispatching item.
+                # ACK/expiry/cancellation are terminal and must not be revived.
+                return
             new_retries = row["retry_count"] + 1
             if row["event_type"] == "reminder.alert":
                 try:
@@ -1634,11 +1870,19 @@ class LifeService:
                 else:
                     next_retry = None
 
-            conn.execute(
-                "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
-                "WHERE outbox_id = ? AND state != 'cancelled'",
-                (new_retries, new_state, next_retry, outbox_id),
-            )
+            if is_summary_delivery:
+                conn.execute(
+                    "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
+                    "WHERE outbox_id = ? AND event_type = 'notification.summary.deliver' "
+                    "AND state = ?",
+                    (new_retries, new_state, next_retry, outbox_id, row["state"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
+                    "WHERE outbox_id = ? AND state != 'cancelled'",
+                    (new_retries, new_state, next_retry, outbox_id),
+                )
             conn.commit()
 
     def queue_outbox_message(self, topic: str, payload: Mapping[str, Any]) -> str:
