@@ -1355,6 +1355,56 @@ class TestCodexCompanion(unittest.TestCase):
         self.assertEqual([event for event, _ in events], ["codex.turn_completed"])
         resumed.close()
 
+    def test_recovery_completed_turn_does_not_promote_user_tool_or_approval_items_to_output(self) -> None:
+        db_file = os.path.join(self.temp_dir.name, "resume-untrusted-items.db")
+        original = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=DefaultMockTransport(),
+            db_path=db_file,
+        )
+        prompt = "private user request"
+        task = original.submit_task("tsk-resume-untrusted-items", "test-project", prompt)
+        original.close()
+
+        class ResumeCompletedTransport(JsonRpcTransport):
+            def send_request(self, method: str, params: Mapping[str, Any]) -> dict[str, Any]:
+                if method == "initialize":
+                    return {"server_version": "test"}
+                if method == "thread/resume":
+                    return {"thread": {"id": task["thread_id"], "turns": [{
+                        "id": task["turn_id"],
+                        "status": "completed",
+                        "items": [
+                            {"type": "userMessage", "content": [{"type": "text", "text": prompt}]},
+                            {"type": "commandExecution", "command": "private tool command", "output": "private tool output"},
+                            {"type": "fileChange/requestApproval", "description": "private approval detail"},
+                        ],
+                    }]}}
+                return {}
+
+        resumed = CodexCompanion(
+            allowed_workspaces=self.workspaces,
+            transport=ResumeCompletedTransport(),
+            db_path=db_file,
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        resumed.add_event_listener(lambda event, data: events.append((event, data)))
+        resumed.initialize()
+
+        status = resumed.get_task_status("tsk-resume-untrusted-items")
+        self.assertEqual(status["status"], "completed")
+        self.assertEqual(status["last_output"], "")
+        self.assertEqual(status["summary"], "任务已成功完成")
+        device_result = {key: status[key] for key in ("summary", "last_output", "output")}
+        self.assertNotIn(prompt, json.dumps(device_result))
+        self.assertNotIn("private tool", json.dumps(device_result))
+        self.assertNotIn("private approval detail", json.dumps(device_result))
+        self.assertEqual([event for event, _ in events], ["codex.turn_completed"])
+        self.assertNotIn(prompt, json.dumps(events))
+        self.assertNotIn("private tool", json.dumps(events))
+        self.assertNotIn("private approval detail", json.dumps(events))
+        resumed.close()
+
     def test_turn_start_timeout_persists_thread_and_recovers_actual_turn(self) -> None:
         db_file = os.path.join(self.temp_dir.name, "turn-start-timeout.db")
 
