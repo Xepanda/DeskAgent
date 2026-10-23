@@ -4,7 +4,7 @@
  *
  * Implements standard WatcheRobot device protocol endpoints:
  * - sys.client.hello / sys.ack handshake and capabilities negotiation
- * - WSPK binary framing for image media (SDK audio transport is not advertised)
+ * - WSPK binary framing for image media and HAL-ready PCM playback
  * - Inputs event notifications (backtouch, screentouch, roller)
  * - Motion & Camera commands with strict resource arbitration
  * - Bidirectional RequestEnvelope / ResponseEnvelope tool routing
@@ -30,6 +30,7 @@ extern "C" {
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
 #define DESK_SDK_CAP_CAMERA_STREAM "camera.stream.mjpeg.wspk.v1"
+#define DESK_SDK_CAP_AUDIO_STREAM  "audio.stream"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
 #define DESK_SDK_CAP_EXPRESSION_ALT "expression"
 #define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"

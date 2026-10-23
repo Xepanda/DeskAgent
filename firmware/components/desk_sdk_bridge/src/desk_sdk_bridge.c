@@ -163,6 +163,47 @@ static int desk_sdk_audio_stream_begin_command(const char *json_in,
                                                char *out_buf, size_t max_out_len);
 static int desk_sdk_audio_stop_command(const char *json_in,
                                        char *out_buf, size_t max_out_len);
+static bool desk_sdk_audio_playback_available(void);
+static int desk_sdk_build_capabilities_json(char *out, size_t out_len);
+
+/* The official SDK's `audio.stream` means host-to-device PCM playback only.
+ * The A1 status API reports ready only after the Watcher audio resources,
+ * including the speaker and stream queue, have initialized successfully. */
+static bool desk_sdk_audio_playback_available(void)
+{
+    desk_hardware_audio_status_t status = {0};
+    return desk_hardware_audio_get_status(&status) == DESK_HW_OK && status.ready;
+}
+
+static int desk_sdk_build_capabilities_json(char *out, size_t out_len)
+{
+    if (!out || out_len < 3) return -1;
+    const char *capabilities[8];
+    size_t count = 0;
+    capabilities[count++] = DESK_SDK_CAP_MOTION;
+    capabilities[count++] = DESK_SDK_CAP_CAMERA;
+    capabilities[count++] = DESK_SDK_CAP_EXPRESSION;
+    capabilities[count++] = DESK_SDK_CAP_EXPRESSION_ALT;
+    capabilities[count++] = DESK_SDK_CAP_MCP_TOOLS;
+    capabilities[count++] = DESK_SDK_CAP_INPUTS;
+    if (desk_sdk_camera_stream_available())
+        capabilities[count++] = DESK_SDK_CAP_CAMERA_STREAM;
+    if (desk_sdk_audio_playback_available())
+        capabilities[count++] = DESK_SDK_CAP_AUDIO_STREAM;
+
+    size_t used = 0;
+    int n = snprintf(out, out_len, "[");
+    if (n < 0 || (size_t)n >= out_len) return -1;
+    used = (size_t)n;
+    for (size_t i = 0; i < count; ++i) {
+        n = snprintf(out + used, out_len - used, "%s\"%s\"", i ? "," : "",
+                     capabilities[i]);
+        if (n < 0 || (size_t)n >= out_len - used) return -1;
+        used += (size_t)n;
+    }
+    n = snprintf(out + used, out_len - used, "]");
+    return n >= 0 && (size_t)n < out_len - used ? 0 : -1;
+}
 
 #define DESK_SDK_AUDIO_STOP_TIMEOUT_MS 1500U
 typedef struct {
@@ -1911,23 +1952,15 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
             return 0;
         }
 
-        /* Standard SDK / desktop hello response */
-        if (desk_sdk_camera_stream_available()) {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS,
-                     DESK_SDK_CAP_INPUTS, DESK_SDK_CAP_CAMERA_STREAM);
-        } else {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS, DESK_SDK_CAP_INPUTS);
-        }
+        /* Standard SDK / desktop hello response. Re-query A1 readiness for
+         * each response so late init or readiness loss is reflected. */
+        char capabilities[256];
+        if (desk_sdk_build_capabilities_json(capabilities, sizeof(capabilities)) != 0)
+            return -1;
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
+                 "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":%s}}",
+                 capabilities);
         return 0;
     }
 
@@ -1935,22 +1968,13 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     else if (strcmp(msg_type, "sys.sdk.ready.get") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        if (desk_sdk_camera_stream_available()) {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     rid, DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS,
-                     DESK_SDK_CAP_INPUTS, DESK_SDK_CAP_CAMERA_STREAM);
-        } else {
-            snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
-                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
-                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                     rid, DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
-                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS, DESK_SDK_CAP_INPUTS);
-        }
+        char capabilities[256];
+        if (desk_sdk_build_capabilities_json(capabilities, sizeof(capabilities)) != 0)
+            return -1;
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
+                 "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":%s}}",
+                 rid, capabilities);
         return 0;
     }
 

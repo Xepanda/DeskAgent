@@ -157,9 +157,14 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'static desk_audio_stream_status_t test_audio_status;\n'
                 'static uint32_t test_audio_free_frames = 8; static int test_audio_active; static unsigned test_audio_drain_checks;\n'
                 'static int test_audio_hold_stop_drain;\n'
+                'static int test_audio_hal_ready;\n'
                 'void desk_sdk_test_audio_reset(void) { memset(&test_audio_status, 0, sizeof(test_audio_status)); '
-                'test_audio_free_frames = 8; test_audio_active = 0; test_audio_drain_checks = 0; test_audio_hold_stop_drain = 0; }\n'
+                'test_audio_free_frames = 8; test_audio_active = 0; test_audio_drain_checks = 0; test_audio_hold_stop_drain = 0; test_audio_hal_ready = 0; }\n'
                 'int desk_sdk_test_audio_is_active(void) { return test_audio_active; }\n'
+                'void desk_sdk_test_audio_set_hal_ready(int ready) { test_audio_hal_ready = ready; }\n'
+                'int __wrap_desk_hardware_audio_get_status(desk_hardware_audio_status_t *status) { '
+                'if (!status) return DESK_HW_ERR_INVALID_ARG; memset(status, 0, sizeof(*status)); '
+                'status->ready = test_audio_hal_ready != 0; return status->ready ? DESK_HW_OK : DESK_HW_ERR_UNAVAILABLE; }\n'
                 'void desk_sdk_test_audio_hold_stop_drain(int hold) { test_audio_hold_stop_drain = hold; }\n'
                 'void desk_sdk_test_audio_release_drain(void) { test_audio_status.tx_drained = true; '
                 'test_audio_status.queue_depth = 0; test_audio_status.pending_frames = 0; '
@@ -215,6 +220,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             "-Wl,--wrap=desk_hardware_audio_stream_finish",
             "-Wl,--wrap=desk_hardware_audio_stream_stop",
             "-Wl,--wrap=desk_hardware_audio_stream_get_status",
+            "-Wl,--wrap=desk_hardware_audio_get_status",
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
@@ -1963,6 +1969,30 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(resp_ready["type"], "sys.ack")
         self.assertEqual(resp_ready["data"]["capabilities"], caps)
 
+    def test_audio_playback_capability_tracks_hal_readiness(self) -> None:
+        """Only advertise the SDK's PCM playback capability when A1 audio HAL is ready."""
+        set_ready = self.lib.desk_sdk_test_audio_set_hal_ready
+        set_ready.argtypes = [ctypes.c_int]
+        set_ready.restype = None
+        set_ready(0)
+        hello = self._exec_command({"type": "sys.client.hello", "code": 0,
+                                    "data": {"role": "desktop", "version": "1.0"}})
+        self.assertNotIn("audio.stream", hello["data"]["capabilities"])
+
+        # Readiness is queried for every capability response, so a later HAL
+        # initialization failure/readiness loss cannot leave stale support.
+        set_ready(1)
+        ready = self._exec_command({"type": "sys.sdk.ready.get", "code": 0,
+                                    "data": {"command_id": "cmd-audio-ready-01"}})
+        self.assertIn("audio.stream", ready["data"]["capabilities"])
+        self.assertNotIn("audio_uplink", ready["data"])
+        self.assertNotIn("wake", ready["data"]["capabilities"])
+
+        set_ready(0)
+        unavailable = self._exec_command({"type": "sys.sdk.ready.get", "code": 0,
+                                           "data": {"command_id": "cmd-audio-ready-02"}})
+        self.assertNotIn("audio.stream", unavailable["data"]["capabilities"])
+
     def test_official_motion_set_target(self) -> None:
         """Verifies ctrl.motion.set_target as emitted by WatcheRobot.motion.set_target()."""
         resp = self._exec_command({
@@ -2126,9 +2156,17 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
 
                 async with websockets.connect(server.url) as desktop:
+                    self.lib.desk_sdk_test_audio_set_hal_ready(1)
                     await desktop.send(json.dumps({"type": "sys.client.hello", "code": 0,
                         "data": {"role": "desktop", "version": "1.0"}}))
-                    self.assertEqual(json.loads(await asyncio.wait_for(desktop.recv(), 2))["type"], "sys.ack")
+                    desktop_hello = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(desktop_hello["type"], "sys.ack", desktop_hello)
+                    await desktop.send(json.dumps({"type": "sys.sdk.ready.get", "code": 0,
+                        "request_id": "audio-ready-capability", "data": {}}))
+                    capability_ack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(capability_ack["type"], "sys.ack", capability_ack)
+                    self.assertIn("audio.stream", capability_ack["data"]["capabilities"], capability_ack)
+                    self.assertNotIn("audio_uplink", capability_ack["data"], capability_ack)
 
                     stream_id = 71
                     pcm = bytes((i * 7) & 0xff for i in range(8192))
