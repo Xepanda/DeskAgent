@@ -50,6 +50,10 @@ from host.desk_agent.connectors.robot.official_camera_adapter import (
     MAX_WSPK_FRAME_BYTES,
     OfficialRobotCameraAdapter,
 )
+from host.desk_agent.connectors.robot.official_camera_stream_ingress import (
+    OfficialCameraStreamIngress,
+    install_raw_device_frame_observer,
+)
 from host.desk_agent.connectors.robot.managed_codex_feedback_adapter import ManagedCodexFeedbackAdapter
 from companion.src.codex_companion import CodexCompanion
 
@@ -181,6 +185,10 @@ class DeskAgentHostApp:
         # CR-009 authorization/subscription is not implemented by this lifecycle hook.
         self._network_log_authorized = False
         self.official_camera_adapter: Optional[OfficialRobotCameraAdapter] = None
+        self.official_camera_stream_ingress: Optional[OfficialCameraStreamIngress] = None
+        self._managed_camera_raw_observer_remove: Optional[Callable[[], None]] = None
+        self._camera_stream_metadata_lock = threading.Lock()
+        self._latest_camera_stream_metadata: Optional[dict[str, Any]] = None
 
         codex_cfg = self.config.get("codex", {})
         companion_url = codex_cfg.get("companion_url") or self.config.get("codex_companion", {}).get("endpoint")
@@ -635,6 +643,12 @@ class DeskAgentHostApp:
             self._delivery_thread.join()
         if self.official_camera_adapter:
             self.official_camera_adapter.close()
+        if self.official_camera_stream_ingress:
+            self.official_camera_stream_ingress.close()
+        self._clear_camera_stream_metadata()
+        if self._managed_camera_raw_observer_remove:
+            self._managed_camera_raw_observer_remove()
+            self._managed_camera_raw_observer_remove = None
         if self._managed_network_log_listener is not None:
             try:
                 self._managed_network_log_listener.remove(self._on_managed_sdk_message)
@@ -904,7 +918,21 @@ class DeskAgentHostApp:
                 message=f"Camera lease is currently held by '{res.get('current_owner')}'",
                 details=res,
             )
-        if self.official_camera_adapter is not None:
+        if self.official_camera_stream_ingress is not None:
+            device_result = self.official_camera_stream_ingress.acquire(
+                client_id,
+                res.get("lease_duration_ms", 10000),
+                target_fps=15.0,
+            )
+            if not device_result.get("granted"):
+                self.camera_service.release_lease(client_id)
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code=device_result.get("reason", "DEVICE_ERROR"),
+                    message="Official SDK camera stream lease was not granted",
+                    details=device_result,
+                )
+        elif self.official_camera_adapter is not None:
             device_result = self.official_camera_adapter.acquire(
                 client_id, res.get("lease_duration_ms", 10000), target_fps=float(target_fps or res.get("target_fps", 2.0))
             )
@@ -968,6 +996,7 @@ class DeskAgentHostApp:
         robot: Any,
         *,
         command_sender: Callable[[str, dict[str, Any], Optional[float]], dict[str, Any]],
+        communicators: Optional[object] = None,
         on_disconnect: Optional[Callable[[Callable[[], None]], None]] = None,
     ) -> OfficialRobotCameraAdapter:
         """Attach an existing managed-SDK session; this method never starts a Runtime or connection."""
@@ -980,15 +1009,67 @@ class DeskAgentHostApp:
         )
         self.official_camera_adapter = adapter
 
+        def owner_is_valid(owner: str) -> bool:
+            with self.camera_service._lock:
+                return (
+                    self.camera_service._active_lease_owner == owner
+                    and time.time() < self.camera_service._lease_expires_at
+                )
+
+        ingress = OfficialCameraStreamIngress(
+            send_command=command_sender,
+            ingest_frame=self._ingest_official_camera_frame,
+            owner_is_valid=owner_is_valid,
+            capabilities=(getattr(robot, "capabilities", ()) if communicators is not None else ()),
+            clear_frame=self._invalidate_official_camera_owner,
+        )
+        self.official_camera_stream_ingress = ingress
+        if communicators is not None:
+            self._managed_camera_raw_observer_remove = install_raw_device_frame_observer(
+                communicators, ingress.on_application_frame
+            )
+
         def release_device_lease(owner: str, reason: str) -> None:
             if previous_teardown:
                 previous_teardown(owner, reason)
             adapter.release(owner)
+            ingress.release(owner)
 
         self.camera_service.on_lease_released = release_device_lease
         if on_disconnect is not None:
             on_disconnect(adapter.on_sdk_disconnect)
+            on_disconnect(self._on_official_camera_session_disconnect)
         return adapter
+
+    @property
+    def latest_camera_stream_metadata(self) -> Optional[dict[str, Any]]:
+        """Return metadata paired with the newest JPEG accepted by A3 ingress."""
+        with self._camera_stream_metadata_lock:
+            return dict(self._latest_camera_stream_metadata) if self._latest_camera_stream_metadata else None
+
+    def _ingest_official_camera_frame(self, jpeg: bytes, metadata: dict[str, Any]) -> None:
+        """Preserve stream metadata at the A3-to-A6 seam while updating A6's JPEG slot."""
+        with self._camera_stream_metadata_lock:
+            self._latest_camera_stream_metadata = dict(metadata)
+        self.camera_service.ingest_robot_frame(jpeg)
+
+    def _clear_camera_stream_metadata(self) -> None:
+        lock = getattr(self, "_camera_stream_metadata_lock", None)
+        if lock is not None:
+            with lock:
+                self._latest_camera_stream_metadata = None
+
+    def _invalidate_official_camera_owner(self, owner: str) -> None:
+        self.camera_service.invalidate_owner_on_upstream_disconnect(owner)
+        self._clear_camera_stream_metadata()
+
+    def _on_official_camera_session_disconnect(self) -> None:
+        if self.official_camera_stream_ingress is not None:
+            self.official_camera_stream_ingress.on_session_disconnect()
+        self._clear_camera_stream_metadata()
+        if self._managed_camera_raw_observer_remove is not None:
+            self._managed_camera_raw_observer_remove()
+            self._managed_camera_raw_observer_remove = None
 
     def register_managed_sdk_codex_feedback_session(
         self,
@@ -1673,6 +1754,7 @@ async def _run_managed_application(config_path: Optional[str], host: str, port: 
             app.register_official_sdk_camera_session(
                 context.robot,
                 command_sender=transport.send_command,
+                communicators=getattr(transport, "_communicators", None),
                 on_disconnect=lifecycle.add,
             )
             app.register_managed_sdk_network_log_session(context)
