@@ -153,6 +153,48 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertEqual(replay["outbox_id"], first["outbox_id"])
         self.assertEqual(len(self.service.get_pending_outbox_messages(now_iso="2026-10-23T12:05:00Z")), 1)
 
+    def test_rescheduling_summary_member_supersedes_batch_and_releases_all_occurrences_after_restart(self) -> None:
+        original_occurrence = self._reminder("rescheduled", "2026-10-23T11:00:00Z", "UTC")
+        sibling_occurrence = self._reminder("summary-sibling", "2026-10-23T11:30:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            original_batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.service.update_reminder(
+            "rescheduled", due_at="2026-10-23T13:00:00Z"
+        )
+
+        old_occurrences = self.service.get_all_occurrences("rescheduled")
+        self.assertEqual([item["state"] for item in old_occurrences], ["cancelled", "pending"])
+        self.assertEqual(old_occurrences[0]["occurrence_id"], original_occurrence)
+        new_occurrence = old_occurrences[-1]
+        self.assertNotEqual(new_occurrence["occurrence_id"], original_occurrence)
+        self.assertEqual(new_occurrence["scheduled_at"], "2026-10-23T13:00:00Z")
+
+        with self.service._get_connection() as conn:
+            batch_state = conn.execute(
+                "SELECT state FROM recovery_batches WHERE batch_id = ?", (original_batch["batch_id"],)
+            ).fetchone()["state"]
+            outbox_state = conn.execute(
+                "SELECT state FROM outbox WHERE outbox_id = ?", (original_batch["outbox_id"],)
+            ).fetchone()["state"]
+        self.assertEqual(batch_state, "cancelled")
+        self.assertEqual(outbox_state, "cancelled")
+
+        self.service.close()
+        self.service = LifeService(self.db_path)
+        due = self.service.get_due_occurrences("2026-10-23T13:01:00Z")
+        self.assertEqual(
+            {item["occurrence_id"] for item in due},
+            {new_occurrence["occurrence_id"], sibling_occurrence},
+        )
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            replacement_batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T13:01:00Z")
+        self.assertNotEqual(replacement_batch["batch_id"], original_batch["batch_id"])
+        self.assertEqual(
+            {item["occurrence_id"] for item in replacement_batch["payload"]["items"]},
+            {new_occurrence["occurrence_id"], sibling_occurrence},
+        )
+
     def test_summary_batch_has_deterministic_ids_and_exact_24_hour_ttl(self) -> None:
         self._reminder("identity", "2026-10-23T11:00:00Z")
 

@@ -556,14 +556,60 @@ class LifeService:
 
             # If due_at changed, update the active pending occurrence schedule
             if due_at is not None and due_at != current["due_at"]:
-                conn.execute(
-                    """
-                    UPDATE occurrences
-                    SET scheduled_at = ?
-                    WHERE reminder_id = ? AND state = 'pending'
-                    """,
-                    (new_due, reminder_id),
-                )
+                pending = conn.execute(
+                    "SELECT occurrence_id FROM occurrences WHERE reminder_id = ? AND state = 'pending'",
+                    (reminder_id,),
+                ).fetchall()
+                pending_ids = [row["occurrence_id"] for row in pending]
+                if pending_ids:
+                    placeholders = ",".join("?" for _ in pending_ids)
+                    batches = conn.execute(
+                        f"SELECT DISTINCT batch_id FROM recovery_batch_items WHERE occurrence_id IN ({placeholders})",
+                        pending_ids,
+                    ).fetchall()
+                    for batch in batches:
+                        batch_id = batch["batch_id"]
+                        summary = conn.execute(
+                            "SELECT summary_id FROM recovery_batches WHERE batch_id = ?", (batch_id,)
+                        ).fetchone()
+                        if summary:
+                            conn.execute(
+                                "UPDATE outbox SET state = 'cancelled', next_retry_at = NULL "
+                                "WHERE event_type = 'notification.summary.deliver' "
+                                "AND json_extract(payload_json, '$.summary_id') = ? "
+                                "AND state IN ('pending', 'dispatching')",
+                                (summary["summary_id"],),
+                            )
+                        # A frozen summary is no longer valid after a member is
+                        # rescheduled. Release every member so the next scan can
+                        # build a fresh snapshot for the remaining pending items.
+                        conn.execute(
+                            "UPDATE recovery_batches SET state = 'cancelled' WHERE batch_id = ? "
+                            "AND state NOT IN ('expired', 'cancelled')",
+                            (batch_id,),
+                        )
+                        conn.execute("DELETE FROM recovery_batch_items WHERE batch_id = ?", (batch_id,))
+
+                    if batches:
+                        # A new occurrence identity prevents the replacement
+                        # schedule from colliding with the immutable summary's
+                        # deterministic member digest.
+                        conn.execute(
+                            "UPDATE occurrences SET state = 'cancelled' "
+                            f"WHERE occurrence_id IN ({placeholders})",
+                            pending_ids,
+                        )
+                        conn.execute(
+                            "INSERT INTO occurrences (occurrence_id, reminder_id, scheduled_at, state) "
+                            "VALUES (?, ?, ?, 'pending')",
+                            (f"occ-{reminder_id}-rescheduled-{uuid.uuid4().hex}", reminder_id, new_due),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE occurrences SET scheduled_at = ? "
+                            "WHERE reminder_id = ? AND state = 'pending'",
+                            (new_due, reminder_id),
+                        )
 
             conn.commit()
 
