@@ -1,93 +1,109 @@
-# CR-022 Proposal：相机实时媒体目标与传输路径
+# CR-022：相机实时 MJPEG 媒体流协议裁定
 
-- **提出方：** A0 架构与协议
-- **状态：** **PROPOSAL / NOT APPROVED；不冻结 wire，不授权固件、SDK 或 Host 实现**
+- **裁定方：** A0 架构与协议
+- **状态：** **A0 ADJUDICATED / APPROVED FOR IMPLEMENTATION**（协议与产品目标已冻结；尚未实现、构建或实机验收）
+- **授权依据：** 用户明确要求继续实现相机真实采集及视频/实时媒体推流，并授权“按冻结协议或经 A0 裁定的变更实现”。本裁定据此解除“只允许 2 FPS 快照”对实时媒体目标的限制。
 - **关联：** [CR-004](../cr-004-sdk-camera-frame-delivery.md)、[CR-006](../CR-006-host-mjpeg-camera-stream.md)、[CR-011](../CR-011-hx6538-transport-adjudication.md)、[CR-002](../cr-002-wspk-media-frame-limit.md)、`contracts/camera_frame_delivery.md`
-- **目的：** 将“相机视频/实时媒体推流”拆成可选且可验收的目标。本文不把现有 2 FPS 单帧轮询称为原生视频，也不批准变更消息协议。
+- **范围：** 冻结设备到 Host 的实时相机帧协议、Host 到浏览器的媒体路径、最低验收指标及资源/安全语义。允许 A1/A2/A3/A6 按 ownership 实现；不表示 HX6538 已达到指标，也不代表任何 L3/L4 通过。
+- **兼容性裁决：** 对 capability `camera.stream.mjpeg.wspk.v1`，本 CR 覆盖 CR-004/CR-006 中针对重复 `camera.capture()` 刷新的 2 FPS 上限与 2000 ms freshness。该上限/阈值仍只适用于单帧快照模式；实时 stream 必须满足本 CR 的 15 FPS 与 1000 ms 门槛。
 
-## 1. 当前实现与证据边界
+## 1. A0 裁定
 
-当前链路是 **按需采集 JPEG 快照，再由 Host 持续输出最新帧**：
+**目标路径：** 继续使用已配对 WatcheRobot Runtime 的现有设备 WebSocket/WSPK 通道，增加受相机租约和会话门控的主动 JPEG 帧序列；A3 通过 pinned SDK 的 `ApplicationChannels` 原始帧回调接收，交给 A6 现有 latest-frame sink；浏览器继续使用 CR-006 已定义的 Host 鉴权 multipart MJPEG `/api/camera/stream`。
 
 ```text
-Host camera lease
-  -> repeated SDK camera.capture() commands
-  -> firmware ctrl.camera.capture: one HX PTL JPEG capture per command
-  -> one WSPK FRAME_IMAGE per command
-  -> A3 official_camera_adapter
-  -> A6 CameraViewerService latest-frame slot
-  -> Host HTTP multipart MJPEG /api/camera/stream
+物理相机连续新鲜帧
+  -> A1 唯一 camera/SPI owner
+  -> A2 WSPK FRAME_IMAGE（每帧一个 WJPG v1 + JPEG）
+  -> paired WatcheRobot Runtime / ApplicationChannels
+  -> A3 校验 stream、sequence、timestamp、JPEG
+  -> A6 有界 latest-frame slot / Host multipart MJPEG
+  -> 已鉴权且持有 lease 的浏览器
 ```
 
-- CR-004 与 `contracts/camera_frame_delivery.md` 将 SDK `camera.capture()` 定义为 request/response；firmware 每次回一个 `FRAME_IMAGE=3`。当前 SDK capture cadence 上限为 2 FPS，Host 的 `iter_mjpeg()` 也最多输出 2 FPS。HTTP multipart 连接可以持续，但图像仍来自重复快照命令。此为持续更新的低帧率预览，不代表传感器连续采集或设备主动推流。
-- `desk_sdk_bridge.c` 的 capture handler 为每次命令分配 JPEG buffer，取得一次 `desk_hardware_camera_capture_jpeg()` 结果后发送一个 WSPK image。当前 handler 的 JPEG 上限为 64 KiB（CR-004 记录）；WSPK 通用 128 KiB 上限不是当前相机路径能力证明。
-- `desk_watcher_camera.c::desk_watcher_camera_capture()` 按次切换 HX 模式、等待 SYNC、读取一帧 PTL JPEG 并退出/释放 SPI bus；默认 PTL capture timeout 为 500 ms。HX6538 的连续传感器输出、硬件编码器或可持续取帧能力不能从这段 host 侧 receiver 代码推出。
-- CR-011 选择 WatcheRobot HX PTL 为本项目运行时相机 transport，但目标板 HX 固件身份和 PTL 兼容性仍未由当前源码证明；不能假定其他摄像头协议或传感器模式在目标设备可用。
-- **更正 SDK README 与实际执行路径的冲突：**锁定的 Python SDK commit `8bc13967a06ef073459be47e930ff43ef37ee8fb` 有 `ApplicationRtc` 和 `rtc.video.mjpeg.v1`。README 的一段文字称 MJPEG 走名为 `mjpeg-data` 的 WebRTC data channel；但同一 pinned 安装包的实际浏览器代码 `sdk_media_lab/web/app.js::createMjpegVideoTransport()` 从 Runtime 状态读取 `mjpeg_websocket_url`，调用 `new WebSocket(url)`，连接成功后发文本 `ready`，并解析该 socket 收到的二进制 WJPG/JPEG。pinned `runtime/daemon/runtime.py::device_status()` 给出的 URL 是 `ws://<peer-ip>:82/ws/mjpeg`。纯视频模式不创建 RTCPeerConnection；AV 模式的 WebRTC 负责音频，视频仍走单独 MJPEG WebSocket。`ApplicationRtc`（`application/rtc.py`）通过 Device channel 发送 `ctrl.rtc.session.start/stop`、offer/candidate 和状态/能力/统计；它本身不是 JPEG 数据通道。故当前有证据的 SDK 示例媒体拓扑是 **SDK Application 会话控制 + 独立设备 MJPEG WebSocket + 浏览器**，不是 README 所称的 MJPEG WebRTC data channel。该 bundled app/endpoint 属 pinned SDK 随附示例实现，不等于通用 SDK 的公开视频传输 API，也不是当前 DeskAgent 的实现或实测。
-- 当前已审固件更没有可供该拓扑复用的持续帧源：`desk_hardware_camera_stream_start()` 和 `desk_hardware_camera_stream_pump()` 在 `ESP_PLATFORM` 返回 `DESK_HW_ERR_UNAVAILABLE`；HX6538 板级路径暴露的是一次调用采集一张 PTL JPEG。A1/A2 源码审计未证明目标板可持续采集、循环 one-shot 的稳定帧率/延迟或相机供电/总线在长时间推流时可用。当前 Host capture adapter 限制为最多 2 FPS；重复快照只能是低帧率预览，不能满足用户明确要求的实时视频/媒体推流验收目标。
-- pinned 示例的设备 `:82/ws/mjpeg` 直连浏览器路径未提供当前 DeskAgent 所需的 Host lease 集成证据；README/客户端可见的 `ready` 文本握手不是身份认证。不能据此声称该端点已认证或受现有官方 Runtime 配对保护。其是否监听、如何鉴权及其生命周期均需本项目固件实现和实测；当前固件未发现该 MJPEG server。
-- 当前固件虽定义 WSPK `FRAME_VIDEO=2` 常量，官方 SDK 对 `FRAME_VIDEO` 的默认接收用途是 face tracking preview 回调；这不自动形成通用 video API、RTC session 或浏览器直播链路。该常量也不等于已实现视频编码器。
+此为设备主动持续发送的 MJPEG 视频流；它不依赖每帧调用 `camera.capture()`。Host HTTP multipart 仍是浏览器输出封装，不构成传感器连续性的证据。每个帧必须来自新的真实传感器采集；重发缓存 JPEG、循环测试图、重复 capture 结果都不能计入帧率或验收。
 
-源码/契约依据：`docs/implementation/cr-004-sdk-camera-frame-delivery.md` §1–3；`docs/implementation/CR-006-host-mjpeg-camera-stream.md` §1–3；`contracts/camera_frame_delivery.md`；`firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c` capture handler；`firmware/components/desk_hardware/src/desk_hardware.c` `desk_hardware_camera_stream_start/pump`；`firmware/components/desk_hardware/src/desk_watcher_camera.c` capture；`firmware/components/desk_sdk_bridge/include/desk_sdk_bridge.h` frame type。pinned vendor checkout `.target_logging/sdk-acceptance/vendor/WatcheRobot_python_sdk` HEAD `8bc13967a06ef073459be47e930ff43ef37ee8fb`：`examples/sdk_media_lab/README.md`（与下述执行源码冲突）、`examples/sdk_media_lab/web/app.js::createMjpegVideoTransport/parseWjpgPacket`、`web/mjpeg-transport.mjs`、`web/mjpeg-chunk-reassembly.mjs`、`service.py` RTC lifecycle and device-status use、`src/watcherobot/runtime/daemon/runtime.py::device_status`、`src/watcherobot/application/rtc.py::ApplicationRtc`。vendor checkout 是忽略路径下的 L1 参考，不是 DeskAgent 生产实现。
+**明确取舍：**
 
-## 2. 可选路径与权衡
+| 路径 | SDK/仓库证据 | A0 裁定 |
+|---|---|---|
+| WSPK `FRAME_IMAGE=3` 单次 `camera.capture()` | pinned Python SDK 将 `FRAME_IMAGE` 放入容量为 1 的 latest-image 队列；`CameraDomain.capture()` 仍按请求等待对应图片。CR-004/006 当前最多 2 FPS，属于单帧快照刷新。 | 保留为拍照与明确标注的低帧率快照预览；不能满足本 CR 实时视频验收。 |
+| WSPK `FRAME_VIDEO=2` | pinned SDK `Robot._on_binary()` 仅在 face-tracking preview 已打开时将该帧传给 `FaceTrackingPreview._push_image()`；没有通用相机视频订阅 API。 | 不选作通用直播 wire；不得仅因存在帧类型常量就声称兼容。 |
+| pinned sample 独立设备 `:82/ws/mjpeg` | 固定 SDK 示例 `sdk_media_lab` 实际使用此 WebSocket 和 WJPG 包；Runtime 状态可给出 endpoint。浏览器发送的 `ready` 不是认证，且 DeskAgent 固件没有该 server。 | 不作为产品路径：新增裸设备端口绕开现有 paired WSPK 与 Host lease/auth 边界。示例 README 关于 `mjpeg-data` WebRTC data channel 的说法与其实际网页代码冲突，不据此选 WebRTC。 |
+| **WSPK `FRAME_IMAGE` 主动序列 + Host MJPEG relay** | 同一 paired Runtime 通道提供配对会话边界；SDK `ApplicationChannels` 可将原始设备帧交给受管 Application；Host 已有 lease、鉴权和 multipart MJPEG sink。需要新增相机 stream 控制和 WJPG 子封装。 | **选定。** 保留现有 Runtime、WSPK 和 Host viewer 安全边界，新增 wire 语义明确区分直播帧与单次 capture。 |
 
-| 选项 | 语义 | 优点 | 代价/限制 |
-|---|---|---|---|
-| **A. 保持 CR-004/006 快照预览** | 按租约周期调用 capture；每次一个 JPEG/WSPK `FRAME_IMAGE`；Host multipart MJPEG 发送新鲜帧，当前上限 2 FPS。 | 复用已实现的控制、adapter、租约、Host latest-frame 与 HTTP viewer；无新 wire。 | 更新慢且受每次命令/采集延迟影响；仍是轮询快照。只有产品接受 ≤2 FPS 的画面更新时适用。不得标成连续相机视频或设备主动推流。 |
-| **B. SDK 会话控制 + 有界 MJPEG WebSocket 媒体流（推荐进入可行性阶段）** | 复用 pinned SDK 的 `ApplicationRtc`/`rtc.video.mjpeg.v1` 做会话控制；媒体 source transport 参考 pinned `sdk_media_lab` 实际执行的独立设备 MJPEG WebSocket（设备 producer → MJPEG WS consumer → A6 viewer），再由 Host relay 到受控浏览器。Host relay 是本产品拟议适配，并非 SDK 示例已有能力；README 声称的 `mjpeg-data` WebRTC data channel 未被该网页执行代码使用。 | 方向上符合用户明确的实时推流目标；避免把每帧做成 SDK capture command；可由 Host 管 viewer、租约及 latest-frame sink。可以复用 pinned 示例的 WJPG/chunk source 格式作为协议审查输入。 | 当前 DeskAgent 没有 RTC session handler/capability、MJPEG WebSocket server、持续 JPEG producer 或 A6 relay 接线。sample `:82/ws/mjpeg` 的 `ready` 握手不认证；必须由 A0/安全审查冻结并验证授权，不能直接照搬为生产认证。A1 未证明 HX 连续/重复 capture 的吞吐、延迟和并发资源能力。需设备、SDK Application 与 Host/A6 协同实现和真机验收。 |
-| **C. 新增 WSPK `FRAME_VIDEO` 设备主动发送** | 在现有 Runtime WebSocket binary channel 定义连续帧会话。 | 复用设备到 Runtime 的既有连接，避免额外的设备媒体监听端口。 | pinned SDK 对 `FRAME_VIDEO` 的默认消费者是 face-tracking preview callback，不是通用 live-camera sink；会话、帧封装、时间戳、背压、浏览器交付和授权仍需新增契约。除非验证 B 不适用，否则不推荐先走此路。 |
+不选择 H.264/WebRTC 视频编码。当前目标板源码只证明 HX PTL 单次 JPEG capture；没有可用的连续编码器证据。若未来要改为其他编码或独立设备媒体 socket，必须另行 A0 裁定。
 
-**不提出 H.264 或其他编码方案。** 当前本仓及锁定 SDK 对目标 HX6538 的证据是 PTL JPEG/SDK MJPEG 路径，没有目标设备硬件编码器或持续视频输出证明。任何其他编码须先有供应商/设备源码和目标硬件证据，再另行裁决。
+## 2. 冻结的设备控制与媒体消息
 
-## 3. A0 建议路径
+以下是本 CR 批准的新相机流能力。它复用既有 WSPK 外层 framing、JSON 控制 envelope、camera lease 与官方配对 Runtime；不要求修改 pinned SDK 源码或启动第二个 Runtime。
 
-若产品目标确为用户要求的“相机视频/实时媒体推流”，建议以**选项 B：SDK 会话控制 + 独立 MJPEG WebSocket source + Host/A6 relay**作为下一阶段可行性验证方向。这是基于 pinned SDK 示例的媒体 source 形态，为本项目提议的 Host relay 适配；不是该 SDK 示例当前已实现的拓扑，也不表示已有可直接复用的 DeskAgent 接口。拟议顺序为：A6 viewer 通过 Host 鉴权并申请单一 camera lease；A3 使用现有唯一 SDK Runtime / `ApplicationRtc` 控制会话；A2 在获批的设备 session 内门控媒体 capability；A1 持有唯一 HX/SPI camera owner，产出完整 JPEG 到有界 latest-frame slot；设备媒体 WS 只向获授权的 Host consumer 发送冻结格式，A3/A6 校验后写入现有 latest-frame sink 并服务浏览器。不能让浏览器直连未认证的 `:82` 端点作为产品默认路径。若改用 pinned sample 的 browser-direct topology，则必须先由 A0 冻结可验证的会话绑定认证方案，并由 A6/A3 明确如何不绕过 Host lease。
+### 2.1 Capability 和控制面
 
-在批准 B 前，A1 必须以目标 HX6538/目标固件证据确认真实持续帧源：当前 HAL stream start/pump 在 ESP 上明确不可用，板级 capture 是单次 PTL JPEG。需要实现或复用受仲裁的持续 producer，并实测持续帧率、帧间隔、P95 采集到显示延迟、资源回收及 SPI/SYNC/相机与语音/显示并发；暂不能假定循环 one-shot 达标。当前 ≤2 FPS SDK capture 路径仅适合作为低帧率快照预览，不满足实时直播验收。若源端能力无法达到产品指标，应选择接受 A 的明确低帧率预览，或开展 HX/传感器能力项目，不能将快照重新命名为直播。
+- 仅在固件能够启动真实 producer、完成授权/资源门控并发送下述 framing 时，才广告 capability **`camera.stream.mjpeg.wspk.v1`**。未广告或不支持时，Host 必须将直播标为 unavailable 并拒绝 start；不得静默回退到 2 FPS capture。
+- 先使用 CR-004 的现有 `ctrl.camera.acquire` 建立唯一设备 camera lease。设备 Runtime 配对会话中的同一 `client_id`/lease owner 才可开始和停止流。无租约、owner 不匹配、已有拍照/直播 producer 或 camera 资源冲突时以既有 `sys.nack`/资源忙错误拒绝。
+- 新增 JSON 控制类型 **`ctrl.camera.stream.start`**，沿用既有 envelope 的 `client_id`、`session_id`、`command_id` 和 ACK/NACK correlation。`data` 固定字段：`width=640`、`height=480`、`target_fps=15`。成功 ACK 的 `data` 必须含 `stream_id`（非零 uint16）和 `device_monotonic_ms`（设备单调时钟，uint32 ms）；只能在 producer 已启动且首帧能力就绪后 ACK。分辨率不支持或能力暂不可用须明确 NACK，不得上采样伪装 640×480。
+- 新增 **`ctrl.camera.stream.stop`**，包含当前 `stream_id`。ACK 仅在 producer 已停、帧发送已停止且 camera/SPI/buffer owner 已释放后返回。重复 stop 对已终止 stream 幂等成功；未知 stream 返回既有无效会话错误。
+- 新增 **`ctrl.camera.clock.ping`**：请求 `data={ping_id, host_send_monotonic_ms}`；`sys.ack` 回显 `ping_id` 并返回 `device_receive_monotonic_ms`、`device_send_monotonic_ms`。Host 收到 ACK 时记录 `host_receive_monotonic_ms`，与本地发送时间构成四时点样本；至少每 10 秒采样，忽略 RTT 最大样本并以低 RTT 样本估 offset。所有时间均为各端 monotonic uint32 ms，计算须处理回绕。offset 不确定度超过 100 ms 即停止报告延迟并使性能验收失败。
+- 保留现有 `ctrl.camera.capture` 作为独立单帧操作。拍照与 stream 在设备端互斥；stream 活跃期间 capture 返回 busy，不得并行访问 HX/SPI2。
 
-如果产品只需要远程看一张偶尔更新的现场画面，则选项 A 已是最小路径，应该继续明确使用“快照预览 / 最高 2 FPS”命名并验收端到端新鲜度，而不启动 RTC 项目。
+### 2.2 WSPK 帧与 WJPG v1 子封装
 
-### 3.1 新协议提案必须冻结的消息语义
+- 每个完整媒体消息是现有 WSPK binary frame，`frame_type=FRAME_IMAGE (3)`、`flags=0`、`stream_id` 等于 start ACK 的值，WSPK `sequence` 为该 stream 内递增的 uint32 序号。只在一个 paired Device channel 上发送。
+- WSPK payload 使用 pinned `sdk_media_lab` 已实现的 **WJPG v1** 20-byte little-endian header，紧接完整 JPEG：
+  - byte 0..3：ASCII `WJPG`；byte 4：version `1`；byte 5：reserved `0`；
+  - byte 6..7：header size `20`；byte 8..11：sequence；
+  - byte 12..15：capture timestamp，设备 monotonic 毫秒 uint32；
+  - byte 16..19：JPEG 长度；余下字节为 JPEG。
+- WJPG sequence 必须等于外层 WSPK sequence，且同一 stream 严格递增（允许 uint32 回绕）；timestamp 单调递增（允许 uint32 回绕）。JPEG 长度必须精确匹配 payload，JPEG marker/解码必须通过验证。`FRAME_IMAGE` stream **禁止 WSPK fragmentation**；完整 WSPK frame 不超过 CR-002 的 128 KiB payload，上述限制使单张 JPEG 最大为 `128 KiB - 20 bytes`。超限帧丢弃并计数，不拆成无界缓存。
+- 设备 monotonic 时间与 Host 单调时间不得直接相减。A3 在 start ACK 后按至少每 10 秒一次的四时点 ping/ack 估算时钟 offset，使用 RTT 最小样本并记录不确定度；offset 不确定度超过 100 ms 时显示 latency 未知/验收失败，不能报告伪精确延迟。Host 每帧保留 capture timestamp、Host receive time、browser rendered time及 stream/session generation，以计算采集到渲染延迟。
 
-选择 B 后，应先由 A0 核对 pinned SDK `ApplicationRtc` API、bundled app 的 MJPEG socket/WJPG framing 与当前设备 JSON envelope，再另立批准 CR/schema。以下列出必须冻结的语义/字段，不在本 proposal 中创造新 wire payload：
+## 3. 产品目标与验收门槛
 
-1. 只有设备真实实现 video session 且 camera capability 就绪时才广告 `rtc.video.mjpeg.v1`；不支持时拒绝 start，不静默回落到 2 FPS 快照。
-2. Control plane 冻结 SDK 现有 `client_id`、`session_id`、`command_id`、`mode`、RTC protocol/capability gating、ACK/NACK/event correlation、重复请求和终态语义；复用 `ApplicationRtc`/`watcher-rtc/1` 的已定义形状，不因媒体 transport 更换而私造 RTC payload。
-3. Media plane 明确 socket endpoint 所有者/端口、WS binary message 的封装、帧内 version/header length/sequence/capture timestamp/JPEG byte length 语义、chunk transfer identifier/index/count/offset/完整性以及上限。pinned bundled sample 的 `app.js` 解析 `WJPG` v1、20-byte little-endian header（sequence、capture timestamp ms、JPEG size）；chunk reassembly source 使用 `WDCH` magic。只有 A0 在确认来源/兼容和测试后，才能将这些 sample-defined bytes 选入 DeskAgent 契约；否则必须通过单独 A0 CR 定义，并明确不兼容该样例。此处不扩展或猜测 sample 之外的字段。
-4. Session/lifecycle 冻结 host lease owner 与 device media session 的绑定键、start/stop ACK、租约续期/到期、session generation、每连接身份、断线/重连/替代 viewer 行为。未通过授权或 lease 失效不得发送；stop、断线、应用退出、browser close、设备重启需清理 producer、sensor mode、SPI owner、buffers、WebSocket、RTC peer（若音频使用）和 Host latest-frame/client state；旧 generation/sequence 不得进入新会话。
-5. Resource ownership 冻结唯一 camera producer 与 `camera.capture()` 的互斥关系、camera lease 的唯一 authority、SPI/SYNC 占用窗口，以及与 audio/display/motion 的允许并发。不得由 RTC producer 和 capture command 同时操作 HX/SPI2。
-6. Bounded delivery/backpressure 冻结 source queue、socket send buffer 和 Host/browser 各自上限、超限/慢消费者时 latest-frame-wins 丢弃策略及可观测 dropped counter、分片重组最大数量/总字节/TTL、单/多 viewer 数量，以及 freshness timeout。禁止无限队列、无界分片缓存和以重复旧图满足新帧状态。
-7. Authentication/fanout 冻结媒体 socket 和 Host viewer 的认证主体、session/lease 绑定、授权撤销、重放隔离、LAN/TLS 假设和 token 生命周期；pinned sample 的 `ready` 握手不是认证机制。若暂时只能运行于受信隔离 LAN，须在产品决策中明确该范围，不能宣称生产鉴权完成。Host/A6 只向授权 viewer 分发当前租约内新鲜帧。
-8. A6 当前 HTTP MJPEG API 与设备 MJPEG WebSocket 的 relay 关系必须明确：relay 采用何种有界单槽/订阅模型，释放时清空 frame 和订阅；或选择 sample 的 browser-direct topology，并另行证明其鉴权和 lease 控制。不得默认把 websocket、WebRTC data channel、WSPK `FRAME_VIDEO` 视为可互换的传输。
+以下是实时媒体的最低合格线，不是性能预测或可下调的默认值：
 
-## 4. 待产品决策
+| 指标 | 必须达到 |
+|---|---|
+| 物理画面 | 实际相机传感器的新鲜 JPEG；不允许 mock、合成画面、缓存帧、上采样替代目标分辨率。 |
+| 输出分辨率 | 每帧至少 **640×480**。设备不支持时该目标失败，不能靠缩放较低分辨率帧达标。 |
+| 持续帧率 | source 采集帧率与浏览器成功渲染帧率均至少 **15 FPS**；以每个 60 秒窗口计，不只看短时峰值。 |
+| 延迟 | 帧采集到浏览器显示的 **P95 ≤500 ms**，P99 ≤1000 ms；报告时钟 offset 不确定度和 source/sent/rendered FPS。 |
+| 新鲜度 | 最新帧年龄超过 **1000 ms** 即清空旧图并显示 unavailable/reconnecting；禁止继续呈现旧画面为 live。 |
+| 连续性/时长 | 目标设备端到端连续运行 **10 分钟**；每个 60 秒窗口至少 15 FPS，且不得发生超过 1000 ms 的无新帧间隔。 |
+| 帧上限与完整性 | WSPK payload ≤128 KiB；JPEG 必须完整且可解码；记录大小分布和丢帧率。 |
 
-产品需先给出这些可测目标，再批准下一步规格：
+若 HX6538/PTL、ESP32-S3 内存、总线或 Runtime 网络不能达到以上值，应将“实时视频推流”验收判为失败并修复源端/链路；不得通过把指标改成 ≤2 FPS、放大 freshness timeout、重复旧 JPEG 或只测 Host HTTP 连接来关闭目标。用户可另行使用名称明确的快照模式，但快照通过不等于本 CR 通过。
 
-- 需量化实时目标：最低持续 source/rendered FPS、采集到浏览器显示的最大或 P95 延迟，以及验收持续时长。用户已明确目标是实时媒体推流；选项 A ≤2 FPS 只可作为另行接受的快照预览降级，不关闭直播需求。
-- 画面目标：分辨率、JPEG 质量/单帧大小上限、是否需要音视频同步或纯视频即可。
-- 观看路径二选一：沿用 Host `/api/camera/stream`，由 Host 从设备 MJPEG WebSocket 有界 relay 并统一做 viewer 鉴权/lease；或让浏览器按 pinned sample 直连 Runtime 提供的 `ws://<device>:82/ws/mjpeg`。后者不是 WebRTC data channel，且 sample `ready` 握手没有鉴权；只有先冻结 session/lease 绑定认证并验证不绕过 Host policy 后才可选用。
-- 并发媒体：视频是否需与机器人声音、麦克风录音、屏幕动画同时运行；组合模式下可接受的帧率和音频质量下限。
-- 退化行为：网络变慢时允许跳帧到什么程度；多长时间无帧应报 unavailable；是否接受短暂黑屏并自动重连。
+## 4. 租约、安全、资源仲裁和降级
 
-这些指标当前没有被本仓产品契约裁决。本 proposal 不擅自设定目标 FPS、分辨率、码率或延迟数字。
+- **唯一授权路径：** paired WatcheRobot Device channel 是设备媒体出口；不增设未认证 `:82` listener。A3 只接受当前 paired `session_id`、当前有效 Host lease owner、活动 `stream_id` 的帧。A6 只向持有 Bearer 鉴权且 lease owner 相同的 viewer relay。浏览器不直连设备端口；token 不进 URL、HTML、帧头或日志。
+- **单一 owner：** 每设备同时只允许一个 camera producer、一个 active stream generation、一个 Host lease owner 和一个浏览器 subscriber。Host latest-frame 槽容量为 1；设备发送队列和 A3/A6 待处理队列也各最多保留 1 张待发/最新帧。慢消费者采用 latest-frame-wins 丢弃旧帧，暴露 source/transport/host drop counters；不积压历史视频。
+- **资源所有权：** A1 是唯一 HX6538/SPI2 camera owner，stream 与单次 capture 互斥。每帧完成后释放 PTL/SPI 临时资源，producer 在 stop/lease expiry/disconnect 释放 sensor mode、SPI、DMA/JPEG buffers。与 audio/display/motion 并发只有在资源 arbiter 明确准入且同样达到上述帧率/延迟门槛时才允许；冲突返回 busy 或停止视频，不可饿死语音/显示或绕过现有 motion owner。
+- **续租和停止：** Host lease 续租仍用现有规则；lease 失效、显式 release、viewer/Host shutdown 或 session stop 时先停止采集并发送 stream.stop。设备 Runtime channel 断开、Host process 崩溃或设备重启时 producer 必须本地 fail-safe 停止，清除 stream generation/帧缓存；Host 超过 1000 ms 无新帧立即清空 viewer。未收到 stop ACK 标为未确认，等待设备租约 TTL；不得马上在同一设备上假定已释放并启动第二个 producer。
+- **重连/重放：** 新连接必须重新配对/恢复 Runtime session、取得新 lease 并 start 新 stream；新的 stream_id/generation 与旧 session 绑定。丢弃迟到的旧 session、旧 stream 或非递增 sequence；禁止从 Host 快照、SDK 队列或浏览器 canvas 恢复旧图。
+- **降级：** 实时 capability 缺失、source FPS 不达标、frame age 超限、鉴权失败、资源 busy、解析错误、断线或同步误差超过 100 ms 时显示明确 unavailable/error。不得自动切到 2 FPS snapshot 并仍标记 LIVE。若产品启用快照入口，必须由用户显式选择并显示“快照预览，最高 2 FPS”。
 
-## 5. Ownership 与未来验收
+## 5. Ownership 与验证
 
-以下是方案边界建议，不构成实现授权：
+- **A0（本裁定）：** 冻结 capability、消息、帧格式、实时目标与安全/资源语义；任何改变外层 WSPK、WJPG 字段、指标或路径的变更回到 A0。
+- **A1 `firmware/components/desk_hardware/`：** 实现真实新鲜帧 producer 和唯一相机仲裁；先证明 640×480、15 FPS/10 分钟、内存峰值与并发可行。当前 `desk_hardware_camera_stream_start/pump()` 在 ESP 路径返回 unavailable，`desk_watcher_camera_capture()` 为单次 PTL JPEG，因此源端实现是明确依赖，不得用循环 mock pump 声称完成。
+- **A2 `firmware/components/desk_sdk_bridge/`：** 实现 `camera.stream.mjpeg.wspk.v1` capability、上述 start/stop ACK、WSPK `FRAME_IMAGE` WJPG v1 frame、授权/session gate、序号、背压/错误计数和 disconnect teardown；保持原 `camera.capture` 语义并互斥。
+- **A3 `host/desk_agent/connectors/robot/`：** 使用锁定 WatcheRobot SDK `ApplicationChannels` 的原始 binary callback，不创建第二个 Runtime；解析并关联 WSPK/WJPG、同步时钟、丢弃旧 generation、在有效 lease 内将 JPEG 交给 A6。既有 Robot `camera.capture()` adapter 只服务单帧模式。
+- **A6 `host/desk_agent/camera/` 与 `web/`：** 沿用 CR-006 的 Host multipart MJPEG、Bearer/lease owner 校验和 one-slot viewer；输出帧龄/序号/渲染速率指标、freshness timeout 清图、断线 unavailable 与重新连接状态。
+- **A7 `tests/e2e/`、`tools/verification/`、`docs/acceptance/`：** 做软件负例/背压/会话重放和故障恢复验证；设备可用后按表中数值完成真实源帧到浏览器闭环及 10 分钟连续测量。软件 fixture 只能算 L2。
 
-- **A1 — `firmware/components/desk_hardware/`：** 核实目标 HX6538/PTL 源端能力并实现唯一 sensor/SPI producer（只有 capability 确证且 CR 批准后）；负责 capture scheduling、frame ownership/slot、timestamp、resource arbitration 和停止回收。当前 stream HAL 在 ESP 上明确 unavailable；不得把循环快照或 mock pump 写成已具备连续源。
-- **A2 — `firmware/components/desk_sdk_bridge/`：** 获批后负责唯一 SDK device-session gate/capability、media socket lifecycle/authorization and bounded egress；实现 A0 冻结的已有/新增 framing、sequence/error/drop reporting、session generation 及 stop/disconnect teardown。不因 `ApplicationRtc` 存在、`:82/ws/mjpeg` 见于 sample 或 WSPK `FRAME_VIDEO` 常量而声称固件实现完成。
-- **A3 — `host/desk_agent/connectors/robot/` 与最小 Host composition root：** 复用 pinned SDK 唯一 Runtime/Application session 和 RTC control API；按冻结方案管理 lease/capability、媒体 consumer 与 session generation。若 Host relay 被选，提供一个有界媒体 consumer 接入 A6 sink；不得创建第二个 Runtime、越过认证或持久化视频。
-- **A6 — `host/desk_agent/camera/`、`host/desk_agent/web/`：** 负责现有 Host viewer 的会话/lease API、viewer 认证、帧新鲜度、断线 unavailable、relay bounded slot 与 release 清空。若选择 browser-direct sample topology，则必须新增并验证它与 Host authorization/lease 的安全绑定，不能把 `ready` 当认证，也不能把 SDK demo 当作 DeskAgent 已集成。
-- **A0：** 审批产品目标、最终 wire/schema、与 CR-004/006/011 的兼容性，以及是否保留两个明确模式。当前提案不批准改 `contracts/`。
+### 验收分层
 
-验证必须分层：
+1. **L1 源码/契约：** pinned SDK HEAD `8bc13967a06ef073459be47e930ff43ef37ee8fb`；核验 `protocol.py` WSPK frame types、`Robot._on_binary()` 的 FRAME_VIDEO 特殊路由、`ApplicationChannels` 原始帧回调、示例 `parseWjpgPacket()`、Runtime 提供 `mjpeg_websocket_url` 的代码；本仓 CR-004/006、`desk_sdk_bridge.c` capture handler 与 `desk_watcher_camera.c` PTL 路径。此等级只证明接口/设计依据。
+2. **L2 软件：** WSPK/WJPG malformed/oversized/sequence/timestamp/session 测试；无 lease、错 owner、并发 capture/start、重复 start/stop、慢 consumer 单槽丢帧、clock offset 不确定、断线/重启/旧 frame 重放、HTTP auth/freshness/clear/reconnect。必须验证 Host 分辨率、source/sent/rendered 计数分开；fixture 不算真实画面。
+3. **L3 单项硬件：** 目标 HX6538 与 ESP32-S3 实测 640×480 真实内容，连续 10 分钟达到 source ≥15 FPS、资源回收、内存/队列有界；保存脱敏 WSPK/WJPG 序号/时戳/长度、错误/丢帧计数及可打开 JPEG。
+4. **L4 端到端：** paired Runtime → A3 → A6 鉴权 Host `/api/camera/stream` → 浏览器的真实帧闭环，测量每 60 秒 source/rendered FPS 与 P95/P99 延迟；同时验证 lease release、慢客户端、断 Wi-Fi、Runtime 断开、浏览器关闭、设备重启后 1000 ms 内清图、资源释放和新 lease 恢复。截图或长连接本身不能证明实时流。
 
-1. **L1 源码/SDK 契约：** 记录 pinned SDK revision、API/runtime endpoints、README 与执行代码的冲突、实际传输/帧封装、capability gating 和设备实现覆盖范围；用当前固件源码说明 stream API 在 ESP 上 unavailable、HX path 是按次 capture。SDK bundled sample/其它配套固件不能替代目标板 source evidence。
-2. **L2 软件验证：** session/control lifecycle、authorization/lease/capability gate、frame/session/sequence/chunk validation、malformed/oversize/duplicate/stale frames、concurrent start/viewer、stop/timeout/disconnect/reconnect cleanup；慢客户端只允许冻结的有界队列/latest-frame slot 并有 dropped counter。证明旧会话帧不能进入新 viewer、无无限队列、无并行 producer，browser direct 与 relay 两种方案只测获选的一种。
-3. **L3 目标设备测量：** 真实 HX6538 与当前 ESP32 固件上记录源端帧率、发送/浏览器解码帧率、采集到显示延迟分布、JPEG size、丢帧/断流、内存峰值和释放后回收；在产品选择的并发 audio/animation 模式下重复。验证断 Wi-Fi、WebSocket/RTC 中断、浏览器关闭和设备重启后的资源释放/恢复。
-4. **L4 场景验收：** 持续时长、网络质量、重连次数、帧率及延迟阈值从产品目标中取得；报告始终区分 source FPS、sent FPS、rendered FPS。截图、HTTP MJPEG 长连接、伪帧、SDK 回环测试不能单独证明真实连续视频体验。
+## 6. 依据与剩余硬件依赖
 
-**当前等级：** 本提案所引用的本仓契约/源码和锁定 SDK source/package 为 L1。源码已更正：pinned sample 的媒体实际经独立 `:82/ws/mjpeg` WebSocket，而不是 README 声称的 `mjpeg-data` WebRTC data channel；此 sample 不证明 DeskAgent 具备该 server、鉴权或连续 HX source。DeskAgent ESP camera stream start/pump 当前返回 unavailable，现有最多 2 FPS capture 是快照预览，不满足用户要求的实时视频验收。没有新增构建、设备、服务或浏览器闭环测试；产品交付目标/观看路径仍待选择，CR-022 仍 PROPOSAL / NOT APPROVED。
+- CR-004 和 `contracts/camera_frame_delivery.md`：目前 `camera.capture()` 为 request/response，SDK adapter 最高 2 FPS，Host 单帧新鲜度槽；不能满足上述实时门槛。
+- CR-006：已有 Host `/api/camera/stream` multipart relay、Bearer/lease owner 校验、单槽 latest-frame 和过期清图语义，可复用浏览器出口，不证明源端持续帧。
+- 固定 WatcheRobot SDK commit：`src/watcherobot/protocol.py` 定义 `FRAME_VIDEO=2`、`FRAME_IMAGE=3`；`src/watcherobot/robot.py::_on_binary()` 将 FRAME_VIDEO 专用于已启动的 face-tracking preview，将 FRAME_IMAGE 放入容量 1 的 image queue；`application/channels.py` 暴露原始 Application frame；`examples/sdk_media_lab/web/app.js::parseWjpgPacket()` 解析 WJPG v1 20-byte header；`runtime/daemon/runtime.py::device_status()` 暴露示例 `:82/ws/mjpeg` URL。该 SDK 示例 URL/ready 不能替代本产品认证。
+- 本仓 `firmware/components/desk_hardware/src/desk_hardware.c` 的 ESP stream start/pump 当前 unavailable；`desk_watcher_camera.c::desk_watcher_camera_capture()` 是带 SYNC/PTL deadline 的单次 JPEG 路径。**因此本裁定目前仅是 A0 协议决策（L1），连续物理 producer、FPS/分辨率/延迟、SPI/语音并发、实际 paired Runtime 收发和浏览器画面均待 A1/A2/A3/A6/A7 实现及硬件验收；不宣称直播已跑通。**
+
+- 当前 desk_sdk_bridge.c 的 ctrl.camera.capture 仍是每条命令分配缓冲、调用一次 desk_hardware_camera_capture_jpeg() 并发送一条 FRAME_IMAGE；其现有捕获缓冲为 64 KiB。该单帧路径不等价于本 CR 主动流，A2 需实现独立 stream handler 并复核有界 JPEG buffer。
