@@ -384,6 +384,22 @@ class TestWatcherHardwareContract(unittest.TestCase):
         self.assertTrue(found)
         self.assertEqual(body_size.value, 1024)
 
+    def test_camera_ptl_resync_skips_observed_misaligned_capture_bytes(self) -> None:
+        # Captured from the reported device log: these bytes end in the media
+        # magic WR, so they are not a PTL header. Follow with the upstream
+        # PTL base-header layout and require the C scanner to find that header.
+        observed = bytes.fromhex("08 80 15 00 00 57 52")
+        official_layout_header = b"\xC0\x5A\x01" + struct.pack("<I", 1024)
+        scanner = self.CameraResync()
+        body_size = ctypes.c_uint32(0)
+        found = False
+        for byte in observed + official_layout_header:
+            found = self.lib.desk_watcher_camera_resync_push(
+                ctypes.byref(scanner), byte, 128 * 1024, ctypes.byref(body_size)
+            )
+        self.assertTrue(found)
+        self.assertEqual(body_size.value, 1024)
+
     def test_camera_ptl_frame_assembly_and_crc32(self) -> None:
         """Verifies complete PTL Media Header validation, CRC32, and JPEG extraction."""
         fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"

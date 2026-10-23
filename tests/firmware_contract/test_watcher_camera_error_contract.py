@@ -440,6 +440,18 @@ int main(void) {
         self.assertIn("esp_timer_get_time() >= camera_capture_deadline_us", capture)
         self.assertIn("camera_capture_spi_budget_available(capture_deadline_us, sizeof(chunk))", source)
 
+    def test_hx_mode_transition_drains_pending_ptl_frame_like_upstream(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        mode = source.split("static int camera_control_mode_until(", 1)[1].split("static int camera_control_mode(", 1)[0]
+        drain = source.split("static void camera_control_drain_transition_frame(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("state.mode == 3U", mode)
+        self.assertIn("camera_control_drain_transition_frame(deadline_us)", mode)
+        self.assertIn("s_capture_bus_acquired", drain)
+        self.assertIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", drain)
+        self.assertIn("CAM_SYNC", source)
+        self.assertIn("desk_watcher_camera_parse_ptl_header", drain)
+        self.assertIn("spi_device_release_bus(s_spi_dev)", drain)
+
     def test_cli_camera_capture_uses_upstream_five_second_default(self):
         cli = (ROOT / "firmware/components/desk_cli/src/desk_cli.c").read_text(encoding="utf-8")
         camera_command = cli.rsplit("static void cmd_camera(int argc, char *argv[])", 1)[1].split("static void cmd_body", 1)[0]
