@@ -14,7 +14,7 @@
 capture_esp32s3_logs.py --capture --port COM21 --baud 115200 --output-dir .target_logging/serial-capture-20261023 --no-raw --live-events stdout
 ```
 
-连接成功。周期遥测记录 heap 值 `21911`、PSRAM 值约 `7063464`。采集期间没有观察到 KWS、ASR 或 TTS 事件。采集输出目录中的事件记录路径为 `.target_logging/serial-capture-20261023/events.jsonl`。该 ignored 输出目录不在本独立 worktree 内，命令行原始输出也没有归档；以上数值与事件观察按本轮现场采集结果摘要记录。
+连接成功。周期遥测记录 heap 值 `21911`、PSRAM 值约 `7063464`。本轮摘要报告采集期间没有观察到 KWS、ASR 或 TTS 事件。命令指定的输出目录为 `.target_logging/serial-capture-20261023`，预期事件记录路径为 `.target_logging/serial-capture-20261023/events.jsonl`；该文件在主工作区与本独立 worktree 中均未找到，事件行无法复核。命令行原始输出也没有归档；以上数值与事件观察按本轮现场采集摘要记录。
 
 随后将 COM21 的 DTR/RTS 置低，执行只读 CLI：
 
