@@ -7,6 +7,7 @@
 #include "desk_watcher_log_source.h"
 #include "desk_tclaw_bridge.h"
 #include "desk_notification.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2856,7 +2857,7 @@ static int desk_sdk_camera_stream_command(const char *json, char *out, size_t ca
     const char *rid = desk_sdk_request_id_fragment(json, rid_scratch, sizeof(rid_scratch));
     int n = snprintf(out, cap,
         "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"type\":\"%s\",\"command_id\":\"%s\","
-        "\"ping_id\":%d,\"host_send_monotonic_ms\":%u,\"device_receive_monotonic_ms\":%u,\"device_send_monotonic_ms\":%u}}",
+        "\"ping_id\":%d,\"host_send_monotonic_ms\":%" PRIu32 ",\"device_receive_monotonic_ms\":%" PRIu32 ",\"device_send_monotonic_ms\":%" PRIu32 "}}",
         rid, type, command_id, (int)ping_id, (uint32_t)host_send,
         (uint32_t)receive_ms, (uint32_t)send_ms);
     return n >= 0 && (size_t)n < cap ? 0 : -1;
