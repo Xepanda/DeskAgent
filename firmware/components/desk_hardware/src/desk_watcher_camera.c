@@ -57,6 +57,7 @@
 #define CAM_CONTROL_MODE_TIMEOUT_MS 3500U
 #define CAM_PTL_EMPTY_BACKOFF_MS  5U
 #define CAM_PTL_CAPTURE_TIMEOUT_MS 5000U
+#define CAM_PTL_CLEANUP_RESERVE_MAX_US 750000ULL
 #define CAM_PTL_SPI_TRANSACTION_GUARD_US 20000ULL
 #define CAM_PTL_RESYNC_TIMEOUT_MS 50U
 #define CAM_PTL_RESYNC_CHUNK_SIZE 16U
@@ -99,6 +100,7 @@ static spi_device_handle_t s_spi_dev = NULL;
 static SemaphoreHandle_t s_cam_mutex = NULL;
 static bool s_spi_bus_owned = false;
 static bool s_capture_bus_acquired = false;
+static bool s_camera_needs_idle_recovery = false;
 static bool s_hx_uart_owned = false;
 static uint32_t s_hx_request_id = 0;
 #endif
@@ -341,12 +343,18 @@ static bool camera_capture_spi_budget_available(int64_t deadline_us, size_t tran
                                                        CAM_PTL_SPI_TRANSACTION_GUARD_US);
 }
 
-static int camera_capture_release(int result, int64_t deadline_us)
+static int camera_capture_release(int result, int64_t overall_deadline_us)
 {
     /* Every capture exit, including an expired retry deadline, drops any SPI
      * lease still held after the most recent successful reacquire. */
     camera_capture_release_bus();
-    int stop_rc = camera_control_mode_until(0U, 0U, deadline_us);
+    int stop_rc = camera_control_mode_until(0U, 0U, overall_deadline_us);
+    result = desk_watcher_camera_cleanup_result(result, stop_rc == 0,
+                                                 DESK_WATCHER_CAMERA_ERR_CONTROL,
+                                                 &s_camera_needs_idle_recovery);
+    if (stop_rc != 0) {
+        ESP_LOGE(TAG, "HX6538 MODE0 cleanup failed rc=%d; next capture must recover idle", stop_rc);
+    }
     if (s_cam_mutex) xSemaphoreGive(s_cam_mutex);
     return stop_rc != 0 && result == DESK_HW_OK ? DESK_WATCHER_CAMERA_ERR_CONTROL : result;
 }
@@ -600,7 +608,15 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     }
 
     if (timeout_ms == 0U) timeout_ms = CAM_PTL_CAPTURE_TIMEOUT_MS;
-    const int64_t camera_capture_deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    const uint64_t capture_start_us = (uint64_t)esp_timer_get_time();
+    const uint64_t camera_capture_overall_deadline_us = capture_start_us + (uint64_t)timeout_ms * 1000ULL;
+    uint64_t camera_capture_work_deadline_us = 0;
+    if (!desk_watcher_camera_work_deadline(capture_start_us, camera_capture_overall_deadline_us,
+                                          CAM_PTL_CLEANUP_RESERVE_MAX_US,
+                                          &camera_capture_work_deadline_us)) {
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    const int64_t camera_capture_deadline_us = (int64_t)camera_capture_work_deadline_us;
     uint64_t mutex_wait_ticks = 0;
     if (!s_cam_mutex || !desk_watcher_camera_bus_deadline_ticks(
                             (uint64_t)camera_capture_deadline_us, (uint64_t)esp_timer_get_time(),
@@ -616,12 +632,28 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         return DESK_HW_ERR_TIMEOUT;
     }
 
+    if (s_camera_needs_idle_recovery) {
+        int recovery_rc = camera_control_mode_until(0U, 0U, (int64_t)camera_capture_overall_deadline_us);
+        if (recovery_rc != 0) {
+            ESP_LOGE(TAG, "HX6538 idle recovery failed rc=%d; capture deferred", recovery_rc);
+            xSemaphoreGive(s_cam_mutex);
+            return esp_timer_get_time() >= (int64_t)camera_capture_overall_deadline_us ?
+                   DESK_HW_ERR_TIMEOUT : DESK_WATCHER_CAMERA_ERR_CONTROL;
+        }
+        s_camera_needs_idle_recovery = false;
+        if (esp_timer_get_time() >= camera_capture_deadline_us) {
+            xSemaphoreGive(s_cam_mutex);
+            return DESK_HW_ERR_TIMEOUT;
+        }
+    }
+
     /* MODE request, status verification, and SPI reads share the caller's deadline. */
+    s_camera_needs_idle_recovery = true;
     if (camera_control_mode_until(1U, 0U, camera_capture_deadline_us) != 0) {
         ESP_LOGE(TAG, "HX6538 failed to enter PTL capture mode");
         int control_rc = esp_timer_get_time() >= camera_capture_deadline_us ?
                          DESK_HW_ERR_TIMEOUT : DESK_WATCHER_CAMERA_ERR_CONTROL;
-        return camera_capture_release(control_rc, camera_capture_deadline_us);
+        return camera_capture_release(control_rc, (int64_t)camera_capture_overall_deadline_us);
     }
 
     /* SYNC is a readiness hint during aligned reads. During recovery, scan
@@ -632,7 +664,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         int sync_rc = camera_sync_is_active(&sync_active);
         if (sync_rc != DESK_HW_OK) {
             ESP_LOGE(TAG, "SYNC read failed: PCA9535 INPUT0 rc=%d", sync_rc);
-            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO, camera_capture_deadline_us);
+            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO, (int64_t)camera_capture_overall_deadline_us);
         }
         if (sync_active) {
             sync_ready = true;
@@ -643,7 +675,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
 
     if (!sync_ready) {
         ESP_LOGE(TAG, "SYNC timeout after capture deadline %u ms: ready signal stayed low", (unsigned)timeout_ms);
-        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT, camera_capture_deadline_us);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT, (int64_t)camera_capture_overall_deadline_us);
     }
 
     /* SYNC is a FIFO readiness hint: upstream waits 2 ms after its rising
@@ -654,7 +686,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     int acquire_rc = camera_capture_acquire_bus(camera_capture_deadline_us);
     if (acquire_rc != DESK_HW_OK) {
         ESP_LOGE(TAG, "SPI bus acquire failed or exceeded capture deadline: rc=%d", acquire_rc);
-        return camera_capture_release(acquire_rc, camera_capture_deadline_us);
+        return camera_capture_release(acquire_rc, (int64_t)camera_capture_overall_deadline_us);
     }
     esp_err_t err = ESP_OK;
 
@@ -669,7 +701,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             spi_transaction_t close_trans = {.length = 8, .rxlength = 8, .rx_buffer = &dummy, .flags = 0};
             (void)spi_device_transmit(s_spi_dev, &close_trans);
             camera_capture_release_bus();
-            return camera_capture_release(scan_rc, camera_capture_deadline_us);
+            return camera_capture_release(scan_rc, (int64_t)camera_capture_overall_deadline_us);
         }
         s_ptl_resynchronizing = false;
     } else {
@@ -679,7 +711,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     bool header_received = false;
     while (esp_timer_get_time() < camera_capture_deadline_us) {
         if (!camera_capture_spi_budget_available(camera_capture_deadline_us, sizeof(base_header))) {
-            return camera_capture_release(DESK_HW_ERR_TIMEOUT, camera_capture_deadline_us);
+            return camera_capture_release(DESK_HW_ERR_TIMEOUT, (int64_t)camera_capture_overall_deadline_us);
         }
         spi_transaction_t hdr_trans = {
             .length = sizeof(base_header) * 8,
@@ -693,7 +725,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             camera_capture_release_bus();
             s_ptl_resynchronizing = true;
             memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI, camera_capture_deadline_us);
+            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI, (int64_t)camera_capture_overall_deadline_us);
         }
         if (esp_timer_get_time() >= camera_capture_deadline_us) {
             uint8_t dummy = 0;
@@ -702,7 +734,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             camera_capture_release_bus();
             s_ptl_resynchronizing = true;
             memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-            return camera_capture_release(DESK_HW_ERR_TIMEOUT, camera_capture_deadline_us);
+            return camera_capture_release(DESK_HW_ERR_TIMEOUT, (int64_t)camera_capture_overall_deadline_us);
         }
         uint8_t header_or = 0;
         for (size_t i = 0; i < sizeof(base_header); ++i) header_or |= base_header[i];
@@ -728,7 +760,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             int retry_sync_rc = camera_sync_is_active(&active);
             if (retry_sync_rc != DESK_HW_OK) {
                 ESP_LOGE(TAG, "SYNC retry read failed: PCA9535 INPUT0 rc=%d", retry_sync_rc);
-                return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO, camera_capture_deadline_us);
+                return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO, (int64_t)camera_capture_overall_deadline_us);
             }
             if (active) { retry_sync = true; break; }
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -740,7 +772,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         acquire_rc = camera_capture_acquire_bus(camera_capture_deadline_us);
         if (acquire_rc != DESK_HW_OK) {
             ESP_LOGE(TAG, "SPI bus reacquire failed or exceeded capture deadline: rc=%d", acquire_rc);
-            return camera_capture_release(acquire_rc, camera_capture_deadline_us);
+            return camera_capture_release(acquire_rc, (int64_t)camera_capture_overall_deadline_us);
         }
     }
 
@@ -748,7 +780,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         (void)desk_watcher_log_source_publish_camera_capture_empty();
         ESP_LOGW(TAG, "PTL warmup deadline expired after %u ms and %u empty headers",
                  (unsigned)timeout_ms, empty_attempt);
-        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY, camera_capture_deadline_us);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY, (int64_t)camera_capture_overall_deadline_us);
     }
 
     int ptl_rc = desk_watcher_camera_parse_ptl_header(base_header, sizeof(base_header), &body_size);
@@ -770,7 +802,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         camera_capture_release_bus();
         s_ptl_resynchronizing = true;
         memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL, camera_capture_deadline_us);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL, (int64_t)camera_capture_overall_deadline_us);
     }
     }
 
@@ -791,7 +823,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         camera_capture_release_bus();
         s_ptl_resynchronizing = true;
         memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-        return camera_capture_release(DESK_HW_ERR_TIMEOUT, camera_capture_deadline_us);
+        return camera_capture_release(DESK_HW_ERR_TIMEOUT, (int64_t)camera_capture_overall_deadline_us);
     }
     err = spi_device_transmit(s_spi_dev, &body_trans);
     camera_capture_release_bus();
@@ -800,10 +832,10 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
                  (unsigned)body_size, esp_err_to_name(err), (int)err);
         s_ptl_resynchronizing = true;
         memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI, camera_capture_deadline_us);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI, (int64_t)camera_capture_overall_deadline_us);
     }
     if (esp_timer_get_time() >= camera_capture_deadline_us) {
-        return camera_capture_release(DESK_HW_ERR_TIMEOUT, camera_capture_deadline_us);
+        return camera_capture_release(DESK_HW_ERR_TIMEOUT, (int64_t)camera_capture_overall_deadline_us);
     }
 
     /* Step 3: Validate Media Header, CRC32, and extract JPEG */
@@ -815,18 +847,18 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
             ESP_LOGE(TAG, "CRC mismatch: media payload size=%u", (unsigned)(body_size - HX_MEDIA_HEADER_SIZE));
             s_ptl_resynchronizing = true;
             memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_CRC, camera_capture_deadline_us);
+            return camera_capture_release(DESK_WATCHER_CAMERA_ERR_CRC, (int64_t)camera_capture_overall_deadline_us);
         }
         ESP_LOGE(TAG, "Media frame rejected: validator rc=%d body_size=%u", frame_rc, (unsigned)body_size);
         s_ptl_resynchronizing = true;
         memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL, camera_capture_deadline_us);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL, (int64_t)camera_capture_overall_deadline_us);
     }
 
     if (jpeg_sz > max_len) {
         ESP_LOGE(TAG, "JPEG output buffer too small: jpeg_size=%u max_len=%u",
                  (unsigned)jpeg_sz, (unsigned)max_len);
-        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL, camera_capture_deadline_us);
+        return camera_capture_release(DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL, (int64_t)camera_capture_overall_deadline_us);
     }
 
     memcpy(out_buf, jpeg_ptr, jpeg_sz);
@@ -834,7 +866,7 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
 
     s_ptl_resynchronizing = false;
     memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
-    return camera_capture_release(DESK_HW_OK, camera_capture_deadline_us);
+    return camera_capture_release(DESK_HW_OK, (int64_t)camera_capture_overall_deadline_us);
 #else
     return DESK_HW_ERR_UNAVAILABLE;
 #endif
