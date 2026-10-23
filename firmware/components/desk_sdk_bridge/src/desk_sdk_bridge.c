@@ -245,7 +245,7 @@ static int desk_sdk_audio_hash_begin_locked(void)
 {
 #ifdef ESP_PLATFORM
     mbedtls_sha256_init(&s_sdk_audio.hash);
-    if (mbedtls_sha256_starts_ret(&s_sdk_audio.hash, 0) != 0) return -1;
+    if (mbedtls_sha256_starts(&s_sdk_audio.hash, 0) != 0) return -1;
 #elif defined(DESK_SDK_OPENSSL_TESTING)
     s_sdk_audio.hash = EVP_MD_CTX_new();
     if (!s_sdk_audio.hash || EVP_DigestInit_ex(s_sdk_audio.hash, EVP_sha256(), NULL) != 1) return -1;
@@ -260,7 +260,7 @@ static int desk_sdk_audio_hash_update_locked(const uint8_t *data, size_t len)
 {
     if (!s_sdk_audio.hash_ready || !data || !len) return -1;
 #ifdef ESP_PLATFORM
-    return mbedtls_sha256_update_ret(&s_sdk_audio.hash, data, len) == 0 ? 0 : -1;
+    return mbedtls_sha256_update(&s_sdk_audio.hash, data, len) == 0 ? 0 : -1;
 #elif defined(DESK_SDK_OPENSSL_TESTING)
     return EVP_DigestUpdate(s_sdk_audio.hash, data, len) == 1 ? 0 : -1;
 #else
@@ -284,7 +284,7 @@ static int desk_sdk_audio_hash_finish_locked(uint8_t digest[32])
 {
     if (!s_sdk_audio.hash_ready || !digest) return -1;
 #ifdef ESP_PLATFORM
-    int rc = mbedtls_sha256_finish_ret(&s_sdk_audio.hash, digest);
+    int rc = mbedtls_sha256_finish(&s_sdk_audio.hash, digest);
 #elif defined(DESK_SDK_OPENSSL_TESTING)
     unsigned int digest_len = 0;
     int rc = EVP_DigestFinal_ex(s_sdk_audio.hash, digest, &digest_len) == 1 && digest_len == 32 ? 0 : -1;
