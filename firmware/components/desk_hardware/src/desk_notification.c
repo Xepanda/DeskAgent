@@ -376,7 +376,8 @@ int desk_hardware_notification_process_pending(void)
             if (entry->is_summary) {
                 memcpy(text, "Missed: ", 8);
                 offset = 8;
-                char suffix[16] = {0};
+                /* " +" plus all 20 decimal digits of uint64_t and the NUL. */
+                char suffix[23] = {0};
                 if (entry->summary_more_count)
                     snprintf(suffix, sizeof(suffix), " +%llu",
                              (unsigned long long)entry->summary_more_count);

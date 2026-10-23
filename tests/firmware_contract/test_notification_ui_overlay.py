@@ -245,14 +245,14 @@ class TestNotificationUiOverlay(unittest.TestCase):
                                              b"Asia/Shanghai", display_time)
         items = (self.NotificationSummaryItem * 1)(item)
         summary = self.NotificationSummaryInput(b"summary:utf8", b"batch", created, expires,
-                                                items, 1, 2)
+                                                items, 1, 0xFFFFFFFF)
         self.assertEqual(self.lib.desk_hardware_notification_deliver_summary(
             ctypes.byref(summary)), 0)
         self.assertEqual(self.lib.desk_hardware_notification_process_pending(), 0)
         rendered = self.visible()[1]
         rendered.encode("utf-8").decode("utf-8")
         self.assertIn(display_time.decode(), rendered)
-        self.assertIn(" +2", rendered)
+        self.assertIn(" +4294967295", rendered)
         self.assertNotIn("�", rendered)
 
         malformed = self.NotificationSummaryItem(b"r2", b"o2", b"Invalid time", created,

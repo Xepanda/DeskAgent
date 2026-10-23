@@ -24,6 +24,34 @@ int desk_watcher_motion_get_last_ambiguous_move_stop_result(void);
 int desk_watcher_motion_deinit(void);
 bool desk_watcher_motion_is_ready(void);
 
+typedef enum {
+    DESK_WATCHER_MOTION_ERROR_NONE = 0,
+    DESK_WATCHER_MOTION_ERROR_UART_UNAVAILABLE,
+    DESK_WATCHER_MOTION_ERROR_UART_BUSY,
+    DESK_WATCHER_MOTION_ERROR_TX_IO,
+    DESK_WATCHER_MOTION_ERROR_BAD_CRC,
+    DESK_WATCHER_MOTION_ERROR_WRONG_SEQUENCE,
+    DESK_WATCHER_MOTION_ERROR_INVALID_RESPONSE,
+    DESK_WATCHER_MOTION_ERROR_NACK,
+    DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT,
+} desk_watcher_motion_error_t;
+
+typedef struct {
+    uint32_t tx_bytes; /* Bytes reported accepted by uart_write_bytes. */
+    uint32_t rx_bytes; /* Bytes returned by uart_read_bytes. */
+    uint32_t ack_count; /* CRC-valid ACKs correlated to an outstanding request. */
+    uint32_t nack_count;
+    uint32_t bad_crc_count;
+    uint32_t wrong_sequence_count;
+    uint32_t timeout_count;
+    uint32_t retry_count;
+    desk_watcher_motion_error_t last_error;
+} desk_watcher_motion_diagnostics_t;
+
+/* Read-only, since-boot transport diagnostics. These do not represent physical
+ * position or prove that UART bytes reached the STM32 pins. */
+void desk_watcher_motion_get_diagnostics(desk_watcher_motion_diagnostics_t *out);
+
 /* COBS and Wire Framing functions */
 int desk_watcher_motion_cobs_encode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len, size_t *out_len);
 int desk_watcher_motion_cobs_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len, size_t *out_len);

@@ -26,6 +26,24 @@
 #include "desk_watcher_motion.h"
 #endif
 
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+static const char *cli_motion_error_name(desk_watcher_motion_error_t error)
+{
+    switch (error) {
+    case DESK_WATCHER_MOTION_ERROR_NONE: return "none";
+    case DESK_WATCHER_MOTION_ERROR_UART_UNAVAILABLE: return "uart-unavailable";
+    case DESK_WATCHER_MOTION_ERROR_UART_BUSY: return "uart-busy";
+    case DESK_WATCHER_MOTION_ERROR_TX_IO: return "tx-io";
+    case DESK_WATCHER_MOTION_ERROR_BAD_CRC: return "bad-crc";
+    case DESK_WATCHER_MOTION_ERROR_WRONG_SEQUENCE: return "wrong-sequence";
+    case DESK_WATCHER_MOTION_ERROR_INVALID_RESPONSE: return "invalid-response";
+    case DESK_WATCHER_MOTION_ERROR_NACK: return "nack";
+    case DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT: return "ack-timeout";
+    default: return "unknown";
+    }
+}
+#endif
+
 #ifdef ESP_PLATFORM
 #include "netmgr.h"
 #include "esp_system.h"
@@ -543,6 +561,10 @@ static void cmd_body(int argc, char *argv[])
         uint8_t last_frame[64];
         size_t last_len = 0;
         int frame_rc = desk_hardware_get_last_mcu_frame(last_frame, sizeof(last_frame), &last_len);
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        desk_watcher_motion_diagnostics_t motion_diag;
+        desk_watcher_motion_get_diagnostics(&motion_diag);
+#endif
         printf("STM32 Body Coprocessor:\r\n");
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
         printf("  UART Driver State: %s\r\n",
@@ -557,12 +579,25 @@ static void cmd_body(int argc, char *argv[])
             printf("  Setpoint: UNKNOWN (read rc=%d)\r\n", position_rc);
         }
         if (frame_rc == DESK_HW_OK) {
-            printf("  Last formatted TX request length: %lu bytes (not an RX/ACK counter)\r\n",
+            printf("  Last formatted TX request length: %lu bytes (cached formatter data)\r\n",
                    (unsigned long)last_len);
         } else {
             printf("  Last formatted TX request length: UNKNOWN (read rc=%d)\r\n", frame_rc);
         }
-        printf("  STM32 peer/ACK state: UNKNOWN (no independent peer status in CLI)\r\n");
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        printf("  UART TX bytes (driver reported): %lu; RX bytes: %lu\r\n",
+               (unsigned long)motion_diag.tx_bytes, (unsigned long)motion_diag.rx_bytes);
+        printf("  Valid correlated ACKs: %lu; NACKs: %lu; bad CRC: %lu; wrong sequence: %lu\r\n",
+               (unsigned long)motion_diag.ack_count, (unsigned long)motion_diag.nack_count,
+               (unsigned long)motion_diag.bad_crc_count, (unsigned long)motion_diag.wrong_sequence_count);
+        printf("  Timeouts: %lu; retries: %lu; last motion error: %s\r\n",
+               (unsigned long)motion_diag.timeout_count, (unsigned long)motion_diag.retry_count,
+               cli_motion_error_name(motion_diag.last_error));
+        printf("  STM32 peer evidence: %s (since boot; no physical position feedback)\r\n",
+               motion_diag.ack_count > 0 ? "valid ACK observed" : "no valid ACK observed");
+#else
+        printf("  STM32 peer/ACK state: UNKNOWN (no board motion diagnostics API)\r\n");
+#endif
         printf("  UART Protocol: A5 5A Class=0x02 Motion Frame\r\n");
         return;
     }

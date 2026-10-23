@@ -28,13 +28,20 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = CLI_C.read_text(encoding="utf-8")
 
-    def test_body_status_does_not_call_tx_length_receive_or_ack_evidence(self) -> None:
+    def test_body_status_reports_only_observed_uart_diagnostics(self) -> None:
         body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",
                              "static void cmd_peripherals(int argc, char *argv[])\n{")
         self.assertNotIn("Last Packet Length", body)
         self.assertIn("Last formatted TX request length", body)
-        self.assertIn("not an RX/ACK counter", body)
-        self.assertIn("STM32 peer/ACK state: UNKNOWN", body)
+        self.assertIn("desk_watcher_motion_get_diagnostics(&motion_diag)", body)
+        self.assertIn("UART TX bytes (driver reported)", body)
+        self.assertIn("RX bytes", body)
+        self.assertIn("Valid correlated ACKs", body)
+        self.assertIn("bad CRC", body)
+        self.assertIn("wrong sequence", body)
+        self.assertIn("last motion error", body)
+        self.assertIn("no valid ACK observed", body)
+        self.assertNotIn("desk_hardware_mcu_receive_bytes", body)
         self.assertIn("not physical feedback", body)
 
     def test_peripheral_placeholders_are_unknown_without_status_apis(self) -> None:

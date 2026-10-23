@@ -30,6 +30,15 @@
 
 static bool s_motion_initialized = false;
 static atomic_uint_least32_t s_mcu_sequence = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_tx_bytes = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_rx_bytes = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_ack_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_nack_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_bad_crc_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_wrong_sequence_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_timeout_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_retry_count = ATOMIC_VAR_INIT(0);
+static atomic_int s_diag_last_error = ATOMIC_VAR_INIT(DESK_WATCHER_MOTION_ERROR_NONE);
 /* Local diagnostic for the one-shot STOP paired with the last ambiguous MOVE. */
 static atomic_int s_last_ambiguous_move_stop_result = ATOMIC_VAR_INIT(DESK_HW_ERR_UNAVAILABLE);
 /* UART2 may be shared with another initialized component. Only delete a
@@ -330,16 +339,20 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
     if (out_may_have_sent) *out_may_have_sent = false;
 #ifdef ESP_PLATFORM
     if (!s_motion_initialized || !uart_is_driver_installed(UART_NUM_2)) {
+        atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_UART_UNAVAILABLE, memory_order_relaxed);
         return DESK_HW_ERR_UNAVAILABLE;
     }
 
     if (!s_motion_mutex || xSemaphoreTake(s_motion_mutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_UART_BUSY, memory_order_relaxed);
         return DESK_HW_ERR_BUSY;
     }
 
+    atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_NONE, memory_order_relaxed);
     uint32_t max_attempts = allow_retries ? MCU_MAX_RETRIES + 1U : 1U;
     for (uint32_t attempt = 0; attempt < max_attempts; ++attempt) {
         if (attempt > 0) {
+            atomic_fetch_add_explicit(&s_diag_retry_count, 1U, memory_order_relaxed);
             vTaskDelay(pdMS_TO_TICKS(MCU_RETRY_BACKOFF_MS));
         }
 
@@ -347,10 +360,14 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         uart_flush_input(UART_NUM_2);
 
         int written = uart_write_bytes(UART_NUM_2, (const char *)frame_data, frame_len);
+        if (written > 0) {
+            atomic_fetch_add_explicit(&s_diag_tx_bytes, (uint32_t)written, memory_order_relaxed);
+        }
         /* A nonzero or indeterminate write result means some command bytes may
          * have reached the peer. Only an exact zero proves no TX occurred. */
         if (written != 0 && out_may_have_sent) *out_may_have_sent = true;
         if (written != (int)frame_len) {
+            atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_TX_IO, memory_order_relaxed);
             xSemaphoreGive(s_motion_mutex);
             return DESK_HW_ERR_IO;
         }
@@ -365,6 +382,7 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
             uint8_t byte = 0;
             int r = uart_read_bytes(UART_NUM_2, &byte, 1, pdMS_TO_TICKS(10));
             if (r <= 0) continue;
+            atomic_fetch_add_explicit(&s_diag_rx_bytes, (uint32_t)r, memory_order_relaxed);
 
             /* Find the native 0xA5 0x5A frame sync, then consume its fixed header. */
             if (frame_rx_len == 0 && byte != MCU_FRAME_MAGIC0) continue;
@@ -398,14 +416,34 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
                                                            expected_seq, frame_data[4],
                                                            &nack_code, &is_nack);
                 if (ack_rc == DESK_HW_OK) {
+                    atomic_fetch_add_explicit(&s_diag_ack_count, 1U, memory_order_relaxed);
+                    atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_NONE, memory_order_relaxed);
                     xSemaphoreGive(s_motion_mutex);
                     return DESK_HW_OK;
                 }
                 if (ack_rc == DESK_HW_ERR_IO && is_nack) {
+                    atomic_fetch_add_explicit(&s_diag_nack_count, 1U, memory_order_relaxed);
+                    atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_NACK, memory_order_relaxed);
                     xSemaphoreGive(s_motion_mutex);
                     return (nack_code == MCU_NACK_ERR_OUT_OF_BOUNDS ||
                             nack_code == MCU_NACK_ERR_INVALID_PARAM)
                                ? DESK_HW_ERR_INVALID_ARG : DESK_HW_ERR_IO;
+                }
+                uint16_t rx_payload_len = (uint16_t)frame_rx[10] | ((uint16_t)frame_rx[11] << 8);
+                uint16_t rx_crc = (uint16_t)frame_rx[12 + rx_payload_len] |
+                                  ((uint16_t)frame_rx[13 + rx_payload_len] << 8);
+                if (motion_calc_crc16(frame_rx, 12 + rx_payload_len) != rx_crc) {
+                    atomic_fetch_add_explicit(&s_diag_bad_crc_count, 1U, memory_order_relaxed);
+                    atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_BAD_CRC, memory_order_relaxed);
+                } else {
+                    uint32_t rx_seq = (uint32_t)frame_rx[6] | ((uint32_t)frame_rx[7] << 8) |
+                                      ((uint32_t)frame_rx[8] << 16) | ((uint32_t)frame_rx[9] << 24);
+                    if (rx_seq != expected_seq) {
+                        atomic_fetch_add_explicit(&s_diag_wrong_sequence_count, 1U, memory_order_relaxed);
+                        atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_WRONG_SEQUENCE, memory_order_relaxed);
+                    } else {
+                        atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_INVALID_RESPONSE, memory_order_relaxed);
+                    }
                 }
                 frame_rx_len = 0;
                 expected_frame_len = 0;
@@ -413,6 +451,8 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
         }
     }
 
+    atomic_fetch_add_explicit(&s_diag_timeout_count, 1U, memory_order_relaxed);
+    atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT, memory_order_relaxed);
     xSemaphoreGive(s_motion_mutex);
     desk_hardware_record_mcu_ack_timeout();
     return DESK_HW_ERR_TIMEOUT;
@@ -495,4 +535,18 @@ int desk_watcher_motion_deinit(void)
 bool desk_watcher_motion_is_ready(void)
 {
     return s_motion_initialized;
+}
+
+void desk_watcher_motion_get_diagnostics(desk_watcher_motion_diagnostics_t *out)
+{
+    if (!out) return;
+    out->tx_bytes = atomic_load_explicit(&s_diag_tx_bytes, memory_order_relaxed);
+    out->rx_bytes = atomic_load_explicit(&s_diag_rx_bytes, memory_order_relaxed);
+    out->ack_count = atomic_load_explicit(&s_diag_ack_count, memory_order_relaxed);
+    out->nack_count = atomic_load_explicit(&s_diag_nack_count, memory_order_relaxed);
+    out->bad_crc_count = atomic_load_explicit(&s_diag_bad_crc_count, memory_order_relaxed);
+    out->wrong_sequence_count = atomic_load_explicit(&s_diag_wrong_sequence_count, memory_order_relaxed);
+    out->timeout_count = atomic_load_explicit(&s_diag_timeout_count, memory_order_relaxed);
+    out->retry_count = atomic_load_explicit(&s_diag_retry_count, memory_order_relaxed);
+    out->last_error = (desk_watcher_motion_error_t)atomic_load_explicit(&s_diag_last_error, memory_order_relaxed);
 }
