@@ -38,6 +38,7 @@ static atomic_uint_least32_t s_diag_bad_crc_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_least32_t s_diag_wrong_sequence_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_least32_t s_diag_timeout_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_least32_t s_diag_retry_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_least32_t s_diag_hello_ignored_count = ATOMIC_VAR_INIT(0);
 static atomic_int s_diag_last_error = ATOMIC_VAR_INIT(DESK_WATCHER_MOTION_ERROR_NONE);
 /* Local diagnostic for the one-shot STOP paired with the last ambiguous MOVE. */
 static atomic_int s_last_ambiguous_move_stop_result = ATOMIC_VAR_INIT(DESK_HW_ERR_UNAVAILABLE);
@@ -290,7 +291,7 @@ int desk_watcher_motion_pack_hello_req(uint32_t seq, uint8_t *out_wire, size_t w
                ? DESK_HW_OK : DESK_HW_ERR_INVALID_ARG;
 }
 
-int desk_watcher_motion_parse_hello_rsp(const uint8_t *wire, size_t wire_len, uint32_t expected_seq,
+int desk_watcher_motion_parse_hello_rsp(const uint8_t *wire, size_t wire_len,
                                         desk_watcher_motion_peer_info_t *out)
 {
     uint8_t raw[160];
@@ -301,18 +302,16 @@ int desk_watcher_motion_parse_hello_rsp(const uint8_t *wire, size_t wire_len, ui
 
     uint16_t payload_len = (uint16_t)raw[10] | ((uint16_t)raw[11] << 8);
     if (raw[0] != MCU_FRAME_MAGIC0 || raw[1] != MCU_FRAME_MAGIC1 ||
-        raw[2] != MCU_FRAME_PROTO_VERSION || raw[3] != MCU_FRAME_CLASS_SYS ||
-        raw[4] != MCU_SYS_MSG_HELLO_RSP || (raw[5] & MCU_FRAME_FLAG_RESPONSE) == 0u ||
-        raw_len != (size_t)(14u + payload_len) || payload_len < 9u)
+        raw[2] != MCU_FRAME_PROTO_VERSION || payload_len > 128u ||
+        raw_len != (size_t)(14u + payload_len))
         return DESK_HW_ERR_IO;
 
-    uint32_t seq = (uint32_t)raw[6] | ((uint32_t)raw[7] << 8) |
-                   ((uint32_t)raw[8] << 16) | ((uint32_t)raw[9] << 24);
-    if (seq != expected_seq) return DESK_HW_ERR_BUSY;
     uint16_t received_crc = (uint16_t)raw[12u + payload_len] |
                             ((uint16_t)raw[13u + payload_len] << 8);
     if (motion_calc_crc16(raw, 12u + payload_len) != received_crc) return DESK_HW_ERR_IO;
-    if (raw[12u + 8u] != 0x01u) return DESK_HW_ERR_UNAVAILABLE;
+    if (raw[3] != MCU_FRAME_CLASS_SYS || raw[4] != MCU_SYS_MSG_HELLO_RSP)
+        return DESK_HW_ERR_BUSY;
+    if (payload_len < 9u) return DESK_HW_ERR_IO;
 
     out->fw_major = raw[13];
     out->fw_minor = raw[14];
@@ -321,7 +320,36 @@ int desk_watcher_motion_parse_hello_rsp(const uint8_t *wire, size_t wire_len, ui
     out->capability_bitmap = raw[17];
     out->sensor_bitmap = raw[18];
     out->default_stream_profile = raw[20];
+    out->response_seq = (uint32_t)raw[6] | ((uint32_t)raw[7] << 8) |
+                        ((uint32_t)raw[8] << 16) | ((uint32_t)raw[9] << 24);
     return DESK_HW_OK;
+}
+
+int desk_watcher_motion_hello_rx_feed(desk_watcher_motion_hello_rx_t *rx, uint8_t byte,
+                                      desk_watcher_motion_peer_info_t *out)
+{
+    if (!rx || !out) return DESK_HW_ERR_INVALID_ARG;
+    if (rx->discarding_oversize_frame) {
+        if (byte == 0u) {
+            rx->discarding_oversize_frame = false;
+            rx->length = 0u;
+        }
+        return DESK_HW_ERR_BUSY;
+    }
+    if (byte != 0u) {
+        if (rx->length >= sizeof(rx->wire) - 1u) {
+            rx->length = 0u;
+            rx->discarding_oversize_frame = true;
+            return DESK_HW_ERR_BUSY;
+        }
+        rx->wire[rx->length++] = byte;
+        return DESK_HW_ERR_BUSY;
+    }
+    if (rx->length == 0u) return DESK_HW_ERR_BUSY;
+    rx->wire[rx->length++] = 0u;
+    int result = desk_watcher_motion_parse_hello_rsp(rx->wire, rx->length, out);
+    rx->length = 0u;
+    return result;
 }
 
 int desk_watcher_motion_parse_ack(const uint8_t *frame, size_t frame_len,
@@ -620,8 +648,7 @@ int desk_watcher_motion_probe(desk_watcher_motion_peer_info_t *out, uint32_t tim
     }
 
     int64_t deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
-    uint8_t rx[160];
-    size_t rx_len = 0;
+    desk_watcher_motion_hello_rx_t rx = {0};
     int result = DESK_HW_ERR_TIMEOUT;
     while (esp_timer_get_time() < deadline_us) {
         uint8_t byte = 0;
@@ -633,15 +660,15 @@ int desk_watcher_motion_probe(desk_watcher_motion_peer_info_t *out, uint32_t tim
         int received = uart_read_bytes(UART_NUM_2, &byte, 1, wait_ticks);
         if (received <= 0) continue;
         atomic_fetch_add_explicit(&s_diag_rx_bytes, (uint32_t)received, memory_order_relaxed);
+        result = desk_watcher_motion_hello_rx_feed(&rx, byte, out);
+        if (result == DESK_HW_OK) break;
         if (byte == 0u) {
-            if (rx_len == sizeof(rx)) rx_len = 0;
-            rx[rx_len++] = 0u;
-            result = desk_watcher_motion_parse_hello_rsp(rx, rx_len, seq, out);
-            break;
+            atomic_fetch_add_explicit(&s_diag_hello_ignored_count, 1U, memory_order_relaxed);
+            atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_INVALID_RESPONSE,
+                                  memory_order_relaxed);
         }
-        if (rx_len < sizeof(rx) - 1u) rx[rx_len++] = byte;
-        else rx_len = 0;
     }
+    if (result != DESK_HW_OK) result = DESK_HW_ERR_TIMEOUT;
     atomic_store_explicit(&s_diag_last_error,
                           result == DESK_HW_OK ? DESK_WATCHER_MOTION_ERROR_NONE :
                           result == DESK_HW_ERR_TIMEOUT ? DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT :
@@ -668,5 +695,6 @@ void desk_watcher_motion_get_diagnostics(desk_watcher_motion_diagnostics_t *out)
     out->wrong_sequence_count = atomic_load_explicit(&s_diag_wrong_sequence_count, memory_order_relaxed);
     out->timeout_count = atomic_load_explicit(&s_diag_timeout_count, memory_order_relaxed);
     out->retry_count = atomic_load_explicit(&s_diag_retry_count, memory_order_relaxed);
+    out->hello_ignored_frame_count = atomic_load_explicit(&s_diag_hello_ignored_count, memory_order_relaxed);
     out->last_error = (desk_watcher_motion_error_t)atomic_load_explicit(&s_diag_last_error, memory_order_relaxed);
 }

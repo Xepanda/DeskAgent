@@ -138,16 +138,23 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         class MCUHelloPeerInfo(ctypes.Structure):
             _fields_ = [(name, ctypes.c_uint8) for name in (
                 "fw_major", "fw_minor", "fw_patch", "hw_version",
-                "capability_bitmap", "sensor_bitmap", "default_stream_profile")]
+                "capability_bitmap", "sensor_bitmap", "default_stream_profile")] + [
+                    ("response_seq", ctypes.c_uint32)]
         cls.MCUHelloPeerInfo = MCUHelloPeerInfo
+        class MCUHelloRx(ctypes.Structure):
+            _fields_ = [("wire", ctypes.c_uint8 * 160), ("length", ctypes.c_size_t),
+                        ("discarding_oversize_frame", ctypes.c_bool)]
+        cls.MCUHelloRx = MCUHelloRx
         cls.lib.desk_watcher_motion_pack_hello_req.restype = ctypes.c_int
         cls.lib.desk_watcher_motion_pack_hello_req.argtypes = [
             ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_size_t)]
         cls.lib.desk_watcher_motion_parse_hello_rsp.restype = ctypes.c_int
         cls.lib.desk_watcher_motion_parse_hello_rsp.argtypes = [
-            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint32,
-            ctypes.POINTER(MCUHelloPeerInfo)]
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(MCUHelloPeerInfo)]
+        cls.lib.desk_watcher_motion_hello_rx_feed.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_hello_rx_feed.argtypes = [
+            ctypes.POINTER(MCUHelloRx), ctypes.c_uint8, ctypes.POINTER(MCUHelloPeerInfo)]
 
         # Function bindings
         cls.lib.desk_hardware_init.restype = ctypes.c_int
@@ -400,8 +407,9 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         self.assertEqual(len(raw), 14)
         self.assertEqual(struct.unpack_from("<H", raw, 12)[0], python_crc16_ccitt(raw[:12]))
 
-        payload = bytes([0, 2, 7, 9, 3, 0x21, 0x05, 0, 1])
-        rsp_raw = bytearray([0xA5, 0x5A, 1, 1, 2, 6]) + bytearray(struct.pack("<I", seq))
+        response_seq = 0xAABBCCDD
+        payload = bytes([0, 2, 7, 9, 3, 0x21, 0x05, 0, 7])
+        rsp_raw = bytearray([0xA5, 0x5A, 1, 1, 2, 0]) + bytearray(struct.pack("<I", response_seq))
         rsp_raw.extend(struct.pack("<H", len(payload)))
         rsp_raw.extend(payload)
         rsp_raw.extend(struct.pack("<H", python_crc16_ccitt(rsp_raw)))
@@ -409,14 +417,39 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         frame = (ctypes.c_uint8 * len(rsp_wire)).from_buffer_copy(rsp_wire)
         info = self.MCUHelloPeerInfo()
         parse = self.lib.desk_watcher_motion_parse_hello_rsp
-        self.assertEqual(parse(frame, len(rsp_wire), seq, ctypes.byref(info)), DESK_HW_OK)
+        self.assertEqual(parse(frame, len(rsp_wire), ctypes.byref(info)), DESK_HW_OK)
         self.assertEqual((info.fw_major, info.fw_minor, info.fw_patch, info.hw_version), (2, 7, 9, 3))
-        self.assertEqual((info.capability_bitmap, info.sensor_bitmap, info.default_stream_profile), (0x21, 0x05, 1))
-        self.assertNotEqual(parse(frame, len(rsp_wire), seq + 1, ctypes.byref(info)), DESK_HW_OK)
+        self.assertEqual((info.capability_bitmap, info.sensor_bitmap, info.default_stream_profile), (0x21, 0x05, 7))
+        self.assertEqual(info.response_seq, response_seq)
         corrupt_wire = bytearray(rsp_wire)
         corrupt_wire[-3] ^= 1
         corrupt = (ctypes.c_uint8 * len(corrupt_wire)).from_buffer_copy(corrupt_wire)
-        self.assertNotEqual(parse(corrupt, len(corrupt_wire), seq, ctypes.byref(info)), DESK_HW_OK)
+        self.assertNotEqual(parse(corrupt, len(corrupt_wire), ctypes.byref(info)), DESK_HW_OK)
+
+        ack_payload = bytes([0, 0, 0, 0, 0, 0])
+        ack_raw = bytearray([0xA5, 0x5A, 1, 1, 4, 2]) + bytearray(struct.pack("<I", 55))
+        ack_raw.extend(struct.pack("<H", len(ack_payload)))
+        ack_raw.extend(ack_payload)
+        ack_raw.extend(struct.pack("<H", python_crc16_ccitt(ack_raw)))
+        ack_wire = self._cobs_encode(bytes(ack_raw)) + b"\x00"
+        rx = self.MCUHelloRx()
+        feed = self.lib.desk_watcher_motion_hello_rx_feed
+        for byte in ack_wire:
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_ERR_BUSY)
+        for byte in rsp_wire:
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_OK)
+        self.assertEqual(info.response_seq, response_seq)
+
+        rx = self.MCUHelloRx()
+        for byte in bytes([0x55] * 200 + [0]):
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_ERR_BUSY)
+        self.assertFalse(rx.discarding_oversize_frame)
+        for byte in rsp_wire:
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_OK)
 
     @staticmethod
     def _cobs_encode(raw: bytes) -> bytes:

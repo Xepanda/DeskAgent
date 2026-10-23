@@ -515,7 +515,8 @@ static void cmd_body(int argc, char *argv[])
         desk_watcher_motion_peer_info_t peer = {0};
         int rc = desk_watcher_motion_probe(&peer, 1000U);
         if (rc == DESK_HW_OK) {
-            printf("STM32 HELLO valid: fw=%u.%u.%u hw=%u caps=0x%02x sensors=0x%02x stream_profile=%u\r\n",
+            printf("STM32 HELLO valid: response_seq=%08lx fw=%u.%u.%u hw=%u caps=0x%02x sensors=0x%02x stream_profile=%u\r\n",
+                   (unsigned long)peer.response_seq,
                    (unsigned)peer.fw_major, (unsigned)peer.fw_minor, (unsigned)peer.fw_patch,
                    (unsigned)peer.hw_version, (unsigned)peer.capability_bitmap,
                    (unsigned)peer.sensor_bitmap, (unsigned)peer.default_stream_profile);
@@ -610,6 +611,8 @@ static void cmd_body(int argc, char *argv[])
         printf("  Timeouts: %lu; retries: %lu; last motion error: %s\r\n",
                (unsigned long)motion_diag.timeout_count, (unsigned long)motion_diag.retry_count,
                cli_motion_error_name(motion_diag.last_error));
+        printf("  Ignored non-HELLO/invalid probe frames: %lu\r\n",
+               (unsigned long)motion_diag.hello_ignored_frame_count);
         printf("  STM32 peer evidence: %s (since boot; no physical position feedback)\r\n",
                motion_diag.ack_count > 0 ? "valid ACK observed" : "no valid ACK observed");
 #else
