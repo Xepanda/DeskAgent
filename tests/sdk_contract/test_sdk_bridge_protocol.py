@@ -2801,6 +2801,46 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(resp.get("error", {}).get("code"), "NO_ACTIVE_LEASE")
         self.assertEqual(resp.get("request_id"), "req-cap-nolease-01")
 
+    def test_official_ws_camera_capture_uses_cli_five_second_budget(self) -> None:
+        """The native C path grants the driver the same 5 s capture budget as CLI."""
+        self.lib.desk_sdk_bridge_set_pairing_code(b"123456")
+        rc, pair_reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0, pair_reply)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+
+        captured: dict[str, int] = {}
+        jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00fixture\xff\xd9"
+
+        @DRIVER_CAMERA_CAPTURE_CB
+        def camera_capture(out_buf, max_len, out_len, timeout_ms):
+            captured["timeout_ms"] = int(timeout_ms)
+            if max_len < len(jpeg):
+                return -1
+            ctypes.memmove(out_buf, jpeg, len(jpeg))
+            out_len[0] = len(jpeg)
+            return DESK_HW_OK
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"camera_budget_test_provider"
+        ops.camera_capture = ctypes.cast(camera_capture, ctypes.c_void_p)
+        self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops)), 0)
+        self._driver_ops_keepalive = [(ops, camera_capture)]
+
+        acquired = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "client_id": "camera-budget-owner",
+            "data": {"client_id": "camera-budget-owner", "lease_duration_ms": 10000},
+        })
+        self.assertEqual(acquired.get("type"), "sys.ack")
+        response = self._process_ws_cmd({
+            "type": "ctrl.camera.capture", "request_id": "req-camera-budget",
+            "client_id": "camera-budget-owner", "data": {},
+        })
+        self.assertEqual(response.get("type"), "sys.ack", response)
+        self.assertEqual(response.get("request_id"), "req-camera-budget")
+        self.assertEqual(captured.get("timeout_ms"), 5000)
+
+
     # ------------------------------------------------------------------
     # WP3 -- TCP stream framing
     # ------------------------------------------------------------------

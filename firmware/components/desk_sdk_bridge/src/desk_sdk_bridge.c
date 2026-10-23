@@ -49,6 +49,7 @@ static char s_ws_camera_owner_id[32];
 #define DESK_CAMERA_STREAM_FPS 15.0f
 #define DESK_CAMERA_STREAM_PERIOD_MS 66U
 #define DESK_CAMERA_STREAM_READY_TIMEOUT_MS 1800U
+#define DESK_CAMERA_CAPTURE_TIMEOUT_MS 5000U
 #define DESK_CAMERA_STREAM_MAX_JPEG (DESK_WSPK_MAX_PAYLOAD_SIZE - 20U)
 
 typedef struct {
@@ -2219,7 +2220,8 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         }
 
         size_t jpeg_len = 0;
-        int cap_rc = desk_hardware_camera_capture_jpeg(jpeg_buf, max_jpeg, &jpeg_len, 1000);
+        int cap_rc = desk_hardware_camera_capture_jpeg(jpeg_buf, max_jpeg, &jpeg_len,
+                                                       DESK_CAMERA_CAPTURE_TIMEOUT_MS);
         if (cap_rc != DESK_HW_OK || jpeg_len == 0) {
             desk_psram_free(jpeg_buf);
             atomic_store(&s_camera_exclusive_state, 0);
