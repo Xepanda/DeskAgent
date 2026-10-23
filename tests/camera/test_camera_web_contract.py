@@ -324,6 +324,61 @@ global.setTimeout = () => 1;
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute browser frame rendering")
+    def test_late_image_load_from_replaced_frame_does_not_update_live_metrics(self) -> None:
+        source = WEB.read_text(encoding="utf-8")
+        script = source.split("<script>", 1)[1].split("</script>", 1)[0]
+        helpers = script[script.index("function hideFrame"):script.index("async function consumeMjpeg")]
+        checks = r'''
+const assert = require("node:assert/strict");
+const nodes = new Map();
+for (const id of ["cameraFrame", "videoPlaceholder", "frameStats", "cameraConnectionStatus"]) {
+  nodes.set(id, { style: {}, innerText: "", removeAttribute() {} });
+}
+const image = nodes.get("cameraFrame");
+global.document = { getElementById: id => nodes.get(id) };
+global.leaseActive = true;
+global.frameExpiryTimer = null;
+global.currentObjectUrl = null;
+global.lastFrameSeq = null;
+global.streamFrameTimes = [];
+global.renderedFrameTimes = [];
+global.pendingRenderMetric = null;
+let now = 0;
+let created = 0;
+global.performance = { now: () => now };
+global.Blob = class { constructor(parts) { this.parts = parts; } };
+global.createImageBitmap = async () => ({ close() {} });
+global.URL = { createObjectURL: () => `blob:${++created}`, revokeObjectURL() {} };
+global.clearTimeout = () => {};
+global.setTimeout = () => 1;
+(async () => {
+  const jpeg = Uint8Array.from([255, 216, 1, 2, 255, 217]);
+  await renderStreamFrame(jpeg, { seq: 10, ageMs: 5, sourceLatencyMs: 50, clockUncertaintyMs: 10 }, 0);
+  const firstLoad = image.onload;
+  await renderStreamFrame(jpeg, { seq: 11, ageMs: 7, sourceLatencyMs: 80, clockUncertaintyMs: 10 }, 0);
+  const currentStats = nodes.get("frameStats").innerText;
+  assert.match(currentStats, /LIVE \| 帧序号: #11 \| 新鲜度: 7 ms/);
+  now = 100;
+  firstLoad();
+  assert.equal(
+    nodes.get("frameStats").innerText,
+    currentStats,
+    "a delayed load event for a replaced image must not publish metrics for the newer image"
+  );
+  image.onload();
+  assert.match(nodes.get("frameStats").innerText, /采集到显示 180 ms/);
+})().catch(err => { console.error(err); process.exitCode = 1; });
+''';
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", helpers + "\n" + checks],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_disconnect_expiry_and_page_exit_clear_or_stop_the_viewer(self) -> None:
         source = WEB.read_text(encoding="utf-8")
         self.assertIn("frameExpiryTimer", source)

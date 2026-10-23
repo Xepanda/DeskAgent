@@ -83,7 +83,6 @@
     let lastFrameSeq = null;
     let streamFrameTimes = [];
     let renderedFrameTimes = [];
-    let pendingRenderMetric = null;
     let currentPan = 90;
     let currentTilt = 120;
 
@@ -293,24 +292,24 @@
       if (!leaseActive || effectiveAgeMs > 1000) return;
       clearTimeout(frameExpiryTimer);
       if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
-      currentObjectUrl = URL.createObjectURL(blob);
+      const objectUrl = URL.createObjectURL(blob);
+      currentObjectUrl = objectUrl;
       const img = document.getElementById("cameraFrame");
-      pendingRenderMetric = { frame, receivedAt };
       img.onload = () => {
-        const metric = pendingRenderMetric;
-        if (!metric) return;
-        pendingRenderMetric = null;
+        // Image load events can be queued while a newer frame replaces the
+        // source. Only the currently displayed URL may update live metrics.
+        if (!leaseActive || currentObjectUrl !== objectUrl) return;
         const now = performance.now();
         renderedFrameTimes.push(now);
-        const loadedFrame = metric.frame;
+        const loadedFrame = frame;
         const uncertainty = loadedFrame.clockUncertaintyMs;
         const latency = Number.isFinite(loadedFrame.sourceLatencyMs) && Number.isFinite(uncertainty) && uncertainty <= 100
-          ? Math.max(0, loadedFrame.sourceLatencyMs + (now - metric.receivedAt))
+          ? Math.max(0, loadedFrame.sourceLatencyMs + (now - receivedAt))
           : null;
         const latencyText = latency === null ? "未知（时钟不确定度 >100 ms 或缺少同步 metadata）" : `${Math.round(latency)} ms`;
         document.getElementById("frameStats").innerText = `LIVE | 接收 ${rollingFps(streamFrameTimes, now).toFixed(1)} FPS | 渲染 ${rollingFps(renderedFrameTimes, now).toFixed(1)} FPS | 帧 #${loadedFrame.deviceSeq || loadedFrame.seq} | 采集到显示 ${latencyText}`;
       };
-      img.src = currentObjectUrl;
+      img.src = objectUrl;
       img.style.display = "block";
       document.getElementById("videoPlaceholder").style.display = "none";
       lastFrameSeq = displaySeq;
