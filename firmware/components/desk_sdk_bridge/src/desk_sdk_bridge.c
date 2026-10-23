@@ -35,6 +35,82 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+static pthread_mutex_t s_ws_camera_owner_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char s_ws_camera_owner_id[32];
+
+#define DESK_CAMERA_STREAM_FPS 15.0f
+#define DESK_CAMERA_STREAM_PERIOD_MS 66U
+#define DESK_CAMERA_STREAM_READY_TIMEOUT_MS 1800U
+#define DESK_CAMERA_STREAM_MAX_JPEG (DESK_WSPK_MAX_PAYLOAD_SIZE - 20U)
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    bool active;
+    bool starting;
+    bool stop_requested;
+    bool external_join;
+    bool ready;
+    bool ack_sent;
+    bool producer_failed;
+    bool thread_started;
+    bool cleanup_in_progress;
+    pthread_t thread;
+    uint16_t stream_id;
+    uint16_t last_stopped_stream_id;
+    uint32_t sequence;
+    uint32_t last_timestamp_ms;
+    uint64_t next_capture_ms;
+    char client_id[32];
+    char session_id[65];
+    char last_client_id[32];
+    char last_session_id[65];
+    uint8_t *frame_slot;
+    size_t frame_len;
+    uint32_t source_drop_count;
+    uint32_t transport_drop_count;
+} desk_camera_stream_state_t;
+
+static desk_camera_stream_state_t s_camera_stream = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .changed = PTHREAD_COND_INITIALIZER,
+};
+static uint16_t s_camera_stream_id_seed;
+static atomic_int s_camera_exclusive_state = ATOMIC_VAR_INIT(0); /* 0 idle, 1 capture, 2 stream */
+static int desk_sdk_camera_stream_stop_internal(bool from_worker);
+static bool desk_sdk_camera_stream_available(void);
+static bool desk_sdk_log_command_id_valid(const char *id);
+static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed,
+                                         size_t allowed_count);
+
+static uint64_t desk_sdk_camera_worker_now_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)now.tv_nsec / 1000000ULL;
+}
+
+#ifdef DESK_SDK_TESTING
+static bool s_test_camera_stream_available;
+static int (*s_test_camera_binary_send_hook)(const char *, size_t);
+void desk_sdk_test_camera_stream_set_available(bool available) { s_test_camera_stream_available = available; }
+void desk_sdk_test_camera_binary_send_set_hook(int (*hook)(const char *, size_t)) { s_test_camera_binary_send_hook = hook; }
+uint32_t desk_sdk_test_camera_stream_transport_drop_count(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    uint32_t count = s_camera_stream.transport_drop_count;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    return count;
+}
+uint32_t desk_sdk_test_camera_stream_source_drop_count(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    uint32_t count = s_camera_stream.source_drop_count;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    return count;
+}
+#endif
+
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
@@ -1551,6 +1627,22 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         }
     }
 
+    /* Live camera controls are intentionally unavailable on the legacy TCP
+     * command path. They require an authenticated, identity-bound WebSocket
+     * session; the current protocol exposes no trusted client/session binding. */
+    if (strcmp(msg_type, "ctrl.camera.stream.start") == 0 ||
+        strcmp(msg_type, "ctrl.camera.stream.stop") == 0 ||
+        strcmp(msg_type, "ctrl.camera.clock.ping") == 0) {
+        char rid_scratch[128];
+        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                 "\"code\":\"WEBSOCKET_SESSION_REQUIRED\","
+                 "\"message\":\"Camera stream controls require the authenticated WebSocket session\"}}",
+                 rid);
+        return 0;
+    }
+
     /* Handshake: sys.client.hello */
     if (strcmp(msg_type, "sys.client.hello") == 0) {
         char provided_token[128] = "";
@@ -1597,17 +1689,22 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         }
 
         /* Standard SDK / desktop hello response */
-        snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
-                 "\"role\":\"device\","
-                 "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                 DESK_SDK_CAP_MOTION,
-                 DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_EXPRESSION_ALT,
-                 DESK_SDK_CAP_MCP_TOOLS,
-                 DESK_SDK_CAP_INPUTS);
+        if (desk_sdk_camera_stream_available()) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
+                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
+                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                     DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
+                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS,
+                     DESK_SDK_CAP_INPUTS, DESK_SDK_CAP_CAMERA_STREAM);
+        } else {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
+                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
+                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                     DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
+                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS, DESK_SDK_CAP_INPUTS);
+        }
         return 0;
     }
 
@@ -1615,18 +1712,22 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     else if (strcmp(msg_type, "sys.sdk.ready.get") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
-        snprintf(out_buf, max_out_len,
-                 "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
-                 "\"role\":\"device\","
-                 "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                 rid,
-                 DESK_SDK_CAP_MOTION,
-                 DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_EXPRESSION_ALT,
-                 DESK_SDK_CAP_MCP_TOOLS,
-                 DESK_SDK_CAP_INPUTS);
+        if (desk_sdk_camera_stream_available()) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
+                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
+                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                     rid, DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
+                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS,
+                     DESK_SDK_CAP_INPUTS, DESK_SDK_CAP_CAMERA_STREAM);
+        } else {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
+                     "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":["
+                     "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
+                     rid, DESK_SDK_CAP_MOTION, DESK_SDK_CAP_CAMERA, DESK_SDK_CAP_EXPRESSION,
+                     DESK_SDK_CAP_EXPRESSION_ALT, DESK_SDK_CAP_MCP_TOOLS, DESK_SDK_CAP_INPUTS);
+        }
         return 0;
     }
 
@@ -1817,9 +1918,18 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                      rid);
             return 0;
         }
+        int idle = 0;
+        if (!atomic_compare_exchange_strong(&s_camera_exclusive_state, &idle, 1)) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
+                     "\"code\":\"RESOURCE_BUSY\",\"message\":\"Camera is owned by an active capture or stream\"}}",
+                     rid);
+            return 0;
+        }
         size_t max_jpeg = 65536;
         uint8_t *jpeg_buf = (uint8_t *)desk_psram_malloc(max_jpeg);
         if (!jpeg_buf) {
+            atomic_store(&s_camera_exclusive_state, 0);
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.nack\",%s\"code\":500,\"error\":{"
                      "\"code\":\"OUT_OF_MEMORY\","
@@ -1832,6 +1942,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         int cap_rc = desk_hardware_camera_capture_jpeg(jpeg_buf, max_jpeg, &jpeg_len, 1000);
         if (cap_rc != DESK_HW_OK || jpeg_len == 0) {
             desk_psram_free(jpeg_buf);
+            atomic_store(&s_camera_exclusive_state, 0);
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
                      "\"code\":\"RESOURCE_BUSY\","
@@ -1852,6 +1963,7 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         desk_sdk_bridge_send_media_frame(DESK_WSPK_TYPE_IMAGE, 0, s_camera_session_id, s_camera_seq,
                                          jpeg_buf, jpeg_len);
         desk_psram_free(jpeg_buf);
+        atomic_store(&s_camera_exclusive_state, 0);
         return 0;
     }
 
@@ -2019,6 +2131,455 @@ static bool desk_sdk_log_pairing_is_complete(void)
                s_pair_host[0] != '\0' && s_pair_websocket_port != 0;
     pthread_mutex_unlock(&s_pairing_code_mutex);
     return complete;
+}
+
+/* Camera ownership is scoped to the one paired Runtime connection. A valid
+ * pairing token plus the WebSocket HardwareHello ACK latch is the identity
+ * boundary; host/port are connection setup details, not additional auth. */
+static bool desk_sdk_camera_ws_session_is_paired(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    bool paired = s_paired && desk_sdk_is_lower_hex_32(s_pair_request_id) &&
+                  desk_sdk_is_lower_hex_32(s_pair_daemon_instance_id) &&
+                  desk_sdk_is_lower_hex_64(s_active_pairing_token);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return paired && desk_sdk_ws_client_is_authenticated();
+}
+
+void desk_sdk_bridge_camera_session_closed(void)
+{
+    pthread_mutex_lock(&s_ws_camera_owner_mutex);
+    s_ws_camera_owner_id[0] = '\0';
+    pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+    (void)desk_sdk_camera_stream_stop_internal(false);
+}
+
+static bool desk_sdk_camera_stream_available(void)
+{
+#ifdef DESK_SDK_TESTING
+    if (s_test_camera_stream_available) return true;
+#endif
+    return desk_hardware_camera_stream_is_available();
+}
+
+static bool desk_sdk_camera_jpeg_dimensions(const uint8_t *jpeg, size_t len,
+                                            uint16_t *width, uint16_t *height)
+{
+    if (!jpeg || !width || !height || len < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 ||
+        jpeg[len - 2] != 0xFF || jpeg[len - 1] != 0xD9) return false;
+    size_t pos = 2;
+    while (pos + 4 <= len - 2) {
+        if (jpeg[pos++] != 0xFF) return false;
+        while (pos < len && jpeg[pos] == 0xFF) ++pos;
+        if (pos >= len) return false;
+        uint8_t marker = jpeg[pos++];
+        if (marker == 0xD9 || marker == 0xDA) break;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+        if (pos + 2 > len) return false;
+        size_t segment_len = ((size_t)jpeg[pos] << 8) | jpeg[pos + 1];
+        if (segment_len < 2 || segment_len > len - pos) return false;
+        bool sof = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+                   marker != 0xC8 && marker != 0xCC;
+        if (sof) {
+            if (segment_len < 8) return false;
+            *height = (uint16_t)(((uint16_t)jpeg[pos + 3] << 8) | jpeg[pos + 4]);
+            *width = (uint16_t)(((uint16_t)jpeg[pos + 5] << 8) | jpeg[pos + 6]);
+            return *width && *height;
+        }
+        pos += segment_len;
+    }
+    return false;
+}
+
+static void desk_sdk_camera_stream_finalize(void)
+{
+    uint8_t *slot = NULL;
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    slot = s_camera_stream.frame_slot;
+    s_camera_stream.frame_slot = NULL;
+    s_camera_stream.frame_len = 0;
+    s_camera_stream.active = false;
+    s_camera_stream.starting = false;
+    s_camera_stream.stop_requested = false;
+    s_camera_stream.ready = false;
+    s_camera_stream.ack_sent = false;
+    s_camera_stream.producer_failed = false;
+    s_camera_stream.thread_started = false;
+    s_camera_stream.stream_id = 0;
+    s_camera_stream.client_id[0] = '\0';
+    s_camera_stream.session_id[0] = '\0';
+    s_camera_stream.external_join = false;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    if (slot) desk_psram_free(slot);
+    atomic_store(&s_camera_exclusive_state, 0);
+}
+
+static void desk_sdk_camera_stream_frame_cb(const uint8_t *jpeg, size_t jpeg_len,
+                                            uint32_t timestamp_ms, void *user_data)
+{
+    (void)user_data;
+    uint16_t width = 0, height = 0;
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    bool acceptable = (s_camera_stream.active || s_camera_stream.starting) &&
+                      !s_camera_stream.stop_requested && s_camera_stream.frame_slot &&
+                      jpeg_len <= DESK_CAMERA_STREAM_MAX_JPEG &&
+                      desk_sdk_camera_jpeg_dimensions(jpeg, jpeg_len, &width, &height) &&
+                      width == 640 && height == 480 &&
+                      (!s_camera_stream.last_timestamp_ms ||
+                       (int32_t)(timestamp_ms - s_camera_stream.last_timestamp_ms) > 0);
+    if (acceptable) {
+        if (s_camera_stream.ready && !s_camera_stream.ack_sent)
+            ++s_camera_stream.source_drop_count;
+        uint32_t sequence = s_camera_stream.sequence + 1U;
+        size_t wjpg_len = 0;
+        int rc = desk_sdk_bridge_pack_wjpg_v1(sequence, timestamp_ms, jpeg, jpeg_len,
+            s_camera_stream.frame_slot + DESK_WSPK_HEADER_SIZE,
+            DESK_WSPK_MAX_PAYLOAD_SIZE - DESK_WSPK_HEADER_SIZE, &wjpg_len);
+        if (rc == 0) rc = desk_wspk_pack_header(DESK_WSPK_TYPE_IMAGE, 0,
+            s_camera_stream.stream_id, sequence, (uint32_t)wjpg_len,
+            s_camera_stream.frame_slot, DESK_WSPK_HEADER_SIZE);
+        if (rc == 0) {
+            s_camera_stream.sequence = sequence;
+            s_camera_stream.last_timestamp_ms = timestamp_ms;
+            s_camera_stream.frame_len = DESK_WSPK_HEADER_SIZE + wjpg_len;
+            s_camera_stream.ready = true;
+            pthread_cond_broadcast(&s_camera_stream.changed);
+        } else ++s_camera_stream.source_drop_count;
+    } else if (s_camera_stream.active || s_camera_stream.starting) {
+        ++s_camera_stream.source_drop_count;
+    }
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+}
+
+static int desk_sdk_camera_stream_send_binary(const uint8_t *frame, size_t len)
+{
+#ifdef DESK_SDK_TESTING
+    if (s_test_camera_binary_send_hook)
+        return s_test_camera_binary_send_hook((const char *)frame, len);
+#endif
+    return desk_sdk_ws_client_send_binary(frame, len);
+}
+
+static int desk_sdk_camera_stream_stop_internal(bool from_worker)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    while (s_camera_stream.cleanup_in_progress)
+        pthread_cond_wait(&s_camera_stream.changed, &s_camera_stream.mutex);
+    if (!s_camera_stream.frame_slot && !s_camera_stream.thread_started) {
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        return DESK_HW_OK;
+    }
+    s_camera_stream.stop_requested = true;
+    s_camera_stream.active = false;
+    s_camera_stream.starting = false;
+    bool had_thread = s_camera_stream.thread_started;
+    bool self = had_thread && pthread_equal(pthread_self(), s_camera_stream.thread);
+    bool join = s_camera_stream.thread_started && !from_worker && !self;
+    pthread_t thread = s_camera_stream.thread;
+    if (join) s_camera_stream.external_join = true;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+
+    if (join) {
+        (void)pthread_join(thread, NULL);
+        int stop_rc = desk_hardware_camera_stream_stop();
+        desk_sdk_camera_stream_finalize();
+        return stop_rc;
+    }
+    if (self) return DESK_HW_OK;
+    if (!had_thread) {
+        int stop_rc = desk_hardware_camera_stream_stop();
+        desk_sdk_camera_stream_finalize();
+        return stop_rc;
+    }
+    return DESK_HW_OK;
+}
+
+static void *desk_sdk_camera_stream_worker(void *unused)
+{
+    (void)unused;
+    bool failed = false;
+    for (;;) {
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        bool stop = s_camera_stream.stop_requested;
+        char client_id[sizeof(s_camera_stream.client_id)];
+        memcpy(client_id, s_camera_stream.client_id, sizeof(client_id));
+        uint64_t next_ms = s_camera_stream.next_capture_ms;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (stop) break;
+        if (!desk_sdk_camera_ws_session_is_paired() || !desk_arbiter_camera_lease_matches(client_id)) {
+            pthread_mutex_lock(&s_ws_camera_owner_mutex);
+            if (strcmp(s_ws_camera_owner_id, client_id) == 0) s_ws_camera_owner_id[0] = '\0';
+            pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+            failed = true;
+            break;
+        }
+
+        uint64_t now_ms = desk_sdk_camera_worker_now_ms();
+        if (!now_ms) { failed = true; break; }
+        if (!next_ms || now_ms >= next_ms) {
+            int pump_rc = desk_hardware_camera_stream_pump();
+            pthread_mutex_lock(&s_camera_stream.mutex);
+            now_ms = desk_sdk_camera_worker_now_ms();
+            s_camera_stream.next_capture_ms = now_ms + DESK_CAMERA_STREAM_PERIOD_MS;
+            bool may_send = pump_rc == DESK_HW_OK && s_camera_stream.active &&
+                            s_camera_stream.ack_sent && s_camera_stream.ready &&
+                            !s_camera_stream.stop_requested && s_camera_stream.frame_slot;
+            uint8_t *frame = s_camera_stream.frame_slot;
+            size_t frame_len = s_camera_stream.frame_len;
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            if (may_send) {
+                int send_rc = desk_sdk_camera_stream_send_binary(frame, frame_len);
+                if (send_rc == -3) {
+                    pthread_mutex_lock(&s_camera_stream.mutex);
+                    ++s_camera_stream.transport_drop_count;
+                    pthread_mutex_unlock(&s_camera_stream.mutex);
+                } else if (send_rc != 0) { failed = true; break; }
+            }
+            if (pump_rc != DESK_HW_OK && pump_rc != DESK_HW_ERR_BUSY) {
+                failed = true;
+                break;
+            }
+        }
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 5000000L };
+        nanosleep(&pause, NULL);
+    }
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    s_camera_stream.stop_requested = true;
+    s_camera_stream.producer_failed = failed;
+    bool external_join = s_camera_stream.external_join;
+    if (!external_join) s_camera_stream.cleanup_in_progress = true;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    if (!external_join) {
+        (void)desk_hardware_camera_stream_stop();
+        (void)pthread_detach(pthread_self());
+        desk_sdk_camera_stream_finalize();
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        s_camera_stream.cleanup_in_progress = false;
+        pthread_cond_broadcast(&s_camera_stream.changed);
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+    }
+    return NULL;
+}
+
+void desk_sdk_bridge_camera_start_ack_sent(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    if (s_camera_stream.active && s_camera_stream.ready)
+        s_camera_stream.ack_sent = true;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+}
+
+bool desk_sdk_bridge_camera_stream_is_active(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    bool active = s_camera_stream.active || s_camera_stream.starting;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    return active;
+}
+
+static int desk_sdk_camera_stream_reply(char *out, size_t cap, const char *json,
+                                        const char *type, const char *command_id,
+                                        const char *error, int code,
+                                        uint16_t stream_id, uint32_t device_ms,
+                                        bool ack)
+{
+    char rid_scratch[128];
+    const char *rid = desk_sdk_request_id_fragment(json, rid_scratch, sizeof(rid_scratch));
+    int n;
+    if (ack) {
+        n = snprintf(out, cap,
+            "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"type\":\"%s\",\"command_id\":\"%s\","
+            "\"stream_id\":%u,\"device_monotonic_ms\":%u}}",
+            rid, type, command_id, (unsigned)stream_id, (unsigned)device_ms);
+    } else {
+        n = snprintf(out, cap,
+            "{\"type\":\"sys.nack\",%s\"code\":%d,\"error\":{\"code\":\"%s\","
+            "\"message\":\"Camera stream control rejected\"},\"data\":{\"command_id\":\"%s\"}}",
+            rid, code, error, command_id ? command_id : "");
+    }
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int desk_sdk_camera_stream_command(const char *json, char *out, size_t cap,
+                                          const char *type)
+{
+    char command_id[40] = "", client_id[32] = "", session_id[65] = "";
+    char data[512] = "";
+    (void)json_parse_top_level_str(json, "command_id", command_id, sizeof(command_id));
+    (void)json_parse_top_level_str(json, "client_id", client_id, sizeof(client_id));
+    (void)json_parse_top_level_str(json, "session_id", session_id, sizeof(session_id));
+    if (!desk_sdk_log_command_id_valid(command_id) || client_id[0] == '\0' || session_id[0] == '\0' ||
+        !json_extract_subobject(json, "data", data, sizeof(data)))
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "INVALID_ARGUMENT", 400, 0, 0, false);
+
+    if (!desk_sdk_camera_ws_session_is_paired())
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "AUTH_REQUIRED", 403, 0, 0, false);
+    pthread_mutex_lock(&s_ws_camera_owner_mutex);
+    bool bound_owner = strcmp(client_id, s_ws_camera_owner_id) == 0;
+    pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+    if (!bound_owner || !desk_arbiter_camera_lease_matches(client_id))
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "NO_ACTIVE_LEASE", 403, 0, 0, false);
+
+    if (strcmp(type, "ctrl.camera.stream.start") == 0) {
+        static const char *const keys[] = { "width", "height", "target_fps" };
+        if (!desk_log_object_keys_allowed(data, keys, 3) ||
+            json_parse_int(data, "width", -1) != 640 ||
+            json_parse_int(data, "height", -1) != 480 ||
+            json_parse_int(data, "target_fps", -1) != 15)
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "UNSUPPORTED_FORMAT", 400, 0, 0, false);
+        if (!desk_sdk_camera_stream_available())
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_STREAM_UNAVAILABLE", 503, 0, 0, false);
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        if (s_camera_stream.active && strcmp(client_id, s_camera_stream.client_id) == 0 &&
+            strcmp(session_id, s_camera_stream.session_id) == 0) {
+            uint16_t sid = s_camera_stream.stream_id;
+            uint64_t now = 0;
+            (void)desk_sdk_monotonic_now_ms(&now);
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                NULL, 0, sid, (uint32_t)now, true);
+        }
+        if (s_camera_stream.active || s_camera_stream.starting || s_camera_stream.thread_started) {
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "RESOURCE_BUSY", 409, 0, 0, false);
+        }
+        int idle = 0;
+        if (!atomic_compare_exchange_strong(&s_camera_exclusive_state, &idle, 2)) {
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "RESOURCE_BUSY", 409, 0, 0, false);
+        }
+        uint16_t stream_id = ++s_camera_stream_id_seed;
+        if (!stream_id) stream_id = ++s_camera_stream_id_seed;
+        size_t slot_len = DESK_WSPK_HEADER_SIZE + DESK_WSPK_MAX_PAYLOAD_SIZE;
+        uint8_t *slot = (uint8_t *)desk_psram_malloc(slot_len);
+        if (!slot) {
+            atomic_store(&s_camera_exclusive_state, 0);
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "OUT_OF_MEMORY", 500, 0, 0, false);
+        }
+        s_camera_stream.frame_slot = slot;
+        s_camera_stream.frame_len = 0;
+        s_camera_stream.stream_id = stream_id;
+        s_camera_stream.sequence = 0;
+        s_camera_stream.last_timestamp_ms = 0;
+        s_camera_stream.ready = false;
+        s_camera_stream.ack_sent = false;
+        s_camera_stream.producer_failed = false;
+        s_camera_stream.source_drop_count = 0;
+        s_camera_stream.transport_drop_count = 0;
+        s_camera_stream.active = false;
+        s_camera_stream.starting = true;
+        s_camera_stream.stop_requested = false;
+        s_camera_stream.external_join = false;
+        snprintf(s_camera_stream.client_id, sizeof(s_camera_stream.client_id), "%s", client_id);
+        snprintf(s_camera_stream.session_id, sizeof(s_camera_stream.session_id), "%s", session_id);
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+
+        int start_rc = desk_hardware_camera_stream_start(client_id, DESK_CAMERA_STREAM_FPS,
+                                                          desk_sdk_camera_stream_frame_cb, NULL);
+        if (start_rc != DESK_HW_OK) {
+            desk_sdk_camera_stream_finalize();
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_START_FAILED", 503, 0, 0, false);
+        }
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        s_camera_stream.active = true;
+        s_camera_stream.starting = false;
+        s_camera_stream.thread_started = true;
+        if (pthread_create(&s_camera_stream.thread, NULL, desk_sdk_camera_stream_worker, NULL) != 0) {
+            s_camera_stream.thread_started = false;
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            (void)desk_hardware_camera_stream_stop();
+            desk_sdk_camera_stream_finalize();
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_START_FAILED", 503, 0, 0, false);
+        }
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += (long)DESK_CAMERA_STREAM_READY_TIMEOUT_MS * 1000000L;
+        until.tv_sec += until.tv_nsec / 1000000000L;
+        until.tv_nsec %= 1000000000L;
+        int wait_rc = 0;
+        while (!s_camera_stream.ready && !s_camera_stream.stop_requested &&
+               !s_camera_stream.producer_failed && wait_rc == 0)
+            wait_rc = pthread_cond_timedwait(&s_camera_stream.changed, &s_camera_stream.mutex, &until);
+        bool ready = s_camera_stream.ready && !s_camera_stream.stop_requested &&
+                     !s_camera_stream.producer_failed;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (!ready) {
+            (void)desk_sdk_camera_stream_stop_internal(false);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_NOT_READY", 503, 0, 0, false);
+        }
+        uint64_t now = 0;
+        (void)desk_sdk_monotonic_now_ms(&now);
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            NULL, 0, stream_id, (uint32_t)now, true);
+    }
+
+    if (strcmp(type, "ctrl.camera.stream.stop") == 0) {
+        int32_t stream_id = json_parse_int(data, "stream_id", -1);
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        bool match = stream_id > 0 && s_camera_stream.active &&
+                     (uint16_t)stream_id == s_camera_stream.stream_id &&
+                     strcmp(client_id, s_camera_stream.client_id) == 0 &&
+                     strcmp(session_id, s_camera_stream.session_id) == 0;
+        bool repeated = stream_id > 0 && (uint16_t)stream_id == s_camera_stream.last_stopped_stream_id &&
+                        strcmp(client_id, s_camera_stream.last_client_id) == 0 &&
+                        strcmp(session_id, s_camera_stream.last_session_id) == 0;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (repeated) return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                         NULL, 0, (uint16_t)stream_id, 0, true);
+        if (!match) return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                        "INVALID_SESSION", 404, 0, 0, false);
+        if (desk_sdk_camera_stream_stop_internal(false) != DESK_HW_OK)
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_STOP_FAILED", 500, 0, 0, false);
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        s_camera_stream.last_stopped_stream_id = (uint16_t)stream_id;
+        snprintf(s_camera_stream.last_client_id, sizeof(s_camera_stream.last_client_id), "%s", client_id);
+        snprintf(s_camera_stream.last_session_id, sizeof(s_camera_stream.last_session_id), "%s", session_id);
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            NULL, 0, (uint16_t)stream_id, 0, true);
+    }
+
+    static const char *const ping_keys[] = { "ping_id", "host_send_monotonic_ms" };
+    if (!desk_log_object_keys_allowed(data, ping_keys, 2))
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "INVALID_ARGUMENT", 400, 0, 0, false);
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    bool active = s_camera_stream.active && strcmp(client_id, s_camera_stream.client_id) == 0 &&
+                  strcmp(session_id, s_camera_stream.session_id) == 0;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    int32_t ping_id = json_parse_int(data, "ping_id", -1);
+    int32_t host_send = json_parse_int(data, "host_send_monotonic_ms", -1);
+    if (!active || ping_id < 0 || host_send < 0)
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            active ? "INVALID_ARGUMENT" : "INVALID_SESSION", 400, 0, 0, false);
+    uint64_t receive_ms = 0, send_ms = 0;
+    (void)desk_sdk_monotonic_now_ms(&receive_ms);
+    (void)desk_sdk_monotonic_now_ms(&send_ms);
+    char rid_scratch[128];
+    const char *rid = desk_sdk_request_id_fragment(json, rid_scratch, sizeof(rid_scratch));
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"type\":\"%s\",\"command_id\":\"%s\","
+        "\"ping_id\":%d,\"host_send_monotonic_ms\":%u,\"device_receive_monotonic_ms\":%u,\"device_send_monotonic_ms\":%u}}",
+        rid, type, command_id, (int)ping_id, (uint32_t)host_send,
+        (uint32_t)receive_ms, (uint32_t)send_ms);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
 }
 
 static int desk_sdk_log_nack(char *out, size_t cap, const char *type,
@@ -2637,6 +3198,66 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
     if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1) return -1;
     char type[64] = "";
     if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "ctrl.camera.stream.start") == 0 ||
+        strcmp(type, "ctrl.camera.stream.stop") == 0 ||
+        strcmp(type, "ctrl.camera.clock.ping") == 0) {
+        return desk_sdk_camera_stream_command(json_in, out_buf, max_out_len, type);
+    }
+    if (strcmp(type, "ctrl.camera.acquire") == 0 || strcmp(type, "camera.acquire") == 0) {
+        if (!desk_sdk_camera_ws_session_is_paired()) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                     "\"code\":\"AUTH_REQUIRED\",\"message\":\"Camera lease requires paired WebSocket\"}}", rid);
+            return 0;
+        }
+        int rc = desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
+        if (rc == 0 && strstr(out_buf, "\"type\":\"sys.ack\"")) {
+            char client_id[32] = "";
+            if (json_parse_top_level_str(json_in, "client_id", client_id, sizeof(client_id)) && client_id[0] &&
+                desk_arbiter_camera_lease_matches(client_id)) {
+                pthread_mutex_lock(&s_ws_camera_owner_mutex);
+                snprintf(s_ws_camera_owner_id, sizeof(s_ws_camera_owner_id), "%s", client_id);
+                pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+            }
+        }
+        return rc;
+    }
+    if (strcmp(type, "ctrl.camera.release") == 0 || strcmp(type, "camera.release") == 0) {
+        char client_id[32] = "";
+        (void)json_parse_top_level_str(json_in, "client_id", client_id, sizeof(client_id));
+        pthread_mutex_lock(&s_ws_camera_owner_mutex);
+        bool owner_matches = client_id[0] && strcmp(client_id, s_ws_camera_owner_id) == 0;
+        pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+        if (!desk_sdk_camera_ws_session_is_paired() || !owner_matches) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                     "\"code\":\"NO_ACTIVE_LEASE\",\"message\":\"Paired WebSocket does not own this lease\"}}", rid);
+            return 0;
+        }
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        bool stream_owned = s_camera_stream.active &&
+                            strcmp(client_id, s_camera_stream.client_id) == 0;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (stream_owned && desk_sdk_camera_stream_stop_internal(false) != DESK_HW_OK) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":500,\"error\":{"
+                     "\"code\":\"CAMERA_STOP_FAILED\",\"message\":\"Camera stream could not be stopped\"}}", rid);
+            return 0;
+        }
+        int rc = desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
+        if (rc == 0 && strstr(out_buf, "\"type\":\"sys.ack\"")) {
+            pthread_mutex_lock(&s_ws_camera_owner_mutex);
+            s_ws_camera_owner_id[0] = '\0';
+            pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+        }
+        return rc;
+    }
     if (strcmp(type, "notification.summary.deliver") == 0)
         return desk_sdk_notification_summary_dispatch(json_in, out_buf, max_out_len);
     if (!desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;

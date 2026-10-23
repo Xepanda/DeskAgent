@@ -95,6 +95,7 @@ typedef struct {
     uint8_t opcode;
     uint32_t generation;
     bool close_after_send;
+    bool camera_start_ack;
     size_t len;
     uint8_t payload[WS_CONTROL_FRAME_MAX];
 } ws_outbound_frame_t;
@@ -181,6 +182,8 @@ static void *ws_writer_main(void *unused)
             } else if (!stale && frame->close_after_send) {
                 ws_disconnect_generation_and_schedule(frame->generation);
             }
+            if (!stale && send_rc == 0 && frame->camera_start_ack)
+                desk_sdk_bridge_camera_start_ack_sent();
             pthread_mutex_lock(&s_ws_writer_mutex);
             memset(&s_ws_writer_current, 0, sizeof(s_ws_writer_current));
             pthread_mutex_unlock(&s_ws_writer_mutex);
@@ -246,7 +249,8 @@ static int ws_writer_start(void)
     return 0;
 }
 
-static int ws_enqueue_frame(uint8_t opcode, const uint8_t *payload, size_t len)
+static int ws_enqueue_frame_with_camera_ack(uint8_t opcode, const uint8_t *payload,
+                                            size_t len, bool camera_start_ack)
 {
     if (!payload || len > WS_CONTROL_FRAME_MAX || ws_writer_start() != 0) {
         if (len > WS_CONTROL_FRAME_MAX) ws_disconnect_and_schedule();
@@ -262,12 +266,18 @@ static int ws_enqueue_frame(uint8_t opcode, const uint8_t *payload, size_t len)
     s_ws_control_queue[tail].opcode = opcode;
     s_ws_control_queue[tail].generation = ws_lifecycle_generation();
     s_ws_control_queue[tail].close_after_send = opcode == 0x8;
+    s_ws_control_queue[tail].camera_start_ack = camera_start_ack;
     s_ws_control_queue[tail].len = len;
     memcpy(s_ws_control_queue[tail].payload, payload, len);
     ++s_ws_control_count;
     pthread_cond_signal(&s_ws_writer_cond);
     pthread_mutex_unlock(&s_ws_writer_mutex);
     return 0;
+}
+
+static int ws_enqueue_frame(uint8_t opcode, const uint8_t *payload, size_t len)
+{
+    return ws_enqueue_frame_with_camera_ack(opcode, payload, len, false);
 }
 
 /* Roller input is delivered synchronously from the hardware input worker.
@@ -404,6 +414,7 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     }
     ws_clear_outbound_queue();
     desk_sdk_bridge_log_session_closed();
+    desk_sdk_bridge_camera_session_closed();
     return true;
 }
 
@@ -836,6 +847,12 @@ int desk_sdk_ws_client_send_text(const char *text)
     return ws_enqueue_frame(0x1, (const uint8_t *)text, strlen(text));
 }
 
+int desk_sdk_ws_client_send_camera_start_ack(const char *text)
+{
+    if (!s_ws_ready || !text) return -1;
+    return ws_enqueue_frame_with_camera_ack(0x1, (const uint8_t *)text, strlen(text), true);
+}
+
 int desk_sdk_ws_client_send_text_nonblocking(const char *text)
 {
     if (!text) return -1;
@@ -973,8 +990,12 @@ int desk_sdk_ws_client_poll(int timeout_ms)
     char message_type[64] = "";
     if (json_parse_top_level_str((const char *)payload, "type", message_type, sizeof(message_type)) &&
         strcmp(message_type, "sys.client.hello") == 0) { ws_disconnect_and_schedule(); return -1; }
-    if (desk_sdk_bridge_process_ws_command((const char *)payload, s_ws_response, sizeof(s_ws_response)) == 0)
+    if (desk_sdk_bridge_process_ws_command((const char *)payload, s_ws_response, sizeof(s_ws_response)) == 0) {
+        if (strcmp(message_type, "ctrl.camera.stream.start") == 0 &&
+            strstr(s_ws_response, "\"type\":\"sys.ack\""))
+            return desk_sdk_ws_client_send_camera_start_ack(s_ws_response);
         return desk_sdk_ws_client_send_text(s_ws_response);
+    }
     return 0;
 }
 
@@ -984,6 +1005,18 @@ void desk_sdk_test_ws_seed_ready(void)
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
     ++s_ws_generation;
     s_ws_ready = true;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_writer_started = true;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_seed_authenticated(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    ++s_ws_generation;
+    s_ws_ready = true;
+    s_ws_authenticated = true;
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
     pthread_mutex_lock(&s_ws_writer_mutex);
     s_ws_writer_started = true;

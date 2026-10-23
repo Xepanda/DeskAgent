@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import struct
 import unittest
 
 # Mirror of DESK_SDK_MAX_FRAME_LEN in desk_sdk_bridge.h (interfaces.md 6.3.2).
@@ -76,6 +77,13 @@ TOOL_RESP_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
 DRIVER_MOTION_MOVE_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_uint32)
 DRIVER_MOTION_STOP_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_bool)
 MCU_TX_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p)
+DRIVER_CAMERA_CAPTURE_CB = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t), ctypes.c_uint32,
+)
+CAMERA_BINARY_SEND_CB = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+)
 
 
 class DeskBoardDriverOps(ctypes.Structure):
@@ -227,6 +235,26 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         ]
         cls.lib.desk_sdk_test_ws_seed_ready.restype = None
         cls.lib.desk_sdk_test_ws_seed_ready.argtypes = []
+        cls.lib.desk_sdk_test_ws_seed_authenticated.restype = None
+        cls.lib.desk_sdk_test_ws_seed_authenticated.argtypes = []
+        cls.lib.desk_sdk_test_camera_stream_set_available.restype = None
+        cls.lib.desk_sdk_test_camera_stream_set_available.argtypes = [ctypes.c_bool]
+        cls.lib.desk_sdk_test_camera_stream_transport_drop_count.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_test_camera_stream_transport_drop_count.argtypes = []
+        cls.lib.desk_sdk_test_camera_stream_source_drop_count.restype = ctypes.c_uint32
+        cls.lib.desk_sdk_test_camera_stream_source_drop_count.argtypes = []
+        cls.lib.desk_sdk_test_camera_binary_send_set_hook.restype = None
+        cls.lib.desk_sdk_test_camera_binary_send_set_hook.argtypes = [CAMERA_BINARY_SEND_CB]
+        cls.lib.desk_sdk_bridge_process_ws_command.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_process_ws_command.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
+        ]
+        cls.lib.desk_sdk_bridge_camera_start_ack_sent.restype = None
+        cls.lib.desk_sdk_bridge_camera_start_ack_sent.argtypes = []
+        cls.lib.desk_sdk_bridge_camera_session_closed.restype = None
+        cls.lib.desk_sdk_bridge_camera_session_closed.argtypes = []
+        cls.lib.desk_sdk_bridge_camera_stream_is_active.restype = ctypes.c_bool
+        cls.lib.desk_sdk_bridge_camera_stream_is_active.argtypes = []
         cls.lib.desk_sdk_test_ws_lock_control_queue.restype = None
         cls.lib.desk_sdk_test_ws_lock_control_queue.argtypes = []
         cls.lib.desk_sdk_test_ws_unlock_control_queue.restype = None
@@ -427,6 +455,13 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         out_buf = ctypes.create_string_buffer(4096)
         rc = self.lib.desk_sdk_bridge_process_command(cmd_str, out_buf, 4096)
         self.assertEqual(rc, 0, f"desk_sdk_bridge_process_command returned error code {rc}")
+        return json.loads(out_buf.value.decode("utf-8"))
+
+    def _process_ws_cmd(self, cmd_dict: dict) -> dict:
+        cmd_str = json.dumps(cmd_dict).encode("utf-8")
+        out_buf = ctypes.create_string_buffer(4096)
+        rc = self.lib.desk_sdk_bridge_process_ws_command(cmd_str, out_buf, 4096)
+        self.assertEqual(rc, 0, f"desk_sdk_bridge_process_ws_command returned error code {rc}")
         return json.loads(out_buf.value.decode("utf-8"))
 
     def _parse_top_level(self, json_str: str, key: str, max_len: int = 128) -> str | None:
@@ -1415,18 +1450,174 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(self.lib.desk_sdk_bridge_pack_wjpg_v1(
             2, 2, too_big_buf, too_big_len, out, len(out), ctypes.byref(out_len)), -2)
 
-    def test_camera_stream_commands_fail_closed_without_real_producer(self) -> None:
-        """No camera stream command succeeds while ESP has no real stream producer."""
-        for msg_type, data in (
-            ("ctrl.camera.stream.start", {"width": 640, "height": 480, "target_fps": 15}),
-            ("ctrl.camera.stream.stop", {"stream_id": 1}),
-            ("ctrl.camera.clock.ping", {"ping_id": 1, "host_send_monotonic_ms": 1}),
-        ):
-            with self.subTest(msg_type=msg_type):
-                response = self._process_cmd({"type": msg_type, "request_id": "req-camera-stream", "data": data})
-                self.assertEqual(response.get("type"), "sys.nack")
-                self.assertEqual(response.get("error", {}).get("code"), "CAMERA_STREAM_UNAVAILABLE")
-                self.assertEqual(response.get("request_id"), "req-camera-stream")
+    def test_camera_stream_commands_are_ws_only_and_fail_closed(self) -> None:
+        """TCP cannot route stream controls; paired WS requires a lease owner and producer."""
+        request = {
+            "type": "ctrl.camera.stream.start", "request_id": "req-camera-stream",
+            "client_id": "stream-owner", "session_id": "pair-session", "command_id": "a" * 32,
+            "data": {"width": 640, "height": 480, "target_fps": 15},
+        }
+        tcp_response = self._process_cmd(request)
+        self.assertEqual(tcp_response.get("type"), "sys.nack")
+        self.assertEqual(tcp_response.get("error", {}).get("code"), "WEBSOCKET_SESSION_REQUIRED")
+
+        self.lib.desk_sdk_bridge_set_pairing_code(b"123456")
+        rc, pair_reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0, pair_reply)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        tcp_acquired = self._process_cmd({
+            "type": "ctrl.camera.acquire", "client_id": "stream-owner",
+            "data": {"client_id": "stream-owner", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(tcp_acquired.get("type"), "sys.ack")
+        no_lease = self._process_ws_cmd(request)
+        self.assertEqual(no_lease.get("error", {}).get("code"), "NO_ACTIVE_LEASE")
+
+        self._process_cmd({
+            "type": "ctrl.camera.release", "client_id": "stream-owner",
+            "data": {"client_id": "stream-owner"},
+        })
+        acquired = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "client_id": "stream-owner",
+            "data": {"client_id": "stream-owner", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(acquired.get("type"), "sys.ack")
+        unavailable_caps = self._process_cmd({"type": "sys.sdk.ready.get"})
+        self.assertNotIn("camera.stream.mjpeg.wspk.v1",
+                         unavailable_caps.get("data", {}).get("capabilities", []))
+        unavailable = self._process_ws_cmd(request)
+        self.assertEqual(unavailable.get("type"), "sys.nack")
+        self.assertEqual(unavailable.get("error", {}).get("code"), "CAMERA_STREAM_UNAVAILABLE")
+
+    def test_camera_stream_requires_first_frame_and_waits_for_ack_send(self) -> None:
+        """Native fixture exercises WSPK/WJPG framing and ACK-before-media gating."""
+        self.lib.desk_sdk_test_camera_stream_set_available(True)
+        self.addCleanup(self.lib.desk_sdk_test_camera_stream_set_available, False)
+        self.lib.desk_sdk_bridge_set_pairing_code(b"123456")
+        rc, pair_reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0, pair_reply)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+
+        jpeg = bytes.fromhex(
+            "ffd8ffc000110801e0028003011100021100031100"
+            "ffda0008010100003f0001ffd9"
+        )
+        @DRIVER_CAMERA_CAPTURE_CB
+        def camera_capture(out_buf, max_len, out_len, _timeout_ms):
+            if max_len < len(jpeg):
+                return -1
+            ctypes.memmove(out_buf, jpeg, len(jpeg))
+            out_len[0] = len(jpeg)
+            return DESK_HW_OK
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"camera_stream_test_provider"
+        ops.camera_capture = ctypes.cast(camera_capture, ctypes.c_void_p)
+        self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops)), 0)
+        self._driver_ops_keepalive = [(ops, camera_capture)]
+
+        acquired = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "client_id": "stream-owner",
+            "data": {"client_id": "stream-owner", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(acquired.get("type"), "sys.ack")
+        ready = self._process_cmd({"type": "sys.sdk.ready.get"})
+        self.assertIn("camera.stream.mjpeg.wspk.v1", ready.get("data", {}).get("capabilities", []))
+
+        sent_frames: list[bytes] = []
+        busy_sends = [0]
+        @CAMERA_BINARY_SEND_CB
+        def capture_binary(data, length):
+            if busy_sends[0] == 0:
+                busy_sends[0] += 1
+                return -3  # bounded writer busy: drop this latest-frame attempt
+            sent_frames.append(ctypes.string_at(data, length))
+            return 0
+        self.lib.desk_sdk_test_camera_binary_send_set_hook(capture_binary)
+        self.addCleanup(self.lib.desk_sdk_test_camera_binary_send_set_hook,
+                        ctypes.cast(None, CAMERA_BINARY_SEND_CB))
+
+        start = {
+            "type": "ctrl.camera.stream.start", "request_id": "req-stream-start",
+            "client_id": "stream-owner", "session_id": "paired-session", "command_id": "a" * 32,
+            "data": {"width": 640, "height": 480, "target_fps": 15},
+        }
+        response = self._process_ws_cmd(start)
+        self.assertEqual(response.get("type"), "sys.ack", response)
+        stream_id = response.get("data", {}).get("stream_id")
+        self.assertIsInstance(stream_id, int)
+        self.assertGreater(stream_id, 0)
+        time.sleep(0.12)
+        self.assertEqual(sent_frames, [], "media must wait until the WS writer sends the start ACK")
+        self.assertGreater(self.lib.desk_sdk_test_camera_stream_source_drop_count(), 0,
+                           "the single latest-frame slot must count overwritten pre-ACK frames")
+        self.lib.desk_sdk_bridge_camera_start_ack_sent()
+        deadline = time.monotonic() + 1.0
+        while (not sent_frames or self.lib.desk_sdk_test_camera_stream_transport_drop_count() == 0) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(sent_frames)
+        self.assertGreater(self.lib.desk_sdk_test_camera_stream_transport_drop_count(), 0)
+        media = sent_frames[0]
+        self.assertEqual(media[:4], b"WSPK")
+        magic, frame_type, flags, sent_stream_id, sequence, payload_size = struct.unpack("<4sBBHII", media[:16])
+        self.assertEqual((frame_type, flags, sent_stream_id), (3, 0, stream_id), (len(media), media.hex()))
+        self.assertEqual(payload_size, len(media) - 16)
+        self.assertEqual(media[16:20], b"WJPG")
+        hdr_size, wjpg_sequence, timestamp_ms, jpeg_len = struct.unpack("<HIII", media[22:36])
+        self.assertEqual((hdr_size, wjpg_sequence), (20, sequence))
+        self.assertGreater(timestamp_ms, 0)
+        self.assertEqual(media[36:], jpeg)
+
+        stop = {
+            "type": "ctrl.camera.stream.stop", "request_id": "req-stream-stop",
+            "client_id": "stream-owner", "session_id": "paired-session", "command_id": "b" * 32,
+            "data": {"stream_id": stream_id},
+        }
+        stopped = self._process_ws_cmd(stop)
+        self.assertEqual(stopped.get("type"), "sys.ack")
+        repeated = self._process_ws_cmd(stop)
+        self.assertEqual(repeated.get("type"), "sys.ack")
+
+        self.assertEqual(self._process_ws_cmd({
+            "type": "ctrl.camera.release", "client_id": "stream-owner",
+            "data": {"client_id": "stream-owner"},
+        }).get("type"), "sys.ack")
+        short_lease = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "client_id": "stream-owner",
+            "data": {"client_id": "stream-owner", "lease_duration_ms": 1000},
+        })
+        self.assertEqual(short_lease.get("type"), "sys.ack")
+        second_start = dict(start)
+        second_start["command_id"] = "c" * 32
+        second = self._process_ws_cmd(second_start)
+        self.assertEqual(second.get("type"), "sys.ack", second)
+        self.lib.desk_sdk_bridge_camera_start_ack_sent()
+        deadline = time.monotonic() + 2.0
+        while self.lib.desk_sdk_bridge_camera_stream_is_active() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.lib.desk_sdk_bridge_camera_stream_is_active(),
+                         "expired camera lease must stop the producer")
+
+        self.assertEqual(self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "client_id": "stream-owner",
+            "data": {"client_id": "stream-owner", "lease_duration_ms": 5000},
+        }).get("type"), "sys.ack")
+        @CAMERA_BINARY_SEND_CB
+        def close_during_binary_send(_data, _length):
+            # Mirrors the real synchronous WS send-failure -> transport close hook.
+            self.lib.desk_sdk_bridge_camera_session_closed()
+            return -1
+        self.lib.desk_sdk_test_camera_binary_send_set_hook(close_during_binary_send)
+        third_start = dict(start)
+        third_start["command_id"] = "d" * 32
+        third = self._process_ws_cmd(third_start)
+        self.assertEqual(third.get("type"), "sys.ack", third)
+        self.lib.desk_sdk_bridge_camera_start_ack_sent()
+        deadline = time.monotonic() + 2.0
+        while self.lib.desk_sdk_bridge_camera_stream_is_active() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.lib.desk_sdk_bridge_camera_stream_is_active(),
+                         "sync close from worker send must self-teardown without joining itself")
 
     def test_live_tcp_socket_communication(self) -> None:
         """Verifies live TCP socket server startup, connection, JSON command processing, and event dispatch."""

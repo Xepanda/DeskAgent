@@ -28,6 +28,7 @@ extern "C" {
  */
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
+#define DESK_SDK_CAP_CAMERA_STREAM "camera.stream.mjpeg.wspk.v1"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
 #define DESK_SDK_CAP_EXPRESSION_ALT "expression"
 #define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"
@@ -272,6 +273,8 @@ typedef enum {
 int desk_sdk_ws_client_connect_paired(void);
 int desk_sdk_ws_client_poll(int timeout_ms);
 int desk_sdk_ws_client_send_text(const char *text);
+/* Queues the start ACK with a writer completion callback before live media. */
+int desk_sdk_ws_client_send_camera_start_ack(const char *text);
 /** Best-effort control-queue enqueue for input observer context; fail-fast. */
 int desk_sdk_ws_client_send_text_nonblocking(const char *text);
 int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len);
@@ -292,6 +295,11 @@ void desk_sdk_ws_client_close(void);
 void desk_sdk_bridge_set_local_log_enabled(bool enabled);
 /* Internal transport lifecycle seam; clears the current log stream lease. */
 void desk_sdk_bridge_log_session_closed(void);
+/* Clears A2's current WebSocket camera lease-owner binding on teardown. */
+void desk_sdk_bridge_camera_session_closed(void);
+/* Called by the WS writer only after the stream.start ACK has been sent. */
+void desk_sdk_bridge_camera_start_ack_sent(void);
+bool desk_sdk_bridge_camera_stream_is_active(void);
 /* Internal A2 writer seam: returns one serialized v1 event/gap, or 0 if idle. */
 int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len);
 
