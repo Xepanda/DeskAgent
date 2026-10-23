@@ -83,6 +83,8 @@ static bool desk_sdk_log_command_id_valid(const char *id);
 static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed,
                                          size_t allowed_count);
 static bool desk_sdk_log_pairing_is_complete(void);
+static void desk_sdk_notification_status_callback(
+    const desk_notification_status_event_t *event, void *user_data);
 static void desk_sdk_summary_ack_callback(const char *summary_id, const char *source,
                                           void *user_data);
 
@@ -1352,6 +1354,10 @@ int desk_sdk_bridge_init(void)
         printf("[SDK-INPUT] roller observer registration failed\n");
         return -1;
     }
+    if (desk_hardware_notification_init(desk_sdk_notification_status_callback, NULL) != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION][ERROR] hardware notification init failed\n");
+        return -1;
+    }
     if (desk_hardware_notification_register_summary_ack_callback(
             desk_sdk_summary_ack_callback, NULL) != DESK_HW_OK) {
         printf("[SDK-NOTIFICATION] summary acknowledgement observer registration failed\n");
@@ -1579,6 +1585,8 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     char daemon_id[64] = "";
     char target_mode[32] = "";
     char pairing_code[16] = "";
+    char proto[64] = "";
+    char version[16] = "";
 
     json_parse_str(udp_in, "request_id", req_id, sizeof(req_id));
     if (strlen(req_id) == 0) {
@@ -1590,7 +1598,22 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     }
     json_parse_str(udp_in, "target_mode", target_mode, sizeof(target_mode));
     json_parse_str(udp_in, "pairing_code", pairing_code, sizeof(pairing_code));
+    json_parse_str(udp_in, "protocol", proto, sizeof(proto));
+    json_parse_str(udp_in, "version", version, sizeof(version));
     int32_t websocket_port = json_parse_int(udp_in, "websocket_port", -1);
+
+    /* Only accept the pinned official v1.0 contract or the explicitly named
+     * legacy compatibility schema. Unknown/missing protocol fields must never
+     * fall through to the legacy response, and rejected requests must not
+     * consume the one-time pairing window or mint a session token. */
+    bool official_protocol = strcmp(proto, "watcher-lan-pairing") == 0 &&
+                             strcmp(version, "1.0") == 0;
+    bool legacy_protocol = strcmp(proto, "watcher_lan_pairing_v1") == 0 &&
+                           version[0] == '\0';
+    if (!official_protocol && !legacy_protocol) {
+        printf("[SDK-PAIR] pair.request rejected: reason=unsupported_protocol request_id=%s\n", req_id);
+        return DESK_SDK_PAIRING_REJECTED;
+    }
 
     /* interfaces.md 6.4 / CR-001: never grant a pairing before the pairing code
      * has been validated against the explicitly provisioned device-side code.
@@ -1621,17 +1644,13 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
         return DESK_SDK_PAIRING_REJECTED;
     }
 
-    /* Validation passed: only now generate/issue a session token. */
+    /* All protocol and request validation has passed: only now mint a token. */
     if (s_active_pairing_token[0] == '\0') {
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
     }
 
-    char proto[64] = "";
-    json_parse_str(udp_in, "protocol", proto, sizeof(proto));
-
-    /* Strict official watcher-lan-pairing protocol check per PairAccept contract */
     int reply_len;
-    if (strcmp(proto, "watcher-lan-pairing") == 0) {
+    if (official_protocol) {
         reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"protocol\":\"watcher-lan-pairing\","
@@ -1644,7 +1663,7 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
                  daemon_id,
                  strlen(target_mode) > 0 ? target_mode : "python_sdk",
                  s_active_pairing_token);
-    } else {
+    } else { /* explicitly supported legacy watcher_lan_pairing_v1 schema */
         reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"status\":\"accepted\","
@@ -3332,6 +3351,23 @@ static void desk_sdk_summary_ack_callback(const char *summary_id, const char *so
     (void)desk_sdk_bridge_send_notification_summary_ack(summary_id, source);
 }
 
+static void desk_sdk_notification_status_callback(
+    const desk_notification_status_event_t *event, void *user_data)
+{
+    (void)user_data;
+    if (!event) return;
+    /* User acknowledgement has its own contract event and is never a status. */
+    if (event->status == DESK_NOTIFICATION_ACKNOWLEDGED) {
+        printf("[SDK-NOTIFICATION][WARN] acknowledgement callback has no device event mapping\n");
+        return;
+    }
+    int rc = desk_sdk_bridge_send_notification_status(event->notification_id, event->status);
+    if (rc != 0) {
+        printf("[SDK-NOTIFICATION][WARN] status send failed id=%s status=%d rc=%d\n",
+               event->notification_id, (int)event->status, rc);
+    }
+}
+
 static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out_buf,
                                                   size_t max_out_len)
 {
@@ -4336,6 +4372,11 @@ int desk_firmware_poll(int timeout_ms)
     desk_sdk_socket_server_poll(half);
     desk_sdk_pairing_server_poll(half);
     desk_sdk_ws_client_poll(half);
+    int notification_rc = desk_hardware_notification_process_pending();
+    if (notification_rc != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION][WARN] pending notification processing failed rc=%d\n",
+               notification_rc);
+    }
     return 0;
 }
 

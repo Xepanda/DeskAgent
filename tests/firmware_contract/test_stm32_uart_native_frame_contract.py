@@ -9,6 +9,16 @@ MOTION_C = ROOT / "firmware/components/desk_hardware/src/desk_watcher_motion.c"
 
 
 class TestStm32UartNativeFrameContract(unittest.TestCase):
+    def test_move_and_stop_allocate_sequences_atomically(self) -> None:
+        source = MOTION_C.read_text(encoding="utf-8")
+        self.assertIn("static uint32_t motion_next_sequence(void)", source)
+        allocator = source.split("static uint32_t motion_next_sequence(void)", 1)[1].split(
+            "static uint16_t motion_calc_crc16", 1
+        )[0]
+        self.assertIn("atomic_fetch_add_explicit(&s_mcu_sequence", allocator)
+        self.assertNotRegex(source, r"\+\+s_mcu_sequence")
+        self.assertEqual(source.count("motion_next_sequence()"), 3)
+
     def test_ambiguous_move_failure_sends_one_new_sequence_stop_without_retry(self) -> None:
         source = MOTION_C.read_text(encoding="utf-8")
         move = source.split("int desk_watcher_motion_move", 1)[1].split(
@@ -20,7 +30,7 @@ class TestStm32UartNativeFrameContract(unittest.TestCase):
 
         self.assertIn("may_have_sent", transaction)
         self.assertIn("if (result != DESK_HW_OK && may_have_sent)", move)
-        self.assertIn("++s_mcu_sequence", move)
+        self.assertGreaterEqual(move.count("motion_next_sequence()"), 2)
         self.assertRegex(
             move,
             r"motion_send_and_wait_ack\(\s*stop_buf, stop_len, stop_seq, false,",
