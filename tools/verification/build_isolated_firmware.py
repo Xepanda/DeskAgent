@@ -26,6 +26,7 @@ EXCLUDED_FIRMWARE_DIRS = {
 }
 IDF_VERSION = "5.4"
 IDF_TARGET = "esp32s3"
+SDK_PROVENANCE_MANIFEST = Path("docs/acceptance/cr035-sdk-inputs.json")
 
 
 def is_within(path: Path, root: Path) -> bool:
@@ -282,22 +283,25 @@ def validate_managed_component_lock(lock_path: Path, managed_root: Path) -> list
     return locked
 
 
-def stage_sdk(sdk_source: Path, stage_root: Path, *, dependency_lock: Path | None = None) -> Path:
+def stage_sdk(
+    sdk_source: Path,
+    stage_root: Path,
+    *,
+    dependency_lock: Path | None = None,
+    repo_root: Path | None = None,
+) -> Path:
     """Fail closed until tracked SDK source and toolchain manifests exist.
 
     The local TuyaOpen checkout contains generated component, IDF, and tool
     installation trees. Copying or hashing those trees is not an approved
     source of build inputs, so this runner deliberately refuses to stage them.
     """
-    source_managed = sdk_source / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components"
-    if source_managed.exists():
-        if dependency_lock is None:
-            raise RuntimeError("A tracked dependency lock is required before staging managed components.")
-        validate_managed_component_lock(dependency_lock, source_managed)
-    raise RuntimeError(
-        "BLOCKED: no tracked provenance-verified TuyaOpen/ESP-IDF source and toolchain allowlist is available; "
-        "refusing to traverse, copy, or hash shared SDK trees."
-    )
+    if repo_root is None:
+        raise RuntimeError(
+            "BLOCKED: tracked SDK provenance manifest is missing; refusing all shared SDK access."
+        )
+    require_tracked_sdk_provenance(repo_root)
+    raise RuntimeError("BLOCKED: no approved SDK source allowlist; refusing shared SDK access.")
 
 def install_reviewed_sdkconfig_defaults(firmware_root: Path, staged_project: Path) -> Path:
     """Seed a fresh stage config from the reviewed tracked project defaults only."""
@@ -344,6 +348,36 @@ def assert_non_sensitive_sdkconfig(config_path: Path) -> str:
 def git_output(repo: Path, *args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=repo, check=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+
+def require_tracked_sdk_provenance(repo: Path) -> None:
+    """Refuse SDK access unless a tracked, reviewed SDK input manifest exists.
+
+    No allowlist is currently approved. This gate therefore blocks before any
+    SDK-root filesystem or process operation, even if a manifest is later added.
+    """
+    relative = SDK_PROVENANCE_MANIFEST.as_posix()
+    tracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", relative],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if tracked.returncode != 0:
+        raise RuntimeError(
+            f"BLOCKED: tracked SDK provenance manifest is missing: {relative}; "
+            "refusing all shared SDK and toolchain access."
+        )
+    manifest = repo / SDK_PROVENANCE_MANIFEST
+    try:
+        manifest.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"BLOCKED: tracked SDK provenance manifest cannot be read: {relative}; "
+            "refusing all shared SDK and toolchain access."
+        ) from exc
+    raise RuntimeError(
+        f"BLOCKED: SDK provenance manifest {relative} has no approved allowlist parser; "
+        "refusing all shared SDK and toolchain access."
+    )
 
 
 def source_provenance(repo: Path) -> dict[str, object]:
@@ -519,6 +553,9 @@ def _run_mounted_build(
 
 
 def run_build(repo: Path, sdk_root: Path, archive: Path) -> int:
+    # First build operation: do not resolve, glob, stat, import from, or invoke
+    # tools from sdk_root before the tracked, repo-local provenance gate.
+    require_tracked_sdk_provenance(repo)
     archive_base = (repo / "firmware" / ".target_logging").resolve()
     archive = archive.resolve()
     if not is_within(archive, archive_base) or archive == archive_base:

@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import subprocess
-import sys
 
 
 def _sha256(path: Path) -> str:
@@ -70,45 +67,11 @@ def source_snapshot(repo: Path, sdk: Path, staged_firmware: Path) -> dict[str, o
     }
 
 
-def load_sdk_gitpython(sdk_root: Path) -> Path:
-    """Load GitPython only in this bridge process, never via child env vars."""
-    site_packages = sdk_root.resolve() / ".venv" / "Lib" / "site-packages"
-    if not (site_packages / "git" / "__init__.py").is_file() or not (site_packages / "gitdb" / "__init__.py").is_file():
-        raise RuntimeError(f"SDK GitPython/GitDB packages are missing: {site_packages}")
-    resolved = str(site_packages.resolve())
-    if resolved not in sys.path:
-        sys.path.insert(0, resolved)
-    try:
-        import git  # noqa: F401
-        import gitdb  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(f"Cannot import SDK GitPython/GitDB in bridge process: {exc}") from exc
-    return site_packages.resolve()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("sdk_root", type=Path)
-    parser.add_argument("app_root", type=Path)
-    parser.add_argument("archive_root", type=Path)
-    parser.add_argument("--repo", type=Path, required=True)
-    parser.add_argument("--source-sdk", type=Path, required=True)
-    args = parser.parse_args()
-
-    repo = args.repo.resolve()
-    source_sdk = args.source_sdk.resolve()
-    load_sdk_gitpython(source_sdk)
-    bridge_path = repo / "tools" / "build_watcher_tuyaopen.py"
-    spec = importlib.util.spec_from_file_location("deskagent_existing_tuyaopen_bridge", bridge_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load existing TuyaOpen bridge: {bridge_path}")
-    bridge = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bridge)
-    bridge.capture_firmware_inputs = lambda _firmware, _project_root, _sdk_root: source_snapshot(
-        repo, source_sdk, args.app_root.resolve()
+def main(argv: list[str] | None = None) -> int:
+    del argv  # The standalone route has no runner-issued archive provenance token.
+    raise RuntimeError(
+        "BLOCKED: direct bridge invocation is disabled; use only a runner-authorized staged build."
     )
-    sys.argv = [str(bridge_path), str(args.sdk_root.resolve()), str(args.app_root.resolve()), str(args.archive_root.resolve())]
-    return int(bridge.main())
 
 
 if __name__ == "__main__":

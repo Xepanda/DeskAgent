@@ -1,6 +1,8 @@
 import importlib.util
+import builtins
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -80,7 +82,7 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             lock.write_text("dependencies:\n  vendor/codec:\n    version: 1.2.3\n", encoding="utf-8")
             self.assertEqual(MODULE.validate_managed_component_lock(lock, managed), ["vendor__codec"])
 
-    def test_stage_sdk_rejects_unlocked_dependency_set_before_any_sdk_copy_or_toolchain_stat(self):
+    def test_stage_sdk_missing_manifest_blocks_before_any_sdk_path_access(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sdk = root / "sdk"
@@ -100,16 +102,11 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             (sdk / "platform" / "ESP32" / ".prepare").write_text("esp32s3", encoding="utf-8")
             lock = root / "dependencies.lock"
             lock.write_text("dependencies:\n  vendor/codec:\n    version: 1.0.0\n", encoding="utf-8")
-            forbidden_roots = [sdk / "platform" / "ESP32" / "esp-idf", sdk / "platform" / "ESP32" / ".espressif"]
-            original_stat = Path.stat
+            forbidden_roots = [sdk]
+            original_ops = self._forbidden_access_guards(forbidden_roots)
             original_copy2 = MODULE.shutil.copy2
             original_copytree = MODULE.shutil.copytree
             copies = []
-
-            def guarded_stat(path, *args, **kwargs):
-                if any(path == item or item in path.parents for item in forbidden_roots):
-                    raise AssertionError(f"forbidden toolchain stat: {path}")
-                return original_stat(path, *args, **kwargs)
 
             def guarded_copy2(source, destination, *args, **kwargs):
                 copies.append(Path(source))
@@ -119,12 +116,103 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
                 copies.append(Path(source))
                 return original_copytree(source, destination, *args, **kwargs)
 
-            with mock.patch.object(Path, "stat", guarded_stat), \
+            with original_ops, \
                     mock.patch.object(MODULE.shutil, "copy2", guarded_copy2), \
                     mock.patch.object(MODULE.shutil, "copytree", guarded_copytree):
-                with self.assertRaisesRegex(RuntimeError, "not covered by the tracked lock"):
-                    MODULE.stage_sdk(sdk, root / "archive" / "sdk", dependency_lock=lock)
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                    MODULE.stage_sdk(sdk, root / "archive" / "sdk", dependency_lock=lock,
+                                     repo_root=root)
             self.assertEqual(copies, [])
+
+    def _forbidden_access_guards(self, roots):
+        """Fail if any common pathlib/os file traversal operation touches roots."""
+        def forbidden(value):
+            try:
+                path = Path(value)
+            except (TypeError, ValueError):
+                return False
+            return any(path == root or root in path.parents for root in roots)
+
+        patches = []
+        original_builtin_open = builtins.open
+
+        def guarded_builtin_open(file, *args, **kwargs):
+            if forbidden(file):
+                raise AssertionError(f"forbidden builtins.open access: {file}")
+            return original_builtin_open(file, *args, **kwargs)
+
+        patches.append(mock.patch.object(builtins, "open", guarded_builtin_open))
+        for name in ("open", "stat", "lstat", "exists", "is_file", "is_dir", "resolve", "glob", "rglob", "iterdir"):
+            original = getattr(Path, name)
+
+            def guard(path, *args, __name=name, __original=original, **kwargs):
+                if forbidden(path):
+                    raise AssertionError(f"forbidden Path.{__name} access: {path}")
+                return __original(path, *args, **kwargs)
+
+            patches.append(mock.patch.object(Path, name, guard))
+
+        for name in ("stat", "scandir"):
+            original = getattr(MODULE.os, name)
+
+            def guard(value, *args, __name=name, __original=original, **kwargs):
+                if forbidden(value):
+                    raise AssertionError(f"forbidden os.{__name} access: {value}")
+                return __original(value, *args, **kwargs)
+
+            patches.append(mock.patch.object(MODULE.os, name, guard))
+
+        class GuardContext:
+            def __enter__(self):
+                for patcher in patches:
+                    patcher.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                for patcher in reversed(patches):
+                    patcher.__exit__(*exc)
+        return GuardContext()
+
+    def test_run_build_missing_tracked_manifest_blocks_before_any_sdk_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            sdk = root / "shared-sdk"
+            (repo / "firmware" / ".target_logging").mkdir(parents=True)
+            forbidden = [sdk]
+            (sdk / "platform" / "ESP32" / ".espressif" / "python_env").mkdir(parents=True)
+            (sdk / ".venv" / "Lib" / "site-packages").mkdir(parents=True)
+            original_run = MODULE.subprocess.run
+            calls = []
+
+            def tracked_lookup(command, **kwargs):
+                calls.append(command)
+                if command[:3] == ["git", "ls-files", "--error-unmatch"]:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"missing")
+                return original_run(command, **kwargs)
+
+            with self._forbidden_access_guards(forbidden), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=tracked_lookup):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                    MODULE.run_build(repo, sdk, repo / "firmware" / ".target_logging" / "attempt")
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn(str(sdk), str(calls))
+
+    def test_bridge_direct_cli_refuses_before_sdk_filesystem_or_subprocess_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sdk = root / "shared-sdk"
+            (sdk / ".venv" / "Lib" / "site-packages").mkdir(parents=True)
+            (sdk / "platform" / "ESP32" / "tuya_open_sdk" / "build").mkdir(parents=True)
+            calls = []
+            with self._forbidden_access_guards([sdk]), \
+                    mock.patch.object(BRIDGE.subprocess, "run", side_effect=lambda *a, **k: calls.append(a)), \
+                    mock.patch.object(sys, "argv", [str(BRIDGE_PATH), str(sdk), str(root / "app"),
+                                                      str(root / "archive"), "--repo", str(root / "repo"),
+                                                      "--source-sdk", str(sdk)]):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: direct bridge invocation is disabled"):
+                    BRIDGE.main()
+            self.assertEqual(calls, [])
 
     def test_bridge_source_snapshot_never_accesses_shared_generated_build_params(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -356,26 +444,10 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             lock = root / "dependencies.lock"
             lock.write_text("dependencies:\n  vendor/pkg:\n    version: 1.0.0\n", encoding="utf-8")
             stage = root / "archive" / "sdk"
-            forbidden = [project / "sdkconfig", project / "sdkconfig.old", project / "build",
-                         esp_idf, espressif]
-            original_open = Path.open
-            original_stat = Path.stat
+            forbidden = [sdk]
             copies = []
             original_copy2 = MODULE.shutil.copy2
             original_copytree = MODULE.shutil.copytree
-
-            def under_forbidden(path):
-                return any(path == item or item in path.parents for item in forbidden)
-
-            def guarded_open(path, *args, **kwargs):
-                if under_forbidden(path):
-                    raise AssertionError(f"forbidden generated or toolchain file opened: {path}")
-                return original_open(path, *args, **kwargs)
-
-            def guarded_stat(path, *args, **kwargs):
-                if under_forbidden(path):
-                    raise AssertionError(f"forbidden generated or toolchain path stat: {path}")
-                return original_stat(path, *args, **kwargs)
 
             def guarded_copy2(source, destination, *args, **kwargs):
                 copies.append(Path(source))
@@ -385,15 +457,15 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
                 copies.append(Path(source))
                 return original_copytree(source, destination, *args, **kwargs)
 
-            with mock.patch.object(Path, "open", guarded_open), \
-                    mock.patch.object(Path, "stat", guarded_stat), \
+            with self._forbidden_access_guards(forbidden), \
                     mock.patch.object(MODULE.shutil, "copy2", guarded_copy2), \
                     mock.patch.object(MODULE.shutil, "copytree", guarded_copytree), \
                     mock.patch.object(MODULE, "sha256_file", wraps=MODULE.sha256_file) as hash_file:
-                with self.assertRaisesRegex(RuntimeError, "BLOCKED: no tracked provenance-verified"):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
                     MODULE.stage_sdk(sdk, stage, dependency_lock=lock)
             self.assertEqual(copies, [])
-            self.assertFalse(any(under_forbidden(Path(call.args[0])) for call in hash_file.call_args_list))
+            self.assertFalse(any(Path(call.args[0]) == sdk or sdk in Path(call.args[0]).parents
+                                 for call in hash_file.call_args_list))
     def test_idf_registry_matches_canonical_active_repo_id_through_subst_alias(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -472,30 +544,6 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             before = dict(MODULE.os.environ)
             self.assertEqual(MODULE.gitpython_site_packages(sdk), site.resolve())
             self.assertEqual(dict(MODULE.os.environ), before)
-
-    def test_bridge_imports_sdk_gitpython_in_its_own_sys_path(self):
-        with tempfile.TemporaryDirectory() as temp:
-            sdk = Path(temp) / "sdk"
-            site = sdk / ".venv" / "Lib" / "site-packages"
-            for package in ("git", "gitdb"):
-                package_dir = site / package
-                package_dir.mkdir(parents=True)
-                (package_dir / "__init__.py").write_text("", encoding="utf-8")
-
-            previous = {name: BRIDGE.sys.modules.pop(name, None) for name in ("git", "gitdb")}
-            try:
-                resolved = BRIDGE.load_sdk_gitpython(sdk)
-                self.assertEqual(resolved, site.resolve())
-                self.assertEqual(str(resolved), BRIDGE.sys.path[0])
-                self.assertTrue(Path(BRIDGE.sys.modules["git"].__file__).is_relative_to(resolved))
-                self.assertTrue(Path(BRIDGE.sys.modules["gitdb"].__file__).is_relative_to(resolved))
-            finally:
-                BRIDGE.sys.modules.pop("git", None)
-                BRIDGE.sys.modules.pop("gitdb", None)
-                BRIDGE.sys.path.remove(str(site.resolve()))
-                for name, module in previous.items():
-                    if module is not None:
-                        BRIDGE.sys.modules[name] = module
 
     def test_source_snapshot_returns_provenance_dict(self):
         with tempfile.TemporaryDirectory() as temp:
