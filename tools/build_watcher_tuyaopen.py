@@ -12,6 +12,25 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+SDK_PROVENANCE_MANIFEST = "docs/acceptance/cr035-sdk-inputs.json"
+
+
+def require_runner_authorization(repo_root: Path) -> None:
+    """Block legacy entrypoints before they can inspect shared SDK state."""
+    tracked = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-files", "--error-unmatch", "--", SDK_PROVENANCE_MANIFEST],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if tracked.returncode != 0:
+        raise RuntimeError(
+            f"BLOCKED: tracked SDK provenance manifest is missing: {SDK_PROVENANCE_MANIFEST}; "
+            "legacy TuyaOpen builds are disabled before SDK access."
+        )
+    raise RuntimeError(
+        "BLOCKED: no reviewed runner authorization token format exists; "
+        "legacy TuyaOpen builds remain disabled."
+    )
+
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest().upper()
@@ -20,6 +39,7 @@ def sha256(path: Path) -> str:
 def capture_firmware_inputs(firmware: Path, project_root: Path, sdk_root: Path) -> dict[str, object]:
     """Hash tracked and non-ignored untracked firmware inputs plus build entrypoints."""
     repo_root = firmware.parent
+    require_runner_authorization(repo_root)
     listed = subprocess.run(
         ["git", "-C", str(repo_root), "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "firmware"],
         check=False,
@@ -88,6 +108,9 @@ def capture_firmware_inputs(firmware: Path, project_root: Path, sdk_root: Path) 
 
 
 def main() -> int:
+    # This public legacy CLI is not a runner-authorized build entrypoint.
+    # Check only the tracked repository manifest before touching argv paths.
+    require_runner_authorization(Path(__file__).resolve().parents[1])
     if len(sys.argv) not in (4, 5) or (len(sys.argv) == 5 and sys.argv[4] != "--partition-only"):
         print("usage: build_watcher_tuyaopen.py SDK_ROOT APP_ROOT ARCHIVE_ROOT [--partition-only]", file=sys.stderr)
         return 2

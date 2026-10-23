@@ -20,6 +20,12 @@ BRIDGE = importlib.util.module_from_spec(BRIDGE_SPEC)
 assert BRIDGE_SPEC.loader is not None
 BRIDGE_SPEC.loader.exec_module(BRIDGE)
 
+LEGACY_BRIDGE_PATH = MODULE_PATH.parents[1] / "build_watcher_tuyaopen.py"
+LEGACY_SPEC = importlib.util.spec_from_file_location("build_watcher_tuyaopen", LEGACY_BRIDGE_PATH)
+LEGACY_BRIDGE = importlib.util.module_from_spec(LEGACY_SPEC)
+assert LEGACY_SPEC.loader is not None
+LEGACY_SPEC.loader.exec_module(LEGACY_BRIDGE)
+
 
 class IsolatedFirmwareBuildTests(unittest.TestCase):
     def test_powershell_entrypoint_delegates_without_reading_generated_sdk_state(self):
@@ -204,66 +210,70 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             sdk = root / "shared-sdk"
             (sdk / ".venv" / "Lib" / "site-packages").mkdir(parents=True)
             (sdk / "platform" / "ESP32" / "tuya_open_sdk" / "build").mkdir(parents=True)
-            calls = []
             with self._forbidden_access_guards([sdk]), \
-                    mock.patch.object(BRIDGE.subprocess, "run", side_effect=lambda *a, **k: calls.append(a)), \
                     mock.patch.object(sys, "argv", [str(BRIDGE_PATH), str(sdk), str(root / "app"),
                                                       str(root / "archive"), "--repo", str(root / "repo"),
                                                       "--source-sdk", str(sdk)]):
                 with self.assertRaisesRegex(RuntimeError, "BLOCKED: direct bridge invocation is disabled"):
                     BRIDGE.main()
-            self.assertEqual(calls, [])
 
-    def test_bridge_source_snapshot_never_accesses_shared_generated_build_params(self):
+    def test_legacy_tuyaopen_cli_refuses_before_sdk_filesystem_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sdk = root / "shared-sdk"
+            (sdk / "platform" / "ESP32" / "tuya_open_sdk" / "build").mkdir(parents=True)
+            calls = []
+            def manifest_check(command, **kwargs):
+                calls.append(command)
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"manifest missing")
+
+            with self._forbidden_access_guards([sdk]), \
+                    mock.patch.object(LEGACY_BRIDGE.subprocess, "run", side_effect=manifest_check):
+                with mock.patch.object(LEGACY_BRIDGE.sys, "argv", [
+                    str(LEGACY_BRIDGE_PATH), str(sdk), str(root / "app"), str(root / "archive")
+                ]):
+                    with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                        LEGACY_BRIDGE.main()
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn(str(sdk), str(calls))
+
+    def test_legacy_firmware_snapshot_helper_refuses_before_sdk_or_generated_access(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repo = root / "repo"
+            firmware = repo / "firmware"
             sdk = root / "sdk"
-            (repo / "firmware").mkdir(parents=True)
+            firmware.mkdir(parents=True)
             (repo / "tools").mkdir()
-            (repo / "firmware" / "sdkconfig.defaults").write_text("tracked defaults", encoding="utf-8")
+            (firmware / "sdkconfig.defaults").write_text("tracked defaults", encoding="utf-8")
             (repo / "tools" / "build_watcher_firmware.ps1").write_text("entry", encoding="utf-8")
             (repo / "tools" / "build_watcher_tuyaopen.py").write_text("bridge", encoding="utf-8")
-            staged_firmware = root / "stage"
-            staged_firmware.mkdir()
-            (staged_firmware / "sdkconfig.defaults").write_text("tracked defaults", encoding="utf-8")
-            forbidden = repo / "firmware" / ".build" / "build" / "build_param.json"
-            forbidden.parent.mkdir(parents=True)
-            forbidden.write_text("DO_NOT_OPEN", encoding="utf-8")
-            outputs = [
-                b"firmware/sdkconfig.defaults\0",
-                b"tracked diff",
-                "source-head\n",
-                "sdk-head\n",
-                "",
-            ]
+            (firmware / ".build" / "build").mkdir(parents=True)
+            (firmware / ".build" / "build" / "build_param.json").write_text("DO_NOT_OPEN", encoding="utf-8")
+            calls = []
 
-            def completed(stdout):
-                return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout)
+            def tracked_only(command, **kwargs):
+                calls.append(command)
+                if str(sdk) in command:
+                    raise AssertionError(f"forbidden subprocess access under SDK root: {command}")
+                if "--error-unmatch" in command:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"manifest absent")
+                if "ls-files" in command:
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        stdout=b"firmware/sdkconfig.defaults\0tools/build_watcher_firmware.ps1\0tools/build_watcher_tuyaopen.py\0",
+                        stderr=b"",
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
 
-            original_open = Path.open
-            original_stat = Path.stat
+            with self._forbidden_access_guards([sdk, firmware / ".build"]), \
+                    mock.patch.object(LEGACY_BRIDGE.subprocess, "run", side_effect=tracked_only):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                    LEGACY_BRIDGE.capture_firmware_inputs(firmware, repo, sdk)
+            self.assertEqual(len(calls), 1)
 
-            def is_forbidden(path):
-                return path == forbidden or forbidden in path.parents
-
-            def guarded_open(path, *args, **kwargs):
-                if is_forbidden(path):
-                    raise AssertionError(f"forbidden generated file opened: {path}")
-                return original_open(path, *args, **kwargs)
-
-            def guarded_stat(path, *args, **kwargs):
-                if is_forbidden(path):
-                    raise AssertionError(f"forbidden generated file stat: {path}")
-                return original_stat(path, *args, **kwargs)
-
-            with mock.patch.object(BRIDGE.subprocess, "run", side_effect=[completed(value) for value in outputs]), \
-                    mock.patch.object(Path, "open", guarded_open), \
-                    mock.patch.object(Path, "stat", guarded_stat), \
-                    mock.patch.object(BRIDGE, "_sha256", wraps=BRIDGE._sha256) as hash_file:
-                snapshot = BRIDGE.source_snapshot(repo, sdk, staged_firmware)
-            self.assertTrue(snapshot["aggregate_sha256"])
-            self.assertFalse(any(str(call.args[0]) == str(forbidden) for call in hash_file.call_args_list))
+    def test_isolated_bridge_does_not_expose_direct_source_snapshot_helper(self):
+        self.assertFalse(hasattr(BRIDGE, "source_snapshot"))
 
 
     def test_mounted_bridge_wrapper_preserves_archive_paths_lexically(self):
@@ -544,34 +554,6 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             before = dict(MODULE.os.environ)
             self.assertEqual(MODULE.gitpython_site_packages(sdk), site.resolve())
             self.assertEqual(dict(MODULE.os.environ), before)
-
-    def test_source_snapshot_returns_provenance_dict(self):
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            sdk = Path(temp) / "sdk"
-            (repo / "firmware" / ".build" / "build").mkdir(parents=True)
-            (repo / "tools").mkdir()
-            (repo / "firmware" / ".build" / "build" / "build_param.json").write_text("{}", encoding="utf-8")
-            (repo / "tools" / "build_watcher_firmware.ps1").write_text("build", encoding="utf-8")
-            (repo / "tools" / "build_watcher_tuyaopen.py").write_text("bridge", encoding="utf-8")
-            outputs = [
-                b"", b"tracked diff", "source-head\n", "sdk-head\n", "",
-            ]
-
-            def completed(stdout):
-                return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout)
-
-            with mock.patch.object(BRIDGE.subprocess, "run", side_effect=[completed(value) for value in outputs]):
-                snapshot = BRIDGE.source_snapshot(repo, sdk, Path(temp) / "staged-firmware")
-
-            self.assertIsInstance(snapshot, dict)
-            self.assertEqual(snapshot["source_commit"], "source-head")
-            self.assertEqual(snapshot["diff_bytes"], b"tracked diff")
-            self.assertTrue(snapshot["aggregate_sha256"])
-            self.assertEqual(len(snapshot["inputs"]), 2)
-            self.assertNotIn("firmware/.build/build/build_param.json",
-                             [item["path"] for item in snapshot["inputs"]])
-            self.assertEqual(snapshot["external_sdk_state"]["head"], "sdk-head")
 
     def test_idf_export_uses_staging_espressif_paths_for_both_build_phases(self):
         with tempfile.TemporaryDirectory() as temp:
