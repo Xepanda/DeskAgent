@@ -149,11 +149,15 @@ int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void 
 #define MCU_FRAME_CLASS_MOTION    0x02u
 #define MCU_SYS_MSG_HELLO_REQ     0x01u
 #define MCU_SYS_MSG_HELLO_RSP     0x02u
+#define MCU_SYS_MSG_ACK           0x04u
+#define MCU_SYS_MSG_NACK          0x05u
+#define MCU_CAPABILITY_MOTION     0x01u
 
 /* MCU Message IDs */
-#define MCU_MOTION_MSG_ACK        0x00u
 #define MCU_MOTION_MSG_SERVO_MOVE 0x01u
 #define MCU_MOTION_MSG_SERVO_STOP 0x02u
+/* Legacy test-injection IDs; not used by the UART2 official MCU-link driver. */
+#define MCU_MOTION_MSG_ACK        0x00u
 #define MCU_MOTION_MSG_NACK       0xFFu
 
 /* MCU Frame Flags */
@@ -174,6 +178,8 @@ int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void 
 /* Axis Mask Definitions */
 #define MCU_AXIS_MASK_PAN_TILT    0x03u
 #define MCU_AXIS_MASK_CANCEL_ALL  0x01u
+#define MCU_MOTION_PROFILE_EASE_IN_OUT 0x01u
+#define MCU_MOTION_SOURCE_UNKNOWN 0x00u
 
 /* NACK Error Codes */
 #define MCU_NACK_ERR_CRC          0x01u

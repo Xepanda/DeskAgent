@@ -32,6 +32,8 @@ typedef enum {
     TX_MOVE_ACK,
     TX_WRONG_SEQ,
     TX_BAD_CRC,
+    TX_NO_MOTION_CAPABILITY,
+    TX_NO_HELLO,
 } tx_mode_t;
 
 static tx_mode_t s_mode;
@@ -58,28 +60,74 @@ static uint16_t crc16(const uint8_t *data, size_t len)
     return crc;
 }
 
-static void make_response(uint8_t msg_id, uint8_t flags, uint32_t seq,
+static size_t cobs_encode(const uint8_t *src, size_t len, uint8_t *dst, size_t cap)
+{
+    size_t read = 0, write = 1, code_at = 0;
+    uint8_t code = 1;
+    if (cap < len + len / 254 + 1) return 0;
+    while (read < len) {
+        if (src[read] == 0) {
+            dst[code_at] = code;
+            code_at = write++;
+            code = 1;
+        } else {
+            dst[write++] = src[read];
+            if (++code == 0xFF) {
+                dst[code_at] = code;
+                code_at = write++;
+                code = 1;
+            }
+        }
+        ++read;
+    }
+    dst[code_at] = code;
+    return write;
+}
+
+static size_t cobs_decode(const uint8_t *src, size_t len, uint8_t *dst, size_t cap)
+{
+    size_t read = 0, write = 0;
+    while (read < len) {
+        uint8_t code = src[read++];
+        if (code == 0 || read + code - 1 > len) return 0;
+        for (uint8_t i = 1; i < code; ++i) {
+            if (write >= cap) return 0;
+            dst[write++] = src[read++];
+        }
+        if (code != 0xFF && read < len) {
+            if (write >= cap) return 0;
+            dst[write++] = 0;
+        }
+    }
+    return write;
+}
+
+static void make_response(uint8_t msg_id, uint32_t ref_seq,
                           const uint8_t *payload, uint16_t payload_len)
 {
-    memset(s_response, 0, sizeof(s_response));
-    s_response[0] = 0xA5;
-    s_response[1] = 0x5A;
-    s_response[2] = 1;
-    s_response[3] = 2;
-    s_response[4] = msg_id;
-    s_response[5] = flags;
-    s_response[6] = (uint8_t)seq;
-    s_response[7] = (uint8_t)(seq >> 8);
-    s_response[8] = (uint8_t)(seq >> 16);
-    s_response[9] = (uint8_t)(seq >> 24);
-    s_response[10] = (uint8_t)payload_len;
-    s_response[11] = (uint8_t)(payload_len >> 8);
-    memcpy(s_response + 12, payload, payload_len);
-    uint16_t crc = crc16(s_response, 12 + payload_len);
-    s_response[12 + payload_len] = (uint8_t)crc;
-    s_response[13 + payload_len] = (uint8_t)(crc >> 8);
-    s_response_len = 14 + payload_len;
+    uint8_t raw[32] = {0};
+    raw[0] = 0xA5;
+    raw[1] = 0x5A;
+    raw[2] = 1;
+    raw[3] = 1; /* official SYS ACK/NACK */
+    raw[4] = msg_id;
+    raw[5] = 2; /* RESPONSE */
+    raw[6] = 0xAA; /* header seq is deliberately independent of ref_seq */
+    raw[7] = 0xBB;
+    raw[8] = 0xCC;
+    raw[9] = 0xDD;
+    raw[10] = (uint8_t)payload_len;
+    raw[11] = (uint8_t)(payload_len >> 8);
+    memcpy(raw + 12, payload, payload_len);
+    uint16_t crc = crc16(raw, 12 + payload_len);
+    raw[12 + payload_len] = (uint8_t)crc;
+    raw[13 + payload_len] = (uint8_t)(crc >> 8);
+    size_t encoded = cobs_encode(raw, 14 + payload_len, s_response, sizeof(s_response) - 1);
+    assert(encoded > 0 && encoded < sizeof(s_response));
+    s_response[encoded] = 0;
+    s_response_len = encoded + 1;
     s_response_offset = 0;
+    (void)ref_seq;
 }
 
 bool uart_is_driver_installed(int port) { (void)port; return s_uart_installed; }
@@ -99,28 +147,38 @@ void uart_flush_input(int port) { (void)port; }
 int uart_write_bytes(int port, const char *data, size_t len)
 {
     (void)port;
+    uint8_t raw[64];
+    size_t raw_len = cobs_decode((const uint8_t *)data, len - 1, raw, sizeof(raw));
+    assert(len > 1 && ((const uint8_t *)data)[len - 1] == 0 && raw_len >= 14);
+    if (raw[3] == 1 && raw[4] == 1) { /* HELLO probe */
+        if (s_mode == TX_NO_HELLO) return (int)len;
+        const uint8_t hello[] = {0, 1, 0, 0, 1,
+                                 (uint8_t)(s_mode == TX_NO_MOTION_CAPABILITY ? 0 : 1),
+                                 0, 0, 1};
+        uint32_t req_seq = (uint32_t)raw[6] | ((uint32_t)raw[7] << 8) |
+                           ((uint32_t)raw[8] << 16) | ((uint32_t)raw[9] << 24);
+        make_response(2, req_seq, hello, sizeof(hello));
+        return (int)len;
+    }
     assert(s_write_calls < 12);
     memcpy(s_frames[s_write_calls], data, len);
     s_frame_lens[s_write_calls] = len;
     unsigned index = s_write_calls++;
-    if ((uint8_t)data[4] == MCU_MOTION_MSG_SERVO_STOP) {
+    if (raw[4] == MCU_MOTION_MSG_SERVO_STOP) {
         assert(desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL) ==
                DESK_OWNER_SDK_REMOTE);
         ++s_stop_owner_checks;
     }
-    uint32_t seq = (uint32_t)(uint8_t)data[6] |
-                   ((uint32_t)(uint8_t)data[7] << 8) |
-                   ((uint32_t)(uint8_t)data[8] << 16) |
-                   ((uint32_t)(uint8_t)data[9] << 24);
+    uint32_t seq = (uint32_t)raw[6] | ((uint32_t)raw[7] << 8) |
+                   ((uint32_t)raw[8] << 16) | ((uint32_t)raw[9] << 24);
     if (index == 0 && s_mode == TX_MOVE_NACK) {
-        const uint8_t payload[] = { MCU_NACK_ERR_BUSY, 0 };
-        make_response(MCU_MOTION_MSG_NACK, MCU_FRAME_FLAG_NACK_RESP,
-                      seq, payload, sizeof(payload));
+        uint8_t payload[8] = {(uint8_t)seq, (uint8_t)(seq >> 8), (uint8_t)(seq >> 16), (uint8_t)(seq >> 24), 0, 0, 3, 0};
+        make_response(MCU_SYS_MSG_NACK, seq, payload, sizeof(payload));
     } else if (index == 0 && (s_mode == TX_MOVE_ACK || s_mode == TX_WRONG_SEQ || s_mode == TX_BAD_CRC)) {
-        const uint8_t payload[] = { 0x84, 0x03, 0xB0, 0x04 };
-        make_response(MCU_MOTION_MSG_ACK, MCU_FRAME_FLAG_ACK_RESP,
-                      s_mode == TX_WRONG_SEQ ? seq + 1U : seq, payload, sizeof(payload));
-        if (s_mode == TX_BAD_CRC) s_response[s_response_len - 1] ^= 1U;
+        uint32_t ref = s_mode == TX_WRONG_SEQ ? seq + 1U : seq;
+        uint8_t payload[6] = {(uint8_t)ref, (uint8_t)(ref >> 8), (uint8_t)(ref >> 16), (uint8_t)(ref >> 24), 0, 0};
+        make_response(MCU_SYS_MSG_ACK, ref, payload, sizeof(payload));
+        if (s_mode == TX_BAD_CRC) s_response[s_response_len - 2] ^= 1U;
     }
     if (s_mode == TX_ZERO && index == 0) return 0;
     if (s_mode == TX_PARTIAL && index == 0) return len > 1 ? (int)len - 1 : 1;
@@ -130,8 +188,7 @@ int uart_write_bytes(int port, const char *data, size_t len)
 int uart_read_bytes(int port, uint8_t *data, size_t len, uint32_t timeout_ticks)
 {
     (void)port; (void)timeout_ticks;
-    if ((s_mode == TX_MOVE_NACK || s_mode == TX_MOVE_ACK || s_mode == TX_WRONG_SEQ || s_mode == TX_BAD_CRC) &&
-        s_write_calls == 1 && s_response_offset < s_response_len) {
+    if (s_response_offset < s_response_len) {
         *data = s_response[s_response_offset++];
         return 1;
     }
@@ -174,10 +231,40 @@ static void reset_transport(tx_mode_t mode)
 
 static uint32_t frame_seq(unsigned index)
 {
-    return (uint32_t)s_frames[index][6] |
-           ((uint32_t)s_frames[index][7] << 8) |
-           ((uint32_t)s_frames[index][8] << 16) |
-           ((uint32_t)s_frames[index][9] << 24);
+    uint8_t raw[64];
+    size_t n = cobs_decode(s_frames[index], s_frame_lens[index] - 1, raw, sizeof(raw));
+    assert(n >= 14);
+    return (uint32_t)raw[6] | ((uint32_t)raw[7] << 8) |
+           ((uint32_t)raw[8] << 16) | ((uint32_t)raw[9] << 24);
+}
+
+static uint8_t frame_msg_id(unsigned index)
+{
+    uint8_t raw[64];
+    size_t n = cobs_decode(s_frames[index], s_frame_lens[index] - 1, raw, sizeof(raw));
+    assert(n >= 14);
+    return raw[4];
+}
+
+static void assert_move_payload(unsigned index)
+{
+    uint8_t raw[64];
+    size_t n = cobs_decode(s_frames[index], s_frame_lens[index] - 1, raw, sizeof(raw));
+    assert(n == 23 && raw[0] == 0xA5 && raw[1] == 0x5A);
+    assert(raw[3] == 2 && raw[4] == 1 && raw[5] == 1);
+    assert(raw[10] == 9 && raw[11] == 0 && raw[12] == 3);
+    assert(raw[13] == 0x84 && raw[14] == 0x03 && raw[15] == 0xB0 && raw[16] == 0x04);
+    assert(raw[17] == 250 && raw[18] == 0 && raw[19] == 1 && raw[20] == 0);
+    assert(((uint16_t)raw[21] | ((uint16_t)raw[22] << 8)) == crc16(raw, 21));
+}
+
+static void assert_stop_payload(unsigned index)
+{
+    uint8_t raw[64];
+    size_t n = cobs_decode(s_frames[index], s_frame_lens[index] - 1, raw, sizeof(raw));
+    assert(n == 16 && raw[3] == 2 && raw[4] == 2 && raw[5] == 1);
+    assert(raw[10] == 2 && raw[11] == 0 && raw[12] == 1 && raw[13] == 0);
+    assert(((uint16_t)raw[14] | ((uint16_t)raw[15] << 8)) == crc16(raw, 14));
 }
 
 static void begin_case(tx_mode_t mode)
@@ -186,6 +273,11 @@ static void begin_case(tx_mode_t mode)
     assert(desk_watcher_motion_init() == DESK_HW_OK);
     assert(desk_hardware_register_driver_ops(&s_ops) == DESK_HW_OK);
     reset_transport(mode);
+    desk_watcher_motion_peer_info_t peer;
+    int probe_rc = desk_watcher_motion_probe(&peer, 20);
+    assert(probe_rc == (mode == TX_NO_HELLO ? DESK_HW_ERR_TIMEOUT : DESK_HW_OK));
+    if (probe_rc == DESK_HW_OK)
+        assert((peer.capability_bitmap & 1u) == (mode == TX_NO_MOTION_CAPABILITY ? 0u : 1u));
     s_release_calls = 0;
 }
 
@@ -199,6 +291,14 @@ int main(void)
 {
     desk_watcher_motion_diagnostics_t before;
     desk_watcher_motion_diagnostics_t after;
+    begin_case(TX_NO_MOTION_CAPABILITY);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
+    assert(s_write_calls == 0);
+    assert_single_hal_release();
+    begin_case(TX_NO_HELLO);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
+    assert(s_write_calls == 0);
+    assert_single_hal_release();
     /* A provable zero-byte write is the sole transport-error no-STOP case. */
     begin_case(TX_ZERO);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_IO);
@@ -214,7 +314,7 @@ int main(void)
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_IO);
     assert(s_write_calls == 2);
     assert(s_stop_owner_checks == 1);
-    assert(s_frames[0][4] == 0x01 && s_frames[1][4] == 0x02);
+    assert(frame_msg_id(0) == 0x01 && frame_msg_id(1) == 0x02);
     assert(frame_seq(1) != frame_seq(0));
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_TIMEOUT);
     desk_watcher_motion_get_diagnostics(&after);
@@ -227,8 +327,8 @@ int main(void)
     begin_case(TX_NEGATIVE_WRITE);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_IO);
     assert(s_write_calls == 2);
-    assert(s_frames[0][4] == MCU_MOTION_MSG_SERVO_MOVE &&
-           s_frames[1][4] == MCU_MOTION_MSG_SERVO_STOP);
+    assert(frame_msg_id(0) == MCU_MOTION_MSG_SERVO_MOVE &&
+           frame_msg_id(1) == MCU_MOTION_MSG_SERVO_STOP);
     assert(frame_seq(1) != frame_seq(0));
     assert(s_stop_owner_checks == 1);
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_TIMEOUT);
@@ -240,10 +340,14 @@ int main(void)
     desk_watcher_motion_get_diagnostics(&before);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_TIMEOUT);
     assert(s_write_calls == 4);
+    assert_move_payload(0);
+    assert_move_payload(1);
+    assert_move_payload(2);
+    assert_stop_payload(3);
     assert(s_stop_owner_checks == 1);
-    assert(s_frames[0][4] == 0x01 && s_frames[1][4] == 0x01 && s_frames[2][4] == 0x01);
+    assert(frame_msg_id(0) == 0x01 && frame_msg_id(1) == 0x01 && frame_msg_id(2) == 0x01);
     assert(frame_seq(0) == frame_seq(1) && frame_seq(1) == frame_seq(2));
-    assert(s_frames[3][4] == 0x02 && frame_seq(3) != frame_seq(2));
+    assert(frame_msg_id(3) == 0x02 && frame_seq(3) != frame_seq(2));
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_TIMEOUT);
     desk_watcher_motion_get_diagnostics(&after);
     assert(after.tx_bytes - before.tx_bytes == s_frame_lens[0] + s_frame_lens[1] + s_frame_lens[2] + s_frame_lens[3]);
@@ -259,7 +363,7 @@ int main(void)
     desk_watcher_motion_get_diagnostics(&before);
     int nack_rc = desk_hardware_motion_move_to(90.0f, 120.0f, 250);
     assert(nack_rc == DESK_HW_ERR_IO);
-    assert(s_write_calls == 2 && s_frames[1][4] == 0x02);
+    assert(s_write_calls == 2 && frame_msg_id(1) == 0x02);
     assert(s_stop_owner_checks == 1);
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_TIMEOUT);
     desk_watcher_motion_get_diagnostics(&after);
@@ -271,7 +375,8 @@ int main(void)
     begin_case(TX_MOVE_ACK);
     desk_watcher_motion_get_diagnostics(&before);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_OK);
-    assert(s_write_calls == 1 && s_frames[0][4] == 0x01);
+    assert(s_write_calls == 1 && frame_msg_id(0) == 0x01);
+    assert_move_payload(0);
     assert(s_stop_owner_checks == 0);
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_UNAVAILABLE);
     desk_watcher_motion_get_diagnostics(&after);
@@ -291,7 +396,7 @@ int main(void)
     assert(after.wrong_sequence_count - before.wrong_sequence_count >= 1);
     assert(after.retry_count - before.retry_count == 2);
     assert(after.last_error == DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT);
-    assert(s_frames[0][4] == MCU_MOTION_MSG_SERVO_MOVE && frame_seq(0) == frame_seq(1) && frame_seq(1) == frame_seq(2));
+    assert(frame_msg_id(0) == MCU_MOTION_MSG_SERVO_MOVE && frame_seq(0) == frame_seq(1) && frame_seq(1) == frame_seq(2));
     assert_single_hal_release();
 
     /* A complete response with a bad CRC increments only the CRC diagnostic,
