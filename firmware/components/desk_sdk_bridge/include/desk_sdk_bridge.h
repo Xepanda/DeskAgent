@@ -333,12 +333,18 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
  * - ctrl.motion.move / ctrl.motion.stop -> sys.ack with CR-002 ACK-only semantics
  *   (status="accepted", accepted=true, state_confirmed=false)
  * - ctrl.camera.acquire / ctrl.camera.release / ctrl.camera.capture
- * - SDK audio transport controls currently return UNSUPPORTED_OPERATION
+ * - Audio playback controls are denied here and only dispatched on the
+ *   authenticated, generation-bound WebSocket receive path
  * - ctrl.expression.play / ctrl.expression.set / ctrl.expression.audio_follow
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
 /* WebSocket-only dispatch. Never use this entry point for the legacy TCP server. */
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len);
+/* Receive-loop dispatch binds commands to the lifecycle generation that read the frame. */
+int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
+                                                       char *out_buf,
+                                                       size_t max_out_len,
+                                                       uint32_t connection_generation);
 /* Internal A2 media hooks called by the authenticated WebSocket receive loop. */
 int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
                                            uint32_t connection_generation);

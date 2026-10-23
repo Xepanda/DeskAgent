@@ -160,9 +160,11 @@ static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
 static bool desk_sdk_is_lower_hex_64(const char *s);
 static int desk_sdk_audio_stream_begin_command(const char *json_in,
-                                               char *out_buf, size_t max_out_len);
+                                               char *out_buf, size_t max_out_len,
+                                               uint32_t connection_generation);
 static int desk_sdk_audio_stop_command(const char *json_in,
-                                       char *out_buf, size_t max_out_len);
+                                       char *out_buf, size_t max_out_len,
+                                       uint32_t connection_generation);
 static bool desk_sdk_audio_playback_available(void);
 static int desk_sdk_build_capabilities_json(char *out, size_t out_len);
 
@@ -1920,6 +1922,21 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
+    /* The legacy TCP line server has no authenticated WebSocket identity or
+     * connection generation. Audio playback can only enter through the
+     * generation-bound WebSocket receive dispatcher below. */
+    if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0 ||
+        strcmp(msg_type, "ctrl.audio.stop") == 0) {
+        char rid_scratch[128];
+        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                 "\"code\":\"WEBSOCKET_SESSION_REQUIRED\","
+                 "\"message\":\"Audio playback commands require the authenticated WebSocket session\"}}",
+                 rid);
+        return 0;
+    }
+
     /* Handshake: sys.client.hello */
     if (strcmp(msg_type, "sys.client.hello") == 0) {
         char provided_token[128] = "";
@@ -2225,13 +2242,6 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         desk_psram_free(jpeg_buf);
         atomic_store(&s_camera_exclusive_state, 0);
         return 0;
-    }
-
-    else if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0) {
-        return desk_sdk_audio_stream_begin_command(json_in, out_buf, max_out_len);
-    }
-    else if (strcmp(msg_type, "ctrl.audio.stop") == 0) {
-        return desk_sdk_audio_stop_command(json_in, out_buf, max_out_len);
     }
 
     /* Microphone is a separate unsupported uplink direction until the A1
@@ -3810,7 +3820,8 @@ int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
 }
 
 static int desk_sdk_audio_stream_begin_command(const char *json_in,
-                                              char *out_buf, size_t max_out_len)
+                                               char *out_buf, size_t max_out_len,
+                                               uint32_t connection_generation)
 {
     char rid_scratch[128];
     const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
@@ -3835,7 +3846,8 @@ static int desk_sdk_audio_stream_begin_command(const char *json_in,
     uint8_t expected_digest[32];
     if (desk_sdk_audio_hex_decode(digest, expected_digest) != 0) return -1;
     uint32_t generation = desk_sdk_ws_client_generation();
-    if (!generation || !desk_sdk_ws_client_is_authenticated()) {
+    if (!connection_generation || generation != connection_generation ||
+        !desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete()) {
         snprintf(out_buf, max_out_len,
             "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
             "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stream requires an authenticated SDK session\"}}", rid);
@@ -3897,20 +3909,30 @@ static int desk_sdk_audio_stream_begin_command(const char *json_in,
 }
 
 static int desk_sdk_audio_stop_command(const char *json_in,
-                                       char *out_buf, size_t max_out_len)
+                                       char *out_buf, size_t max_out_len,
+                                       uint32_t connection_generation)
 {
     char rid_scratch[128], data[256];
     const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
     if (!json_extract_subobject(json_in, "data", data, sizeof(data))) data[0] = '\0';
-    int32_t requested_id = json_parse_int(data, "stream_id", 0);
-    if (!desk_sdk_ws_client_is_authenticated()) {
+    int32_t requested_id = json_parse_int(data, "stream_id", -1);
+    uint32_t current_generation = desk_sdk_ws_client_generation();
+    if (!connection_generation || current_generation != connection_generation ||
+        !desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete()) {
         snprintf(out_buf, max_out_len,
             "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
             "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stop requires an authenticated SDK session\"}}", rid);
         return 0;
     }
+    if (requested_id < 1 || requested_id > UINT16_MAX) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":400,\"error\":{"
+            "\"code\":\"INVALID_ARGUMENTS\",\"message\":\"Audio stop requires the active stream_id\"}}", rid);
+        return 0;
+    }
     pthread_mutex_lock(&s_sdk_audio.mutex);
-    if (!s_sdk_audio.active || (requested_id > 0 && (uint32_t)requested_id != s_sdk_audio.stream_id)) {
+    if (!s_sdk_audio.active || s_sdk_audio.generation != connection_generation ||
+        (uint32_t)requested_id != s_sdk_audio.stream_id) {
         pthread_mutex_unlock(&s_sdk_audio.mutex);
         snprintf(out_buf, max_out_len,
             "{\"type\":\"sys.nack\",%s\"code\":404,\"error\":{"
@@ -3936,6 +3958,17 @@ static int desk_sdk_audio_stop_command(const char *json_in,
 
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len)
 {
+    /* Compatibility entry point for non-audio WebSocket contract helpers.
+     * Audio commands require an explicit receive-loop generation below. */
+    return desk_sdk_bridge_process_ws_command_for_generation(json_in, out_buf,
+                                                               max_out_len, 0);
+}
+
+int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
+                                                       char *out_buf,
+                                                       size_t max_out_len,
+                                                       uint32_t connection_generation)
+{
     char type_raw[96] = "", code_raw[16] = "";
     char data[3072] = "";
     if (!json_in || strnlen(json_in, DESK_SDK_MAX_FRAME_LEN + 1U) > DESK_SDK_MAX_FRAME_LEN ||
@@ -3943,6 +3976,25 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
     if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1) return -1;
     char type[64] = "";
     if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "ctrl.audio.stream.begin") == 0 ||
+        strcmp(type, "ctrl.audio.stop") == 0) {
+        if (!connection_generation ||
+            connection_generation != desk_sdk_ws_client_generation() ||
+            !desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete()) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
+                     "\"code\":\"AUTH_FAILED\",\"message\":\"Audio command is not bound to the authenticated WebSocket generation\"}}",
+                     rid);
+            return 0;
+        }
+        if (strcmp(type, "ctrl.audio.stream.begin") == 0)
+            return desk_sdk_audio_stream_begin_command(json_in, out_buf, max_out_len,
+                                                       connection_generation);
+        return desk_sdk_audio_stop_command(json_in, out_buf, max_out_len,
+                                            connection_generation);
+    }
     if (strcmp(type, "ctrl.camera.stream.start") == 0 ||
         strcmp(type, "ctrl.camera.stream.stop") == 0 ||
         strcmp(type, "ctrl.camera.clock.ping") == 0) {

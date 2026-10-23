@@ -1005,16 +1005,21 @@ int desk_sdk_ws_client_poll(int timeout_ms)
         }
         return 0;
     }
+    uint32_t frame_generation = ws_lifecycle_generation();
     uint8_t op; uint8_t *payload = s_ws_payload; size_t len = 0;
     int rc = ws_read_frame(timeout_ms, &op, payload, WS_FRAME_CAP-1, &len);
     if (rc == 1) return 0;
     if (rc != 0) { ws_disconnect_and_schedule(); return -1; }
+    if (frame_generation != ws_lifecycle_generation()) {
+        ws_disconnect_generation_and_schedule(frame_generation);
+        return -1;
+    }
     if (op == 0x8) { return ws_enqueue_frame(0x8, payload, len); }
     if (op == 0x9) { return ws_enqueue_frame(0xA, payload, len); }
     if (op == 0xA) return 0;
     if (op == 0x2) {
         if (desk_sdk_bridge_process_ws_audio_frame(payload, len,
-                                                  ws_lifecycle_generation()) != 0) {
+                                                  frame_generation) != 0) {
             ws_disconnect_and_schedule();
             return -1;
         }
@@ -1027,7 +1032,8 @@ int desk_sdk_ws_client_poll(int timeout_ms)
     char message_type[64] = "";
     if (json_parse_top_level_str((const char *)payload, "type", message_type, sizeof(message_type)) &&
         strcmp(message_type, "sys.client.hello") == 0) { ws_disconnect_and_schedule(); return -1; }
-    if (desk_sdk_bridge_process_ws_command((const char *)payload, s_ws_response, sizeof(s_ws_response)) == 0) {
+    if (desk_sdk_bridge_process_ws_command_for_generation((const char *)payload,
+            s_ws_response, sizeof(s_ws_response), frame_generation) == 0) {
         if (strcmp(message_type, "ctrl.camera.stream.start") == 0 &&
             strstr(s_ws_response, "\"type\":\"sys.ack\""))
             return desk_sdk_ws_client_send_camera_start_ack(s_ws_response);
@@ -1035,7 +1041,7 @@ int desk_sdk_ws_client_poll(int timeout_ms)
             strstr(s_ws_response, "\"type\":\"sys.ack\""))
             return desk_sdk_ws_client_send_log_subscribe_ack(s_ws_response);
         int send_rc = desk_sdk_ws_client_send_text(s_ws_response);
-        desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
+        desk_sdk_bridge_audio_poll(frame_generation);
         return send_rc;
     }
     return 0;
