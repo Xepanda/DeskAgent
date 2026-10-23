@@ -30,6 +30,8 @@ typedef enum {
     TX_NEGATIVE_WRITE,
     TX_MOVE_NACK,
     TX_MOVE_ACK,
+    TX_WRONG_SEQ,
+    TX_BAD_CRC,
 } tx_mode_t;
 
 static tx_mode_t s_mode;
@@ -114,10 +116,11 @@ int uart_write_bytes(int port, const char *data, size_t len)
         const uint8_t payload[] = { MCU_NACK_ERR_BUSY, 0 };
         make_response(MCU_MOTION_MSG_NACK, MCU_FRAME_FLAG_NACK_RESP,
                       seq, payload, sizeof(payload));
-    } else if (index == 0 && s_mode == TX_MOVE_ACK) {
+    } else if (index == 0 && (s_mode == TX_MOVE_ACK || s_mode == TX_WRONG_SEQ || s_mode == TX_BAD_CRC)) {
         const uint8_t payload[] = { 0x84, 0x03, 0xB0, 0x04 };
         make_response(MCU_MOTION_MSG_ACK, MCU_FRAME_FLAG_ACK_RESP,
-                      seq, payload, sizeof(payload));
+                      s_mode == TX_WRONG_SEQ ? seq + 1U : seq, payload, sizeof(payload));
+        if (s_mode == TX_BAD_CRC) s_response[s_response_len - 1] ^= 1U;
     }
     if (s_mode == TX_ZERO && index == 0) return 0;
     if (s_mode == TX_PARTIAL && index == 0) return len > 1 ? (int)len - 1 : 1;
@@ -127,11 +130,8 @@ int uart_write_bytes(int port, const char *data, size_t len)
 int uart_read_bytes(int port, uint8_t *data, size_t len, uint32_t timeout_ticks)
 {
     (void)port; (void)timeout_ticks;
-    if (s_mode == TX_MOVE_NACK && s_write_calls == 1 && s_response_offset < s_response_len) {
-        *data = s_response[s_response_offset++];
-        return 1;
-    }
-    if (s_mode == TX_MOVE_ACK && s_write_calls == 1 && s_response_offset < s_response_len) {
+    if ((s_mode == TX_MOVE_NACK || s_mode == TX_MOVE_ACK || s_mode == TX_WRONG_SEQ || s_mode == TX_BAD_CRC) &&
+        s_write_calls == 1 && s_response_offset < s_response_len) {
         *data = s_response[s_response_offset++];
         return 1;
     }
@@ -197,6 +197,8 @@ static void assert_single_hal_release(void)
 
 int main(void)
 {
+    desk_watcher_motion_diagnostics_t before;
+    desk_watcher_motion_diagnostics_t after;
     /* A provable zero-byte write is the sole transport-error no-STOP case. */
     begin_case(TX_ZERO);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_IO);
@@ -208,12 +210,16 @@ int main(void)
     /* Partial MOVE write is ambiguous: preserve MOVE IO error, emit one new-seq
      * STOP only once, do not retry STOP, and retain its timeout separately. */
     begin_case(TX_PARTIAL);
+    desk_watcher_motion_get_diagnostics(&before);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_IO);
     assert(s_write_calls == 2);
     assert(s_stop_owner_checks == 1);
     assert(s_frames[0][4] == 0x01 && s_frames[1][4] == 0x02);
     assert(frame_seq(1) != frame_seq(0));
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_TIMEOUT);
+    desk_watcher_motion_get_diagnostics(&after);
+    assert(after.tx_bytes - before.tx_bytes == (s_frame_lens[0] - 1U) + s_frame_lens[1]);
+    assert(after.ack_count == before.ack_count);
     assert_single_hal_release();
 
     /* A negative/indeterminate UART write is not proof of zero-byte delivery:
@@ -231,6 +237,7 @@ int main(void)
     /* Full MOVE timeout retries MOVE with same sequence, then performs exactly
      * one STOP attempt with a new sequence and preserves the original timeout. */
     begin_case(TX_FULL_NO_RESPONSE);
+    desk_watcher_motion_get_diagnostics(&before);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_TIMEOUT);
     assert(s_write_calls == 4);
     assert(s_stop_owner_checks == 1);
@@ -238,23 +245,64 @@ int main(void)
     assert(frame_seq(0) == frame_seq(1) && frame_seq(1) == frame_seq(2));
     assert(s_frames[3][4] == 0x02 && frame_seq(3) != frame_seq(2));
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_TIMEOUT);
+    desk_watcher_motion_get_diagnostics(&after);
+    assert(after.tx_bytes - before.tx_bytes == s_frame_lens[0] + s_frame_lens[1] + s_frame_lens[2] + s_frame_lens[3]);
+    assert(after.rx_bytes == before.rx_bytes); /* no bytes received; never synthesize an ACK */
+    assert(after.retry_count - before.retry_count == 2);
+    assert(after.ack_count == before.ack_count);
+    assert(after.timeout_count - before.timeout_count == 2); /* MOVE and best-effort STOP */
+    assert(after.last_error == DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT);
     assert_single_hal_release();
 
     /* A correlated NACK remains ambiguous; append one STOP. */
     begin_case(TX_MOVE_NACK);
+    desk_watcher_motion_get_diagnostics(&before);
     int nack_rc = desk_hardware_motion_move_to(90.0f, 120.0f, 250);
     assert(nack_rc == DESK_HW_ERR_IO);
     assert(s_write_calls == 2 && s_frames[1][4] == 0x02);
     assert(s_stop_owner_checks == 1);
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_TIMEOUT);
+    desk_watcher_motion_get_diagnostics(&after);
+    assert(after.nack_count - before.nack_count == 1);
+    assert(after.ack_count == before.ack_count);
     assert_single_hal_release();
 
     /* A valid correlated ACK is accepted and does not provoke STOP. */
     begin_case(TX_MOVE_ACK);
+    desk_watcher_motion_get_diagnostics(&before);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_OK);
     assert(s_write_calls == 1 && s_frames[0][4] == 0x01);
     assert(s_stop_owner_checks == 0);
     assert(desk_watcher_motion_get_last_ambiguous_move_stop_result() == DESK_HW_ERR_UNAVAILABLE);
+    desk_watcher_motion_get_diagnostics(&after);
+    assert(after.tx_bytes - before.tx_bytes == s_frame_lens[0]);
+    assert(after.rx_bytes - before.rx_bytes == s_response_len);
+    assert(after.ack_count - before.ack_count == 1);
+    assert(after.last_error == DESK_WATCHER_MOTION_ERROR_NONE);
+    assert_single_hal_release();
+
+    /* A CRC-valid ACK with an unrelated sequence is counted as RX evidence,
+     * retried with the same request sequence, and never accepted as an ACK. */
+    begin_case(TX_WRONG_SEQ);
+    desk_watcher_motion_get_diagnostics(&before);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_TIMEOUT);
+    desk_watcher_motion_get_diagnostics(&after);
+    assert(after.ack_count == before.ack_count);
+    assert(after.wrong_sequence_count - before.wrong_sequence_count >= 1);
+    assert(after.retry_count - before.retry_count == 2);
+    assert(after.last_error == DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT);
+    assert(s_frames[0][4] == MCU_MOTION_MSG_SERVO_MOVE && frame_seq(0) == frame_seq(1) && frame_seq(1) == frame_seq(2));
+    assert_single_hal_release();
+
+    /* A complete response with a bad CRC increments only the CRC diagnostic,
+     * remains unaccepted, and falls through the ordinary retry/timeout path. */
+    begin_case(TX_BAD_CRC);
+    desk_watcher_motion_get_diagnostics(&before);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_TIMEOUT);
+    desk_watcher_motion_get_diagnostics(&after);
+    assert(after.ack_count == before.ack_count);
+    assert(after.bad_crc_count - before.bad_crc_count >= 1);
+    assert(after.retry_count - before.retry_count == 2);
     assert_single_hal_release();
 
     puts("ambiguous STOP native ESP transaction harness: PASS");
