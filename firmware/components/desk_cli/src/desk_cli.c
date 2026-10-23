@@ -465,7 +465,7 @@ static void cmd_camera(int argc, char *argv[])
     if (argc >= 2 && strcmp(argv[1], "capture") == 0) {
         static DESK_DIAG_BSS uint8_t jpeg_buf[8192];
         size_t out_len = 0;
-        int rc = desk_hardware_camera_capture_jpeg(jpeg_buf, sizeof(jpeg_buf), &out_len, 500);
+        int rc = desk_hardware_camera_capture_jpeg(jpeg_buf, sizeof(jpeg_buf), &out_len, 5000);
         printf("Camera Capture: rc=%d (%s), valid_frame=%s, out_len=%lu bytes\r\n",
                rc, rc == DESK_HW_OK ? "ok" : cli_camera_capture_error_name(rc),
                rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
