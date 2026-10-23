@@ -149,6 +149,58 @@ class TestCameraService(unittest.TestCase):
         cam.release_lease("sdk-owner")
         cam.stop_capture()
 
+    def _assert_stale_stop_cannot_stop_reacquired_pipeline(self, *, expire: bool) -> None:
+        cam = CameraViewerService(auto_start_pipeline=True)
+        initial_lease_ms = 35 if expire else 5000
+        cam.acquire_lease("viewer", lease_ms=initial_lease_ms)
+        old_capture_generation = cam._capture_generation
+        old_pipeline_generation = cam._pipeline_generation
+        self.assertIsNotNone(old_pipeline_generation)
+        self.assertTrue(cam.pipeline._running)
+
+        stop_entered = threading.Event()
+        allow_old_stop = threading.Event()
+        original_stop = cam.pipeline.stop_if_generation
+
+        def delayed_stop(generation):
+            if generation == old_pipeline_generation:
+                stop_entered.set()
+                self.assertTrue(allow_old_stop.wait(1.0), "test must release the delayed stop")
+            return original_stop(generation)
+
+        cam.pipeline.stop_if_generation = delayed_stop
+        if expire:
+            time.sleep(0.05)
+            invalidator = threading.Thread(target=cam.is_lease_valid)
+        else:
+            invalidator = threading.Thread(target=lambda: cam.release_lease("viewer"))
+        invalidator.start()
+        try:
+            self.assertTrue(stop_entered.wait(1.0), "old lease cleanup must reach the blocked stop")
+            reacquired = cam.acquire_lease("viewer", lease_ms=5000)
+            self.assertTrue(reacquired["granted"])
+        finally:
+            allow_old_stop.set()
+            invalidator.join(1.0)
+
+        self.assertFalse(invalidator.is_alive())
+        self.assertEqual(cam._active_lease_owner, "viewer")
+        self.assertTrue(cam.pipeline._running, "stopping an old generation must preserve the new lease's worker")
+        cam.push_frame(
+            b"\xff\xd8late-old-lease-frame\xff\xd9",
+            is_hardware=True,
+            capture_generation=old_capture_generation,
+        )
+        self.assertIsNone(cam.get_latest_frame("viewer"), "the old lease must remain unable to publish a JPEG")
+        cam.release_lease("viewer")
+        cam.stop_capture()
+
+    def test_release_stop_cannot_stop_pipeline_started_by_same_owner_reacquire(self) -> None:
+        self._assert_stale_stop_cannot_stop_reacquired_pipeline(expire=False)
+
+    def test_expiry_stop_cannot_stop_pipeline_started_by_same_owner_reacquire(self) -> None:
+        self._assert_stale_stop_cannot_stop_reacquired_pipeline(expire=True)
+
     def test_release_and_reacquire_does_not_start_second_blocked_capture_worker(self) -> None:
         entered_source = threading.Event()
         unblock_source = threading.Event()
