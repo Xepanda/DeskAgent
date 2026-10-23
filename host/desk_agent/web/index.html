@@ -333,6 +333,7 @@
       let streamSessionGeneration = null;
       while (leaseActive && !controller.signal.aborted) {
         const { value, done } = await reader.read();
+        if (!leaseActive || controller.signal.aborted) break;
         if (done) break;
         const receivedAt = performance.now();
         buffer = concatBytes(buffer, value);
