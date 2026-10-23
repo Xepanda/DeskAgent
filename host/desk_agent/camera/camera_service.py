@@ -27,7 +27,7 @@ LIVE_CAMERA_STALE_THRESHOLD_MS = 1000
 MAX_CAMERA_STREAMS = 4
 MAX_CAMERA_STREAMS_PER_OWNER = 1
 
-LeaseReleaseCallback = Callable[[str, str], None]
+LeaseReleaseCallback = Callable[[str, str, int], None]
 
 
 class CameraStreamError(RuntimeError):
@@ -251,6 +251,8 @@ class CameraViewerService:
         self._lock = threading.RLock()
         self._frame_changed = threading.Condition(self._lock)
         self._active_lease_owner: Optional[str] = None
+        self._lease_generation_counter = 0
+        self._active_lease_generation: Optional[int] = None
         self._lease_expires_at: float = 0.0
 
         # Bounded single latest frame buffer
@@ -313,13 +315,13 @@ class CameraViewerService:
         duration = (lease_ms or self.default_lease_ms) / 1000.0
         now = time.time()
 
-        expired_owner = None
+        expired_lease = None
         expired_pipeline_generation = None
         new_lease = False
         with self._lock:
             previous_pipeline_generation = self._pipeline_generation
-            expired_owner = self._expire_lease_locked(now)
-            if expired_owner:
+            expired_lease = self._expire_lease_locked(now)
+            if expired_lease:
                 expired_pipeline_generation = previous_pipeline_generation
             if self._active_lease_owner and self._active_lease_owner != client_id:
                 return {
@@ -331,10 +333,14 @@ class CameraViewerService:
 
             if self._active_lease_owner is None:
                 self._capture_generation += 1
+                self._lease_generation_counter += 1
+                self._active_lease_generation = self._lease_generation_counter
                 new_lease = True
             self._active_lease_owner = client_id
             self._lease_expires_at = now + duration
             capture_generation = self._capture_generation
+            lease_generation = self._active_lease_generation
+            assert lease_generation is not None
 
             if target_fps is not None:
                 self.pipeline.fps = max(0.5, min(30.0, float(target_fps)))
@@ -346,12 +352,14 @@ class CameraViewerService:
                 "lease_id": f"lease-{client_id}",
                 "lease_duration_ms": int(duration * 1000),
                 "expires_at": self._lease_expires_at,
+                "lease_generation": lease_generation,
                 "target_fps": self.pipeline.fps,
             }
 
-        if expired_owner:
+        if expired_lease:
+            expired_owner, expired_lease_generation = expired_lease
             self.pipeline.stop_if_generation(expired_pipeline_generation)
-            self._trigger_teardown(expired_owner, "expired")
+            self._trigger_teardown(expired_owner, "expired", expired_lease_generation)
         if self.auto_start_pipeline:
             pipeline_generation = self.pipeline.start(
                 lambda frame, is_hardware: self.push_frame(
@@ -374,15 +382,24 @@ class CameraViewerService:
                 self.pipeline.stop_if_generation(pipeline_generation)
         return result
 
-    def release_lease(self, client_id: str) -> bool:
+    def release_lease(self, client_id: str, expected_generation: Optional[int] = None) -> bool:
         """Explicitly releases camera viewing lease."""
         with self._lock:
-            if self._active_lease_owner == client_id:
+            if (
+                self._active_lease_owner == client_id
+                and (
+                    expected_generation is None
+                    or self._active_lease_generation == expected_generation
+                )
+            ):
                 owner = self._active_lease_owner
+                lease_generation = self._active_lease_generation
+                assert lease_generation is not None
                 pipeline_generation = self._pipeline_generation
                 self._pipeline_generation = None
                 self._capture_generation += 1
                 self._active_lease_owner = None
+                self._active_lease_generation = None
                 self._lease_expires_at = 0.0
                 self._latest_jpeg = None
                 self._latest_frame_time = 0.0
@@ -395,10 +412,14 @@ class CameraViewerService:
             else:
                 return False
         self.pipeline.stop_if_generation(pipeline_generation)
-        self._trigger_teardown(owner, "explicit_release")
+        self._trigger_teardown(owner, "explicit_release", lease_generation)
         return True
 
-    def invalidate_owner_on_upstream_disconnect(self, client_id: str) -> bool:
+    def invalidate_owner_on_upstream_disconnect(
+        self,
+        client_id: str,
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Invalidates camera state after the owning SDK transport disconnects.
 
         This is deliberately a non-blocking invalidation path: it clears the
@@ -408,12 +429,19 @@ class CameraViewerService:
         for teardown callbacks and synchronous pipeline stopping.
         """
         with self._lock:
-            if self._active_lease_owner != client_id:
+            if (
+                self._active_lease_owner != client_id
+                or (
+                    expected_generation is not None
+                    and self._active_lease_generation != expected_generation
+                )
+            ):
                 return False
             pipeline_generation = self._pipeline_generation
             self._pipeline_generation = None
             self._capture_generation += 1
             self._active_lease_owner = None
+            self._active_lease_generation = None
             self._lease_expires_at = 0.0
             self._latest_jpeg = None
             self._latest_frame_time = 0.0
@@ -430,20 +458,24 @@ class CameraViewerService:
         """Checks if current camera lease is valid and active."""
         with self._lock:
             pipeline_generation = self._pipeline_generation
-            owner = self._expire_lease_locked(time.time())
+            expired_lease = self._expire_lease_locked(time.time())
             valid = self._active_lease_owner is not None
-        if owner:
+        if expired_lease:
+            owner, lease_generation = expired_lease
             self.pipeline.stop_if_generation(pipeline_generation)
-            self._trigger_teardown(owner, "expired")
+            self._trigger_teardown(owner, "expired", lease_generation)
         return valid
 
-    def _expire_lease_locked(self, now: float) -> Optional[str]:
+    def _expire_lease_locked(self, now: float) -> Optional[tuple[str, int]]:
         """Clears expired owner/frame state; caller performs teardown after unlock."""
         if self._active_lease_owner and now >= self._lease_expires_at:
             owner = self._active_lease_owner
+            lease_generation = self._active_lease_generation
+            assert lease_generation is not None
             self._pipeline_generation = None
             self._capture_generation += 1
             self._active_lease_owner = None
+            self._active_lease_generation = None
             self._lease_expires_at = 0.0
             self._latest_jpeg = None
             self._latest_frame_time = 0.0
@@ -453,13 +485,13 @@ class CameraViewerService:
             self._last_device_sequence = None
             self._is_hardware_frame = False
             self._frame_changed.notify_all()
-            return owner
+            return owner, lease_generation
         return None
 
-    def _trigger_teardown(self, owner: str, reason: str) -> None:
+    def _trigger_teardown(self, owner: str, reason: str, lease_generation: int) -> None:
         if self.on_lease_released:
             try:
-                self.on_lease_released(owner, reason)
+                self.on_lease_released(owner, reason, lease_generation)
             except Exception as exc:
                 logger.error("Error executing camera teardown callback: %s", exc)
 
@@ -544,9 +576,10 @@ class CameraViewerService:
             owner = None
             pipeline_generation = self._pipeline_generation
             if self._active_lease_owner != client_id or time.time() >= self._lease_expires_at:
-                owner = self._expire_lease_locked(time.time())
-                error = "NO_ACTIVE_LEASE" if owner or self._active_lease_owner is None else "RESOURCE_BUSY"
+                expired_lease = self._expire_lease_locked(time.time())
+                error = "NO_ACTIVE_LEASE" if expired_lease or self._active_lease_owner is None else "RESOURCE_BUSY"
             else:
+                expired_lease = None
                 error = None
             if error is None and client_id in self._active_stream_owners:
                 raise CameraStreamCapacityError("STREAM_ALREADY_ACTIVE")
@@ -556,9 +589,10 @@ class CameraViewerService:
                 self._active_stream_owners.add(client_id)
                 lease_generation = self._capture_generation
             last_seq = self._frame_seq
-        if owner:
+        if expired_lease:
+            owner, lease_generation = expired_lease
             self.pipeline.stop_if_generation(pipeline_generation)
-            self._trigger_teardown(owner, "expired")
+            self._trigger_teardown(owner, "expired", lease_generation)
         if error:
             raise CameraStreamLeaseError(error)
 
@@ -738,6 +772,7 @@ class CameraViewerService:
         if isinstance(wait_timeout_ms, bool) or not isinstance(wait_timeout_ms, int) or not 0 <= wait_timeout_ms <= 5000:
             raise ValueError("wait_timeout_ms must be an integer between 0 and 5000")
         acquired_ephemeral = False
+        ephemeral_lease_generation: Optional[int] = None
         if self.is_lease_valid():
             with self._lock:
                 # An active lease is held: caller must explicitly match the lease owner.
@@ -750,6 +785,7 @@ class CameraViewerService:
             if not acq.get("granted"):
                 return None
             acquired_ephemeral = True
+            ephemeral_lease_generation = acq["lease_generation"]
 
         try:
             # SDK ingress is independent from pipeline._running. Wait on the
@@ -761,12 +797,15 @@ class CameraViewerService:
             return frame
         finally:
             if acquired_ephemeral:
-                self.release_lease(effective_client)
+                self.release_lease(
+                    effective_client,
+                    expected_generation=ephemeral_lease_generation,
+                )
 
     def _wait_for_fresh_frame(self, client_id: str, timeout_s: float) -> Optional[dict[str, Any]]:
         """Wait for a fresh JPEG from any producer while this client owns the lease."""
         deadline = time.monotonic() + timeout_s
-        expired_owner: Optional[str] = None
+        expired_lease: Optional[tuple[str, int]] = None
         expired_pipeline_generation: Optional[int] = None
         frame: Optional[dict[str, Any]] = None
         with self._frame_changed:
@@ -776,7 +815,7 @@ class CameraViewerService:
                     break
                 if now_wall >= self._lease_expires_at:
                     expired_pipeline_generation = self._pipeline_generation
-                    expired_owner = self._expire_lease_locked(now_wall)
+                    expired_lease = self._expire_lease_locked(now_wall)
                     break
                 age_ms = (time.monotonic() - self._latest_frame_monotonic) * 1000
                 if (
@@ -800,7 +839,8 @@ class CameraViewerService:
                 if remaining <= 0:
                     break
                 self._frame_changed.wait(remaining)
-        if expired_owner:
+        if expired_lease:
+            expired_owner, lease_generation = expired_lease
             self.pipeline.stop_if_generation(expired_pipeline_generation)
-            self._trigger_teardown(expired_owner, "expired")
+            self._trigger_teardown(expired_owner, "expired", lease_generation)
         return frame

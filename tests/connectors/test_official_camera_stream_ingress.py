@@ -127,6 +127,18 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
         self.assertEqual(commands.count("ctrl.camera.acquire"), 2)
         self.assertGreaterEqual(commands.count("ctrl.camera.clock.ping"), 1)
 
+    def test_old_release_generation_cannot_stop_same_owner_new_stream(self):
+        ingress, sender, _delivered = self.make_ingress()
+        self.assertTrue(ingress.acquire("viewer-a", 10000, lease_generation=31)["granted"])
+        self.assertTrue(ingress.acquire("viewer-a", 10000, lease_generation=32)["granted"])
+        command_count = len(sender.commands)
+
+        self.assertFalse(ingress.release("viewer-a", expected_generation=31))
+        self.assertEqual(len(sender.commands), command_count)
+        self.assertEqual(ingress._owner, "viewer-a")
+        self.assertEqual(ingress._lease_generation, 32)
+        self.assertTrue(ingress.release("viewer-a", expected_generation=32))
+
     def test_old_session_stream_and_wrong_owner_are_rejected(self):
         active = {"viewer-a"}
         ingress, _sender, delivered = self.make_ingress(
@@ -161,8 +173,10 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
             clock_ping_interval=3600,
         )
         self.addCleanup(ingress.close)
-        cleared: list[str] = []
-        ingress.set_clear_frame_callback(cleared.append)
+        cleared: list[tuple[str, int | None]] = []
+        ingress.set_clear_frame_callback(
+            lambda owner, *, expected_generation=None: cleared.append((owner, expected_generation))
+        )
         ingress.start("viewer-a", 10000)
         jpeg = jpeg_fixture()
         ingress.on_application_frame("device", packet(jpeg, sequence=1, timestamp_ms=1))
@@ -173,7 +187,7 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
         names = [name for name, _ in sender.commands]
         self.assertIn("ctrl.camera.stream.stop", names)
         self.assertIn("ctrl.camera.release", names)
-        self.assertEqual(cleared, ["viewer-a"])
+        self.assertEqual(cleared, [("viewer-a", None)])
         self.assertIsNone(ingress.latest_frame_metadata)
 
     def test_clock_offset_unknown_fails_closed_for_latency_metrics(self):
@@ -213,6 +227,7 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
             def __init__(self):
                 self._lock = threading.RLock()
                 self._active_lease_owner = None
+                self._active_lease_generation = None
                 self._lease_expires_at = 0.0
                 self.on_lease_released = None
                 self.frames = []
@@ -220,22 +235,29 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
             def ingest_robot_frame(self, jpeg, metadata=None):
                 self.frames.append((jpeg, metadata))
 
-            def invalidate_owner_on_upstream_disconnect(self, owner):
+            def invalidate_owner_on_upstream_disconnect(self, owner, expected_generation=None):
                 with self._lock:
-                    if self._active_lease_owner != owner:
+                    if (self._active_lease_owner != owner
+                            or (expected_generation is not None
+                                and self._active_lease_generation != expected_generation)):
                         return False
                     self._active_lease_owner = None
+                    self._active_lease_generation = None
                     return True
 
-            def release_lease(self, owner):
+            def release_lease(self, owner, expected_generation=None):
                 with self._lock:
-                    if self._active_lease_owner != owner:
+                    if (self._active_lease_owner != owner
+                            or (expected_generation is not None
+                                and self._active_lease_generation != expected_generation)):
                         return False
+                    generation = self._active_lease_generation
                     self._active_lease_owner = None
+                    self._active_lease_generation = None
                     self._lease_expires_at = 0
                     callback = self.on_lease_released
                 if callback:
-                    callback(owner, "explicit_release")
+                    callback(owner, "explicit_release", generation)
                 return True
 
         class Robot:
@@ -269,8 +291,11 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
 
         with app.camera_service._lock:
             app.camera_service._active_lease_owner = "viewer-a"
+            app.camera_service._active_lease_generation = 1
             app.camera_service._lease_expires_at = time.time() + 10
-        self.assertTrue(app.official_camera_stream_ingress.start("viewer-a", 10000)["started"])
+        self.assertTrue(app.official_camera_stream_ingress.start(
+            "viewer-a", 10000, lease_generation=1
+        )["started"])
         jpeg = jpeg_fixture()
         raw = packet(jpeg)
         observer("device", raw)
@@ -293,8 +318,11 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
 
         with app.camera_service._lock:
             app.camera_service._active_lease_owner = "viewer-b"
+            app.camera_service._active_lease_generation = 2
             app.camera_service._lease_expires_at = time.time() + 10
-        self.assertTrue(app.official_camera_stream_ingress.start("viewer-b", 10000)["started"])
+        self.assertTrue(app.official_camera_stream_ingress.start(
+            "viewer-b", 10000, lease_generation=2
+        )["started"])
         disconnect_callbacks[-1]()
         self.assertIs(communicators._on_frame, original_callback)
         self.assertIsNone(app.latest_camera_stream_metadata)
