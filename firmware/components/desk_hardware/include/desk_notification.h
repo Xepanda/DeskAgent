@@ -15,10 +15,12 @@ extern "C" {
 #define DESK_NOTIFICATION_REMINDER_ID_MAX 64
 #define DESK_NOTIFICATION_OCCURRENCE_ID_MAX 64
 #define DESK_NOTIFICATION_ACK_SOURCE_MAX 31
-#define DESK_NOTIFICATION_STORE_SLOT_EMPTY 1
-/* Distinct from DESK_HW_ERR_UNAVAILABLE (for example, an untrusted clock).
- * Returned only when the durable notification provider is known unavailable. */
-#define DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE (-100)
+#define DESK_NOTIFICATION_SUMMARY_ID_MAX 128
+#define DESK_NOTIFICATION_SUMMARY_BATCH_ID_MAX 128
+#define DESK_NOTIFICATION_SUMMARY_MAX_ITEMS 20
+#define DESK_NOTIFICATION_SUMMARY_TITLE_MAX 256
+#define DESK_NOTIFICATION_TIMEZONE_MAX 64
+#define DESK_NOTIFICATION_DISPLAY_TIME_MAX 26
 
 typedef struct {
     char notification_id[DESK_NOTIFICATION_ID_MAX + 1];
@@ -51,26 +53,42 @@ typedef struct {
 typedef void (*desk_notification_status_cb_t)(const desk_notification_status_event_t *event,
                                                void *user_data);
 
-/* A1 storage backend contract. save() must durably commit the opaque, versioned
- * record before returning DESK_HW_OK. load() returns STORE_SLOT_EMPTY only when
- * a slot is empty; storage failures must return an error. No default backend is
- * enabled on protected partitions. */
-typedef struct {
-    int (*load)(unsigned slot, void *out_record, size_t capacity, size_t *out_len, void *user_data);
-    int (*save)(unsigned slot, const void *record, size_t record_len, void *user_data);
-    int (*erase)(unsigned slot, void *user_data);
-    void *user_data;
-} desk_notification_store_ops_t;
-
-/* Register an explicitly authorized durable backend before init. */
-int desk_hardware_notification_register_store(const desk_notification_store_ops_t *ops);
-
-/* Initialize after the approved persistent backend is ready. Fails closed without it. */
+/* Records and dedupe state are RAM-only and are cleared on init/reboot. */
 int desk_hardware_notification_init(desk_notification_status_cb_t callback, void *user_data);
 
-/* Validate and durably dedupe by notification_id before returning ACCEPTED. */
+/* Validate and dedupe by notification_id for this boot session. */
 int desk_hardware_notification_deliver(const desk_notification_input_t *input,
                                        desk_notification_status_event_t *out_status);
+
+typedef struct {
+    const char *reminder_id;
+    const char *occurrence_id;
+    const char *title;
+    const char *scheduled_at;
+    const char *timezone;
+    const char *display_time; /* YYYY-MM-DD HH:MM UTC±HH:MM; max 26 ASCII bytes. */
+} desk_notification_summary_item_t;
+
+typedef struct {
+    const char *summary_id;
+    const char *batch_id;
+    const char *created_at;
+    const char *expires_at;
+    const desk_notification_summary_item_t *items;
+    size_t item_count;
+    uint32_t omitted_count;
+} desk_notification_summary_input_t;
+
+typedef void (*desk_notification_summary_ack_cb_t)(const char *summary_id,
+                                                    const char *source,
+                                                    void *user_data);
+
+/* Summary delivery is display-only. Input strings are consumed synchronously. */
+int desk_hardware_notification_deliver_summary(const desk_notification_summary_input_t *input);
+int desk_hardware_notification_register_summary_ack_callback(
+    desk_notification_summary_ack_cb_t callback, void *user_data);
+/* Emits the registered callback only after this explicit UI acknowledgement call. */
+int desk_hardware_notification_summary_acknowledge(const char *summary_id, const char *source);
 
 /* Serialize all calls through the owning adapter. Status callbacks run in the
  * calling context and are keyed by notification_id. Process at most one queued

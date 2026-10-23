@@ -65,6 +65,8 @@ sudo -u deskagent /opt/desk-agent/venv/bin/pip install --upgrade pip
 sudo -u deskagent /opt/desk-agent/venv/bin/pip install -r /opt/desk-agent/requirements.txt
 ```
 
+The locked `tzdata==2026.5` wheel supplies the Host's IANA timezone database on Windows and Linux. Host code that formats CR-028 summary times must set `zoneinfo`'s `TZPATH` to an empty tuple before constructing `ZoneInfo`, so Linux does not silently use an unpinned `/usr/share/zoneinfo` database. Keep the package inside the application virtual environment; do not install it globally. A deployment is not ready to create summaries unless its installed `tzdata` version matches `contracts/dependency_lock.json`.
+
 ### 2.3 配置与启动参数说明
 Host 守护进程支持以下命令行参数与配置文件选项：
 

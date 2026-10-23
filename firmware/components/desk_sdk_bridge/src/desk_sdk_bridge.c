@@ -83,6 +83,8 @@ static bool desk_sdk_log_command_id_valid(const char *id);
 static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed,
                                          size_t allowed_count);
 static bool desk_sdk_log_pairing_is_complete(void);
+static void desk_sdk_summary_ack_callback(const char *summary_id, const char *source,
+                                          void *user_data);
 
 static uint64_t desk_sdk_camera_worker_now_ms(void)
 {
@@ -1348,6 +1350,11 @@ int desk_sdk_bridge_init(void)
     desk_sdk_ws_client_close();
     if (desk_hardware_register_roller_delta_cb(desk_sdk_roller_input_observer, NULL) != DESK_HW_OK) {
         printf("[SDK-INPUT] roller observer registration failed\n");
+        return -1;
+    }
+    if (desk_hardware_notification_register_summary_ack_callback(
+            desk_sdk_summary_ack_callback, NULL) != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION] summary acknowledgement observer registration failed\n");
         return -1;
     }
     return 0;
@@ -3061,12 +3068,10 @@ static int desk_sdk_notification_nack(char *out, size_t cap, const char *command
 
 static int desk_sdk_notification_result_nack(char *out, size_t cap, const char *command_id, int rc)
 {
-    if (rc == DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE)
-        return desk_sdk_notification_nack(out, cap, command_id, "STORAGE_UNAVAILABLE", 503);
     if (rc == DESK_HW_ERR_BUSY)
-        return desk_sdk_notification_nack(out, cap, command_id, "STORAGE_FULL", 507);
+        return desk_sdk_notification_nack(out, cap, command_id, "QUEUE_FULL", 507);
     if (rc == DESK_HW_ERR_IO)
-        return desk_sdk_notification_nack(out, cap, command_id, "STORAGE_ERROR", 500);
+        return desk_sdk_notification_nack(out, cap, command_id, "DELIVERY_FAILED", 500);
     if (rc == DESK_HW_ERR_TIMEOUT)
         return desk_sdk_notification_nack(out, cap, command_id, "EXPIRED", 410);
     if (rc == DESK_HW_ERR_INVALID_ARG)
@@ -3168,6 +3173,33 @@ static bool desk_sdk_summary_text_nonblank(const char *text)
     return false;
 }
 
+static bool desk_sdk_summary_display_time_valid(const char *text)
+{
+    if (!text || strlen(text) != 26 || text[4] != '-' || text[7] != '-' ||
+        text[10] != ' ' || text[13] != ':' || text[16] != ' ' ||
+        memcmp(text + 17, "UTC", 3) != 0 ||
+        (text[20] != '+' && text[20] != '-')) return false;
+    static const uint8_t digit_positions[] = {
+        0,1,2,3,5,6,8,9,11,12,14,15,21,22,24,25
+    };
+    for (size_t i = 0; i < sizeof(digit_positions); ++i)
+        if (text[digit_positions[i]] < '0' || text[digit_positions[i]] > '9') return false;
+    unsigned hour = (unsigned)(text[11] - '0') * 10u + (unsigned)(text[12] - '0');
+    unsigned minute = (unsigned)(text[14] - '0') * 10u + (unsigned)(text[15] - '0');
+    unsigned offset_hour = (unsigned)(text[21] - '0') * 10u + (unsigned)(text[22] - '0');
+    unsigned offset_minute = (unsigned)(text[24] - '0') * 10u + (unsigned)(text[25] - '0');
+    unsigned month = (unsigned)(text[5] - '0') * 10u + (unsigned)(text[6] - '0');
+    unsigned day = (unsigned)(text[8] - '0') * 10u + (unsigned)(text[9] - '0');
+    unsigned year = (unsigned)(text[0] - '0') * 1000u + (unsigned)(text[1] - '0') * 100u +
+                    (unsigned)(text[2] - '0') * 10u + (unsigned)(text[3] - '0');
+    static const unsigned month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (year < 1970 || month < 1 || month > 12 || hour > 23 || minute > 59 ||
+        offset_hour > 14 || offset_minute > 59 || (offset_hour == 14 && offset_minute != 0)) return false;
+    bool leap = (year % 4u == 0u && year % 100u != 0u) || year % 400u == 0u;
+    unsigned max_day = month_days[month - 1] + (month == 2 && leap ? 1u : 0u);
+    return day >= 1 && day <= max_day;
+}
+
 static bool desk_sdk_summary_validate_items(const char *raw_items, size_t items_len)
 {
     desk_log_json_parser_t p = { .p = raw_items, .depth = 0 };
@@ -3184,10 +3216,11 @@ static bool desk_sdk_summary_validate_items(const char *raw_items, size_t items_
         char item[2048];
         memcpy(item, start, raw_len); item[raw_len] = '\0';
         static const char *const keys[] = {
-            "reminder_id", "occurrence_id", "title", "scheduled_at", "timezone"
+            "reminder_id", "occurrence_id", "title", "scheduled_at", "timezone", "display_time"
         };
         char reminder_id[129] = "", occurrence_id[129] = "", title[1025] = "";
         char scheduled_at[32] = "", timezone_name[65] = "";
+        char display_time[DESK_NOTIFICATION_DISPLAY_TIME_MAX + 1] = "";
         uint64_t scheduled_us = 0;
         if (!desk_log_object_keys_allowed(item, keys, sizeof(keys) / sizeof(keys[0])) ||
             !desk_sdk_notification_get_string(item, "reminder_id", reminder_id, sizeof(reminder_id)) ||
@@ -3195,14 +3228,84 @@ static bool desk_sdk_summary_validate_items(const char *raw_items, size_t items_
             !desk_sdk_notification_get_string(item, "title", title, sizeof(title)) ||
             !desk_sdk_notification_get_string(item, "scheduled_at", scheduled_at, sizeof(scheduled_at)) ||
             !desk_sdk_notification_get_string(item, "timezone", timezone_name, sizeof(timezone_name)) ||
+            !desk_sdk_notification_get_string(item, "display_time", display_time, sizeof(display_time)) ||
             strlen(reminder_id) > 128 || strlen(occurrence_id) > 128 ||
             !desk_sdk_summary_text_nonblank(title) || strlen(title) > 256 ||
             strlen(timezone_name) > 64 || !timezone_name[0] ||
+            !desk_sdk_summary_display_time_valid(display_time) ||
             !desk_sdk_notification_parse_timestamp(scheduled_at, &scheduled_us) ||
             (count > 1 && scheduled_us < previous_us)) return false;
         previous_us = scheduled_us;
         desk_log_json_ws(&p);
         if (*p.p == ']') { ++p.p; return count >= 1 && (size_t)(p.p - raw_items) == items_len; }
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+}
+
+typedef struct {
+    desk_notification_summary_item_t item;
+    char reminder_id[DESK_NOTIFICATION_REMINDER_ID_MAX + 1];
+    char occurrence_id[DESK_NOTIFICATION_OCCURRENCE_ID_MAX + 1];
+    char title[DESK_NOTIFICATION_SUMMARY_TITLE_MAX + 1];
+    char scheduled_at[DESK_NOTIFICATION_TIMESTAMP_MAX + 1];
+    char timezone[DESK_NOTIFICATION_TIMEZONE_MAX + 1];
+    char display_time[DESK_NOTIFICATION_DISPLAY_TIME_MAX + 1];
+} desk_sdk_summary_item_storage_t;
+
+static bool desk_sdk_summary_parse_items(const char *raw_items, size_t items_len,
+                                         desk_sdk_summary_item_storage_t *storage,
+                                         desk_notification_summary_item_t *items,
+                                         size_t *item_count)
+{
+    desk_log_json_parser_t p = { .p = raw_items, .depth = 0 };
+    if (!storage || !items || !item_count || *p.p++ != '[') return false;
+    desk_log_json_ws(&p);
+    uint64_t previous_us = 0;
+    size_t count = 0;
+    if (*p.p == ']') return false;
+    for (;;) {
+        const char *start = p.p;
+        if (!desk_log_json_value(&p) || count >= DESK_NOTIFICATION_SUMMARY_MAX_ITEMS) return false;
+        size_t raw_len = (size_t)(p.p - start);
+        if (raw_len >= 2048) return false;
+        char raw[2048];
+        memcpy(raw, start, raw_len); raw[raw_len] = '\0';
+        static const char *const keys[] = {
+            "reminder_id", "occurrence_id", "title", "scheduled_at", "timezone", "display_time"
+        };
+        desk_sdk_summary_item_storage_t *dst = &storage[count];
+        uint64_t scheduled_us = 0;
+        if (!desk_log_object_keys_allowed(raw, keys, sizeof(keys) / sizeof(keys[0])) ||
+            !desk_sdk_notification_get_string(raw, "reminder_id", dst->reminder_id, sizeof(dst->reminder_id)) ||
+            !desk_sdk_notification_get_string(raw, "occurrence_id", dst->occurrence_id, sizeof(dst->occurrence_id)) ||
+            !desk_sdk_notification_get_string(raw, "title", dst->title, sizeof(dst->title)) ||
+            !desk_sdk_notification_get_string(raw, "scheduled_at", dst->scheduled_at, sizeof(dst->scheduled_at)) ||
+            !desk_sdk_notification_get_string(raw, "timezone", dst->timezone, sizeof(dst->timezone)) ||
+            !desk_sdk_notification_get_string(raw, "display_time", dst->display_time, sizeof(dst->display_time)) ||
+            !desk_sdk_summary_identifier_valid(dst->reminder_id) ||
+            !desk_sdk_summary_identifier_valid(dst->occurrence_id) ||
+            !desk_sdk_summary_text_nonblank(dst->title) ||
+            strlen(dst->title) > DESK_NOTIFICATION_SUMMARY_TITLE_MAX ||
+            !dst->timezone[0] ||
+            !desk_sdk_summary_display_time_valid(dst->display_time) ||
+            !desk_sdk_notification_parse_timestamp(dst->scheduled_at, &scheduled_us) ||
+            (count > 0 && scheduled_us < previous_us)) return false;
+        previous_us = scheduled_us;
+        dst->item.reminder_id = dst->reminder_id;
+        dst->item.occurrence_id = dst->occurrence_id;
+        dst->item.title = dst->title;
+        dst->item.scheduled_at = dst->scheduled_at;
+        dst->item.timezone = dst->timezone;
+        dst->item.display_time = dst->display_time;
+        items[count] = dst->item;
+        ++count;
+        desk_log_json_ws(&p);
+        if (*p.p == ']') {
+            ++p.p;
+            *item_count = count;
+            return count > 0 && (size_t)(p.p - raw_items) == items_len;
+        }
         if (*p.p++ != ',') return false;
         desk_log_json_ws(&p);
     }
@@ -3215,6 +3318,13 @@ static int desk_sdk_notification_summary_nack(char *out, size_t cap, const char 
         "{\"type\":\"sys.nack\",\"code\":%d,\"data\":{\"type\":\"notification.summary.deliver\",\"command_id\":\"%s\",\"error\":\"%s\"}}",
         code, command_id, error);
     return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static void desk_sdk_summary_ack_callback(const char *summary_id, const char *source,
+                                          void *user_data)
+{
+    (void)user_data;
+    (void)desk_sdk_bridge_send_notification_summary_ack(summary_id, source);
 }
 
 static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out_buf,
@@ -3240,7 +3350,7 @@ static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out
 
     char summary_id[129] = "", batch_id[129] = "", created_at[32] = "", expires_at[32] = "";
     char omitted_count[32] = "";
-    const char *items = NULL;
+    const char *items_span = NULL;
     size_t items_len = 0;
     uint64_t created_us = 0, expires_us = 0;
     bool valid =
@@ -3252,16 +3362,51 @@ static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out
         desk_sdk_notification_parse_timestamp(created_at, &created_us) &&
         desk_sdk_notification_parse_timestamp(expires_at, &expires_us) &&
         expires_us > created_us && expires_us - created_us == 86400000000ULL &&
-        desk_log_get_member_span(data, "items", &items, &items_len) &&
-        desk_sdk_summary_validate_items(items, items_len) &&
+        desk_log_get_member_span(data, "items", &items_span, &items_len) &&
+        desk_sdk_summary_validate_items(items_span, items_len) &&
         desk_log_get_member(data, "omitted_count", omitted_count, sizeof(omitted_count)) == 1 &&
         desk_sdk_summary_count_valid(omitted_count);
+    uint64_t omitted_value = 0;
+    if (valid) {
+        for (const char *p = omitted_count; *p; ++p)
+            omitted_value = omitted_value * 10u + (unsigned)(*p - '0');
+        if (omitted_value > UINT32_MAX) valid = false;
+    }
     if (!valid)
         return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
 
-    /* CR-018 has no approved durable device store/provider for summary IDs.
-     * Preserve the stable payload ID at the bridge boundary and fail closed. */
-    return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "STORAGE_UNAVAILABLE", 503);
+    desk_sdk_summary_item_storage_t *storage = calloc(DESK_NOTIFICATION_SUMMARY_MAX_ITEMS, sizeof(*storage));
+    desk_notification_summary_item_t typed_items[DESK_NOTIFICATION_SUMMARY_MAX_ITEMS] = {0};
+    size_t item_count = 0;
+    if (!storage)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "RESOURCE_UNAVAILABLE", 503);
+    if (!desk_sdk_summary_parse_items(items_span, items_len, storage, typed_items, &item_count)) {
+        free(storage);
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    }
+    desk_notification_summary_input_t input = {
+        .summary_id = summary_id,
+        .batch_id = batch_id,
+        .created_at = created_at,
+        .expires_at = expires_at,
+        .items = typed_items,
+        .item_count = item_count,
+        .omitted_count = (uint32_t)omitted_value,
+    };
+    int deliver_rc = desk_hardware_notification_deliver_summary(&input);
+    free(storage);
+    if (deliver_rc == DESK_HW_ERR_TIMEOUT)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "EXPIRED", 410);
+    if (deliver_rc == DESK_HW_ERR_BUSY)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "QUEUE_FULL", 507);
+    if (deliver_rc != DESK_HW_OK)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id,
+            deliver_rc == DESK_HW_ERR_INVALID_ARG ? "INVALID_ARGUMENT" : "DELIVERY_UNAVAILABLE",
+            deliver_rc == DESK_HW_ERR_INVALID_ARG ? 400 : 503);
+    int n = snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"notification.summary.deliver\",\"command_id\":\"%s\"}}",
+        command_id);
+    return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
 }
 
 static bool desk_log_component_filter_valid(const char *raw, uint8_t *component_mask)

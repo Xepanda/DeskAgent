@@ -212,6 +212,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
         cls.lib.desk_hardware_notification_init.restype = ctypes.c_int
         cls.lib.desk_hardware_notification_init.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cls.lib.desk_hardware_notification_summary_acknowledge.restype = ctypes.c_int
+        cls.lib.desk_hardware_notification_summary_acknowledge.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
         cls.lib.desk_sdk_test_notification_result_nack.restype = ctypes.c_int
         cls.lib.desk_sdk_test_notification_result_nack.argtypes = [
             ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
@@ -515,9 +517,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
     def test_notification_a1_result_nack_mappings_fail_closed(self) -> None:
         command_id = "0123456789abcdef0123456789abcdef"
         mappings = (
-            (-100, 503, "STORAGE_UNAVAILABLE"),
-            (-5, 507, "STORAGE_FULL"),
-            (-4, 500, "STORAGE_ERROR"),
+            (-5, 507, "QUEUE_FULL"),
+            (-4, 500, "DELIVERY_FAILED"),
             (-3, 410, "EXPIRED"),
             (-1, 400, "INVALID_ARGUMENT"),
             (-2, 503, "NOTIFICATION_DELIVERY_FAILED"),
@@ -542,24 +543,17 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 })
                 self.assertNotIn("accepted", json.loads(out.value))
 
-    def test_notification_deliver_valid_payload_fails_closed_without_provider(self) -> None:
+    def test_notification_deliver_valid_payload_is_accepted_by_volatile_queue(self) -> None:
         self.lib.desk_sdk_test_seed_ws_auth_latch()
-        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), -100)
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
         first = self._notification_deliver("0123456789abcdef0123456789abcdef")
         retry = self._notification_deliver("fedcba9876543210fedcba9876543210")
 
         first_response = self._dispatch_notification_ws(first)
         retry_response = self._dispatch_notification_ws(retry)
         for command, response in ((first, first_response), (retry, retry_response)):
-            self.assertEqual(response, {
-                "type": "sys.nack",
-                "code": 503,
-                "data": {
-                    "type": "notification.deliver",
-                    "command_id": command["data"]["command_id"],
-                    "error": "STORAGE_UNAVAILABLE",
-                },
-            })
+            self.assertEqual(response, {"type": "sys.ack", "code": 0, "data": {
+                "type": "notification.deliver", "command_id": command["data"]["command_id"]}})
             self.assertNotIn("accepted", response)
             self.assertNotIn("status", response.get("data", {}))
         self.assertEqual(first["data"]["notification_id"], retry["data"]["notification_id"])
@@ -630,28 +624,20 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     "title": "Missed reminder",
                     "scheduled_at": "2026-10-22T12:30:00Z",
                     "timezone": "Asia/Shanghai",
+                    "display_time": "2026-10-22 20:30 UTC+08:00",
                 }],
                 "omitted_count": 0,
                 "command_id": command_id,
             },
         }
 
-    def test_summary_command_is_strict_and_fails_closed_without_durable_provider(self) -> None:
+    def test_summary_command_is_strict_and_enqueues_only_valid_payloads(self) -> None:
         self.lib.desk_sdk_test_seed_ws_auth_latch()
-        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), -100)
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
         valid = self._notification_summary()
         response = self._dispatch_notification_ws(valid)
-        self.assertEqual(response["type"], "sys.nack")
-        self.assertEqual(response["code"], 503)
-        self.assertEqual(response["data"]["type"], "notification.summary.deliver")
-        self.assertEqual(response["data"]["command_id"], valid["data"]["command_id"])
-        self.assertEqual(response["data"]["error"], "STORAGE_UNAVAILABLE")
-        retry = json.loads(json.dumps(valid))
-        retry["data"]["command_id"] = "fedcba9876543210fedcba9876543210"
-        retry_response = self._dispatch_notification_ws(retry)
-        self.assertEqual(retry_response["data"]["command_id"], retry["data"]["command_id"])
-        self.assertEqual(retry_response["data"]["error"], "STORAGE_UNAVAILABLE")
-        self.assertNotIn("summary_id", retry_response["data"])
+        self.assertEqual(response, {"type": "sys.ack", "code": 0, "data": {
+            "type": "notification.summary.deliver", "command_id": valid["data"]["command_id"]}})
 
         malformed = []
         extra = json.loads(json.dumps(valid)); extra["data"]["unexpected"] = True; malformed.append(extra)
@@ -666,6 +652,9 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         unsorted["data"]["items"][1]["scheduled_at"] = "2026-10-22T12:30:00Z"; malformed.append(unsorted)
         item_extra = json.loads(json.dumps(valid)); item_extra["data"]["items"][0]["body"] = "extra"; malformed.append(item_extra)
         item_missing = json.loads(json.dumps(valid)); del item_missing["data"]["items"][0]["timezone"]; malformed.append(item_missing)
+        display_time_missing = json.loads(json.dumps(valid)); del display_time_missing["data"]["items"][0]["display_time"]; malformed.append(display_time_missing)
+        display_time_bad = json.loads(json.dumps(valid)); display_time_bad["data"]["items"][0]["display_time"] = "2026-10-22 20:30 Asia/Shanghai"; malformed.append(display_time_bad)
+        display_time_bad_offset = json.loads(json.dumps(valid)); display_time_bad_offset["data"]["items"][0]["display_time"] = "2026-10-22 20:30 UTC+14:30"; malformed.append(display_time_bad_offset)
         blank_title = json.loads(json.dumps(valid)); blank_title["data"]["items"][0]["title"] = "  "; malformed.append(blank_title)
         negative_omitted = json.loads(json.dumps(valid)); negative_omitted["data"]["omitted_count"] = -1; malformed.append(negative_omitted)
         bool_omitted = json.loads(json.dumps(valid)); bool_omitted["data"]["omitted_count"] = True; malformed.append(bool_omitted)
@@ -679,6 +668,52 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 self.assertEqual(response["data"]["type"], "notification.summary.deliver")
                 self.assertEqual(response["data"]["command_id"], command["data"]["command_id"])
                 self.assertEqual(response["data"]["error"], "INVALID_ARGUMENT")
+
+    def test_summary_expiry_and_volatile_capacity_are_truthful_nacks(self) -> None:
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
+        expired = self._notification_summary("e" * 32)
+        expired["data"]["created_at"] = "2020-10-23T00:00:00Z"
+        expired["data"]["expires_at"] = "2020-10-24T00:00:00Z"
+        response = self._dispatch_notification_ws(expired)
+        self.assertEqual(response["type"], "sys.nack")
+        self.assertEqual(response["code"], 410)
+        self.assertEqual(response["data"]["error"], "EXPIRED")
+
+        for index in range(16):
+            command = self._notification_summary(f"{index + 1:032x}")
+            command["data"]["summary_id"] = f"summary-capacity-{index}"
+            self.assertEqual(self._dispatch_notification_ws(command)["type"], "sys.ack")
+        full = self._notification_summary("f" * 32)
+        full["data"]["summary_id"] = "summary-capacity-overflow"
+        response = self._dispatch_notification_ws(full)
+        self.assertEqual(response["type"], "sys.nack")
+        self.assertEqual(response["code"], 507)
+        self.assertEqual(response["data"]["error"], "QUEUE_FULL")
+
+    def test_summary_explicit_ui_ack_emits_stable_summary_id_without_auto_ack(self) -> None:
+        emitted: list[bytes] = []
+
+        @OUTBOUND_CB
+        def on_outbound(data: int, length: int, _user_data: int) -> int:
+            emitted.append(ctypes.string_at(data, length))
+            return 0
+
+        self.lib.desk_sdk_bridge_register_outbound(on_outbound, None)
+        self.addCleanup(self.lib.desk_sdk_bridge_register_outbound, OUTBOUND_CB(), None)
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
+        command = self._notification_summary()
+        response = self._dispatch_notification_ws(command)
+        self.assertEqual(response["type"], "sys.ack")
+        self.assertEqual(emitted, [])
+        self.assertEqual(self.lib.desk_hardware_notification_summary_acknowledge(
+            b"summary:recovery-20261023-01", b"explicit_ui"), 0)
+        self.assertEqual(len(emitted), 1)
+        event = json.loads(emitted[0])
+        self.assertEqual(event["type"], "notification.acknowledged")
+        self.assertEqual(event["payload"], {
+            "summary_id": "summary:recovery-20261023-01", "source": "explicit_ui"})
 
     def test_summary_ack_event_keeps_summary_id_separate_from_transport_command_id(self) -> None:
         emitted: list[bytes] = []

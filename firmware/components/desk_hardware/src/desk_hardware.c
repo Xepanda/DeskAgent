@@ -86,7 +86,7 @@ static void *s_roller_delta_cb_user_data = NULL;
 static char s_current_preset[32] = "idle";
 static char s_current_status[64] = "Ready";
 
-#define UI_OVERLAY_ID_MAX 64
+#define UI_OVERLAY_ID_MAX 128
 typedef struct {
     bool active;
     uint32_t generation;

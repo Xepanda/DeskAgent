@@ -10,5 +10,8 @@ requests>=2.31.0,<3.0.0
 # WebSocket communication for Home Assistant and robot adapters
 websockets>=14.0,<16.0
 
+# Portable, pinned IANA timezone database for Host ZoneInfo formatting
+tzdata==2026.5
+
 # Development and testing
 pytest>=7.4.0

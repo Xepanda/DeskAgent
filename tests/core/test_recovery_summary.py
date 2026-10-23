@@ -5,7 +5,10 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from zoneinfo import ZoneInfoNotFoundError
 
+from host.desk_agent.services import life_service as life_service_module
 from host.desk_agent.services.life_service import LifeService
 
 
@@ -28,6 +31,17 @@ class TestRecoverySummary(unittest.TestCase):
         )
         return f"occ-{reminder_id}-0"
 
+    def test_zoneinfo_uses_only_the_locked_tzdata_package_path(self) -> None:
+        with patch.object(
+            life_service_module.zoneinfo,
+            "reset_tzpath",
+            wraps=life_service_module.zoneinfo.reset_tzpath,
+        ) as reset_tzpath:
+            life_service_module._pin_zoneinfo_to_locked_tzdata()
+
+        reset_tzpath.assert_called_once_with(())
+        self.assertEqual(life_service_module.zoneinfo.TZPATH, ())
+
     def test_scan_batches_only_due_uncompleted_occurrences_inside_inclusive_24h_window(self) -> None:
         boundary = self._reminder("boundary", "2026-10-22T12:00:00Z", "Asia/Shanghai")
         expired = self._reminder("expired", "2026-10-22T11:59:59Z")
@@ -40,6 +54,7 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertIsNotNone(batch)
         self.assertEqual([item["occurrence_id"] for item in batch["payload"]["items"]], [boundary])
         self.assertEqual(batch["payload"]["items"][0]["timezone"], "Asia/Shanghai")
+        self.assertEqual(batch["payload"]["items"][0]["display_time"], "2026-10-22 20:00 UTC+08:00")
         self.assertEqual(self.service.get_all_occurrences("expired")[0]["state"], "expired")
         self.assertEqual(self.service.get_all_occurrences("future")[0]["state"], "pending")
         self.assertEqual(self.service.get_all_occurrences("completed")[0]["state"], "completed")
@@ -77,6 +92,52 @@ class TestRecoverySummary(unittest.TestCase):
         scheduled = [item["scheduled_at"] for item in batch["payload"]["items"]]
         self.assertEqual(scheduled, sorted(scheduled))
         self.assertEqual(len({item["timezone"] for item in batch["payload"]["items"]}), 2)
+
+    def test_display_time_uses_utc_and_shanghai_zone_offsets(self) -> None:
+        self._reminder("display-utc", "2026-10-23T00:30:00Z", "UTC")
+        self._reminder("display-shanghai", "2026-10-23T00:30:00Z", "Asia/Shanghai")
+
+        batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T01:00:00Z")
+
+        by_id = {item["reminder_id"]: item for item in batch["payload"]["items"]}
+        self.assertEqual(by_id["display-utc"]["display_time"], "2026-10-23 00:30 UTC+00:00")
+        self.assertEqual(by_id["display-shanghai"]["display_time"], "2026-10-23 08:30 UTC+08:00")
+        self.assertEqual(by_id["display-shanghai"]["timezone"], "Asia/Shanghai")
+
+    def test_display_time_computes_new_york_dst_offset_at_each_scheduled_instant(self) -> None:
+        # The fall-back hour occurs twice; the explicit offset makes the labels distinct.
+        self._reminder("dst-daylight", "2026-11-01T05:30:00Z", "America/New_York")
+        self._reminder("dst-standard", "2026-11-01T06:30:00Z", "America/New_York")
+
+        batch = self.service.create_recovery_summary_batch(now_iso="2026-11-01T07:00:00Z")
+
+        by_id = {item["reminder_id"]: item for item in batch["payload"]["items"]}
+        self.assertEqual(by_id["dst-daylight"]["display_time"], "2026-11-01 01:30 UTC-04:00")
+        self.assertEqual(by_id["dst-standard"]["display_time"], "2026-11-01 01:30 UTC-05:00")
+
+    def test_display_time_tracks_new_york_spring_forward_transition(self) -> None:
+        self._reminder("dst-before", "2026-03-08T06:30:00Z", "America/New_York")
+        self._reminder("dst-after", "2026-03-08T07:30:00Z", "America/New_York")
+
+        batch = self.service.create_recovery_summary_batch(now_iso="2026-03-08T08:00:00Z")
+
+        by_id = {item["reminder_id"]: item for item in batch["payload"]["items"]}
+        self.assertEqual(by_id["dst-before"]["display_time"], "2026-03-08 01:30 UTC-05:00")
+        self.assertEqual(by_id["dst-after"]["display_time"], "2026-03-08 03:30 UTC-04:00")
+
+    def test_unavailable_iana_database_fails_closed_without_consuming_occurrences(self) -> None:
+        occurrence_id = self._reminder("no-tzdb", "2026-10-23T11:00:00Z", "Asia/Shanghai")
+
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", side_effect=ZoneInfoNotFoundError("missing tzdb")):
+            with self.assertRaises(ZoneInfoNotFoundError):
+                self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.assertEqual(self.service.get_all_occurrences("no-tzdb")[0]["state"], "pending")
+        due = self.service.get_due_occurrences("2026-10-23T12:00:00Z")
+        self.assertEqual([item["occurrence_id"] for item in due], [occurrence_id])
+        conn = self.service._get_connection()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM recovery_batches").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
 
     def test_rescan_and_restart_reuse_frozen_batch_payload_and_summary_id(self) -> None:
         self._reminder("stable", "2026-10-23T11:00:00Z")

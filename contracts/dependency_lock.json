@@ -429,6 +429,17 @@
       "authkey": "REDACTED: supplied only through local secure configuration"
     }
   },
+  "python_runtime_dependencies": [
+    {
+      "name": "tzdata",
+      "version": "2026.5",
+      "source": "PyPI: https://pypi.org/project/tzdata/2026.5/",
+      "wheel": "tzdata-2026.5-py2.py3-none-any.whl",
+      "wheel_sha256": "b683bd1b6659ddcd810ff02ad09ba821d4bf1065072805063eb35c49617905ac",
+      "license": "Apache-2.0",
+      "role": "Portable pinned IANA timezone database for Python zoneinfo; Host must set TZPATH empty before resolving summary timezones"
+    }
+  ],
   "third_party_dependencies": [
     {
       "name": "espressif/esp_lcd_spd2010",

@@ -23,6 +23,17 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 
+def _pin_zoneinfo_to_locked_tzdata() -> None:
+    """Use the pinned tzdata package instead of host-provided zoneinfo files."""
+    zoneinfo.reset_tzpath(())
+    # reset_tzpath does not invalidate ZoneInfo's key cache; clear any entries
+    # created from the host TZPATH before applying the package-only policy.
+    zoneinfo.ZoneInfo.clear_cache()
+
+
+_pin_zoneinfo_to_locked_tzdata()
+
+
 class _FallbackEasternTz(tzinfo):
     """Fallback for America/New_York when system tzdata is unavailable (e.g. bare Windows)."""
 
@@ -105,6 +116,24 @@ def _validate_timezone_name(tz_name: str) -> str:
         }:
             raise ValueError(f"Unknown timezone: {cleaned}") from exc
     return cleaned
+
+
+def _format_summary_display_time(scheduled_at: str, tz_name: str) -> str:
+    """Format an occurrence with strict IANA data and its instant-specific offset."""
+    utc_dt = datetime.fromisoformat(_normalize_utc_iso(scheduled_at).replace("Z", "+00:00"))
+    local_dt = utc_dt.astimezone(zoneinfo.ZoneInfo(tz_name))
+    offset = local_dt.utcoffset()
+    if offset is None:
+        raise ValueError(f"Timezone has no UTC offset: {tz_name}")
+    offset_seconds = int(offset.total_seconds())
+    if offset_seconds % 60 != 0:
+        raise ValueError(f"Timezone offset is not representable as UTC±HH:MM: {tz_name}")
+    sign = "+" if offset_seconds >= 0 else "-"
+    offset_minutes = abs(offset_seconds) // 60
+    hours, minutes = divmod(offset_minutes, 60)
+    if hours > 23:
+        raise ValueError(f"Timezone offset is out of range: {tz_name}")
+    return f"{local_dt:%Y-%m-%d %H:%M} UTC{sign}{hours:02d}:{minutes:02d}"
 
 
 def _normalize_utc_iso(value: str) -> str:
@@ -732,6 +761,9 @@ class LifeService:
                     "title": row["title"],
                     "scheduled_at": _normalize_utc_iso(row["scheduled_at"]),
                     "timezone": _validate_timezone_name(row["timezone"]),
+                    "display_time": _format_summary_display_time(
+                        row["scheduled_at"], _validate_timezone_name(row["timezone"])
+                    ),
                 }
                 for row in members
             ]

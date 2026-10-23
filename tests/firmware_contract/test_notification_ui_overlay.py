@@ -61,18 +61,6 @@ class TestNotificationUiOverlay(unittest.TestCase):
         ]
         cls.lib.desk_hardware_display_get_expression.restype = ctypes.c_int
 
-        class NotificationStoreOps(ctypes.Structure):
-            pass
-
-        Load = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t,
-                                ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p)
-        Save = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t,
-                                ctypes.c_void_p)
-        Erase = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint, ctypes.c_void_p)
-        NotificationStoreOps._fields_ = [
-            ("load", Load), ("save", Save), ("erase", Erase), ("user_data", ctypes.c_void_p),
-        ]
-
         class NotificationInput(ctypes.Structure):
             _fields_ = [
                 ("notification_id", ctypes.c_char * 65),
@@ -93,35 +81,42 @@ class TestNotificationUiOverlay(unittest.TestCase):
                 ("ack_source", ctypes.c_char * 32),
             ]
 
+        class NotificationSummaryItem(ctypes.Structure):
+            _fields_ = [
+                ("reminder_id", ctypes.c_char_p),
+                ("occurrence_id", ctypes.c_char_p),
+                ("title", ctypes.c_char_p),
+                ("scheduled_at", ctypes.c_char_p),
+                ("timezone", ctypes.c_char_p),
+                ("display_time", ctypes.c_char_p),
+            ]
+
+        class NotificationSummaryInput(ctypes.Structure):
+            _fields_ = [
+                ("summary_id", ctypes.c_char_p),
+                ("batch_id", ctypes.c_char_p),
+                ("created_at", ctypes.c_char_p),
+                ("expires_at", ctypes.c_char_p),
+                ("items", ctypes.POINTER(NotificationSummaryItem)),
+                ("item_count", ctypes.c_size_t),
+                ("omitted_count", ctypes.c_uint32),
+            ]
+
         cls.NotificationInput = NotificationInput
         cls.NotificationStatus = NotificationStatus
-        cls.store_slots: list[bytes | None] = [None] * 16
+        cls.NotificationSummaryItem = NotificationSummaryItem
+        cls.NotificationSummaryInput = NotificationSummaryInput
+        SummaryAck = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p)
+        cls.summary_acks: list[tuple[bytes, bytes]] = []
 
-        def load(slot: int, out_record: int, capacity: int, out_len: object, _user: int) -> int:
-            data = cls.store_slots[slot]
-            if data is None:
-                out_len[0] = 0
-                return 1
-            if len(data) > capacity:
-                return -4
-            ctypes.memmove(out_record, data, len(data))
-            out_len[0] = len(data)
-            return 0
+        def summary_ack(summary_id: bytes, source: bytes, _user_data: int) -> None:
+            cls.summary_acks.append((summary_id, source))
 
-        def save(slot: int, record: int, record_len: int, _user: int) -> int:
-            cls.store_slots[slot] = ctypes.string_at(record, record_len)
-            return 0
-
-        def erase(slot: int, _user: int) -> int:
-            cls.store_slots[slot] = None
-            return 0
-
-        cls.store_callbacks = (Load(load), Save(save), Erase(erase))
-        cls.store_ops = NotificationStoreOps(*cls.store_callbacks, None)
-        cls.lib.desk_hardware_notification_register_store.argtypes = [
-            ctypes.POINTER(NotificationStoreOps),
+        cls.summary_ack_callback = SummaryAck(summary_ack)
+        cls.lib.desk_hardware_notification_register_summary_ack_callback.argtypes = [
+            SummaryAck, ctypes.c_void_p,
         ]
-        cls.lib.desk_hardware_notification_register_store.restype = ctypes.c_int
+        cls.lib.desk_hardware_notification_register_summary_ack_callback.restype = ctypes.c_int
         cls.lib.desk_hardware_notification_init.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.lib.desk_hardware_notification_init.restype = ctypes.c_int
         cls.lib.desk_hardware_notification_deliver.argtypes = [
@@ -138,16 +133,23 @@ class TestNotificationUiOverlay(unittest.TestCase):
             ctypes.c_char_p, ctypes.POINTER(NotificationStatus),
         ]
         cls.lib.desk_hardware_notification_get_status.restype = ctypes.c_int
-        if cls.lib.desk_hardware_notification_register_store(ctypes.byref(cls.store_ops)) != 0:
-            raise RuntimeError("native notification test store registration failed")
+        cls.lib.desk_hardware_notification_deliver_summary.argtypes = [
+            ctypes.POINTER(NotificationSummaryInput),
+        ]
+        cls.lib.desk_hardware_notification_deliver_summary.restype = ctypes.c_int
+        cls.lib.desk_hardware_notification_summary_acknowledge.argtypes = [ctypes.c_char_p,
+                                                                           ctypes.c_char_p]
+        cls.lib.desk_hardware_notification_summary_acknowledge.restype = ctypes.c_int
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temp_dir.cleanup()
 
     def setUp(self) -> None:
-        self.store_slots[:] = [None] * len(self.store_slots)
         self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
+        self.summary_acks.clear()
+        self.assertEqual(self.lib.desk_hardware_notification_register_summary_ack_callback(
+            self.summary_ack_callback, None), 0)
 
     @staticmethod
     def epoch_us() -> int:
@@ -186,6 +188,102 @@ class TestNotificationUiOverlay(unittest.TestCase):
         self.assertEqual(self.visible(), ("alert", "Reminder"))
         self.assertEqual(self.lib.desk_hardware_ui_overlay_dismiss(handle), 0)
         self.assertEqual(self.visible(), ("thinking", "Thinking"))
+
+    def test_notification_init_is_ram_only_without_storage_provider(self) -> None:
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
+
+    def test_summary_is_display_only_expiring_and_acknowledged_explicitly(self) -> None:
+        self.assertEqual(self.lib.desk_hardware_set_screen_expression(b"idle", b"Ready"), 0)
+        now = datetime.now(timezone.utc)
+        created = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        expires = (now + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        display_time = b"2026-10-23 18:45 UTC+08:00"
+        item = self.NotificationSummaryItem(b"reminder-1", b"occurrence-1", "吃药".encode(),
+                                             created, b"Asia/Shanghai", display_time)
+        items = (self.NotificationSummaryItem * 1)(item)
+        summary_id = ("s:" + "x" * 126).encode()
+        summary = self.NotificationSummaryInput(summary_id, b"batch-001", created,
+                                                expires, items, 1, 2)
+        self.assertEqual(self.lib.desk_arbiter_acquire(2, 4, 0), 0)
+        self.assertEqual(self.lib.desk_hardware_notification_deliver_summary(
+            ctypes.byref(summary)), 0)
+        self.assertEqual(self.lib.desk_hardware_notification_deliver_summary(
+            ctypes.byref(summary)), 0, "same summary id is idempotent in this boot session")
+        self.assertEqual(self.lib.desk_hardware_notification_process_pending(), 0,
+                         "summary presentation must not acquire/play audio")
+        self.assertEqual(self.visible()[0], "alert")
+        self.assertIn("Missed", self.visible()[1])
+        self.assertIn(display_time.decode(), self.visible()[1],
+                      "render the Host generated local display time verbatim")
+        self.assertEqual(self.lib.desk_hardware_notification_summary_acknowledge(
+            summary_id, b"explicit_ui"), 0)
+        self.assertEqual(self.lib.desk_hardware_notification_summary_acknowledge(
+            summary_id, b"explicit_ui"), 0)
+        self.assertEqual(self.summary_acks, [(summary_id, b"explicit_ui")],
+                         "only the first explicit ACK for this volatile ID emits the callback")
+        self.assertEqual(self.visible(), ("idle", "Ready"))
+        self.lib.desk_arbiter_release(2, 4)
+
+    def test_summary_expiry_and_ram_reset_allow_same_id_redelivery(self) -> None:
+        now = datetime.now(timezone.utc)
+        created = (now - timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        expires = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        item = self.NotificationSummaryItem(b"r", b"o", b"Old item", created, b"UTC",
+                                             b"2026-10-23 18:45 UTC+00:00")
+        items = (self.NotificationSummaryItem * 1)(item)
+        summary = self.NotificationSummaryInput(b"summary:expired", b"batch", created,
+                                                expires, items, 1, 0)
+        self.assertEqual(self.lib.desk_hardware_notification_deliver_summary(
+            ctypes.byref(summary)), -3)
+
+    def test_summary_display_time_validation_and_utf8_safe_truncation(self) -> None:
+        now = datetime.now(timezone.utc)
+        created = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        expires = (now + timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        display_time = b"2026-10-23 18:45 UTC+08:00"
+        item = self.NotificationSummaryItem(b"r", b"o", ("界" * 50).encode(), created,
+                                             b"Asia/Shanghai", display_time)
+        items = (self.NotificationSummaryItem * 1)(item)
+        summary = self.NotificationSummaryInput(b"summary:utf8", b"batch", created, expires,
+                                                items, 1, 2)
+        self.assertEqual(self.lib.desk_hardware_notification_deliver_summary(
+            ctypes.byref(summary)), 0)
+        self.assertEqual(self.lib.desk_hardware_notification_process_pending(), 0)
+        rendered = self.visible()[1]
+        rendered.encode("utf-8").decode("utf-8")
+        self.assertIn(display_time.decode(), rendered)
+        self.assertIn(" +2", rendered)
+        self.assertNotIn("�", rendered)
+
+        malformed = self.NotificationSummaryItem(b"r2", b"o2", b"Invalid time", created,
+                                                  b"Asia/Shanghai", b"2026-10-23 18:45 UTC+8")
+        malformed_items = (self.NotificationSummaryItem * 1)(malformed)
+        rejected = self.NotificationSummaryInput(b"summary:bad-time", b"batch", created,
+                                                 expires, malformed_items, 1, 0)
+        self.assertEqual(self.lib.desk_hardware_notification_deliver_summary(
+            ctypes.byref(rejected)), -1)
+
+    def test_occurrence_capacity_is_bounded_and_init_clears_session_dedupe(self) -> None:
+        now = datetime.now(timezone.utc)
+        scheduled = (now - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        expires = (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ").encode()
+        for i in range(16):
+            key = f"bounded-{i}".encode()
+            item = self.NotificationInput(key, b"reminder", key, b"Take a break",
+                                          scheduled, expires, False)
+            status = self.NotificationStatus()
+            self.assertEqual(self.lib.desk_hardware_notification_deliver(
+                ctypes.byref(item), ctypes.byref(status)), 0)
+        key = b"bounded-overflow"
+        item = self.NotificationInput(key, b"reminder", key, b"Take a break",
+                                      scheduled, expires, False)
+        status = self.NotificationStatus()
+        self.assertEqual(self.lib.desk_hardware_notification_deliver(
+            ctypes.byref(item), ctypes.byref(status)), -5)
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
+        self.assertEqual(self.lib.desk_hardware_notification_deliver(
+            ctypes.byref(item), ctypes.byref(status)), 0,
+                         "init/reboot clears RAM dedupe and permits same-ID redelivery")
 
     def test_single_overlay_idempotency_busy_and_stale_generation(self) -> None:
         first = self.present("overlay-first")
@@ -277,7 +375,7 @@ class TestNotificationUiOverlay(unittest.TestCase):
         self.assertTrue(status.acknowledged)
         self.assertEqual(status.status, 5, "ACK must not infer reminder completion or played")
 
-    def test_notification_dismiss_propagates_busy_but_ack_reports_durable_success(self) -> None:
+    def test_notification_dismiss_propagates_busy_but_ack_is_session_local(self) -> None:
         self.assertEqual(self.lib.desk_hardware_set_screen_expression(b"idle", b"Ready"), 0)
         self.deliver_and_process_notification("overlay-busy-dismiss")
         self.assertEqual(self.lib.desk_hardware_set_screen_expression(b"thinking", b"Latest base"), 0)
@@ -294,8 +392,8 @@ class TestNotificationUiOverlay(unittest.TestCase):
         self.deliver_and_process_notification("overlay-busy-ack")
         self.assertEqual(self.lib.desk_hardware_set_screen_expression(b"speaking", b"Latest ACK base"), 0)
         self.assertEqual(self.lib.desk_arbiter_acquire(4, 5, 0), 0)
-        # ACK success means its durable business update succeeded. A temporary
-        # display BUSY is logged and retried by the regular UI processing loop.
+        # ACK is only a volatile user action; a temporary display BUSY is retried
+        # by the regular UI processing loop.
         self.assertEqual(self.lib.desk_hardware_notification_acknowledge(
             b"overlay-busy-ack", b"explicit_ui"), 0)
         status = self.NotificationStatus()
