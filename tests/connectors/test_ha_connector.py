@@ -14,11 +14,12 @@ Covers:
 from __future__ import annotations
 
 import json
+import copy
 import threading
 import time
 import unittest
 from typing import Any, Mapping, Optional
-from host.desk_agent.connectors.ha.ha_connector import HAConnector
+from host.desk_agent.connectors.ha.ha_connector import HAConnector, _normalize_state_poll_interval_sec
 
 
 class MockWebSocketClient:
@@ -71,6 +72,28 @@ class TestHAConnector(unittest.TestCase):
         ha = HAConnector(base_url="http://127.0.0.1:59999", token="dummy-token", timeout_sec=0.5)
         with self.assertRaises(ConnectionError):
             ha.execute("light.desk", "turn_on")
+
+    def test_state_subscription_rejects_invalid_poll_interval_before_starting_workers(self) -> None:
+        """Invalid fallback intervals must not create a busy loop or poison the WS worker."""
+        for interval in (0, -0.1, 1e-300, 0.999, float("nan"), float("inf"), True):
+            with self.subTest(interval=interval):
+                ha = HAConnector(base_url="http://ha.test:8123", token="token", mock_mode=True)
+                stop = None
+                try:
+                    with self.assertRaises(ValueError):
+                        stop = ha.subscribe_state_changes(lambda *args: None, interval_sec=interval)
+                finally:
+                    if stop is not None:
+                        stop()
+                self.assertEqual(ha._subscribers, [])
+                self.assertIsNone(ha._ws_thread)
+                ha.close()
+
+    def test_state_poll_interval_is_capped_to_keep_waits_platform_safe(self) -> None:
+        self.assertEqual(_normalize_state_poll_interval_sec(1e300), 300.0)
+
+    def test_state_poll_interval_accepts_documented_minimum(self) -> None:
+        self.assertEqual(_normalize_state_poll_interval_sec(1.0), 1.0)
 
     # -------------------------------------------------------------------------
     # 2. Domain & Entity Allowlist / Denylist Tests
@@ -167,6 +190,26 @@ class TestHAConnector(unittest.TestCase):
         with self.assertRaises(PermissionError):
             ha.execute("light.desk", "turn_on")
 
+    def test_service_action_must_be_a_single_ha_service_segment(self) -> None:
+        """A configured service name cannot inject extra REST path segments."""
+        requests: list[tuple[str, str]] = []
+
+        def transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            requests.append((method, url))
+            return 200, []
+
+        malformed_action = "turn_on/../../states"
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            allowed_services=[f"light.{malformed_action}"],
+            transport=transport,
+        )
+        with self.assertRaises(ValueError):
+            ha.execute("light.desk", malformed_action)
+
+        self.assertEqual(requests, [])
+
     def test_parameters_cannot_replace_allowlisted_target_entity(self) -> None:
         """A caller cannot pass entity authorization for one entity and execute against another."""
         posted: list[Mapping[str, Any]] = []
@@ -184,6 +227,31 @@ class TestHAConnector(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ha.execute("light.desk", "turn_on", parameters={"entity_id": "light.restricted"})
+        self.assertEqual(posted, [])
+
+    def test_parameters_cannot_widen_allowlisted_entity_target(self) -> None:
+        """HA alternative target selectors must not bypass the entity allowlist."""
+        posted: list[Mapping[str, Any]] = []
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "POST":
+                posted.append(payload or {})
+            return 200, {"entity_id": "light.desk", "state": "on"}
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123",
+            token="token",
+            allowed_entities=["light.desk"],
+            transport=mock_transport,
+        )
+        for selector in ("area_id", "device_id", "floor_id", "label_id", "target"):
+            with self.subTest(selector=selector):
+                with self.assertRaises(ValueError):
+                    ha.execute("light.desk", "turn_on", parameters={selector: "other-target"})
+        for invalid_parameters in ([], ["brightness", 200]):
+            with self.subTest(parameters=invalid_parameters):
+                with self.assertRaises(ValueError):
+                    ha.execute("light.desk", "turn_on", parameters=invalid_parameters)
         self.assertEqual(posted, [])
 
     def test_invalid_state_confirmation_timeout_rejected_before_service_call(self) -> None:
@@ -330,6 +398,96 @@ class TestHAConnector(unittest.TestCase):
         rep5 = ha.reconcile_states()
         self.assertEqual(rep5["reconciled_changes"], [])
 
+    def test_reconcile_emits_attribute_only_change_and_ignores_unchanged_snapshot(self) -> None:
+        state_data = [{"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 100}}]
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            return 200, list(state_data)
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        ha.reconcile_states()
+        state_data[0] = {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 180}}
+
+        changed = ha.reconcile_states()["reconciled_changes"]
+        self.assertEqual(changed, [{
+            "entity_id": "light.desk", "old_state": "on", "new_state": "on",
+            "attributes": {"brightness": 180},
+        }])
+        self.assertEqual(ha.reconcile_states()["reconciled_changes"], [])
+
+    def test_mutating_get_state_result_cannot_corrupt_reconciliation_baseline(self) -> None:
+        state = {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 100}}
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if url.endswith("/api/states/light.desk"):
+                return 200, state
+            return 200, [state]
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        returned_snapshot = ha.get_state("light.desk")
+        returned_snapshot["state"] = "off"
+        returned_snapshot["attributes"]["brightness"] = 0
+
+        state["state"] = "off"
+        state["attributes"]["brightness"] = 0
+        changes = ha.reconcile_states()["reconciled_changes"]
+
+        self.assertEqual(changes, [{
+            "entity_id": "light.desk",
+            "old_state": "on",
+            "new_state": "off",
+            "attributes": {"brightness": 0},
+        }])
+
+    def test_reconcile_emits_new_entity_attributes_and_removal_once(self) -> None:
+        state_data = []
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            return 200, list(state_data)
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        state_data.append({"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 10}})
+        self.assertEqual(ha.reconcile_states()["reconciled_changes"], [{
+            "entity_id": "light.desk", "old_state": None, "new_state": "on",
+            "attributes": {"brightness": 10},
+        }])
+        state_data.clear()
+        self.assertEqual(ha.reconcile_states()["reconciled_changes"], [{
+            "entity_id": "light.desk", "old_state": "on", "new_state": None,
+        }])
+        self.assertEqual(ha.reconcile_states()["reconciled_changes"], [])
+
+    def test_subscriber_nested_attribute_mutation_does_not_repeat_reconciliation_event(self) -> None:
+        current_attributes = {"profile": {"modes": ["quiet"]}}
+        delivered: list[dict[str, Any]] = []
+        first_event = threading.Event()
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            return 200, [{
+                "entity_id": "light.desk", "state": "on", "attributes": copy.deepcopy(current_attributes),
+            }]
+
+        def subscriber(entity_id: str, old_state: Optional[str], new_state: Optional[str], attributes: Optional[Mapping[str, Any]]) -> None:
+            if attributes is not None:
+                delivered.append(copy.deepcopy(dict(attributes)))
+                if len(delivered) == 1:
+                    attributes["profile"]["modes"].append("subscriber-mutation")
+                first_event.set()
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        ha.reconcile_states()
+        current_attributes["profile"]["modes"].append("bright")
+        stop = ha.subscribe_state_changes(subscriber, interval_sec=1.0)
+        try:
+            self.assertTrue(first_event.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertEqual(delivered, [
+                {"profile": {"modes": ["quiet", "bright"]}},
+            ])
+        finally:
+            stop()
+            ha.close()
+
     def test_polling_subscriber_exception_does_not_drop_other_snapshot_changes(self) -> None:
         """One consumer exception must not permanently lose later changes in the same snapshot."""
         ha = HAConnector(mock_mode=True)
@@ -340,14 +498,14 @@ class TestHAConnector(unittest.TestCase):
         delivered: list[str] = []
         heater_event = threading.Event()
 
-        def subscriber(entity_id: str, old_state: Optional[str], new_state: Optional[str]) -> None:
+        def subscriber(entity_id: str, old_state: Optional[str], new_state: Optional[str], attributes: Optional[Mapping[str, Any]]) -> None:
             delivered.append(entity_id)
             if entity_id == "light.desk":
                 raise RuntimeError("simulated consumer bug")
             if entity_id == "switch.heater":
                 heater_event.set()
 
-        stop = ha.subscribe_state_changes(subscriber, interval_sec=0.02)
+        stop = ha.subscribe_state_changes(subscriber, interval_sec=1.0)
         try:
             self.assertTrue(heater_event.wait(timeout=1.0))
             self.assertEqual(delivered, ["light.desk", "switch.heater"])
@@ -504,7 +662,39 @@ class TestHAConnector(unittest.TestCase):
         self.assertIsNone(res["physical_action_confirmed"])
         state_reads = [timeout for method, timeout in requests if method == "GET"]
         self.assertGreaterEqual(len(state_reads), 2)  # Baseline and bounded confirmation reads.
-        self.assertTrue(all(timeout <= 0.08 for timeout in state_reads), state_reads)
+        self.assertTrue(all(timeout <= 0.08 + 1e-9 for timeout in state_reads), state_reads)
+
+    def test_execute_reports_entity_unavailable_after_accepted_service_without_claiming_transition(self) -> None:
+        """A service can be accepted while the entity disappears before HA state confirmation."""
+        state_reads = 0
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            nonlocal state_reads
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                state_reads += 1
+                if state_reads == 1:
+                    return 200, {"entity_id": "light.desk", "state": "off", "attributes": {}}
+                # Match HA's /api/states/{entity_id} response when the entity
+                # is removed or becomes unavailable after the accepted call.
+                return 404, {"message": "Entity not found"}
+            return 500, None
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123", token="token", timeout_sec=0.5, transport=mock_transport,
+        )
+        result = ha.execute(
+            "light.desk", "turn_on",
+            wait_for_state={"expected_state": "on", "timeout_ms": 80},
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertIsNone(result["observed_state"])
+        self.assertFalse(result["state_confirmed"])
+        self.assertIsNone(result["state_changed"])
+        self.assertIsNone(result["physical_action_confirmed"])
+        self.assertGreaterEqual(state_reads, 2)
 
     def test_execute_with_wait_for_state_timeout(self) -> None:
         """When state does NOT reach expected_state before timeout, state_confirmed is False."""
@@ -551,7 +741,7 @@ class TestHAConnector(unittest.TestCase):
         self.assertGreaterEqual(len(state_reads), 2)
         # Baseline and post-service confirmation reads share the bounded wait
         # budget; none can silently inherit the connector's 5 second default.
-        self.assertTrue(all(timeout <= 0.08 for timeout in state_reads), state_reads)
+        self.assertTrue(all(timeout <= 0.08 + 1e-9 for timeout in state_reads), state_reads)
 
     # -------------------------------------------------------------------------
     # 5. WebSocket Integration & Real-time Event Streaming Tests
@@ -564,11 +754,11 @@ class TestHAConnector(unittest.TestCase):
             json.dumps({"id": 1, "type": "result", "success": True, "result": None}),
         ]
         mock_ws = MockWebSocketClient(script)
-        received_events: list[tuple[str, Optional[str], Optional[str]]] = []
+        received_events: list[tuple[str, Optional[str], Optional[str], Optional[dict[str, Any]]]] = []
         event_received = threading.Event()
 
-        def on_change(eid: str, old_st: Optional[str], new_st: Optional[str]) -> None:
-            received_events.append((eid, old_st, new_st))
+        def on_change(eid: str, old_st: Optional[str], new_st: Optional[str], attributes: Optional[dict[str, Any]]) -> None:
+            received_events.append((eid, old_st, new_st, attributes))
             if (eid, old_st, new_st) == ("light.desk", "off", "on"):
                 event_received.set()
 
@@ -610,7 +800,7 @@ class TestHAConnector(unittest.TestCase):
             }))
 
             self.assertTrue(event_received.wait(timeout=2.0))
-            self.assertIn(("light.desk", "off", "on"), received_events)
+            self.assertIn(("light.desk", "off", "on", {}), received_events)
         finally:
             stop_sub()
             ha.close()
@@ -641,6 +831,92 @@ class TestHAConnector(unittest.TestCase):
             stop_sub()
             ha.close()
 
+    def test_websocket_dispatches_attribute_only_change_once(self) -> None:
+        mock_ws = MockWebSocketClient([
+            json.dumps({"type": "auth_required", "ha_version": "2026.10"}),
+            json.dumps({"type": "auth_ok", "ha_version": "2026.10"}),
+            json.dumps({"id": 1, "type": "result", "success": True, "result": None}),
+        ])
+        received: list[tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]] = []
+        changed = threading.Event()
+        initial_snapshot = threading.Event()
+
+        def transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "GET":
+                return 200, [{"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 10}}]
+            return 200, []
+
+        def on_change(eid: str, old_st: Optional[str], new_st: Optional[str], attributes: Optional[dict[str, Any]]) -> None:
+            received.append((old_st, new_st, attributes))
+            if attributes == {"brightness": 10}:
+                initial_snapshot.set()
+            elif attributes == {"brightness": 80}:
+                changed.set()
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=transport, ws_factory=lambda url: mock_ws)
+        stop = ha.subscribe_state_changes(on_change, interval_sec=60)
+        try:
+            self.assertTrue(ha._ws_connected.wait(timeout=1))
+            self.assertTrue(initial_snapshot.wait(timeout=1))
+            received.clear()
+            event = {"id": 2, "type": "event", "event": {"event_type": "state_changed", "data": {
+                "entity_id": "light.desk",
+                "old_state": {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 10}},
+                "new_state": {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 80}},
+            }}}
+            mock_ws.push_message(json.dumps(event))
+            self.assertTrue(changed.wait(timeout=1))
+            self.assertEqual(received, [("on", "on", {"brightness": 80})])
+            mock_ws.push_message(json.dumps(event))
+            time.sleep(0.05)
+            self.assertEqual(len(received), 1)
+        finally:
+            stop()
+            ha.close()
+
+    def test_websocket_entity_removal_dispatches_once_with_null_state(self) -> None:
+        mock_ws = MockWebSocketClient([
+            json.dumps({"type": "auth_required", "ha_version": "2026.10"}),
+            json.dumps({"type": "auth_ok", "ha_version": "2026.10"}),
+            json.dumps({"id": 1, "type": "result", "success": True, "result": None}),
+        ])
+        received: list[tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]] = []
+        removed = threading.Event()
+        initial_snapshot = threading.Event()
+
+        def transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if method == "GET":
+                return 200, [{"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 80}}]
+            return 200, []
+
+        def on_change(eid: str, old_st: Optional[str], new_st: Optional[str], attributes: Optional[dict[str, Any]]) -> None:
+            received.append((old_st, new_st, attributes))
+            if attributes == {"brightness": 80}:
+                initial_snapshot.set()
+            elif new_st is None:
+                removed.set()
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=transport, ws_factory=lambda url: mock_ws)
+        stop = ha.subscribe_state_changes(on_change, interval_sec=60)
+        try:
+            self.assertTrue(ha._ws_connected.wait(timeout=1))
+            self.assertTrue(initial_snapshot.wait(timeout=1))
+            received.clear()
+            event = {"id": 2, "type": "event", "event": {"event_type": "state_changed", "data": {
+                "entity_id": "light.desk",
+                "old_state": {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 80}},
+                "new_state": None,
+            }}}
+            mock_ws.push_message(json.dumps(event))
+            self.assertTrue(removed.wait(timeout=1))
+            self.assertEqual(received, [("on", None, None)])
+            mock_ws.push_message(json.dumps(event))
+            time.sleep(0.05)
+            self.assertEqual(len(received), 1)
+        finally:
+            stop()
+            ha.close()
+
     def test_websocket_reconnects_after_transient_unavailability(self) -> None:
         """A transient HA outage must recover the authenticated event channel without restarting the host."""
         connected_ws = MockWebSocketClient([
@@ -663,7 +939,7 @@ class TestHAConnector(unittest.TestCase):
             transport=lambda *args: (200, []),
             ws_factory=ws_factory,
         )
-        stop_sub = ha.subscribe_state_changes(lambda *args: None, interval_sec=0.1)
+        stop_sub = ha.subscribe_state_changes(lambda *args: None, interval_sec=1.0)
         try:
             deadline = time.monotonic() + 3.5
             while not ha.is_ws_connected and time.monotonic() < deadline:
@@ -678,18 +954,18 @@ class TestHAConnector(unittest.TestCase):
             stop_sub()
             ha.close()
 
-    def test_websocket_reconnect_reconciliation_notifies_missed_state_changes(self) -> None:
-        """A state change during a short outage is delivered when the authoritative snapshot is reconciled."""
+    def test_websocket_reconnect_reconciliation_notifies_missed_attribute_changes(self) -> None:
+        """An attribute-only change during a short outage is delivered after snapshot reconciliation."""
         connected_ws = MockWebSocketClient([
             json.dumps({"type": "auth_required", "ha_version": "2026.10"}),
             json.dumps({"type": "auth_ok", "ha_version": "2026.10"}),
             json.dumps({"id": 1, "type": "result", "success": True, "result": None}),
         ])
-        state = {"value": "off"}
+        state = {"attributes": {"brightness": 10}}
         first_state_read = threading.Event()
         first_ws_attempt = threading.Event()
         attempts = 0
-        delivered: list[tuple[str, Optional[str], Optional[str]]] = []
+        delivered: list[tuple[str, Optional[str], Optional[str], Optional[dict[str, Any]]]] = []
         delivered_event = threading.Event()
 
         def ws_factory(url: str) -> MockWebSocketClient:
@@ -703,12 +979,12 @@ class TestHAConnector(unittest.TestCase):
         def transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
             if method == "GET":
                 first_state_read.set()
-                return 200, [{"entity_id": "light.desk", "state": state["value"]}]
+                return 200, [{"entity_id": "light.desk", "state": "on", "attributes": dict(state["attributes"])}]
             return 200, []
 
-        def on_change(entity_id: str, old_state: Optional[str], new_state: Optional[str]) -> None:
-            delivered.append((entity_id, old_state, new_state))
-            if (entity_id, old_state, new_state) == ("light.desk", "off", "on"):
+        def on_change(entity_id: str, old_state: Optional[str], new_state: Optional[str], attributes: Optional[dict[str, Any]]) -> None:
+            delivered.append((entity_id, old_state, new_state, attributes))
+            if (entity_id, old_state, new_state, attributes) == ("light.desk", "on", "on", {"brightness": 90}):
                 delivered_event.set()
 
         ha = HAConnector(
@@ -723,9 +999,9 @@ class TestHAConnector(unittest.TestCase):
             self.assertTrue(first_state_read.wait(timeout=1))
             # The long polling interval makes this transition occur between the
             # outage snapshot and WebSocket reconnection.
-            state["value"] = "on"
+            state["attributes"] = {"brightness": 90}
             self.assertTrue(delivered_event.wait(timeout=3))
-            self.assertIn(("light.desk", "off", "on"), delivered)
+            self.assertIn(("light.desk", "on", "on", {"brightness": 90}), delivered)
         finally:
             stop_sub()
             ha.close()
