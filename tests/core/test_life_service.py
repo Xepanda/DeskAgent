@@ -327,6 +327,77 @@ class TestLifeService(unittest.TestCase):
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["payload"]["summary"], "safe")
 
+    def test_managed_notification_receipts_are_durable_deduplicated_and_lifecycle_separate(self) -> None:
+        self.service.create_reminder(
+            reminder_id="rem-managed-receipt",
+            title="Managed receipt",
+            due_at="2026-10-22T12:00:00Z",
+        )
+        occurrence_id = self.service.get_all_occurrences("rem-managed-receipt")[0]["occurrence_id"]
+        self.service.trigger_occurrence_to_outbox(occurrence_id)
+        fixed_now = "2026-10-22T12:00:00Z"
+        pending = self.service.get_pending_outbox_messages(now_iso=fixed_now, include_delayed=True)
+        item = next(row for row in pending if row["topic"] == "reminder.alert")
+        notification = self.service.build_reminder_notification(item)
+        self.assertEqual(notification["notification_id"], occurrence_id)
+        self.assertEqual(notification["expires_at"], "2026-10-23T12:00:00Z")
+        self.assertEqual(
+            self.service.get_active_notification_contexts(now_iso=fixed_now)[occurrence_id],
+            notification["expires_at"],
+        )
+        self.assertEqual(self.service.ensure_notification_receipt(notification, now_iso=fixed_now), "ready")
+
+        accepted = {
+            "type": "notification.status", "notification_id": occurrence_id,
+            "status": "accepted",
+        }
+        self.assertEqual(self.service.record_managed_notification_event(accepted, now_iso=fixed_now), "recorded")
+        self.assertEqual(self.service.record_managed_notification_event(accepted, now_iso=fixed_now), "duplicate")
+        self.assertEqual(
+            self.service.get_notification_receipt(occurrence_id)["delivery_status"], "unknown"
+        )
+
+        rendered = {"type": "notification.status", "notification_id": occurrence_id, "status": "rendered"}
+        played = {"type": "notification.status", "notification_id": occurrence_id, "status": "played"}
+        self.assertEqual(self.service.record_managed_notification_event(rendered, now_iso=fixed_now), "recorded")
+        self.assertEqual(self.service.record_managed_notification_event(played, now_iso=fixed_now), "recorded")
+        self.assertEqual(self.service.record_managed_notification_event(rendered, now_iso=fixed_now), "duplicate")
+        conflict = {"type": "notification.status", "notification_id": occurrence_id, "status": "failed"}
+        self.assertEqual(self.service.record_managed_notification_event(conflict, now_iso=fixed_now), "recorded")
+        ack = {"type": "notification.acknowledged", "notification_id": occurrence_id, "source": "button"}
+        self.assertEqual(self.service.record_managed_notification_event(ack, now_iso=fixed_now), "recorded")
+        self.assertEqual(self.service.record_managed_notification_event(ack, now_iso=fixed_now), "duplicate")
+
+        receipt = self.service.get_notification_receipt(occurrence_id)
+        self.assertEqual(receipt["delivery_status"], "played")
+        self.assertEqual(receipt["protocol_anomaly_count"], 1)
+        self.assertEqual(receipt["user_acknowledged"], 1)
+        self.assertEqual(receipt["ack_source"], "button")
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "pending")
+        self.assertEqual(self.service.get_all_occurrences("rem-managed-receipt")[0]["state"], "ringing")
+
+        self.service.close()
+        self.service = LifeService(self.db_path)
+        restored = self.service.get_notification_receipt(occurrence_id)
+        self.assertEqual(restored["delivery_status"], "played")
+        self.assertEqual(restored["user_acknowledged"], 1)
+        self.assertEqual(self.service.record_managed_notification_event(ack, now_iso=fixed_now), "duplicate")
+
+    def test_managed_notification_events_after_expiry_are_ignored(self) -> None:
+        self.service.create_reminder(
+            reminder_id="rem-managed-expiry",
+            title="Expiry receipt",
+            due_at="2026-10-22T12:00:00Z",
+        )
+        occurrence_id = self.service.get_all_occurrences("rem-managed-expiry")[0]["occurrence_id"]
+        self.service.trigger_occurrence_to_outbox(occurrence_id)
+        event = {"type": "notification.acknowledged", "notification_id": occurrence_id, "source": "button"}
+        self.assertEqual(
+            self.service.record_managed_notification_event(event, now_iso="2026-10-23T12:00:01Z"),
+            "ignored",
+        )
+        self.assertIsNone(self.service.get_notification_receipt(occurrence_id))
+
     def test_outbox_managed_failure_can_remain_pending_after_retry_limit(self) -> None:
         outbox_id = self.service.enqueue_outbox_once(
             "codex.failed", {"task_id": "task-2"}, idempotency_key="task-2:turn-2"
