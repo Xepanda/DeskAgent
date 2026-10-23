@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Build DeskAgent firmware with all writable project state under .target_logging.
 
-The TuyaOpen checkout supplies source and its preinstalled ESP-IDF toolchain.
-The project, ESP32 platform metadata, managed components, sdkconfig and all
-build trees are staged inside a new archive directory before invoking IDF.
+Only locked SDK source/toolchain inputs and reviewed project defaults may enter
+the stage. Generated configuration is created from scratch inside the archive.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -26,14 +24,9 @@ from datetime import datetime, timezone
 EXCLUDED_FIRMWARE_DIRS = {
     ".build", "build", "dist", ".target_logging", "__pycache__",
 }
-STAGED_SDK_INPUT_DIRS = (
-    "boards",
-    "tools",
-    "platform/ESP32/esp-idf",
-    "platform/ESP32/.espressif",
-)
 IDF_VERSION = "5.4"
 IDF_TARGET = "esp32s3"
+SDK_PROVENANCE_MANIFEST = Path("docs/acceptance/cr035-sdk-inputs.json")
 
 
 def is_within(path: Path, root: Path) -> bool:
@@ -195,57 +188,6 @@ def _copy_firmware(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, ignore=ignore, symlinks=False)
 
 
-def _is_link_or_reparse_point(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    is_junction = getattr(path, "is_junction", None)
-    if is_junction is not None and is_junction():
-        return True
-    attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    return bool(attributes & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
-
-
-def _plain_directory_snapshot(root: Path) -> dict[str, object]:
-    """Hash a staged directory tree and refuse links/reparse points anywhere in it."""
-    if _is_link_or_reparse_point(root):
-        raise RuntimeError(f"Staged SDK input is a link or reparse point: {root}")
-    digest = hashlib.sha256()
-    file_count = 0
-    byte_count = 0
-    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
-        current = Path(directory)
-        names.sort()
-        files.sort()
-        for name in list(names):
-            child = current / name
-            if _is_link_or_reparse_point(child):
-                raise RuntimeError(f"SDK input contains a link or reparse point: {child}")
-            relative = child.relative_to(root).as_posix()
-            digest.update(b"D\0" + relative.encode("utf-8", errors="surrogateescape") + b"\n")
-        for name in files:
-            child = current / name
-            if _is_link_or_reparse_point(child):
-                raise RuntimeError(f"SDK input contains a link or reparse point: {child}")
-            metadata = child.stat()
-            if not stat.S_ISREG(metadata.st_mode):
-                raise RuntimeError(f"SDK input contains a non-regular file: {child}")
-            file_hash = sha256_file(child)
-            relative = child.relative_to(root).as_posix()
-            digest.update(
-                b"F\0" + relative.encode("utf-8", errors="surrogateescape") + b"\0"
-                + str(metadata.st_size).encode("ascii") + b"\0"
-                + file_hash.encode("ascii") + b"\n"
-            )
-            file_count += 1
-            byte_count += metadata.st_size
-    return {
-        "file_count": file_count,
-        "byte_count": byte_count,
-        "tree_sha256": digest.hexdigest().upper(),
-        "reparse_points": 0,
-    }
-
-
 def _idf_repo_version(idf_root: Path) -> str:
     version_header = idf_root / "components" / "esp_common" / "include" / "esp_idf_version.h"
     try:
@@ -323,101 +265,119 @@ def assert_staged_idf_target(idf_root: Path, espressif_root: Path, target: str) 
     return record
 
 
-def stage_sdk(sdk_source: Path, stage_root: Path) -> Path:
-    """Create an isolated TuyaOpen source view without SDK build/config state."""
-    sdk_source = sdk_source.resolve()
-    stage_root.mkdir(parents=True, exist_ok=False)
-    for filename in ("CMakeLists.txt", "tos.py"):
-        shutil.copy2(sdk_source / filename, stage_root / filename)
+def validate_managed_component_lock(lock_path: Path, managed_root: Path) -> list[str]:
+    """Require staged managed component directories to exactly match tracked lock entries."""
+    if not lock_path.is_file():
+        raise RuntimeError(f"Tracked component lock is missing: {lock_path}")
+    lock_text = lock_path.read_text(encoding="utf-8")
+    locked = sorted({f"{match.group(1)}__{match.group(2)}"
+                     for match in re.finditer(r"(?m)^  ([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+):\s*$", lock_text)})
+    if not locked:
+        raise RuntimeError(f"Tracked component lock contains no registry component entries: {lock_path}")
+    actual = sorted(item.name for item in managed_root.iterdir() if item.is_dir()) if managed_root.is_dir() else []
+    if actual != locked:
+        raise RuntimeError(
+            "Managed component source set is not covered by the tracked lock; "
+            f"locked={locked}, staged_source={actual}. Refusing to reuse generated component metadata."
+        )
+    return locked
 
-    # TuyaOpen derives include paths from OPEN_HEADER_DIR and CMake retains the
-    # lexical staging path. Copy src so Path.resolve() does not collapse those
-    # generated paths back into the external checkout.
-    shutil.copytree(sdk_source / "src", stage_root / "src")
-    for relative in ("boards", "tools"):
-        source = sdk_source / relative
-        if _is_link_or_reparse_point(source):
-            raise RuntimeError(f"SDK input directory must not be a link or junction: {source}")
-        shutil.copytree(source, stage_root / relative, symlinks=False)
 
-    (stage_root / "platform").mkdir()
-    shutil.copy2(sdk_source / "platform" / "platform_config.yaml",
-                 stage_root / "platform" / "platform_config.yaml")
-    source_platform = sdk_source / "platform" / "ESP32"
-    staged_platform = stage_root / "platform" / "ESP32"
+def stage_sdk(
+    sdk_source: Path,
+    stage_root: Path,
+    *,
+    dependency_lock: Path | None = None,
+    repo_root: Path | None = None,
+) -> Path:
+    """Fail closed until tracked SDK source and toolchain manifests exist.
 
-    def ignore_platform(directory: str, names: list[str]) -> set[str]:
-        excluded = {".git", ".espressif", "esp-idf", "tuya_open_sdk"}
-        return {name for name in names if name in excluded}
+    The local TuyaOpen checkout contains generated component, IDF, and tool
+    installation trees. Copying or hashing those trees is not an approved
+    source of build inputs, so this runner deliberately refuses to stage them.
+    """
+    if repo_root is None:
+        raise RuntimeError(
+            "BLOCKED: tracked SDK provenance manifest is missing; refusing all shared SDK access."
+        )
+    require_tracked_sdk_provenance(repo_root)
+    raise RuntimeError("BLOCKED: no approved SDK source allowlist; refusing shared SDK access.")
 
-    shutil.copytree(source_platform, staged_platform, ignore=ignore_platform)
-    for relative in ("esp-idf", ".espressif"):
-        source = source_platform / relative
-        destination = staged_platform / relative
-        if _is_link_or_reparse_point(source):
-            raise RuntimeError(f"SDK input directory must not be a link or junction: {source}")
-        shutil.copytree(source, destination, symlinks=False)
-
-    source_project = source_platform / "tuya_open_sdk"
-    staged_project = staged_platform / "tuya_open_sdk"
-
-    def ignore_project(directory: str, names: list[str]) -> set[str]:
-        excluded = {"build", "managed_components", ".git"}
-        return {name for name in names if name in excluded}
-
-    shutil.copytree(source_project, staged_project, ignore=ignore_project)
-    # Managed dependencies are substantial but contain input sources only. Copy
-    # them into the archive so the build cannot regenerate anything in the SDK.
-    shutil.copytree(source_project / "managed_components",
-                    staged_project / "managed_components")
-    # Keep the existing prepare marker: this makes build_setup use the already
-    # installed SDK-local tools and prevents its installer/network fallback.
-    prepare_marker = source_platform / ".prepare"
-    if not prepare_marker.is_file() or prepare_marker.read_text(encoding="utf-8").strip() != "esp32s3":
-        raise RuntimeError("SDK ESP32 .prepare marker is absent or not esp32s3; refusing any install/setup fallback.")
-    shutil.copy2(prepare_marker, staged_platform / ".prepare")
-
-    staged_idf = staged_platform / "esp-idf"
-    staged_espressif = staged_platform / ".espressif"
-    idf_registration = register_staged_idf_target(staged_idf, staged_espressif, IDF_TARGET)
-    if assert_staged_idf_target(staged_idf, staged_espressif, IDF_TARGET) != idf_registration:
-        raise RuntimeError("Staged ESP-IDF target registration did not round-trip")
-
-    directories: dict[str, dict[str, object]] = {}
-    aggregate = hashlib.sha256()
-    for relative in STAGED_SDK_INPUT_DIRS:
-        source = sdk_source / Path(relative)
-        staged = stage_root / Path(relative)
-        if os.path.samefile(source, staged):
-            raise RuntimeError(f"Staged SDK input still aliases its external source: {relative}")
-        snapshot = _plain_directory_snapshot(staged)
-        directories[relative] = {
-            "source": str(source),
-            "staged": str(staged),
-            "samefile_source": False,
-            **snapshot,
-        }
-        aggregate.update(relative.encode("utf-8") + b"\0")
-        aggregate.update(str(snapshot["tree_sha256"]).encode("ascii") + b"\n")
-    manifest = {
-        "schema_version": 1,
-        "sdk_source": str(sdk_source),
-        "staged_sdk": str(stage_root),
-        "idf_target_registration": {
-            "repo_id": f"{idf_registration['path']}-v{idf_registration['version']}",
-            **idf_registration,
-        },
-        "directories": directories,
-        "aggregate_sha256": aggregate.hexdigest().upper(),
+def install_reviewed_sdkconfig_defaults(firmware_root: Path, staged_project: Path) -> Path:
+    """Seed a fresh stage config from the reviewed tracked project defaults only."""
+    defaults = firmware_root / "sdkconfig.defaults"
+    if not defaults.is_file():
+        raise RuntimeError(f"Reviewed firmware sdkconfig.defaults is missing: {defaults}")
+    text = defaults.read_text(encoding="utf-8")
+    required = {
+        'CONFIG_IDF_TARGET="esp32s3"',
+        "CONFIG_PARTITION_TABLE_CUSTOM=y",
+        'CONFIG_ESPTOOLPY_FLASHSIZE="32MB"',
     }
-    (stage_root.parent / "staged-sdk-inputs.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    return stage_root
+    missing = sorted(item for item in required if item not in text.splitlines())
+    if missing:
+        raise RuntimeError("Reviewed defaults do not define required target/build settings: " + ", ".join(missing))
+    staged_project.mkdir(parents=True, exist_ok=True)
+    destination = staged_project / "sdkconfig.defaults"
+    if destination.exists():
+        raise FileExistsError(f"Refusing to reuse staged config defaults: {destination}")
+    shutil.copy2(defaults, destination)
+    return destination
+
+
+def assert_non_sensitive_sdkconfig(config_path: Path) -> str:
+    """Reject config entries that look credential-bearing before hashing/logging."""
+    text = config_path.read_text(encoding="utf-8", errors="strict")
+    required = {
+        'CONFIG_IDF_TARGET="esp32s3"',
+        "CONFIG_PARTITION_TABLE_CUSTOM=y",
+        'CONFIG_ESPTOOLPY_FLASHSIZE="32MB"',
+    }
+    missing = sorted(item for item in required if item not in text.splitlines())
+    if missing:
+        raise RuntimeError("Generated sdkconfig is missing required build settings: " + ", ".join(missing))
+    forbidden = re.compile(r"(?i)(?:PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|PRIVATE[_-]?KEY)")
+    matches = [line.split("=", 1)[0] for line in text.splitlines()
+               if line.startswith("CONFIG_") and forbidden.search(line.split("=", 1)[0])]
+    if matches:
+        raise RuntimeError("Generated sdkconfig contains sensitive-looking symbols; refusing to log/hash it: "
+                           + ", ".join(sorted(set(matches))))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest().upper()
 
 
 def git_output(repo: Path, *args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=repo, check=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+
+
+def require_tracked_sdk_provenance(repo: Path) -> None:
+    """Refuse SDK access unless a tracked, reviewed SDK input manifest exists.
+
+    No allowlist is currently approved. This gate therefore blocks before any
+    SDK-root filesystem or process operation, even if a manifest is later added.
+    """
+    relative = SDK_PROVENANCE_MANIFEST.as_posix()
+    tracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--error-unmatch", "--", relative],
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if tracked.returncode != 0:
+        raise RuntimeError(
+            f"BLOCKED: tracked SDK provenance manifest is missing: {relative}; "
+            "refusing all shared SDK and toolchain access."
+        )
+    manifest = repo / SDK_PROVENANCE_MANIFEST
+    try:
+        manifest.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"BLOCKED: tracked SDK provenance manifest cannot be read: {relative}; "
+            "refusing all shared SDK and toolchain access."
+        ) from exc
+    raise RuntimeError(
+        f"BLOCKED: SDK provenance manifest {relative} has no approved allowlist parser; "
+        "refusing all shared SDK and toolchain access."
+    )
 
 
 def source_provenance(repo: Path) -> dict[str, object]:
@@ -479,16 +439,19 @@ def idf_export_prefix(idf_tools_root: Path, python_scripts: Path, export_bat: Pa
     )
 
 
-def configure_staged_partition_config(config_path: Path, csv_path: Path) -> None:
-    """Restore the repository CSV after IDF set-target rewrites sdkconfig."""
-    import re
-    text = config_path.read_text(encoding="utf-8")
-    text = re.sub(r'(?m)^CONFIG_PARTITION_TABLE_(?:CUSTOM_FILENAME|FILENAME)=.*\r?\n?', "", text)
-    value = Path(os.path.abspath(str(csv_path))).as_posix()
-    text += (f'CONFIG_PARTITION_TABLE_CUSTOM=y\n'
-             f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{value}"\n'
-             f'CONFIG_PARTITION_TABLE_FILENAME="{value}"\n')
-    config_path.write_text(text, encoding="utf-8")
+def configure_staged_partition_config(
+    config_path: Path,
+    csv_path: Path,
+    *,
+    repo: Path,
+    authorization: dict[str, object] | None = None,
+) -> None:
+    """Keep partition mutation disabled until provenance and a safe design exist."""
+    require_tracked_sdk_provenance(repo)
+    raise RuntimeError(
+        "BLOCKED: staged partition-config mutation is disabled pending A0-approved SDK provenance "
+        "and a separately reviewed design."
+    )
 
 
 def _run_mounted_build(
@@ -506,7 +469,7 @@ def _run_mounted_build(
     staged_app = paths["app"]
     stage.mkdir()
     _copy_firmware(repo / "firmware", staged_app)
-    stage_sdk(sdk_root, staged_sdk)
+    stage_sdk(sdk_root, staged_sdk, dependency_lock=repo / "firmware" / "dependencies.lock")
     idf_tools_root, idf_python_scripts = staged_idf_tool_paths(
         sdk_root, staged_sdk, python, idf_python_scripts
     )
@@ -520,50 +483,43 @@ def _run_mounted_build(
     # sdkconfig. Do so only in the staged project and bind the repository CSV
     # copied into the staged app.
     staged_project = staged_sdk / "platform" / "ESP32" / "tuya_open_sdk"
+    defaults_path = install_reviewed_sdkconfig_defaults(repo / "firmware", staged_project)
     native_config = staged_project / "sdkconfig"
-    if not native_config.is_file():
-        raise RuntimeError("SDK source sdkconfig is missing; refusing target setup.")
-    config_bytes = native_config.read_bytes()
-    project_csv = (staged_app / "partitions.csv").as_posix()
-    text = config_bytes.decode("utf-8")
-    import re
-    text = re.sub(r'(?m)^(?:# )?CONFIG_ESPTOOLPY_FLASHSIZE(?:_(?:1|2|4|8|16|32|64|128)MB)?(?:=.*| is not set)\r?\n?', "", text)
-    text = re.sub(r'(?m)^(?:# )?CONFIG_PARTITION_TABLE_(?:CUSTOM_FILENAME|FILENAME)(?:=.*| is not set)\r?\n?', "", text)
-    text += (f'\nCONFIG_ESPTOOLPY_FLASHSIZE_32MB=y\nCONFIG_ESPTOOLPY_FLASHSIZE="32MB"\n'
-             f'CONFIG_PARTITION_TABLE_CUSTOM=y\nCONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{project_csv}"\n'
-             f'CONFIG_PARTITION_TABLE_FILENAME="{project_csv}"\n')
-    native_config.write_text(text, encoding="utf-8")
     (staged_project / "partitions.csv").write_bytes((staged_app / "partitions.csv").read_bytes())
 
     bridge = repo / "tools" / "verification" / "run_isolated_tuyaopen_bridge.py"
     idf_export = staged_sdk / "platform" / "ESP32" / "esp-idf" / "export.bat"
     sdkconfig_provenance = {
         "sdkconfig_path": str(native_config),
-        "sdkconfig_sha256_before": hashlib.sha256(config_bytes).hexdigest().upper(),
-        "staged_sdkconfig_sha256": sha256_file(native_config),
+        "sdkconfig_defaults_path": str(defaults_path),
+        "sdkconfig_defaults_sha256": sha256_file(defaults_path),
+        "staged_sdkconfig_sha256": None,
         "partition_csv": str(staged_app / "partitions.csv"),
         "external_sdk_writes": "none intended; project/build/config state is staged under this archive",
     }
     (archive / "sdkconfig-provenance.json").write_text(
         json.dumps(sdkconfig_provenance, indent=2) + "\n", encoding="utf-8")
 
-    config_helper_command = (
-        f'"{python}" "{Path(__file__).resolve()}" --configure-partition '
-        f'"{native_config}" "{staged_app / "partitions.csv"}"'
-    )
     wrapper = paths["archive"] / "run-isolated-bridge-mounted.py"
     wrapper.write_text(mounted_bridge_wrapper_source(), encoding="utf-8")
     bridge_command = mounted_bridge_command(python, wrapper, bridge, mount_root, repo, sdk_root)
     command = (
         f'{idf_export_prefix(idf_tools_root, idf_python_scripts, idf_export)} && '
-        f'idf.py -C "{staged_project}" set-target esp32s3 && '
-        f'{config_helper_command} && '
-        f'idf.py -C "{staged_project}" reconfigure && '
+        f'idf.py -C "{staged_project}" -B "{paths["archive"] / "build"}" set-target esp32s3 && '
+        f'idf.py -C "{staged_project}" -B "{paths["archive"] / "build"}" reconfigure && '
         + subprocess.list2cmdline(bridge_command)
     )
     result = subprocess.run(command, shell=True, cwd=repo,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log = result.stdout.decode("utf-8", errors="replace")
+    if native_config.is_file():
+        config_digest = assert_non_sensitive_sdkconfig(native_config)
+        sdkconfig_provenance["staged_sdkconfig_sha256"] = config_digest
+        sdkconfig_provenance["sdkconfig_generated_from_fresh_stage_defaults"] = True
+        (archive / "sdkconfig-provenance.json").write_text(
+            json.dumps(sdkconfig_provenance, indent=2) + "\n", encoding="utf-8")
+    elif result.returncode == 0:
+        raise RuntimeError("IDF completed but did not produce a fresh staged sdkconfig; refusing build evidence.")
     (archive / "build-console.log").write_text(
         f"COMMAND: {command}\nEXIT_CODE: {result.returncode}\n\n{log}", encoding="utf-8")
 
@@ -594,6 +550,9 @@ def _run_mounted_build(
 
 
 def run_build(repo: Path, sdk_root: Path, archive: Path) -> int:
+    # First build operation: do not resolve, glob, stat, import from, or invoke
+    # tools from sdk_root before the tracked, repo-local provenance gate.
+    require_tracked_sdk_provenance(repo)
     archive_base = (repo / "firmware" / ".target_logging").resolve()
     archive = archive.resolve()
     if not is_within(archive, archive_base) or archive == archive_base:
@@ -628,23 +587,20 @@ def run_build(repo: Path, sdk_root: Path, archive: Path) -> int:
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--configure-partition", nargs=2, metavar=("SDKCONFIG", "CSV"))
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--sdk", type=Path, default=Path.home() / "TuyaOpenIDE" / "TuyaOpenSDK")
     parser.add_argument("--archive", type=Path)
     args = parser.parse_args(argv)
-    if not args.configure_partition and args.archive is None:
+    if args.archive is None:
         parser.error("--archive is required for a firmware build")
     return args
 
 
 def main() -> int:
     args = parse_arguments()
-    if args.configure_partition:
-        configure_staged_partition_config(Path(args.configure_partition[0]), Path(args.configure_partition[1]))
-        return 0
     try:
-        return run_build(args.repo.resolve(), args.sdk.resolve(), args.archive)
+        require_tracked_sdk_provenance(args.repo)
+        return run_build(args.repo.resolve(), args.sdk, args.archive)
     except Exception as exc:
         print(f"isolated firmware build refused/failed before completion: {exc}", file=sys.stderr)
         return 2

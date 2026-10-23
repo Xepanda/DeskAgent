@@ -1,6 +1,10 @@
 import importlib.util
+import builtins
+import contextlib
+import io
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -18,8 +22,347 @@ BRIDGE = importlib.util.module_from_spec(BRIDGE_SPEC)
 assert BRIDGE_SPEC.loader is not None
 BRIDGE_SPEC.loader.exec_module(BRIDGE)
 
+LEGACY_BRIDGE_PATH = MODULE_PATH.parents[1] / "build_watcher_tuyaopen.py"
+LEGACY_SPEC = importlib.util.spec_from_file_location("build_watcher_tuyaopen", LEGACY_BRIDGE_PATH)
+LEGACY_BRIDGE = importlib.util.module_from_spec(LEGACY_SPEC)
+assert LEGACY_SPEC.loader is not None
+LEGACY_SPEC.loader.exec_module(LEGACY_BRIDGE)
+
 
 class IsolatedFirmwareBuildTests(unittest.TestCase):
+    def test_powershell_entrypoint_delegates_without_reading_generated_sdk_state(self):
+        script = (MODULE_PATH.parents[1] / "build_watcher_firmware.ps1").read_text(encoding="utf-8")
+        self.assertNotRegex(script, r"(?i)sdkconfig(?:\.old|\.h)?")
+        self.assertNotIn("ReadAllBytes", script)
+        self.assertIn("build_isolated_firmware.py", script)
+
+    def test_reviewed_defaults_are_staged_fresh_and_required_settings_are_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            firmware = root / "firmware"
+            project = root / "stage" / "project"
+            firmware.mkdir()
+            defaults = ('CONFIG_IDF_TARGET="esp32s3"\n'
+                        "CONFIG_PARTITION_TABLE_CUSTOM=y\n"
+                        'CONFIG_ESPTOOLPY_FLASHSIZE="32MB"\n')
+            (firmware / "sdkconfig.defaults").write_text(defaults, encoding="utf-8")
+            staged = MODULE.install_reviewed_sdkconfig_defaults(firmware, project)
+            self.assertEqual(staged.read_text(encoding="utf-8"), defaults)
+            with self.assertRaises(FileExistsError):
+                MODULE.install_reviewed_sdkconfig_defaults(firmware, project)
+
+    def test_generated_sdkconfig_sensitive_symbols_fail_before_hashing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "sdkconfig"
+            config.write_text('CONFIG_IDF_TARGET="esp32s3"\n'
+                              "CONFIG_PARTITION_TABLE_CUSTOM=y\n"
+                              'CONFIG_ESPTOOLPY_FLASHSIZE="32MB"\n'
+                              'CONFIG_WIFI_PASSWORD="secret"\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "sensitive-looking"):
+                MODULE.assert_non_sensitive_sdkconfig(config)
+
+    def test_generated_sdkconfig_must_resolve_approved_target_and_flash_defaults(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "sdkconfig"
+            config.write_text('CONFIG_IDF_TARGET="esp32s3"\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "missing required build settings"):
+                MODULE.assert_non_sensitive_sdkconfig(config)
+
+    def test_managed_components_must_match_tracked_lock_exactly(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            lock = root / "dependencies.lock"
+            managed = root / "managed_components"
+            managed.mkdir()
+            (managed / "vendor__codec").mkdir()
+            (managed / "vendor__unlocked").mkdir()
+            lock.write_text("dependencies:\n  vendor/codec:\n    version: 1.2.3\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not covered by the tracked lock"):
+                MODULE.validate_managed_component_lock(lock, managed)
+
+    def test_managed_components_are_only_accepted_when_lock_set_matches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            lock = root / "dependencies.lock"
+            managed = root / "managed_components"
+            managed.mkdir()
+            (managed / "vendor__codec").mkdir()
+            lock.write_text("dependencies:\n  vendor/codec:\n    version: 1.2.3\n", encoding="utf-8")
+            self.assertEqual(MODULE.validate_managed_component_lock(lock, managed), ["vendor__codec"])
+
+    def test_stage_sdk_missing_manifest_blocks_before_any_sdk_path_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sdk = root / "sdk"
+            project = sdk / "platform" / "ESP32" / "tuya_open_sdk"
+            managed = project / "managed_components"
+            (managed / "vendor__unlocked").mkdir(parents=True)
+            (sdk / "src").mkdir(parents=True)
+            (sdk / "boards").mkdir()
+            (sdk / "tools").mkdir()
+            (sdk / "CMakeLists.txt").write_text("cmake", encoding="utf-8")
+            (sdk / "tos.py").write_text("cli", encoding="utf-8")
+            (sdk / "platform" / "platform_config.yaml").write_text("platforms: []", encoding="utf-8")
+            (sdk / "platform" / "ESP32" / "esp-idf" / "build").mkdir(parents=True)
+            (sdk / "platform" / "ESP32" / ".espressif" / "python_env" / ".cache").mkdir(parents=True)
+            (sdk / "platform" / "ESP32" / "esp-idf" / "build" / "generated.h").write_text("sentinel", encoding="utf-8")
+            (sdk / "platform" / "ESP32" / ".espressif" / "python_env" / ".cache" / "credential").write_text("sentinel", encoding="utf-8")
+            (sdk / "platform" / "ESP32" / ".prepare").write_text("esp32s3", encoding="utf-8")
+            lock = root / "dependencies.lock"
+            lock.write_text("dependencies:\n  vendor/codec:\n    version: 1.0.0\n", encoding="utf-8")
+            forbidden_roots = [sdk]
+            original_ops = self._forbidden_access_guards(forbidden_roots)
+            original_copy2 = MODULE.shutil.copy2
+            original_copytree = MODULE.shutil.copytree
+            copies = []
+
+            def guarded_copy2(source, destination, *args, **kwargs):
+                copies.append(Path(source))
+                return original_copy2(source, destination, *args, **kwargs)
+
+            def guarded_copytree(source, destination, *args, **kwargs):
+                copies.append(Path(source))
+                return original_copytree(source, destination, *args, **kwargs)
+
+            with original_ops, \
+                    mock.patch.object(MODULE.shutil, "copy2", guarded_copy2), \
+                    mock.patch.object(MODULE.shutil, "copytree", guarded_copytree):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                    MODULE.stage_sdk(sdk, root / "archive" / "sdk", dependency_lock=lock,
+                                     repo_root=root)
+            self.assertEqual(copies, [])
+
+    def _forbidden_access_guards(self, roots):
+        """Fail if any common pathlib/os file traversal operation touches roots."""
+        def forbidden(value):
+            try:
+                path = Path(value)
+            except (TypeError, ValueError):
+                return False
+            return any(path == root or root in path.parents for root in roots)
+
+        patches = []
+        original_builtin_open = builtins.open
+
+        def guarded_builtin_open(file, *args, **kwargs):
+            if forbidden(file):
+                raise AssertionError(f"forbidden builtins.open access: {file}")
+            return original_builtin_open(file, *args, **kwargs)
+
+        patches.append(mock.patch.object(builtins, "open", guarded_builtin_open))
+        for name in ("open", "stat", "lstat", "exists", "is_file", "is_dir", "is_symlink",
+                     "resolve", "glob", "rglob", "iterdir"):
+            original = getattr(Path, name)
+
+            def guard(path, *args, __name=name, __original=original, **kwargs):
+                if forbidden(path):
+                    raise AssertionError(f"forbidden Path.{__name} access: {path}")
+                return __original(path, *args, **kwargs)
+
+            patches.append(mock.patch.object(Path, name, guard))
+
+        for name in ("stat", "scandir"):
+            original = getattr(MODULE.os, name)
+
+            def guard(value, *args, __name=name, __original=original, **kwargs):
+                if forbidden(value):
+                    raise AssertionError(f"forbidden os.{__name} access: {value}")
+                return __original(value, *args, **kwargs)
+
+            patches.append(mock.patch.object(MODULE.os, name, guard))
+
+        original_realpath = MODULE.os.path.realpath
+
+        def guarded_realpath(value, *args, **kwargs):
+            if forbidden(value):
+                raise AssertionError(f"forbidden os.path.realpath access: {value}")
+            return original_realpath(value, *args, **kwargs)
+
+        patches.append(mock.patch.object(MODULE.os.path, "realpath", guarded_realpath))
+
+        class GuardContext:
+            def __enter__(self):
+                for patcher in patches:
+                    patcher.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                for patcher in reversed(patches):
+                    patcher.__exit__(*exc)
+        return GuardContext()
+
+    def test_run_build_missing_tracked_manifest_blocks_before_any_sdk_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            sdk = root / "shared-sdk"
+            (repo / "firmware" / ".target_logging").mkdir(parents=True)
+            forbidden = [sdk]
+            (sdk / "platform" / "ESP32" / ".espressif" / "python_env").mkdir(parents=True)
+            (sdk / ".venv" / "Lib" / "site-packages").mkdir(parents=True)
+            original_run = MODULE.subprocess.run
+            calls = []
+
+            def tracked_lookup(command, **kwargs):
+                calls.append(command)
+                if command[:3] == ["git", "ls-files", "--error-unmatch"]:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"missing")
+                return original_run(command, **kwargs)
+
+            with self._forbidden_access_guards(forbidden), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=tracked_lookup):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                    MODULE.run_build(repo, sdk, repo / "firmware" / ".target_logging" / "attempt")
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn(str(sdk), str(calls))
+
+    def test_main_checks_repo_manifest_before_resolving_sdk_argument(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            sdk = root / "shared-sdk"
+            archive = repo / "firmware" / ".target_logging" / "attempt"
+            (repo / "firmware" / ".target_logging").mkdir(parents=True)
+            sdk.mkdir()
+            commands = []
+
+            def missing_manifest(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"missing")
+
+            stderr = io.StringIO()
+            with self._forbidden_access_guards([sdk]), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=missing_manifest), \
+                    mock.patch.object(sys, "argv", [str(MODULE_PATH), "--repo", str(repo),
+                                                       "--sdk", str(sdk), "--archive", str(archive)]), \
+                    contextlib.redirect_stderr(stderr):
+                result = MODULE.main()
+            self.assertEqual(result, 2)
+            self.assertIn("tracked SDK provenance manifest", stderr.getvalue())
+            self.assertEqual(len(commands), 1)
+            self.assertNotIn(str(sdk), str(commands))
+
+    def test_configure_partition_cli_is_disabled_before_touching_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sdkconfig = root / "shared" / "sdkconfig"
+            csv_path = root / "shared" / "partitions.csv"
+            sdkconfig.parent.mkdir()
+            sdkconfig.write_text("SENTINEL_CONFIG", encoding="utf-8")
+            csv_path.write_text("SENTINEL_CSV", encoding="utf-8")
+            stderr = io.StringIO()
+            with self._forbidden_access_guards([sdkconfig, csv_path]), \
+                    mock.patch.object(sys, "argv", [
+                        str(MODULE_PATH), "--configure-partition", str(sdkconfig), str(csv_path),
+                    ]), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    MODULE.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("unrecognized arguments", stderr.getvalue())
+
+    def test_partition_helper_ignores_forged_authorization_and_never_touches_symlink_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            shared = root / "shared"
+            shared.mkdir()
+            sentinel = shared / "config-sentinel"
+            sentinel.write_text("SENTINEL_CONFIG", encoding="utf-8")
+            # This lexical path represents an attacker-controlled symlink to
+            # sentinel; the guard proves the helper never follows or stats it.
+            sdkconfig = shared / "sdkconfig-symlink-sentinel"
+            csv_path = shared / "partitions.csv"
+            csv_path.write_text("SENTINEL_CSV", encoding="utf-8")
+            commands = []
+
+            def missing_manifest(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"missing")
+
+            forged = {
+                "schema": "deskagent-stage-token-v1",
+                "sdkconfig_path": str(sdkconfig),
+                "partition_csv_path": str(csv_path),
+            }
+            with self._forbidden_access_guards([sdkconfig, csv_path, sentinel]), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=missing_manifest):
+                with self.assertRaisesRegex(RuntimeError, "tracked SDK provenance manifest"):
+                    MODULE.configure_staged_partition_config(
+                        sdkconfig, csv_path, repo=repo, authorization=forged)
+            self.assertEqual(len(commands), 1)
+
+    def test_bridge_direct_cli_refuses_before_sdk_filesystem_or_subprocess_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sdk = root / "shared-sdk"
+            (sdk / ".venv" / "Lib" / "site-packages").mkdir(parents=True)
+            (sdk / "platform" / "ESP32" / "tuya_open_sdk" / "build").mkdir(parents=True)
+            with self._forbidden_access_guards([sdk]), \
+                    mock.patch.object(sys, "argv", [str(BRIDGE_PATH), str(sdk), str(root / "app"),
+                                                      str(root / "archive"), "--repo", str(root / "repo"),
+                                                      "--source-sdk", str(sdk)]):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: direct bridge invocation is disabled"):
+                    BRIDGE.main()
+
+    def test_legacy_tuyaopen_cli_refuses_before_sdk_filesystem_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sdk = root / "shared-sdk"
+            (sdk / "platform" / "ESP32" / "tuya_open_sdk" / "build").mkdir(parents=True)
+            calls = []
+            def manifest_check(command, **kwargs):
+                calls.append(command)
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"manifest missing")
+
+            with self._forbidden_access_guards([sdk]), \
+                    mock.patch.object(LEGACY_BRIDGE.subprocess, "run", side_effect=manifest_check):
+                with mock.patch.object(LEGACY_BRIDGE.sys, "argv", [
+                    str(LEGACY_BRIDGE_PATH), str(sdk), str(root / "app"), str(root / "archive")
+                ]):
+                    with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                        LEGACY_BRIDGE.main()
+            self.assertEqual(len(calls), 1)
+            self.assertNotIn(str(sdk), str(calls))
+
+    def test_legacy_firmware_snapshot_helper_refuses_before_sdk_or_generated_access(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            firmware = repo / "firmware"
+            sdk = root / "sdk"
+            firmware.mkdir(parents=True)
+            (repo / "tools").mkdir()
+            (firmware / "sdkconfig.defaults").write_text("tracked defaults", encoding="utf-8")
+            (repo / "tools" / "build_watcher_firmware.ps1").write_text("entry", encoding="utf-8")
+            (repo / "tools" / "build_watcher_tuyaopen.py").write_text("bridge", encoding="utf-8")
+            (firmware / ".build" / "build").mkdir(parents=True)
+            (firmware / ".build" / "build" / "build_param.json").write_text("DO_NOT_OPEN", encoding="utf-8")
+            calls = []
+
+            def tracked_only(command, **kwargs):
+                calls.append(command)
+                if str(sdk) in command:
+                    raise AssertionError(f"forbidden subprocess access under SDK root: {command}")
+                if "--error-unmatch" in command:
+                    return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"manifest absent")
+                if "ls-files" in command:
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        stdout=b"firmware/sdkconfig.defaults\0tools/build_watcher_firmware.ps1\0tools/build_watcher_tuyaopen.py\0",
+                        stderr=b"",
+                    )
+                return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+            with self._forbidden_access_guards([sdk, firmware / ".build"]), \
+                    mock.patch.object(LEGACY_BRIDGE.subprocess, "run", side_effect=tracked_only):
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                    LEGACY_BRIDGE.capture_firmware_inputs(firmware, repo, sdk)
+            self.assertEqual(len(calls), 1)
+
+    def test_isolated_bridge_does_not_expose_direct_source_snapshot_helper(self):
+        self.assertFalse(hasattr(BRIDGE, "source_snapshot"))
+
+
     def test_mounted_bridge_wrapper_preserves_archive_paths_lexically(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -176,131 +519,50 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             for excluded in (".build", "build", "dist", ".target_logging"):
                 self.assertFalse((destination / excluded).exists())
 
-    def test_sdk_staging_keeps_project_build_and_managed_components_local(self):
+    def test_sdk_staging_fails_closed_before_shared_generated_inputs_are_touched(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sdk = root / "sdk"
             platform = sdk / "platform" / "ESP32"
             project = platform / "tuya_open_sdk"
-            (sdk / "tools").mkdir(parents=True)
-            source_header = sdk / "src" / "common" / "include" / "tuya_iot_config.h"
-            source_header.parent.mkdir(parents=True)
-            source_header.write_text("/* staged header */\n", encoding="utf-8")
-            (sdk / "boards").mkdir()
-            (platform / ".espressif").mkdir(parents=True)
-            (platform / "esp-idf").mkdir()
-            (platform / ".espressif" / "idf-env.json").write_text(
-                '{"idfInstalled": {}}\n', encoding="utf-8"
-            )
-            version_header = (platform / "esp-idf" / "components" / "esp_common" / "include" / "esp_idf_version.h")
-            version_header.parent.mkdir(parents=True)
-            version_header.write_text(
-                "#define ESP_IDF_VERSION_MAJOR 5\n#define ESP_IDF_VERSION_MINOR 4\n",
-                encoding="utf-8",
-            )
-            (project / "managed_components" / "vendor").mkdir(parents=True)
-            (project / "build").mkdir()
-            (sdk / "CMakeLists.txt").write_text("cmake", encoding="utf-8")
-            (sdk / "tos.py").write_text("cli", encoding="utf-8")
-            (sdk / "platform" / "platform_config.yaml").write_text("platforms: []", encoding="utf-8")
-            (platform / ".prepare").write_text("esp32s3", encoding="utf-8")
-            (platform / "build_setup.py").write_text("setup", encoding="utf-8")
-            (project / "sdkconfig").write_text("config", encoding="utf-8")
-            (project / "managed_components" / "vendor" / "CMakeLists.txt").write_text("dep", encoding="utf-8")
-            (project / "build" / "old.bin").write_bytes(b"old")
+            managed = project / "managed_components" / "vendor__pkg"
+            managed.mkdir(parents=True)
+            (managed / "component.h").write_text("fixture", encoding="utf-8")
+            for relative in ("sdkconfig", "sdkconfig.old", "build/config/sdkconfig.h"):
+                path = project / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("DO_NOT_READ", encoding="utf-8")
+            esp_idf = platform / "esp-idf"
+            espressif = platform / ".espressif"
+            (esp_idf / "build").mkdir(parents=True)
+            (espressif / "python_env" / ".cache").mkdir(parents=True)
+            (esp_idf / "build" / "generated.h").write_text("DO_NOT_READ", encoding="utf-8")
+            (espressif / "python_env" / ".cache" / "credential").write_text("DO_NOT_READ", encoding="utf-8")
+            lock = root / "dependencies.lock"
+            lock.write_text("dependencies:\n  vendor/pkg:\n    version: 1.0.0\n", encoding="utf-8")
+            stage = root / "archive" / "sdk"
+            forbidden = [sdk]
+            copies = []
+            original_copy2 = MODULE.shutil.copy2
+            original_copytree = MODULE.shutil.copytree
 
-            staged = root / "archive" / "sdk"
-            MODULE.stage_sdk(sdk, staged)
+            def guarded_copy2(source, destination, *args, **kwargs):
+                copies.append(Path(source))
+                return original_copy2(source, destination, *args, **kwargs)
 
-            self.assertTrue((staged / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components" / "vendor" / "CMakeLists.txt").is_file())
-            self.assertFalse((staged / "platform" / "ESP32" / "tuya_open_sdk" / "build").exists())
-            self.assertEqual((staged / "platform" / "ESP32" / ".prepare").read_text(encoding="utf-8"), "esp32s3")
-            self.assertEqual((staged / "platform" / "ESP32" / "tuya_open_sdk" / "sdkconfig").read_text(encoding="utf-8"), "config")
-            self.assertTrue((staged / "src").is_dir())
-            self.assertTrue((staged / "tools").is_dir())
-            staged_header = staged / "src" / "common" / "include" / "tuya_iot_config.h"
-            self.assertFalse(MODULE.os.path.samefile(staged / "src", sdk / "src"))
-            self.assertEqual(staged_header.read_text(encoding="utf-8"), source_header.read_text(encoding="utf-8"))
-            self.assertTrue(MODULE.is_within(staged_header.resolve(), root / "archive"))
+            def guarded_copytree(source, destination, *args, **kwargs):
+                copies.append(Path(source))
+                return original_copytree(source, destination, *args, **kwargs)
 
-    def test_sdk_staging_copies_all_runtime_inputs_and_records_directory_snapshot(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            sdk = root / "sdk"
-            platform = sdk / "platform" / "ESP32"
-            project = platform / "tuya_open_sdk"
-            staged_dirs = ("boards", "tools", "platform/ESP32/esp-idf", "platform/ESP32/.espressif")
-            for relative in staged_dirs:
-                source_dir = sdk / Path(relative)
-                source_dir.mkdir(parents=True, exist_ok=True)
-                (source_dir / "input.txt").write_text(f"{relative}\n", encoding="utf-8")
-            source_idf_env = sdk / "platform" / "ESP32" / ".espressif" / "idf-env.json"
-            source_idf_env.write_text(MODULE.json.dumps({
-                "idfInstalled": {
-                    "existing-idf-v5.4": {
-                        "version": "5.4", "path": "existing-idf", "features": ["core"], "targets": ["esp32"]
-                    }
-                }
-            }), encoding="utf-8")
-            source_idf_env_bytes = source_idf_env.read_bytes()
-            idf_version_header = sdk / "platform" / "ESP32" / "esp-idf" / "components" / "esp_common" / "include" / "esp_idf_version.h"
-            idf_version_header.parent.mkdir(parents=True)
-            idf_version_header.write_text(
-                "#define ESP_IDF_VERSION_MAJOR 5\n#define ESP_IDF_VERSION_MINOR 4\n", encoding="utf-8"
-            )
-            (sdk / "src" / "common").mkdir(parents=True)
-            (sdk / "src" / "common" / "header.h").write_text("header\n", encoding="utf-8")
-            (sdk / "CMakeLists.txt").write_text("cmake", encoding="utf-8")
-            (sdk / "tos.py").write_text("cli", encoding="utf-8")
-            (sdk / "platform" / "platform_config.yaml").write_text("platforms: []", encoding="utf-8")
-            (platform / ".prepare").write_text("esp32s3", encoding="utf-8")
-            (platform / "build_setup.py").write_text("setup", encoding="utf-8")
-            (project / "managed_components" / "vendor").mkdir(parents=True)
-            (project / "managed_components" / "vendor" / "dep.h").write_text("dep", encoding="utf-8")
-            (project / "sdkconfig").write_text("config", encoding="utf-8")
-
-            staged = root / "archive" / "stage" / "sdk"
-            MODULE.stage_sdk(sdk, staged)
-
-            for relative in staged_dirs:
-                source_dir = sdk / Path(relative)
-                staged_dir = staged / Path(relative)
-                self.assertTrue(staged_dir.is_dir(), relative)
-                self.assertFalse(MODULE.os.path.samefile(source_dir, staged_dir), relative)
-                self.assertFalse(staged_dir.is_symlink(), relative)
-                entries = [staged_dir, *staged_dir.rglob("*")]
-                self.assertFalse(any(
-                    entry.is_symlink()
-                    or (getattr(entry, "is_junction", None) is not None and entry.is_junction())
-                    or bool(getattr(entry.lstat(), "st_file_attributes", 0) & 0x400)
-                    for entry in entries
-                ), relative)
-                self.assertEqual((staged_dir / "input.txt").read_text(encoding="utf-8"),
-                                 (source_dir / "input.txt").read_text(encoding="utf-8"))
-            self.assertTrue((staged / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components" / "vendor" / "dep.h").is_file())
-
-            manifest_path = staged.parent / "staged-sdk-inputs.json"
-            self.assertTrue(manifest_path.is_file())
-            manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(set(manifest["directories"]), set(staged_dirs))
-            self.assertTrue(all(item["samefile_source"] is False for item in manifest["directories"].values()))
-            self.assertTrue(all(item["reparse_points"] == 0 for item in manifest["directories"].values()))
-            self.assertTrue(manifest["aggregate_sha256"])
-
-            staged_idf = staged / "platform" / "ESP32" / "esp-idf"
-            staged_env_path = staged / "platform" / "ESP32" / ".espressif" / "idf-env.json"
-            self.assertEqual(source_idf_env.read_bytes(), source_idf_env_bytes)
-            staged_env = MODULE.json.loads(staged_env_path.read_text(encoding="utf-8"))
-            staged_repo = str(staged_idf.resolve())
-            record = staged_env["idfInstalled"][f"{staged_repo}-v5.4"]
-            self.assertEqual(record, {
-                "version": "5.4",
-                "path": staged_repo,
-                "features": ["core"],
-                "targets": ["esp32s3"],
-            })
-            self.assertEqual(MODULE.assert_staged_idf_target(staged_idf, staged / "platform" / "ESP32" / ".espressif", "esp32s3"), record)
-
+            with self._forbidden_access_guards(forbidden), \
+                    mock.patch.object(MODULE.shutil, "copy2", guarded_copy2), \
+                    mock.patch.object(MODULE.shutil, "copytree", guarded_copytree), \
+                    mock.patch.object(MODULE, "sha256_file", wraps=MODULE.sha256_file) as hash_file:
+                with self.assertRaisesRegex(RuntimeError, "BLOCKED: tracked SDK provenance manifest"):
+                    MODULE.stage_sdk(sdk, stage, dependency_lock=lock)
+            self.assertEqual(copies, [])
+            self.assertFalse(any(Path(call.args[0]) == sdk or sdk in Path(call.args[0]).parents
+                                 for call in hash_file.call_args_list))
     def test_idf_registry_matches_canonical_active_repo_id_through_subst_alias(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -339,31 +601,18 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             self.assertEqual(record, registry[expected_active_repo_id])
             self.assertEqual(validated, record)
 
-    def test_partition_config_reasserts_absolute_staged_csv(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            config = root / "sdkconfig"
-            csv = root / "app" / "partitions.csv"
-            csv.parent.mkdir()
-            csv.write_text("csv", encoding="utf-8")
-            config.write_text('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"\n'
-                              'CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"\n', encoding="utf-8")
-            MODULE.configure_staged_partition_config(config, csv)
-            resolved = csv.resolve().as_posix()
-            result = config.read_text(encoding="utf-8")
-            self.assertIn(f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{resolved}"', result)
-            self.assertIn(f'CONFIG_PARTITION_TABLE_FILENAME="{resolved}"', result)
-            self.assertNotIn('CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"', result)
+    def test_partition_config_helper_stays_disabled_without_manifest(self):
+        with self.assertRaisesRegex(RuntimeError, "tracked SDK provenance manifest"):
+            MODULE.configure_staged_partition_config(Path("sdkconfig"), Path("partitions.csv"),
+                                                     repo=MODULE_PATH.parents[2])
 
-    def test_cli_arguments_allow_helper_without_archive_but_require_it_for_build(self):
-        helper = MODULE.parse_arguments(["--configure-partition", "sdkconfig", "partitions.csv"])
-        self.assertEqual(helper.configure_partition, ["sdkconfig", "partitions.csv"])
-        self.assertIsNone(helper.archive)
-
+    def test_cli_arguments_disable_partition_helper_and_require_archive_for_build(self):
         build = MODULE.parse_arguments(["--archive", "firmware/.target_logging/run"])
         self.assertEqual(build.archive, Path("firmware/.target_logging/run"))
-        self.assertIsNone(build.configure_partition)
 
+        with self.assertRaises(SystemExit) as helper_error:
+            MODULE.parse_arguments(["--configure-partition", "sdkconfig", "partitions.csv"])
+        self.assertEqual(helper_error.exception.code, 2)
         with self.assertRaises(SystemExit) as error:
             MODULE.parse_arguments([])
         self.assertEqual(error.exception.code, 2)
@@ -379,56 +628,6 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             before = dict(MODULE.os.environ)
             self.assertEqual(MODULE.gitpython_site_packages(sdk), site.resolve())
             self.assertEqual(dict(MODULE.os.environ), before)
-
-    def test_bridge_imports_sdk_gitpython_in_its_own_sys_path(self):
-        with tempfile.TemporaryDirectory() as temp:
-            sdk = Path(temp) / "sdk"
-            site = sdk / ".venv" / "Lib" / "site-packages"
-            for package in ("git", "gitdb"):
-                package_dir = site / package
-                package_dir.mkdir(parents=True)
-                (package_dir / "__init__.py").write_text("", encoding="utf-8")
-
-            previous = {name: BRIDGE.sys.modules.pop(name, None) for name in ("git", "gitdb")}
-            try:
-                resolved = BRIDGE.load_sdk_gitpython(sdk)
-                self.assertEqual(resolved, site.resolve())
-                self.assertEqual(str(resolved), BRIDGE.sys.path[0])
-                self.assertTrue(Path(BRIDGE.sys.modules["git"].__file__).is_relative_to(resolved))
-                self.assertTrue(Path(BRIDGE.sys.modules["gitdb"].__file__).is_relative_to(resolved))
-            finally:
-                BRIDGE.sys.modules.pop("git", None)
-                BRIDGE.sys.modules.pop("gitdb", None)
-                BRIDGE.sys.path.remove(str(site.resolve()))
-                for name, module in previous.items():
-                    if module is not None:
-                        BRIDGE.sys.modules[name] = module
-
-    def test_source_snapshot_returns_provenance_dict(self):
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            sdk = Path(temp) / "sdk"
-            (repo / "firmware" / ".build" / "build").mkdir(parents=True)
-            (repo / "tools").mkdir()
-            (repo / "firmware" / ".build" / "build" / "build_param.json").write_text("{}", encoding="utf-8")
-            (repo / "tools" / "build_watcher_firmware.ps1").write_text("build", encoding="utf-8")
-            (repo / "tools" / "build_watcher_tuyaopen.py").write_text("bridge", encoding="utf-8")
-            outputs = [
-                b"", b"tracked diff", "source-head\n", "sdk-head\n", "",
-            ]
-
-            def completed(stdout):
-                return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout)
-
-            with mock.patch.object(BRIDGE.subprocess, "run", side_effect=[completed(value) for value in outputs]):
-                snapshot = BRIDGE.source_snapshot(repo, sdk, Path(temp) / "staged-firmware")
-
-            self.assertIsInstance(snapshot, dict)
-            self.assertEqual(snapshot["source_commit"], "source-head")
-            self.assertEqual(snapshot["diff_bytes"], b"tracked diff")
-            self.assertTrue(snapshot["aggregate_sha256"])
-            self.assertEqual(len(snapshot["inputs"]), 3)
-            self.assertEqual(snapshot["external_sdk_state"]["head"], "sdk-head")
 
     def test_idf_export_uses_staging_espressif_paths_for_both_build_phases(self):
         with tempfile.TemporaryDirectory() as temp:
