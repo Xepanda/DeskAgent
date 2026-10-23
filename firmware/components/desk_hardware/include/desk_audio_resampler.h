@@ -6,20 +6,24 @@
 #include <stdint.h>
 
 /* Stateful rational 24 kHz -> 16 kHz mono S16LE conversion. */
+#define DESK_AUDIO_RESAMPLER_FIR_TAPS 19u
 typedef struct {
     int16_t pending[3];
     uint8_t pending_count;
     uint64_t input_samples;
     uint64_t output_samples;
     bool finished;
+    int16_t fir_history[DESK_AUDIO_RESAMPLER_FIR_TAPS];
+    uint8_t fir_position;
 } desk_audio_resampler_t;
 
 /*
- * Streaming 24 kHz -> 16 kHz linear interpolation. This preserves sample
- * duration and chunk continuity but is not an anti-aliasing low-pass filter;
- * callers must provide PCM band-limited to <= 8 kHz. Higher components can
- * fold into the output band. A production quality filter requires a separately
- * specified passband/stopband contract and hardware listening validation.
+ * Streaming 24 kHz -> 16 kHz conversion with a 19-tap Q15 Hamming-windowed
+ * low-pass FIR (7.6 kHz nominal cutoff) before the existing 2:3 interpolation.
+ * FIR history is carried across calls. The conversion preserves output sample
+ * count/duration; it adds 9 input samples (0.375 ms) of causal group delay.
+ * This low-order filter is intended to suppress aliases, not to claim a
+ * studio-grade passband/stopband response or hardware listening validation.
  */
 void desk_audio_resampler_init(desk_audio_resampler_t *state);
 int desk_audio_resampler_process(desk_audio_resampler_t *state,
