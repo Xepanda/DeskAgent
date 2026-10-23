@@ -273,6 +273,7 @@ typedef enum {
 } desk_sdk_ws_state_t;
 int desk_sdk_ws_client_connect_paired(void);
 int desk_sdk_ws_client_poll(int timeout_ms);
+uint32_t desk_sdk_ws_client_generation(void);
 int desk_sdk_ws_client_send_text(const char *text);
 /* Queues the start ACK with a writer completion callback before live media. */
 int desk_sdk_ws_client_send_camera_start_ack(const char *text);
@@ -337,6 +338,11 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
 /* WebSocket-only dispatch. Never use this entry point for the legacy TCP server. */
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len);
+/* Internal A2 media hooks called by the authenticated WebSocket receive loop. */
+int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
+                                           uint32_t connection_generation);
+void desk_sdk_bridge_audio_poll(uint32_t connection_generation);
+void desk_sdk_bridge_audio_session_closed(uint32_t connection_generation);
 #define desk_sdk_bridge_process_line desk_sdk_bridge_process_command
 
 /**

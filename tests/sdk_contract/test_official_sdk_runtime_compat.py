@@ -37,9 +37,12 @@ if OFFICIAL_SDK_PATH.is_dir() and str(OFFICIAL_SDK_PATH) not in sys.path:
 
 try:
     from watcherobot.protocol import (
+        FLAG_FIRST,
+        FLAG_LAST,
         FRAME_AUDIO,
         FRAME_IMAGE,
         BinaryFrame,
+        build_wspk,
         parse_json_message,
         parse_wspk,
     )
@@ -150,6 +153,45 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 'pthread_mutex_unlock(&s_ws_writer_mutex); return clean; }\n'
                 'void desk_sdk_test_pause_writer_without_thread(void) { s_ws_writer_started = true; }\n'
                 'void desk_sdk_test_resume_writer(void) { s_ws_writer_started = false; }\n'
+                'static desk_audio_stream_status_t test_audio_status;\n'
+                'static uint32_t test_audio_free_frames = 8; static int test_audio_active; static unsigned test_audio_drain_checks;\n'
+                'void desk_sdk_test_audio_reset(void) { memset(&test_audio_status, 0, sizeof(test_audio_status)); '
+                'test_audio_free_frames = 8; test_audio_active = 0; test_audio_drain_checks = 0; }\n'
+                'int desk_sdk_test_audio_is_active(void) { return test_audio_active; }\n'
+                'int desk_sdk_test_audio_inject(const uint8_t *frame, size_t len, uint32_t generation) { '
+                'return desk_sdk_bridge_process_ws_audio_frame(frame, len, generation); }\n'
+                'int __wrap_desk_hardware_audio_stream_begin(uint64_t handle, uint32_t generation, uint32_t stream_id, '
+                'uint32_t rate, uint8_t channels, uint8_t width, uint32_t total) { '
+                'if (test_audio_active || rate != 24000 || channels != 1 || width != 2 || total < 2) return DESK_HW_ERR_BUSY; '
+                'memset(&test_audio_status, 0, sizeof(test_audio_status)); test_audio_status.handle = handle; '
+                'test_audio_status.connection_generation = generation; test_audio_status.stream_id = stream_id; '
+                'test_audio_status.total_bytes = total; test_audio_status.free_frames = test_audio_free_frames; '
+                'test_audio_status.start_buffer_frames = 4; test_audio_status.state = DESK_AUDIO_STREAM_RECEIVING; '
+                'test_audio_status.tx_drained = false; test_audio_active = 1; return DESK_HW_OK; }\n'
+                'int __wrap_desk_hardware_audio_stream_write(uint64_t handle, uint32_t generation, uint32_t stream_id, '
+                'uint32_t sequence, const uint8_t *pcm, size_t bytes, desk_audio_stream_status_t *status) { '
+                '(void)pcm; if (test_audio_status.handle != handle || test_audio_status.connection_generation != generation || '
+                'test_audio_status.stream_id != stream_id || test_audio_status.expected_rx_seq != sequence || '
+                'test_audio_status.free_frames == 0) return DESK_HW_ERR_INVALID_ARG; '
+                'test_audio_status.expected_rx_seq++; test_audio_status.accepted_bytes += (uint32_t)bytes; '
+                'test_audio_status.free_frames--; test_audio_status.queue_depth++; test_audio_status.pending_frames++; '
+                'if (status) *status = test_audio_status; return DESK_HW_OK; }\n'
+                'int __wrap_desk_hardware_audio_stream_finish(uint64_t handle) { '
+                'if (test_audio_status.handle != handle || test_audio_status.accepted_bytes != test_audio_status.total_bytes) return DESK_HW_ERR_INVALID_ARG; '
+                'test_audio_status.state = DESK_AUDIO_STREAM_DRAINING; test_audio_status.tx_drained = false; '
+                'test_audio_drain_checks = 0; return DESK_HW_OK; }\n'
+                'int __wrap_desk_hardware_audio_stream_stop(uint64_t handle, uint32_t timeout_ms) { (void)timeout_ms; '
+                'if (test_audio_status.handle != handle) return DESK_HW_ERR_INVALID_ARG; '
+                'test_audio_status.state = DESK_AUDIO_STREAM_CANCELED; test_audio_status.tx_drained = true; '
+                'test_audio_active = 0; test_audio_status.playing = false; test_audio_status.queue_depth = 0; '
+                'test_audio_status.pending_frames = 0; test_audio_status.free_frames = 8; return DESK_HW_OK; }\n'
+                'int __wrap_desk_hardware_audio_stream_get_status(uint64_t handle, desk_audio_stream_status_t *status) { '
+                'if (!status || test_audio_status.handle != handle) return DESK_HW_ERR_INVALID_ARG; '
+                'if (test_audio_status.state == DESK_AUDIO_STREAM_DRAINING && ++test_audio_drain_checks >= 2) { '
+                'test_audio_status.state = DESK_AUDIO_STREAM_COMPLETE; test_audio_status.tx_drained = true; '
+                'test_audio_active = 0; test_audio_status.queue_depth = 0; test_audio_status.pending_frames = 0; '
+                'test_audio_status.free_frames = 8; } '
+                '*status = test_audio_status; return DESK_HW_OK; }\n'
             )
 
         # Compile C shared library
@@ -160,6 +202,11 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             "-O2",
             "-Wall",
             "-DDESK_SDK_OPENSSL_TESTING",
+            "-Wl,--wrap=desk_hardware_audio_stream_begin",
+            "-Wl,--wrap=desk_hardware_audio_stream_write",
+            "-Wl,--wrap=desk_hardware_audio_stream_finish",
+            "-Wl,--wrap=desk_hardware_audio_stream_stop",
+            "-Wl,--wrap=desk_hardware_audio_stream_get_status",
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
@@ -339,6 +386,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         # without it pairing is fail-closed (interfaces.md 6.4 / CR-001).
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
         self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+        self.lib.desk_sdk_test_audio_reset()
 
     def test_websocket_client_starts_offline_and_refuses_unpaired_send(self) -> None:
         self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
@@ -2011,17 +2059,185 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(resp_open["type"], "sys.nack")
         self.assertEqual(resp_open["error"]["code"], "UNSUPPORTED_OPERATION")
 
-    def test_audio_playback_commands_are_explicitly_unsupported(self) -> None:
-        """PCM playback begin/stop must not silently accept a missing media path."""
+    def test_audio_playback_commands_require_authenticated_sdk_session(self) -> None:
+        """PCM playback commands are rejected outside the authenticated WS session."""
         for msg_type in ("ctrl.audio.stream.begin", "ctrl.audio.stop"):
             with self.subTest(msg_type=msg_type):
                 response = self._exec_command({
                     "type": msg_type,
                     "code": 0,
-                    "data": {"stream_id": 1, "total_bytes": 320},
+                    "data": {"stream_id": 1, "total_bytes": 320,
+                             "sample_rate_hz": 24000, "channels": 1,
+                             "sample_width_bytes": 2, "audio_sha256": "0" * 64},
                 })
                 self.assertEqual(response["type"], "sys.nack")
-                self.assertEqual(response["error"]["code"], "UNSUPPORTED_OPERATION")
+                self.assertEqual(response["error"]["code"], "AUTH_FAILED")
+
+    def test_audio_playback_stream_runs_over_pinned_runtime_loopback(self) -> None:
+        """Exercise begin, multi-frame WSPK, HAL-backed credit, completion and cancel."""
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+        import hashlib
+
+        request_id = "a1a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "b730f29e670c49f7a3320c4314eb9805"
+        pairing = DevicePairingSession(daemon_instance_id=daemon_id,
+                                      request_id_factory=lambda: request_id)
+
+        async def exercise_runtime() -> None:
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=time.monotonic())
+
+            server = ExternalWebSocketServer(host="127.0.0.1", port=0,
+                hardware_hello_authorizer=authorize)
+            await server.start()
+            poll_stop = asyncio.Event()
+
+            async def poll_c_client() -> None:
+                while not poll_stop.is_set():
+                    await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 20)
+
+            poll_task = asyncio.create_task(poll_c_client())
+            try:
+                request = PairRequest(request_id=request_id, daemon_instance_id=daemon_id,
+                    pairing_code="123456", target_mode="python_sdk", websocket_port=server.bound_port)
+                pair_reply = ctypes.create_string_buffer(1024)
+                rc = self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(request),
+                                                                  pair_reply, len(pair_reply))
+                self.assertEqual(rc, 0)
+                pair_accept = parse_udp_message(pair_reply.value)
+                pairing.start_pairing(pairing_code="123456", target_mode="python_sdk",
+                                      websocket_port=server.bound_port, now=time.monotonic())
+                pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=time.monotonic())
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(
+                    b"127.0.0.1", server.bound_port), 0)
+                self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
+
+                async with websockets.connect(server.url) as desktop:
+                    await desktop.send(json.dumps({"type": "sys.client.hello", "code": 0,
+                        "data": {"role": "desktop", "version": "1.0"}}))
+                    self.assertEqual(json.loads(await asyncio.wait_for(desktop.recv(), 2))["type"], "sys.ack")
+
+                    stream_id = 71
+                    pcm = bytes((i * 7) & 0xff for i in range(8192))
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stream.begin", "code": 0,
+                        "request_id": "audio-begin-01", "data": {
+                            "stream_id": stream_id, "total_bytes": len(pcm),
+                            "sample_rate_hz": 24000, "channels": 1,
+                            "sample_width_bytes": 2,
+                            "audio_sha256": hashlib.sha256(pcm).hexdigest()}}))
+                    begin_ack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual((begin_ack["type"], begin_ack["request_id"]),
+                                     ("sys.ack", "audio-begin-01"), begin_ack)
+                    # The pinned SDK waits for initial credit before sending
+                    # any WSPK frame; credit must reflect HAL free slots.
+                    initial_flow = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(initial_flow["type"], "evt.audio.buffer_status", initial_flow)
+                    self.assertEqual(initial_flow["data"]["reason"], "running", initial_flow)
+                    self.assertEqual(initial_flow["data"]["free_frames"], 8, initial_flow)
+                    for sequence, offset in enumerate((0, 4096)):
+                        flags = FLAG_FIRST if sequence == 0 else 0
+                        if sequence == 1:
+                            flags |= FLAG_LAST
+                        await desktop.send(build_wspk(FRAME_AUDIO, flags, stream_id,
+                                                      sequence, pcm[offset:offset + 4096]))
+                        flow = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                        self.assertEqual(flow["type"], "evt.audio.buffer_status", flow)
+                        self.assertEqual(flow["data"]["free_frames"], 7 - sequence, flow)
+
+                    complete = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(complete["type"], "evt.audio.buffer_status", complete)
+                    self.assertEqual(complete["data"]["reason"], "complete", complete)
+                    self.assertEqual(complete["data"]["audio_sha256"], hashlib.sha256(pcm).hexdigest())
+
+                    # Bad declared SHA must stop/drain playback and surface the
+                    # actual digest so the pinned Robot marks its job failed.
+                    bad_digest_pcm = b"\x12\x34" * 4096
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stream.begin", "code": 0,
+                        "request_id": "audio-begin-bad-sha", "data": {
+                            "stream_id": 72, "total_bytes": len(bad_digest_pcm),
+                            "sample_rate_hz": 24000, "channels": 1, "sample_width_bytes": 2,
+                            "audio_sha256": "0" * 64}}))
+                    bad_sha_ack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(bad_sha_ack["type"], "sys.ack", bad_sha_ack)
+                    self.assertEqual(json.loads(await asyncio.wait_for(desktop.recv(), 2))["data"]["free_frames"], 8)
+                    await desktop.send(build_wspk(FRAME_AUDIO, FLAG_FIRST, 72, 0,
+                                                  bad_digest_pcm[:4096]))
+                    await desktop.recv()
+                    await desktop.send(build_wspk(FRAME_AUDIO, FLAG_LAST, 72, 1,
+                                                  bad_digest_pcm[4096:]))
+                    await desktop.recv()  # Credit reflects the HAL after final enqueue.
+                    bad_sha_result = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(bad_sha_result["data"]["reason"], "complete", bad_sha_result)
+                    self.assertEqual(bad_sha_result["data"]["audio_sha256"],
+                                     hashlib.sha256(bad_digest_pcm).hexdigest())
+                    self.assertNotEqual(bad_sha_result["data"]["audio_sha256"], "0" * 64)
+
+                    # A frame from a prior connection generation fails the
+                    # active stream and reports stale_frame without faking a release.
+                    stale_pcm = b"\x23\x45" * 4096
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stream.begin", "code": 0,
+                        "request_id": "audio-begin-stale", "data": {
+                            "stream_id": 73, "total_bytes": len(stale_pcm),
+                            "sample_rate_hz": 24000, "channels": 1, "sample_width_bytes": 2,
+                            "audio_sha256": hashlib.sha256(stale_pcm).hexdigest()}}))
+                    stale_ack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(stale_ack["type"], "sys.ack", stale_ack)
+                    self.assertEqual(json.loads(await asyncio.wait_for(desktop.recv(), 2))["data"]["free_frames"], 8)
+                    await desktop.send(build_wspk(FRAME_AUDIO, FLAG_FIRST, 73, 0, stale_pcm[:4096]))
+                    await desktop.recv()
+                    stale_frame = build_wspk(FRAME_AUDIO, FLAG_LAST, 73, 1, stale_pcm[4096:])
+                    inject = self.lib.desk_sdk_test_audio_inject
+                    inject.restype = ctypes.c_int
+                    inject.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
+                    old_generation = self.lib.desk_sdk_test_ws_generation() - 1
+                    self.assertNotEqual(inject(stale_frame, len(stale_frame), old_generation), 0)
+                    self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 0)
+
+                    # A duplicate/out-of-order packet is explicit failure.
+                    sequence_pcm = b"\x34\x56" * 4096
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stream.begin", "code": 0,
+                        "request_id": "audio-begin-seq", "data": {
+                            "stream_id": 74, "total_bytes": len(sequence_pcm),
+                            "sample_rate_hz": 24000, "channels": 1, "sample_width_bytes": 2,
+                            "audio_sha256": hashlib.sha256(sequence_pcm).hexdigest()}}))
+                    seq_ack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(seq_ack["type"], "sys.ack", seq_ack)
+                    self.assertEqual(json.loads(await asyncio.wait_for(desktop.recv(), 2))["data"]["free_frames"], 8)
+                    sequence_frame = build_wspk(FRAME_AUDIO, FLAG_FIRST, 74, 1, sequence_pcm[:4096])
+                    self.assertEqual(inject(sequence_frame, len(sequence_frame),
+                                            self.lib.desk_sdk_test_ws_generation()), 0)
+                    sequence_result = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(sequence_result["data"]["reason"], "sequence_gap", sequence_result)
+
+                    pcm_cancel = b"\x00\x00" * 1024
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stream.begin", "code": 0,
+                        "request_id": "audio-begin-02", "data": {
+                            "stream_id": 75, "total_bytes": len(pcm_cancel),
+                            "sample_rate_hz": 24000, "channels": 1,
+                            "sample_width_bytes": 2,
+                            "audio_sha256": hashlib.sha256(pcm_cancel).hexdigest()}}))
+                    cancel_begin = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(cancel_begin["type"], "sys.ack", cancel_begin)
+                    self.assertEqual(json.loads(await asyncio.wait_for(desktop.recv(), 2))["data"]["free_frames"], 8)
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stop", "code": 0,
+                        "request_id": "audio-stop-02", "data": {}}))
+                    stop_ack = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual((stop_ack["type"], stop_ack["request_id"]),
+                                     ("sys.ack", "audio-stop-02"), stop_ack)
+                    cancelled = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(cancelled["type"], "evt.audio.buffer_status", cancelled)
+                    self.assertEqual(cancelled["data"]["reason"], "aborted", cancelled)
+            finally:
+                poll_stop.set()
+                await poll_task
+                await server.stop()
+
+        asyncio.run(exercise_runtime())
 
     def test_official_microphone_close_is_explicitly_unsupported(self) -> None:
         response = self._exec_command({

@@ -419,6 +419,7 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
         pthread_mutex_unlock(&s_ws_lifecycle_mutex);
         return false;
     }
+    uint32_t closed_generation = s_ws_generation;
     ++s_ws_generation;
     s_ws_ready = false;
     s_ws_authenticated = false;
@@ -443,6 +444,7 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     ws_clear_outbound_queue();
     desk_sdk_bridge_log_session_closed();
     desk_sdk_bridge_camera_session_closed();
+    desk_sdk_bridge_audio_session_closed(closed_generation);
     return true;
 }
 
@@ -868,6 +870,7 @@ bool desk_sdk_ws_client_is_authenticated(void)
     return authenticated;
 }
 desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void) { return s_ws_state; }
+uint32_t desk_sdk_ws_client_generation(void) { return ws_lifecycle_generation(); }
 
 int desk_sdk_ws_client_send_text(const char *text)
 {
@@ -993,6 +996,7 @@ fail:
 
 int desk_sdk_ws_client_poll(int timeout_ms)
 {
+    desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
     if (!s_ws_ready) {
         if (s_pairing_target_valid && s_ws_retry_at != 0 && time(NULL) >= s_ws_retry_at) {
             s_reconnect_attempt = true;
@@ -1009,13 +1013,12 @@ int desk_sdk_ws_client_poll(int timeout_ms)
     if (op == 0x9) { return ws_enqueue_frame(0xA, payload, len); }
     if (op == 0xA) return 0;
     if (op == 0x2) {
-        desk_wspk_header_t media_header;
-        if (len < DESK_WSPK_HEADER_SIZE || desk_wspk_unpack_header(payload, len, &media_header) != 0 ||
-            media_header.payload_size != len - DESK_WSPK_HEADER_SIZE) {
+        if (desk_sdk_bridge_process_ws_audio_frame(payload, len,
+                                                  ws_lifecycle_generation()) != 0) {
             ws_disconnect_and_schedule();
             return -1;
         }
-        /* Binary media ingress is validated here; no application ingress callback exists yet. */
+        desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
         return 0;
     }
     if (op != 0x1) { ws_disconnect_and_schedule(); return -1; }
@@ -1031,7 +1034,9 @@ int desk_sdk_ws_client_poll(int timeout_ms)
         if (strcmp(message_type, "sys.log.subscribe") == 0 &&
             strstr(s_ws_response, "\"type\":\"sys.ack\""))
             return desk_sdk_ws_client_send_log_subscribe_ack(s_ws_response);
-        return desk_sdk_ws_client_send_text(s_ws_response);
+        int send_rc = desk_sdk_ws_client_send_text(s_ws_response);
+        desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
+        return send_rc;
     }
     return 0;
 }
