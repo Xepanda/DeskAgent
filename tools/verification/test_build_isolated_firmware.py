@@ -20,6 +20,67 @@ BRIDGE_SPEC.loader.exec_module(BRIDGE)
 
 
 class IsolatedFirmwareBuildTests(unittest.TestCase):
+    def test_powershell_entrypoint_delegates_without_reading_generated_sdk_state(self):
+        script = (MODULE_PATH.parents[1] / "build_watcher_firmware.ps1").read_text(encoding="utf-8")
+        self.assertNotRegex(script, r"(?i)sdkconfig(?:\.old|\.h)?")
+        self.assertNotIn("ReadAllBytes", script)
+        self.assertIn("build_isolated_firmware.py", script)
+
+    def test_reviewed_defaults_are_staged_fresh_and_required_settings_are_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            firmware = root / "firmware"
+            project = root / "stage" / "project"
+            firmware.mkdir()
+            defaults = ('CONFIG_IDF_TARGET="esp32s3"\n'
+                        "CONFIG_PARTITION_TABLE_CUSTOM=y\n"
+                        'CONFIG_ESPTOOLPY_FLASHSIZE="32MB"\n')
+            (firmware / "sdkconfig.defaults").write_text(defaults, encoding="utf-8")
+            staged = MODULE.install_reviewed_sdkconfig_defaults(firmware, project)
+            self.assertEqual(staged.read_text(encoding="utf-8"), defaults)
+            with self.assertRaises(FileExistsError):
+                MODULE.install_reviewed_sdkconfig_defaults(firmware, project)
+
+    def test_generated_sdkconfig_sensitive_symbols_fail_before_hashing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "sdkconfig"
+            config.write_text('CONFIG_IDF_TARGET="esp32s3"\n'
+                              "CONFIG_PARTITION_TABLE_CUSTOM=y\n"
+                              'CONFIG_ESPTOOLPY_FLASHSIZE="32MB"\n'
+                              'CONFIG_WIFI_PASSWORD="secret"\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "sensitive-looking"):
+                MODULE.assert_non_sensitive_sdkconfig(config)
+
+    def test_generated_sdkconfig_must_resolve_approved_target_and_flash_defaults(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "sdkconfig"
+            config.write_text('CONFIG_IDF_TARGET="esp32s3"\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "missing required build settings"):
+                MODULE.assert_non_sensitive_sdkconfig(config)
+
+    def test_managed_components_must_match_tracked_lock_exactly(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            lock = root / "dependencies.lock"
+            managed = root / "managed_components"
+            managed.mkdir()
+            (managed / "vendor__codec").mkdir()
+            (managed / "vendor__unlocked").mkdir()
+            lock.write_text("dependencies:\n  vendor/codec:\n    version: 1.2.3\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not covered by the tracked lock"):
+                MODULE.validate_managed_component_lock(lock, managed)
+
+    def test_managed_components_are_only_accepted_when_lock_set_matches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            lock = root / "dependencies.lock"
+            managed = root / "managed_components"
+            managed.mkdir()
+            (managed / "vendor__codec").mkdir()
+            lock.write_text("dependencies:\n  vendor/codec:\n    version: 1.2.3\n", encoding="utf-8")
+            self.assertEqual(MODULE.validate_managed_component_lock(lock, managed), ["vendor__codec"])
+
+
     def test_mounted_bridge_wrapper_preserves_archive_paths_lexically(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -176,7 +237,7 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             for excluded in (".build", "build", "dist", ".target_logging"):
                 self.assertFalse((destination / excluded).exists())
 
-    def test_sdk_staging_keeps_project_build_and_managed_components_local(self):
+    def test_sdk_staging_excludes_generated_project_configuration(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             sdk = root / "sdk"
@@ -198,24 +259,34 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
                 "#define ESP_IDF_VERSION_MAJOR 5\n#define ESP_IDF_VERSION_MINOR 4\n",
                 encoding="utf-8",
             )
-            (project / "managed_components" / "vendor").mkdir(parents=True)
+            (project / "managed_components" / "vendor__pkg").mkdir(parents=True)
             (project / "build").mkdir()
             (sdk / "CMakeLists.txt").write_text("cmake", encoding="utf-8")
             (sdk / "tos.py").write_text("cli", encoding="utf-8")
             (sdk / "platform" / "platform_config.yaml").write_text("platforms: []", encoding="utf-8")
             (platform / ".prepare").write_text("esp32s3", encoding="utf-8")
             (platform / "build_setup.py").write_text("setup", encoding="utf-8")
-            (project / "sdkconfig").write_text("config", encoding="utf-8")
-            (project / "managed_components" / "vendor" / "CMakeLists.txt").write_text("dep", encoding="utf-8")
+            sentinel = "DO_NOT_READ_OR_COPY_SHARED_GENERATED_CONFIG"
+            (project / "sdkconfig").write_text(sentinel, encoding="utf-8")
+            (project / "sdkconfig.old").write_text(sentinel, encoding="utf-8")
+            generated_header = project / "build" / "config" / "sdkconfig.h"
+            generated_header.parent.mkdir(parents=True)
+            generated_header.write_text(sentinel, encoding="utf-8")
+            (project / "managed_components" / "vendor__pkg" / "CMakeLists.txt").write_text("dep", encoding="utf-8")
             (project / "build" / "old.bin").write_bytes(b"old")
+            lock = root / "dependencies.lock"
+            lock.write_text("dependencies:\n  vendor/pkg:\n    version: 1.0.0\n", encoding="utf-8")
 
             staged = root / "archive" / "sdk"
-            MODULE.stage_sdk(sdk, staged)
+            MODULE.stage_sdk(sdk, staged, dependency_lock=lock)
 
-            self.assertTrue((staged / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components" / "vendor" / "CMakeLists.txt").is_file())
+            self.assertTrue((staged / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components" / "vendor__pkg" / "CMakeLists.txt").is_file())
             self.assertFalse((staged / "platform" / "ESP32" / "tuya_open_sdk" / "build").exists())
             self.assertEqual((staged / "platform" / "ESP32" / ".prepare").read_text(encoding="utf-8"), "esp32s3")
-            self.assertEqual((staged / "platform" / "ESP32" / "tuya_open_sdk" / "sdkconfig").read_text(encoding="utf-8"), "config")
+            staged_project = staged / "platform" / "ESP32" / "tuya_open_sdk"
+            self.assertFalse((staged_project / "sdkconfig").exists())
+            self.assertFalse((staged_project / "sdkconfig.old").exists())
+            self.assertFalse((staged_project / "build" / "config" / "sdkconfig.h").exists())
             self.assertTrue((staged / "src").is_dir())
             self.assertTrue((staged / "tools").is_dir())
             staged_header = staged / "src" / "common" / "include" / "tuya_iot_config.h"
@@ -255,12 +326,14 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             (sdk / "platform" / "platform_config.yaml").write_text("platforms: []", encoding="utf-8")
             (platform / ".prepare").write_text("esp32s3", encoding="utf-8")
             (platform / "build_setup.py").write_text("setup", encoding="utf-8")
-            (project / "managed_components" / "vendor").mkdir(parents=True)
-            (project / "managed_components" / "vendor" / "dep.h").write_text("dep", encoding="utf-8")
-            (project / "sdkconfig").write_text("config", encoding="utf-8")
+            (project / "managed_components" / "vendor__pkg").mkdir(parents=True)
+            (project / "managed_components" / "vendor__pkg" / "dep.h").write_text("dep", encoding="utf-8")
+            lock = root / "dependencies.lock"
+            lock.write_text("dependencies:\n  vendor/pkg:\n    version: 1.0.0\n", encoding="utf-8")
+            (project / "sdkconfig").write_text("DO_NOT_COPY", encoding="utf-8")
 
             staged = root / "archive" / "stage" / "sdk"
-            MODULE.stage_sdk(sdk, staged)
+            MODULE.stage_sdk(sdk, staged, dependency_lock=lock)
 
             for relative in staged_dirs:
                 source_dir = sdk / Path(relative)
@@ -275,9 +348,13 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
                     or bool(getattr(entry.lstat(), "st_file_attributes", 0) & 0x400)
                     for entry in entries
                 ), relative)
-                self.assertEqual((staged_dir / "input.txt").read_text(encoding="utf-8"),
-                                 (source_dir / "input.txt").read_text(encoding="utf-8"))
-            self.assertTrue((staged / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components" / "vendor" / "dep.h").is_file())
+                if relative == "platform/ESP32/.espressif":
+                    self.assertFalse((staged_dir / "input.txt").exists())
+                else:
+                    self.assertEqual((staged_dir / "input.txt").read_text(encoding="utf-8"),
+                                     (source_dir / "input.txt").read_text(encoding="utf-8"))
+            self.assertTrue((staged / "platform" / "ESP32" / "tuya_open_sdk" / "managed_components" / "vendor__pkg" / "dep.h").is_file())
+            self.assertFalse((staged / "platform" / "ESP32" / "tuya_open_sdk" / "sdkconfig").exists())
 
             manifest_path = staged.parent / "staged-sdk-inputs.json"
             self.assertTrue(manifest_path.is_file())
@@ -291,6 +368,7 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             staged_env_path = staged / "platform" / "ESP32" / ".espressif" / "idf-env.json"
             self.assertEqual(source_idf_env.read_bytes(), source_idf_env_bytes)
             staged_env = MODULE.json.loads(staged_env_path.read_text(encoding="utf-8"))
+            self.assertNotIn("existing-idf-v5.4", staged_env["idfInstalled"])
             staged_repo = str(staged_idf.resolve())
             record = staged_env["idfInstalled"][f"{staged_repo}-v5.4"]
             self.assertEqual(record, {
