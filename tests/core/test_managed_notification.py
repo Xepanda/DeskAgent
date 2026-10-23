@@ -14,6 +14,13 @@ from host.desk_agent.core.managed_notification import (
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCK = ROOT / "contracts" / "dependency_lock.json"
+TEST_NOW_UTC = datetime(2026, 10, 23, 8, 0, tzinfo=timezone.utc)
+
+
+def _make_adapter(*args, **kwargs):
+    """Build adapters against a stable test clock unless a case overrides it."""
+    kwargs.setdefault("now_utc", lambda: TEST_NOW_UTC)
+    return ManagedNotificationAdapter(*args, **kwargs)
 
 
 class FakeTransport:
@@ -70,7 +77,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
             }],
             "omitted_count": 0,
         }
-        adapter = ManagedNotificationAdapter(
+        adapter = _make_adapter(
             context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK,
             now_utc=lambda: datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc),
         )
@@ -82,7 +89,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
     def test_summary_uses_separate_command_and_summary_ack_identity(self) -> None:
         context = FakeContext()
         events = []
-        adapter = ManagedNotificationAdapter(
+        adapter = _make_adapter(
             context, events.append, sdk_version="0.1.11", lock_path=LOCK,
             known_summaries={"summary-01": "2026-10-24T12:00:00Z"},
         )
@@ -109,7 +116,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
 
     def test_pinned_command_ack_is_not_device_render_play_or_user_ack(self) -> None:
         context = FakeContext()
-        adapter = ManagedNotificationAdapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
+        adapter = _make_adapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
         result = adapter.deliver(notification())
         self.assertEqual(context._transport.commands, [("notification.deliver", notification(), 3.0)])
         self.assertTrue(result["transport_acknowledged"])
@@ -144,7 +151,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
                         "error": wire_error,
                     },
                 }
-                adapter = ManagedNotificationAdapter(
+                adapter = _make_adapter(
                     context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK
                 )
                 with self.assertRaises(ManagedNotificationNackError) as raised:
@@ -185,7 +192,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
             with self.subTest(response=response):
                 context = FakeContext()
                 context._transport.response = response
-                adapter = ManagedNotificationAdapter(
+                adapter = _make_adapter(
                     context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK
                 )
                 with self.assertRaises(RuntimeError) as raised:
@@ -204,7 +211,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
             raise timeout
 
         context._transport.send_command = raise_timeout
-        adapter = ManagedNotificationAdapter(
+        adapter = _make_adapter(
             context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK
         )
         with self.assertRaises(TimeoutError) as raised:
@@ -215,7 +222,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
 
     def test_retries_keep_same_occurrence_identity_and_extra_fields_are_not_forwarded(self) -> None:
         context = FakeContext()
-        adapter = ManagedNotificationAdapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
+        adapter = _make_adapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
         noisy = notification(private_note="must not be forwarded")
         adapter.deliver(noisy)
         adapter.deliver(noisy)
@@ -230,23 +237,23 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
     def test_missing_or_mismatched_sdk_pin_fails_closed(self) -> None:
         context = FakeContext()
         with self.assertRaisesRegex(RuntimeError, "SDK 0.1.11"):
-            ManagedNotificationAdapter(context, lambda _event: None, sdk_version="0.1.12", lock_path=LOCK)
+            _make_adapter(context, lambda _event: None, sdk_version="0.1.12", lock_path=LOCK)
         locked = json.loads(LOCK.read_text(encoding="utf-8"))
         locked["repositories"]["watcherobot_python_sdk"]["commit"] = "0" * 40
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dependency_lock.json"
             path.write_text(json.dumps(locked), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "audited SDK lock pin"):
-                ManagedNotificationAdapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=path)
+                _make_adapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=path)
 
     def test_missing_transport_methods_fails_closed(self) -> None:
         context = type("Context", (), {"_transport": object()})()
         with self.assertRaisesRegex(TypeError, "send_command"):
-            ManagedNotificationAdapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
+            _make_adapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
 
     def test_validation_requires_stable_id_and_whitelisted_payload(self) -> None:
         context = FakeContext()
-        adapter = ManagedNotificationAdapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
+        adapter = _make_adapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)
         with self.assertRaisesRegex(ValueError, "equal occurrence_id"):
             adapter.deliver(notification(notification_id="other-id"))
         with self.assertRaisesRegex(ValueError, "is_catchup"):
@@ -256,7 +263,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
     def test_expired_delivery_is_not_sent_and_late_events_are_ignored(self) -> None:
         context = FakeContext()
         events = []
-        adapter = ManagedNotificationAdapter(
+        adapter = _make_adapter(
             context,
             events.append,
             sdk_version="0.1.11",
@@ -273,7 +280,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
     def test_status_and_ack_events_are_correlated_deduplicated_and_lifecycle_separate(self) -> None:
         context = FakeContext()
         events = []
-        adapter = ManagedNotificationAdapter(context, events.append, sdk_version="0.1.11", lock_path=LOCK)
+        adapter = _make_adapter(context, events.append, sdk_version="0.1.11", lock_path=LOCK)
         adapter.deliver(notification())
         status = {"type": "notification.status", "data": {"notification_id": "occ-01", "status": "rendered"}}
         ack = {"type": "notification.acknowledged", "data": {"notification_id": "occ-01", "source": "button"}}
@@ -302,7 +309,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
     def test_disconnect_reconnect_same_transport_keeps_listener_and_expired_state_is_forwarded(self) -> None:
         context = FakeContext()
         events = []
-        adapter = ManagedNotificationAdapter(context, events.append, sdk_version="0.1.11", lock_path=LOCK)
+        adapter = _make_adapter(context, events.append, sdk_version="0.1.11", lock_path=LOCK)
         adapter.deliver(notification())
         adapter.deliver(notification(
             notification_id="occ-02",
@@ -319,7 +326,7 @@ class ManagedNotificationAdapterTests(unittest.TestCase):
     def test_restored_outbox_context_accepts_late_correlated_event_before_redelivery(self) -> None:
         context = FakeContext()
         events = []
-        adapter = ManagedNotificationAdapter(
+        adapter = _make_adapter(
             context,
             events.append,
             sdk_version="0.1.11",

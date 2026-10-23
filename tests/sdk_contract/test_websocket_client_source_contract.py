@@ -111,7 +111,13 @@ class WebSocketClientSourceContract(unittest.TestCase):
         self.assertIn("else if (frame_opcode == 0x2) frame_limit = DESK_WSPK_MAX_FRAME_SIZE", self.ws)
         self.assertIn("n > frame_limit", self.ws)
         self.assertIn("if (op == 0x2)", self.ws)
-        self.assertIn("desk_wspk_unpack_header", self.ws)
+        # The transport owns WebSocket opcode/size framing; WSPK validation is
+        # intentionally delegated to the bridge's media parser.
+        self.assertIn("desk_sdk_bridge_process_ws_audio_frame(payload, len,", self.ws)
+        audio_parser = self.bridge[self.bridge.index("int desk_sdk_bridge_process_ws_audio_frame"):]
+        self.assertIn("desk_wspk_unpack_header(frame, len, &header)", audio_parser)
+        self.assertIn("header.frame_type != DESK_WSPK_TYPE_AUDIO", audio_parser)
+        self.assertIn("header.payload_size != len - DESK_WSPK_HEADER_SIZE", audio_parser)
         binary_max = 128 * 1024 + 16
         text_max = 8192
         self.assertEqual(binary_max, 131088)
