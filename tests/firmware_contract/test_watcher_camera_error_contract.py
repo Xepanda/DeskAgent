@@ -137,6 +137,13 @@ static void release_bus(void) { ++release_calls; }
 static void cleanup(bool *owned) {
     if (desk_watcher_camera_bus_take_release(owned)) release_bus();
 }
+static int capture_cleanup(int capture_rc, bool stop_succeeded, bool *needs_recovery,
+                           bool *bus_owned, bool *mutex_owned) {
+    cleanup(bus_owned);
+    int result = desk_watcher_camera_cleanup_result(capture_rc, stop_succeeded, -26, needs_recovery);
+    *mutex_owned = false; /* cleanup releases the capture mutex after recording recovery state */
+    return result;
+}
 
 int main(void) {
     bool owned = false;
@@ -154,10 +161,10 @@ int main(void) {
 
     bool recovery_required = false;
     bool mutex_owned = true;
-    int capture_rc = desk_watcher_camera_cleanup_result(0, false, -26, &recovery_required);
-    cleanup(&owned);
-    mutex_owned = false; /* failed MODE0 reports error, then releases the mutex */
-    assert(capture_rc == -26 && recovery_required && !mutex_owned);
+    desk_watcher_camera_bus_set_acquired(&owned, true);
+    int capture_rc = capture_cleanup(0, false, &recovery_required, &owned, &mutex_owned);
+    assert(capture_rc == -26 && recovery_required && !mutex_owned && !owned);
+    assert(release_calls == 3); /* failed MODE0 still releases SPI ownership exactly once */
     mutex_owned = true; /* next capture holds the same mutex while retrying MODE0 */
     capture_rc = desk_watcher_camera_cleanup_result(0, true, -26, &recovery_required);
     assert(capture_rc == 0 && !recovery_required && mutex_owned);
