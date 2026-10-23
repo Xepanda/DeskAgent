@@ -2,7 +2,7 @@
 
 - **提出方：** A0
 - **提出日期：** 2026-10-22
-- **状态：** PROPOSED — 等待 Runtime/SDK owner 评审；未实现，未批准 Host 开启网络日志授权
+- **状态：** PROPOSED — A0 当前 pin 复核确认 Runtime/SDK 公共生命周期 API 是阻塞项；Host 网络日志授权保持 fail-closed，待 Runtime/SDK owner 评审与交付
 - **关联：** [CR-009 ESP32-S3 网络日志源](../CR-009-esp32s3-network-log-source.md)、[CR-012 Managed SDK 生命周期观察器](CR-012-managed-sdk-lifecycle-observer.md)、`docs/implementation/p0-3-official-sdk-device-contract.md`
 - **预期 owner：** Runtime/SDK owner 实现并维护接口；A0 裁决契约与兼容性；A3 消费接口并维持 fail-closed；A7 验收
 
@@ -95,7 +95,7 @@ A3 可在本接口实现并经 pin 后，将 CR-009 Host 授权从常量 deny �
 
 以下任一情况必须同步 deny/revoke、停止 consumer、清空该代次队列，并拒绝之后到达的旧代次 ACK/event/gap：`REVOKED`、新 generation、Runtime instance 变化、observer 失效、状态/消息代次不匹配、管理 API 异常、应用停止、设备 channel 断开、unsubscribe 失败或序列/协议错误。Host 不得因旧 ACK 重建 lease；新 generation 必须重新 subscribe 并收到新 ACK。
 
-当前 CR-009 的 `_network_log_authorized = False` 保持不变，直至 Runtime API 可用、pinned 消费者实现并通过 L2 负例。仅有 `WATCHER_APP_DEVICE_STATUS_URL`、Desktop `daemon.device.state`、pairing request ID、TCP 在线态或“最近一次 connected”缓存均不得解除 deny。
+当前 CR-009 的 `_network_log_authorized = False` 保持不变。Host consumer 的 bounded parsing、fail-closed 与 L2 负例已有软件覆盖，但仍须等 Runtime API 可用并由 A3 接入 generation-bound lease，才可评估正向授权。仅有 `WATCHER_APP_DEVICE_STATUS_URL`、Desktop `daemon.device.state`、pairing request ID、TCP 在线态或“最近一次 connected”缓存均不得解除 deny。
 
 ## 5. 兼容性与版本治理
 
@@ -181,3 +181,32 @@ A3 可在本接口实现并经 pin 后，将 CR-009 Host 授权从常量 deny �
 5. L2 最小验收必须在 pinned Runtime 的生产消息路由上覆盖原子注册竞态、旧连接消息拒绝、相同 pairing 信息重连产生新 generation、`DeviceSessionEnd` 与 websocket close 撤销、Runtime 进程重启产生新 `runtime_instance_id`、observer close/overflow 和凭据不出现在 API 数据中。只通过 Application 自己模拟 generation 或测试一个 wrapper，不足以验收。
 
 这些要求可在 Runtime 内部复用现有 HardwareHello/pairing/disconnect/session-end 接缝，但必须由 Runtime owner 实现并公开；不能由 A3 读取 SDK 私有 transport、pairing registry 或 socket 对象来替代。公开接口和消息来源 metadata 合入 Runtime 后，Runtime owner 应提供版本/SHA 与 L2 测试；A0 再审核 pin/契约，A3 才接入 generation-bound lease。部署、实际设备网络日志接收及 L3/L4 仍需分别验收。
+
+## 10. 当前 DeskAgent Host 接入复核（2026-10-23）
+
+按当前仓库源码再次核对后，结论不变：**只靠 DeskAgent 内现有 Host lifecycle 实现，不能为 CR-009 建立可正向授权的 DeviceSession generation-bound lease；该能力必须先由上游 WatcheRobot Runtime/SDK 增加公开 API 与来源代次语义。** DeskAgent 可以并已覆盖本地消费者的 fail-closed、解析/脱敏和断连清队列等 L2 软件行为，但不能在本仓内对真实当前设备会话生命周期做可信的正向 L2 证明。不得把 fake generation、Host 自行计数或 `authorized=True` 的单元注入当作该缺失证据。
+
+### 10.1 当前 pin 的接口证据
+
+- 锁定版本仍为 `contracts/dependency_lock.json::repositories.watcherobot_python_sdk` 的 WatcheRobot Python SDK `v0.1.11` / SHA `8bc13967a06ef073459be47e930ff43ef37ee8fb`。pinned `src/watcherobot/application/context.py::ApplicationContext` 仅保存私有 `_transport` 并公开 `robot`、`desktop`、`rtc`；没有 typed DeviceSession 查询或 session observer。
+- `src/watcherobot/runtime/daemon/pairing/session.py::DevicePairingSession.snapshot()` 返回 pairing `state`、`online`、`mode`、`request_id` 和 `last_error`，不含物理 WebSocket identity、连接 generation、Runtime 进程 instance ID 或单调事件序号。
+- `src/watcherobot/runtime/daemon/connections/websocket_server.py::ExternalWebSocketServer` 有 Runtime 内部 disconnect/session-end listener。`src/watcherobot/runtime/daemon/runtime.py` 将 disconnect 回调交给 `_device_disconnected(_peer_ip)`，将 `DeviceSessionEnd` 按 `pair_request_id` 交给 `_device_session_ended()`；这些接缝未暴露给 managed Application，也未给转发消息附加不可变 session generation。
+- `src/watcherobot/runtime/daemon/runtime.py::_route_application_frame()` 直接调用 router 转发 Application frame，没有来源 generation 校验或 stamp。
+- `src/watcherobot/application/transport.py::DaemonApplicationTransport._run()` 在 Application communicators 结束时调用无参数 `_disconnect_callback`；`_on_frame()` / `_notify_message_listeners()` 将普通 JSON 消息原样发给 listener，不附来源 session 身份。其 `_resource_generation`（初始化/资源 snapshot 版本）不是设备连接 generation。
+
+### 10.2 当前 Host 实现与可达到的证据级别
+
+- `host/desk_agent/core/managed_sdk_lifecycle.py::ManagedSdkLifecycleObservers` 包装 SDK transport 私有 `_disconnect_callback`，通知 Host cleanup observer。它观察的是 managed Application transport 生命周期，不提供设备 WebSocket session identity、断开/替换次序、注册初态快照或每条消息 generation。
+- `host/desk_agent/main.py` 在构造时把 `_network_log_authorized` 固定为 `False`（当前行 186）；`register_managed_sdk_network_log_session()` 只将 message listener 接到 consumer，`_on_managed_sdk_message()` 每次都传入该固定授权值。没有将其设为 true 的 managed composition path。Application transport 断开时 Host 调用 `network_log_consumer.on_disconnect()` 清除队列并 fail closed。
+- `host/desk_agent/services/network_log_consumer.py` 的 bounded allowlist、schema validation、队列/生命周期与 deny 路径仍可在 Host 内完成 L2 测试；它不判断设备会话来源，也不创建授权 lease。
+
+因此：**Host 本地 fail-closed 与 consumer L2 可继续实现/复测；CR-014 正向授权生命周期的 L2 当前不能仅在 DeskAgent 仓库完成。** 若仅将 Host callback 包成 observer 或模拟 generation，会绕过 Runtime 对设备真实 WebSocket connection 的所有权，且无法证明 stale frame 在 Runtime router 层被拒绝，不能解除 `_network_log_authorized = False`。
+
+### 10.3 可执行后续 owner 路径
+
+1. **Runtime/SDK owner（上游 WatcheRobot Python SDK）**：在 Runtime 实际管理连接/配对的 `src/watcherobot/runtime/daemon/connections/websocket_server.py`、`runtime.py`、`pairing/session.py` 实现 CR-014 的 connection-bound `runtime_instance_id + generation`、原子快照/observer、旧连接同步路由撤销；通过 `src/watcherobot/application/context.py` 注入公开版本化 API，并在 `src/watcherobot/application/transport.py` 或等价 Runtime ingress gate 给每条 managed device message 附来源代次/同步校验。上游 owner 提供生产路由层 L2 回归与新版本/SHA。
+2. **A0**：审核 API 语义、版本兼容与源码证据；将实际交付的 SDK commit/version 锁入 `contracts/dependency_lock.json`，确认不改变设备 wire/auth 语义。
+3. **A3**：仅在新 pin 可用后，于 `host/desk_agent/core/managed_sdk_lifecycle.py`、`host/desk_agent/main.py` 与 `host/desk_agent/services/network_log_consumer.py` 消费公开 API，实施 generation-bound lease、精确配置 opt-in、断开/替换/错代次立即撤销；在 `tests/core/` 增加 Host 竞态、旧代次 ACK/event/gap、observer failure/overflow 和 fail-closed 互操作测试。不得再 monkey-patch 私有 callback 充当 CR-014 授权依据。
+4. **A7**：在 `tests/e2e/`、`tools/verification/` 记录 pinned Runtime 与 Host 的 L2 集成证据；真实 Runtime 部署/设备断连重连仍分别需要 L3/L4 验收。
+
+本复核不改变 CR-014 的提议性质、不批准网络日志授权，也不修改现有 fail-closed 行为或外部 SDK checkout。

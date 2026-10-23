@@ -809,6 +809,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         async def exercise() -> tuple[dict, dict]:
             received: dict = {}
             received_event: dict = {}
+            wire_messages_received = asyncio.Event()
             async def handler(websocket) -> None:
                 await websocket.recv()
                 await websocket.send(json.dumps({"type": "sys.ack", "code": 0,
@@ -824,6 +825,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     separators=(",", ":")))
                 received.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
                 received_event.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+                wire_messages_received.set()
 
             async with websockets.serve(handler, "127.0.0.1", 0) as server:
                 port = server.sockets[0].getsockname()[1]
@@ -833,6 +835,10 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port), 0)
                     self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
                     self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 1000), 0)
+                    # The subscribed log ACK is sent by the asynchronous writer.
+                    # Keep the connection alive until it and the post-send
+                    # readiness event have both reached the peer.
+                    await asyncio.wait_for(wire_messages_received.wait(), timeout=2)
                 finally:
                     self.lib.desk_sdk_ws_client_close()
                     self.lib.desk_sdk_bridge_set_local_log_enabled(False)

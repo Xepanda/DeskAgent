@@ -49,6 +49,12 @@ class NetworkLogConsumerTests(unittest.TestCase):
         self.assertFalse(consumer.ingest(camera_empty(), authorized=True))
         self.assertEqual(consumer.snapshot()["queued"], 0)
 
+        for enabled_value in (1, "true", object()):
+            with self.subTest(enabled=type(enabled_value).__name__):
+                truthy_but_not_true = NetworkLogConsumer(enabled=enabled_value)
+                self.assertFalse(truthy_but_not_true.snapshot()["enabled"])
+                self.assertFalse(truthy_but_not_true.ingest(camera_empty(), authorized=True))
+
         enabled = NetworkLogConsumer(enabled=True)
         self.assertFalse(enabled.ingest(camera_empty(), authorized=False))
         self.assertFalse(enabled.ingest(camera_empty(), authorized="yes"))
@@ -124,10 +130,47 @@ class NetworkLogConsumerTests(unittest.TestCase):
             {"type": "tool.request", "data": {"secret": "x"}},
             {"type": "sys.log.event", "data": {"log_schema_version": "1.0.0"}},
         ])
+        out_of_range = camera_empty()
+        out_of_range["data"]["sequence"] = 1 << 64
+        invalid.append(out_of_range)
         for msg in invalid:
             with self.subTest(message=msg):
                 self.assertFalse(consumer.ingest(msg, authorized=True))
         self.assertEqual(consumer.snapshot()["rejected"], len(invalid))
+
+    def test_timestamp_must_use_rfc3339_date_time_and_timezone_syntax(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        invalid_timestamps = [
+            "2026-10-23 12:34:56+00:00",
+            "2026-W43-5T12:34:56+00:00",
+            "2026-10-23T12:34:56",
+            "2026-10-23x12:34:56+00:00",
+            "2026-10-23T12:34:56+00:00trailing",
+        ]
+        for timestamp in invalid_timestamps:
+            event = camera_empty()
+            event["data"]["timestamp_utc"] = timestamp
+            with self.subTest(timestamp=timestamp):
+                self.assertFalse(consumer.ingest(event, authorized=True))
+        valid = camera_empty()
+        valid["data"]["timestamp_utc"] = "2026-10-23T12:34:56.123Z"
+        self.assertTrue(consumer.ingest(valid, authorized=True))
+
+    def test_session_rejects_a_second_stream_or_boot_identity_until_reset(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        first = camera_empty()
+        self.assertTrue(consumer.ingest(first, authorized=True))
+
+        other_stream = camera_empty(2)
+        other_stream["data"]["stream_id"] = "logstream_02"
+        other_boot = camera_empty(3)
+        other_boot["data"]["boot_id"] = "boot-second"
+        self.assertFalse(consumer.ingest(other_stream, authorized=True))
+        self.assertFalse(consumer.ingest(other_boot, authorized=True))
+        self.assertEqual(consumer.drain(), [first])
+
+        consumer.reset_session()
+        self.assertTrue(consumer.ingest(other_stream, authorized=True))
 
     def test_accepts_only_queue_full_gap_with_exact_contiguous_range(self) -> None:
         consumer = NetworkLogConsumer(enabled=True)
@@ -148,6 +191,7 @@ class NetworkLogConsumerTests(unittest.TestCase):
             {**base, "data": {**base["data"], "last_dropped_sequence": 2}},
             {**base, "data": {**base["data"], "first_dropped_sequence": 0}},
             {**base, "data": {**base["data"], "dropped_count": True}},
+            {**base, "data": {**base["data"], "last_dropped_sequence": 1 << 64}},
         ]
         for msg in invalid:
             with self.subTest(message=msg):
