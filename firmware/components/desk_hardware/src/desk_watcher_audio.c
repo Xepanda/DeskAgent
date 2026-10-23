@@ -33,10 +33,13 @@
 static esp_codec_dev_handle_t s_mic, s_speaker;
 static i2s_chan_handle_t s_tx, s_rx;
 static SemaphoreHandle_t s_read_lock, s_write_lock, s_stopped, s_lifecycle;
+static SemaphoreHandle_t s_tclaw_play_lock;
+static SemaphoreHandle_t s_one_shot_lock;
 static SemaphoreHandle_t s_stream_lock, s_stream_done;
 static desk_audio_stream_ctx_t *s_stream_ctx;
 static TaskHandle_t s_stream_task;
 static bool s_stream_worker_running;
+static bool s_tclaw_playback_session_active;
 static uint32_t s_stream_drain_timeout_ms = TX_DMA_DRAIN_TIMEOUT_MS;
 static portMUX_TYPE s_tx_eof_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_tx_eof_sequence;
@@ -96,6 +99,17 @@ int desk_watcher_audio_play(const int16_t *pcm, size_t samples, uint32_t rate)
     return rc == 0 ? DESK_HW_OK : DESK_HW_ERR_IO;
 }
 
+int desk_watcher_audio_play_one_shot(const int16_t *pcm, size_t samples, uint32_t rate)
+{
+    if (!s_one_shot_lock ||
+        xSemaphoreTake(s_one_shot_lock, pdMS_TO_TICKS(TX_DMA_DRAIN_TIMEOUT_MS)) != pdTRUE)
+        return DESK_HW_ERR_TIMEOUT;
+    int rc = desk_watcher_audio_play(pcm, samples, rate);
+    if (rc == DESK_HW_OK) rc = desk_watcher_audio_tx_drain(TX_DMA_DRAIN_TIMEOUT_MS);
+    xSemaphoreGive(s_one_shot_lock);
+    return rc;
+}
+
 static bool IRAM_ATTR tx_on_sent(i2s_chan_handle_t channel,
                                  i2s_event_data_t *event,
                                  void *user_data)
@@ -152,14 +166,29 @@ static bool audio_preempt_quiesce(desk_resource_type_t resource,
         if (stream_active) {
             return desk_watcher_audio_stream_stop(handle, timeout_ms) == DESK_HW_OK;
         }
-        /* Other SDK-owned writes are serialized by the same writer mutex. */
-        return desk_watcher_audio_tx_drain(timeout_ms) == DESK_HW_OK;
+        /* One-shot writers hold this lock across their payload and drain. */
+        if (!s_one_shot_lock ||
+            xSemaphoreTake(s_one_shot_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
+        int drain_rc = desk_watcher_audio_tx_drain(timeout_ms);
+        xSemaphoreGive(s_one_shot_lock);
+        return drain_rc == DESK_HW_OK;
     }
     if (current_owner == DESK_OWNER_TCLAW_VOICE &&
         requester == DESK_OWNER_SYSTEM_ALERT) {
-        /* The synchronous TClaw write is bounded by s_write_lock; append a
-         * full zero tail and confirm DMA EOFs before granting the alert. */
-        return desk_watcher_audio_tx_drain(timeout_ms) == DESK_HW_OK;
+        if (!s_tclaw_play_lock ||
+            xSemaphoreTake(s_tclaw_play_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
+        desk_resource_owner_t actual_owner = desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK);
+        int drain_rc = DESK_HW_OK;
+        if (actual_owner == DESK_OWNER_TCLAW_VOICE) {
+            /* No per-chunk drain: the TDL stream stays contiguous until STOP
+             * or an alert preempts it. Keep ownership if the EOF fence fails. */
+            drain_rc = desk_watcher_audio_tx_drain(timeout_ms);
+        } else if (actual_owner != DESK_OWNER_NONE && actual_owner != requester) {
+            drain_rc = DESK_HW_ERR_BUSY;
+        }
+        if (drain_rc == DESK_HW_OK) s_tclaw_playback_session_active = false;
+        xSemaphoreGive(s_tclaw_play_lock);
+        return drain_rc == DESK_HW_OK;
     }
     return false;
 }
@@ -169,6 +198,18 @@ int desk_watcher_audio_play_stop(void)
     desk_resource_owner_t owner = desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK);
     if (owner == DESK_OWNER_NONE) return DESK_HW_OK;
     if (owner == DESK_OWNER_SYSTEM_ALERT) return DESK_HW_ERR_BUSY;
+    if (owner == DESK_OWNER_TCLAW_VOICE) {
+        if (!s_tclaw_play_lock ||
+            xSemaphoreTake(s_tclaw_play_lock, pdMS_TO_TICKS(TX_DMA_DRAIN_TIMEOUT_MS)) != pdTRUE)
+            return DESK_HW_ERR_TIMEOUT;
+        int rc = desk_watcher_audio_tx_drain(TX_DMA_DRAIN_TIMEOUT_MS);
+        if (rc == DESK_HW_OK) {
+            s_tclaw_playback_session_active = false;
+            desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+        }
+        xSemaphoreGive(s_tclaw_play_lock);
+        return rc;
+    }
     if (!audio_preempt_quiesce(DESK_RES_AUDIO_PLAYBACK, owner,
                                DESK_OWNER_SYSTEM_ALERT, TX_DMA_DRAIN_TIMEOUT_MS, NULL)) {
         return DESK_HW_ERR_TIMEOUT;
@@ -483,10 +524,18 @@ static OPERATE_RET native_play(TDD_AUDIO_HANDLE_T h, uint8_t *data, uint32_t len
 {
     (void)h;
     if (len % sizeof(int16_t) || !len) return OPRT_INVALID_PARM;
-    if (desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 100) != DESK_ARBITER_OK)
+    if (!s_tclaw_play_lock ||
+        xSemaphoreTake(s_tclaw_play_lock, pdMS_TO_TICKS(100)) != pdTRUE)
         return OPRT_RESOURCE_NOT_READY;
+    if (desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 100) != DESK_ARBITER_OK) {
+        xSemaphoreGive(s_tclaw_play_lock);
+        return OPRT_RESOURCE_NOT_READY;
+    }
+    s_tclaw_playback_session_active = true;
     int rc = desk_watcher_audio_play((int16_t *)data, len / sizeof(int16_t), RATE);
-    desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+    /* TDL sends many decoder chunks then issues PLAY_STOP. Do not release the
+     * arbiter at write return: IDF only copied bytes into DMA descriptors. */
+    xSemaphoreGive(s_tclaw_play_lock);
     return rc == DESK_HW_OK ? OPRT_OK : OPRT_COM_ERROR;
 }
 
@@ -495,9 +544,33 @@ static OPERATE_RET native_config(TDD_AUDIO_HANDLE_T h, TDD_AUDIO_CMD_E command, 
     (void)h;
     if (!s_ready) return OPRT_RESOURCE_NOT_READY;
     if (command == TDD_AUDIO_CMD_PLAY_STOP) {
-        /* Writes are synchronous, serialized by the output mutex. */
-        if (xSemaphoreTake(s_write_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return OPRT_RESOURCE_NOT_READY;
-        xSemaphoreGive(s_write_lock); return OPRT_OK;
+        if (!s_tclaw_play_lock ||
+            xSemaphoreTake(s_tclaw_play_lock, pdMS_TO_TICKS(TX_DMA_DRAIN_TIMEOUT_MS)) != pdTRUE)
+            return OPRT_RESOURCE_NOT_READY;
+        desk_resource_owner_t owner = desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK);
+        if (owner == DESK_OWNER_NONE || owner == DESK_OWNER_SYSTEM_ALERT) {
+            /* A completed alert preemption already drained and took ownership. */
+            s_tclaw_playback_session_active = false;
+            xSemaphoreGive(s_tclaw_play_lock);
+            return OPRT_OK;
+        }
+        if (!s_tclaw_playback_session_active) {
+            /* PLAY_STOP without a TClaw-owned session must not release a
+             * different caller's shared audio owner. */
+            xSemaphoreGive(s_tclaw_play_lock);
+            return OPRT_OK;
+        }
+        if (owner != DESK_OWNER_TCLAW_VOICE) {
+            xSemaphoreGive(s_tclaw_play_lock);
+            return OPRT_RESOURCE_NOT_READY;
+        }
+        int drain_rc = desk_watcher_audio_tx_drain(TX_DMA_DRAIN_TIMEOUT_MS);
+        if (drain_rc == DESK_HW_OK) {
+            s_tclaw_playback_session_active = false;
+            desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
+        }
+        xSemaphoreGive(s_tclaw_play_lock);
+        return drain_rc == DESK_HW_OK ? OPRT_OK : OPRT_RESOURCE_NOT_READY;
     }
     if (command != TDD_AUDIO_CMD_SET_VOLUME || !args) return OPRT_INVALID_PARM;
     unsigned volume = *(uint8_t *)args;
@@ -528,6 +601,11 @@ int desk_watcher_audio_test_tone(void)
         return DESK_HW_ERR_UNAVAILABLE;
     if (desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE, 0) != DESK_ARBITER_OK)
         return DESK_HW_ERR_UNAVAILABLE;
+    if (!s_one_shot_lock ||
+        xSemaphoreTake(s_one_shot_lock, pdMS_TO_TICKS(TX_DMA_DRAIN_TIMEOUT_MS)) != pdTRUE) {
+        desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
+        return DESK_HW_ERR_TIMEOUT;
+    }
 
     /* Save previous volume and mute status to restore after test */
     int prev_vol = 50;
@@ -539,6 +617,7 @@ int desk_watcher_audio_test_tone(void)
     if (esp_codec_dev_set_out_mute(s_speaker, false) != 0 ||
         esp_codec_dev_set_out_vol(s_speaker, 65) != 0) {
         desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
+        xSemaphoreGive(s_one_shot_lock);
         return DESK_HW_ERR_IO;
     }
 
@@ -555,11 +634,16 @@ int desk_watcher_audio_test_tone(void)
     }
     ESP_LOGI("watcher_audio", "Audio test tone completed rc=%d", rc);
 
-    /* Restore previous volume and mute status */
-    esp_codec_dev_set_out_vol(s_speaker, prev_vol);
-    esp_codec_dev_set_out_mute(s_speaker, prev_mute);
-
-    desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
+    int drain_rc = desk_watcher_audio_tx_drain(TX_DMA_DRAIN_TIMEOUT_MS);
+    if (drain_rc == DESK_HW_OK) {
+        /* Restore codec controls only after the final tone samples drained. */
+        esp_codec_dev_set_out_vol(s_speaker, prev_vol);
+        esp_codec_dev_set_out_mute(s_speaker, prev_mute);
+        desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
+    } else if (rc == DESK_HW_OK) {
+        rc = drain_rc;
+    }
+    xSemaphoreGive(s_one_shot_lock);
     return rc;
 }
 
@@ -579,10 +663,13 @@ int desk_watcher_audio_init(void)
     s_read_lock = xSemaphoreCreateMutex(); s_write_lock = xSemaphoreCreateMutex();
     s_stopped = xSemaphoreCreateBinary();
     s_lifecycle = xSemaphoreCreateMutex();
+    s_tclaw_play_lock = xSemaphoreCreateMutex();
+    s_one_shot_lock = xSemaphoreCreateMutex();
     s_stream_lock = xSemaphoreCreateMutex();
     s_stream_done = xSemaphoreCreateBinary();
     s_stream_ctx = heap_caps_calloc(1, sizeof(*s_stream_ctx), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_read_lock || !s_write_lock || !s_stopped || !s_lifecycle ||
+    if (!s_read_lock || !s_write_lock || !s_stopped || !s_lifecycle || !s_tclaw_play_lock ||
+        !s_one_shot_lock ||
         !s_stream_lock || !s_stream_done || !s_stream_ctx) goto fail;
     i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     channel.dma_desc_num = TX_DMA_DESC_NUM;
