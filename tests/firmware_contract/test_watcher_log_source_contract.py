@@ -58,7 +58,7 @@ class TestWatcherLogSourceContract(unittest.TestCase):
         )[0]
         self.assertIn("camera_capture_deadline_us", empty_path)
         self.assertIn("desk_watcher_log_source_publish_camera_capture_empty()", empty_path)
-        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", empty_path)
+        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY, camera_capture_deadline_us)", empty_path)
 
     def test_disconnect_clears_queue_and_gap_but_preserves_sequence(self):
         source = SOURCE_C.read_text(encoding="utf-8")
