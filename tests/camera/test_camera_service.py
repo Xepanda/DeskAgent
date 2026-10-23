@@ -483,6 +483,27 @@ class TestCameraService(unittest.TestCase):
         cam.release_lease("viewer")
         self.assertRaises(StopIteration, next, stream)
 
+    def test_old_mjpeg_stream_cannot_read_frames_after_same_owner_reacquires(self) -> None:
+        cam = CameraViewerService(stale_threshold_ms=300)
+        old_frame = b"\xff\xd8old-lease-frame\xff\xd9"
+        new_frame = b"\xff\xd8new-lease-frame\xff\xd9"
+        cam.acquire_lease("viewer", lease_ms=1000)
+        cam.ingest_robot_frame(old_frame)
+        stream = cam.iter_mjpeg("viewer", wait_timeout=0.05)
+        try:
+            cam.ingest_robot_frame(b"\xff\xd8old-lease-next-frame\xff\xd9")
+            self.assertTrue(next(stream).endswith(b"\xff\xd8old-lease-next-frame\xff\xd9\r\n"))
+
+            self.assertTrue(cam.release_lease("viewer"))
+            self.assertTrue(cam.acquire_lease("viewer", lease_ms=1000)["granted"])
+            cam.ingest_robot_frame(new_frame)
+
+            with self.assertRaises(StopIteration):
+                next(stream)
+        finally:
+            stream.close()
+            cam.release_lease("viewer")
+
     def test_mjpeg_rejects_external_or_stale_frame(self) -> None:
         cam = CameraViewerService(stale_threshold_ms=20)
         cam.acquire_lease("viewer", lease_ms=1000)
