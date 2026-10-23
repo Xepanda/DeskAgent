@@ -167,6 +167,58 @@ const response = { body: { getReader: () => ({
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute the browser multipart consumer")
+    def test_aborted_camera_stream_does_not_render_a_chunk_returned_after_abort(self) -> None:
+        source = WEB.read_text(encoding="utf-8")
+        script = source.split("<script>", 1)[1].split("</script>", 1)[0]
+        helpers = script[script.index("function concatBytes"):script.index("function waitForRetry")]
+        checks = r'''
+const assert = require("node:assert/strict");
+const enc = new TextEncoder();
+const boundary = "demo-boundary";
+const jpeg = Uint8Array.from([255, 216, 1, 2, 255, 217]);
+const head = enc.encode(`--${boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\nX-Frame-Seq: 1\r\nX-Frame-Age-Ms: 5\r\n\r\n`);
+const tail = enc.encode(`\r\n--${boundary}\r\n`);
+const part = new Uint8Array(head.length + jpeg.length + tail.length);
+part.set(head); part.set(jpeg, head.length); part.set(tail, head.length + jpeg.length);
+let finishRead;
+const controller = new AbortController();
+let createdUrls = 0;
+global.leaseActive = true;
+global.frameExpiryTimer = null;
+global.currentObjectUrl = null;
+global.lastFrameSeq = null;
+global.streamFrameTimes = [];
+global.renderedFrameTimes = [];
+global.pendingRenderMetric = null;
+global.performance = { now: () => 0 };
+global.document = { getElementById: () => ({ style: {}, innerText: "", removeAttribute() {} }) };
+global.Blob = class { constructor(parts) { this.parts = parts; } };
+global.createImageBitmap = async () => ({ close() {} });
+global.URL = { createObjectURL: () => `blob:${++createdUrls}`, revokeObjectURL() {} };
+global.clearTimeout = () => {};
+global.setTimeout = () => 1;
+const response = { body: { getReader: () => ({
+  read() { return new Promise(resolve => { finishRead = resolve; }); },
+  async cancel() {}
+}) } };
+(async () => {
+  const task = consumeMjpeg(response, controller, boundary);
+  while (!finishRead) await Promise.resolve();
+  controller.abort();
+  finishRead({ done: false, value: part });
+  await task;
+  assert.equal(createdUrls, 0, "a chunk returned after stream abort must never repaint the closed stream");
+})().catch(err => { console.error(err); process.exitCode = 1; });
+''';
+        completed = subprocess.run(
+            [shutil.which("node"), "-e", helpers + "\n" + checks],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is required to execute browser freshness handling")
     def test_browser_hides_expired_frame_and_abort_stops_retry_wait(self) -> None:
         source = WEB.read_text(encoding="utf-8")

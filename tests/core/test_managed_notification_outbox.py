@@ -195,6 +195,150 @@ class ManagedNotificationOutboxTests(unittest.TestCase):
             finally:
                 app.close()
 
+    def test_summary_delivery_claim_failure_skips_adapter(self) -> None:
+        from unittest.mock import patch
+        from datetime import datetime, timedelta, timezone
+        from host.desk_agent.services.life_service import LifeService
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ):
+            config_path, _ = self._write_test_config(directory)
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            try:
+                self._stop_delivery_thread(app)
+                now = datetime.now(timezone.utc)
+                app.life_service.create_reminder(
+                    reminder_id="rem-summary-claim-failure",
+                    title="Claim failure test",
+                    due_at=(now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                    timezone_str="UTC",
+                )
+                with patch("host.desk_agent.services.life_service._format_summary_display_time", return_value="test time"):
+                    batch = app.life_service.create_recovery_summary_batch()
+                self.assertIsNotNone(batch)
+                adapter = _FakeNotificationAdapter()
+                app.managed_notification_adapter = adapter
+
+                with patch.object(LifeService, "claim_recovery_summary_delivery", return_value=False) as claim:
+                    app._scheduler_stop = _OneIterationStop()
+                    app._delivery_loop()
+
+                claim.assert_called_once_with(batch["outbox_id"], batch["summary_id"])
+                self.assertEqual(adapter.summaries, [], "failed claim must not reach the device adapter")
+                row = app.life_service._get_connection().execute(
+                    "SELECT state FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+                ).fetchone()
+                self.assertEqual(row["state"], "pending")
+            finally:
+                app.close()
+
+    def test_unavailable_summary_adapter_applies_pending_backoff(self) -> None:
+        from unittest.mock import patch
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ), patch(
+            "host.desk_agent.services.life_service._format_summary_display_time", return_value="test time"
+        ):
+            config_path, _ = self._write_test_config(directory)
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            try:
+                self._stop_delivery_thread(app)
+                now = datetime.now(timezone.utc)
+                app.life_service.create_reminder(
+                    reminder_id="rem-summary-adapter-unavailable",
+                    title="Unavailable adapter test",
+                    due_at=(now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                    timezone_str="UTC",
+                )
+                batch = app.life_service.create_recovery_summary_batch()
+                self.assertIsNotNone(batch)
+                app.managed_sdk_session = False
+                app.managed_notification_adapter = None
+
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+
+                row = app.life_service._get_connection().execute(
+                    "SELECT state, retry_count, next_retry_at FROM outbox WHERE outbox_id = ?",
+                    (batch["outbox_id"],),
+                ).fetchone()
+                self.assertEqual((row["state"], row["retry_count"]), ("pending", 1))
+                self.assertIsNotNone(row["next_retry_at"], "pre-claim unavailability must apply backoff")
+
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+                unchanged = app.life_service._get_connection().execute(
+                    "SELECT retry_count, next_retry_at FROM outbox WHERE outbox_id = ?",
+                    (batch["outbox_id"],),
+                ).fetchone()
+                self.assertEqual(unchanged["retry_count"], 1, "backoff must prevent a hot retry loop")
+                self.assertEqual(unchanged["next_retry_at"], row["next_retry_at"])
+            finally:
+                app.close()
+
+    def test_ack_during_summary_adapter_call_is_not_resurrected_by_failure(self) -> None:
+        from unittest.mock import patch
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ), patch(
+            "host.desk_agent.services.life_service._format_summary_display_time", return_value="test time"
+        ):
+            config_path, _ = self._write_test_config(directory)
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            try:
+                self._stop_delivery_thread(app)
+                now = datetime.now(timezone.utc)
+                app.life_service.create_reminder(
+                    reminder_id="rem-summary-ack-inflight",
+                    title="ACK in-flight test",
+                    due_at=(now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                    timezone_str="UTC",
+                )
+                batch = app.life_service.create_recovery_summary_batch()
+                self.assertIsNotNone(batch)
+
+                class AckThenFailAdapter:
+                    def __init__(self) -> None:
+                        self.calls = 0
+
+                    def deliver_summary(_self, _payload):
+                        _self.calls += 1
+                        self.assertEqual(
+                            app._record_managed_notification_event({
+                                "type": "notification.acknowledged",
+                                "summary_id": batch["summary_id"],
+                                "source": "button",
+                            }),
+                            "recorded",
+                        )
+                        raise RuntimeError("adapter failed after in-flight ACK")
+
+                    def close(_self) -> None:
+                        pass
+
+                adapter = AckThenFailAdapter()
+                app.managed_notification_adapter = adapter
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+
+                row = app.life_service._get_connection().execute(
+                    "SELECT state, next_retry_at FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+                ).fetchone()
+                self.assertEqual(row["state"], "acknowledged")
+                self.assertIsNone(row["next_retry_at"])
+                self.assertEqual(app.life_service.get_pending_outbox_messages(include_delayed=True), [])
+
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+                self.assertEqual(adapter.calls, 1, "ACKed summaries must not be delivered again")
+            finally:
+                app.close()
+
     def test_managed_outbox_retries_same_id_and_never_marks_dispatched(self) -> None:
         from unittest.mock import patch
 

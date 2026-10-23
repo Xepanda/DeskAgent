@@ -28,6 +28,19 @@
 - 官方 SDK `src/watcherobot/application/transport.py::_send_audio_stream()`：WSPK FRAME_AUDIO、FIRST/LAST、sequence 与 credit 流控；同文件处理 audio flow 更新。
 - 官方 SDK `src/watcherobot/protocol.py::build_wspk()`：16 字节 WSPK 头格式。
 
+### 2.3 A1 播放 HAL 接口裁决（本 CR addendum）
+
+当前 `desk_hardware_audio_play_pcm(pcm, samples, rate)` 是整段同步调用，缺少 owner/session 身份和可中止的流式生命周期；`desk_hardware_audio_play_stop()` 只释放 arbiter owner，不能证明 codec write 已停止。A1 实现 `audio.stream` 前必须提供具备以下语义的 HAL；名称可按现有风格调整，但调用边界不可省略：
+
+1. **会话与 owner：** `begin(owner, connection_generation, stream_id, format, total_bytes) -> handle` 独占取得 `DESK_RES_AUDIO_PLAYBACK`，返回 HAL 生成的 opaque handle。owner 固定为 `DESK_OWNER_SDK_REMOTE`；每次 write/status/finish/cancel 均校验 owner 与 handle。A2 用 `(connection_generation, stream_id)` 将官方 SDK 流映射到 handle，旧连接或旧流的帧/stop 不得作用于新流。一次最多一个设备播放流。
+2. **格式与总长：** pinned SDK v0.1.11 `PCMAudio` 只接受 PCM S16LE、24,000 Hz、单声道，`total_bytes` 为 2..4 MiB 且为 2 的倍数。Watcher codec path 当前固定为 16,000 Hz，I2S0 TX/RX 共用时钟；本合同要求 A1 在播放 HAL 内做有状态、分块的 24→16 kHz PCM 重采样，保持单声道、样本顺序和播放时长，不要求运行时重配 codec/I2S 时钟。重采样状态须跨输入块连续，丢弃/补齐样本不得改变流的累计时长；输入总字节数仍按 SDK 原始 24 kHz 数据核验。A1 不分配整段 `total_bytes` 的内存。
+3. **有界写与 credit：** `write(handle, pcm, bytes)` 只接纳有界块，最大为 SDK 当前 `chunk_bytes=4096`；常规块为 4096 字节，末块为 2..4096 字节且样本对齐。满队列返回可识别的 backpressure，不阻塞地复制/缓存后续整流。A2 仅在 HAL 的实际队列可用量允许时发既有 `evt.audio.buffer_status`：使用 pinned SDK 已读取的 `stream_id`、`expected_rx_seq`（下一条连续可接纳序号）、`free_frames`、`pending_frames`、`queue_depth`、`start_buffer_frames`、`playing`、`reason` 字段；队列计数单位必须与 SDK 的 4096-byte audio slot credit 计算一致，不能发固定乐观 credit。
+4. **完成与取消：** 收到合法 LAST 且累计接收字节等于 `total_bytes` 后，HAL 进入 drain；只有 codec 已播放完且队列为空才报告 `reason="complete"`。A2 收到官方 `ctrl.audio.stop`（该 pinned API 的 data 为空）时，按当前 WebSocket connection 找到活动 handle 并调用 `cancel(handle, timeout)`。取消先拒绝新块、清除尚未提交的队列，并等待当前有界同步 codec write 返回；随后 TX worker 可写入固定零 PCM 作为哨兵，但**零块的 `i2s_channel_write()` 成功返回只证明样本已复制到 TX DMA 描述符，不证明 DMA 已发送完毕**。只有与哨兵顺序关联的 TX EOF/`on_sent` 完成通知证明待发送 DMA 数据已排空时，才能报告 `tx_dma_drained` 并释放 owner；若当前 HAL 无法观测或关联该通知，取消返回超时/失败并保留 owner。此软件状态不等于 codec 内部缓存清空或扬声器物理声学静音。停止流程不得 disable I2S，保持 paired TX/RX clock 运行；不得以仅 release arbiter 替代取消。
+5. **仲裁及断线：** TClaw voice 与 system alert 优先于远端播放。SDK 远端 playback 不得抢占正在进行的 TClaw capture/voice session：begin 立即返回 busy；不暂停或重启 AFE/KWS，也不宣称 barge-in。TClaw voice 要从活动远端播放接管时，先拒绝新块、取消并确认软件 TX DMA 已排空，再取得本地播放/采集资源；DMA 排空失败则本地接管失败，不能并行写 I2S。WebSocket 断开、连接 generation 变化、格式/序号/长度错误或写入失败均执行同一路径取消；只有软件 TX DMA 排空状态被确认后才能清空会话并释放 owner，旧 handle 和迟到帧必须失效。该状态不宣称物理声学静音。
+6. **状态：** HAL 可查询 `accepted_bytes`、实际队列容量/占用、playing、终态和错误码；A2 只把该状态映射为 pinned SDK 已识别的 `evt.audio.buffer_status` / reason（`complete`、已定义失败 reason、`aborted`），不新增自定义 wire message。未知错误必须以失败而非完成报告。仅在 begin、逐块接纳、credit 水位、drain/cancel 和断线清理均实现后，才可启用并宣告 `audio.stream`。
+
+依据：锁定 SDK `src/watcherobot/audio.py` 固定 24 kHz mono S16LE 与 4 MiB 上限；`src/watcherobot/application/transport.py` 使用 4096-byte 块、初始 4 credits、最多 8 credits，并以 `expected_rx_seq` 扣除未确认帧。A1 Watcher source 当前固定 16 kHz I2S0 TX/RX 共时钟，TClaw playback 使用同步 codec write。锁定 TuyaOpen ESP-IDF 5.4.0 的 `esp_driver_i2s/i2s_common.c::i2s_channel_write()` 将输入拷贝到 DMA buffer 并返回；TX EOF 回调处理已完成描述符并触发 `on_sent`。因此 write 成功本身不是 DMA drained 证据。当前本地 checkout 未包含锁定 `esp_codec_dev` v1.3.6 的源码，codec 内部缓存/静止语义未被代码核实；不得推断实际声学静音。本裁决不假设运行时变频或异步硬件 abort/drain API，也不允许停止共享 I2S paired clock。此处只约束 A1 HAL 与 A2 对既有 SDK 事件的映射，不扩展 WSPK 或 JSON wire 协议。
+
 ## 3. 设备 → 主机：麦克风 Opus 上行
 
 ### 3.1 契约
@@ -75,8 +88,8 @@ A2 commit `0e4819e31bad42c3cdc6632d574ce465b980004e` 已完成软件侧 truthful
 
 ### 7.2 未完成：双向媒体数据路径（仍 OPEN）
 
-- **Host → device 播放**：WebSocket `FRAME_AUDIO` 入站解析、PCM payload 校验、audio flow/credit、A1 播放 HAL、停止/完成反馈尚未打通。
-- **Device → Host 麦克风上行**：SDK microphone session、A1 音频 owner/采集接口、Opus 编码、WSPK `FRAME_AUDIO` 上行、sequence/session 关闭与断线清理尚未打通。
-- 因此目前两条方向都应保持 unsupported；`audio.stream` / `audio_stream` 不应重新宣告，也不得生成 `negotiated.audio_uplink`。实现须先解决 A1 HAL owner 契约，再按第 6 节逐方向验收。
+- **Host → device 播放**：WebSocket `FRAME_AUDIO` 入站解析、PCM payload 校验、audio flow/credit、A1 播放 HAL、停止/完成反馈尚未打通。A1 接口语义已由本 CR §2.3 裁决，固件实现和后续验收仍未完成。
+- **Device → Host 麦克风上行**：SDK microphone session、A1 音频 owner/采集接口、Opus 编码、WSPK `FRAME_AUDIO` 上行、sequence/session 关闭与断线清理尚未打通；麦克风 owner 接口仍需 A1 单独提交 CR。
+- 因此目前两条方向都应保持 unsupported；`audio.stream` / `audio_stream` 不应重新宣告，也不得生成 `negotiated.audio_uplink`。实现后按第 6 节逐方向验收。
 
 A2 的 Runtime+C localhost 软件互操作测试不能填补上述缺口：测试的 JPEG 是 fixture；测试没有真实 PCM 播放、麦克风采集或 Opus 音频帧交换。双向音频只有在未修改 pinned SDK 与真实设备完成对应方向的 L3 实测后，才可将该方向从 unsupported 升级为可用；全双工仍不在本 CR 范围。

@@ -416,6 +416,18 @@ class TestWatcherHardwareContract(unittest.TestCase):
         extracted = bytes(ctypes.string_at(out_ptr, out_sz.value))
         self.assertEqual(extracted, fake_jpeg)
 
+        # The locked HX media protocol requires the 640x480 source profile.
+        # A structurally valid JPEG with a 320x240 profile is not a valid
+        # Watcher frame and must not be exported through the board HAL.
+        wrong_profile_header = struct.pack(
+            "<BBBBIII", 0x57, 0x52, 1, 0x10, 100, 5000, crc32_val
+        )
+        wrong_profile_body = (ctypes.c_uint8 * len(body))(*(wrong_profile_header + fake_jpeg))
+        rc_profile = self.lib.desk_watcher_camera_validate_frame(
+            wrong_profile_body, len(body), ctypes.byref(out_ptr), ctypes.byref(out_sz)
+        )
+        self.assertEqual(rc_profile, -6)  # unsupported HX source profile
+
         # Negative test: Corrupted CRC32
         corrupted_hdr = media_header[:12] + struct.pack("<I", crc32_val ^ 0xDEADBEEF)
         bad_body = (ctypes.c_uint8 * len(body))(*(corrupted_hdr + fake_jpeg))
