@@ -150,7 +150,8 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             return original_builtin_open(file, *args, **kwargs)
 
         patches.append(mock.patch.object(builtins, "open", guarded_builtin_open))
-        for name in ("open", "stat", "lstat", "exists", "is_file", "is_dir", "resolve", "glob", "rglob", "iterdir"):
+        for name in ("open", "stat", "lstat", "exists", "is_file", "is_dir", "is_symlink",
+                     "resolve", "glob", "rglob", "iterdir"):
             original = getattr(Path, name)
 
             def guard(path, *args, __name=name, __original=original, **kwargs):
@@ -169,6 +170,15 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
                 return __original(value, *args, **kwargs)
 
             patches.append(mock.patch.object(MODULE.os, name, guard))
+
+        original_realpath = MODULE.os.path.realpath
+
+        def guarded_realpath(value, *args, **kwargs):
+            if forbidden(value):
+                raise AssertionError(f"forbidden os.path.realpath access: {value}")
+            return original_realpath(value, *args, **kwargs)
+
+        patches.append(mock.patch.object(MODULE.os.path, "realpath", guarded_realpath))
 
         class GuardContext:
             def __enter__(self):
@@ -232,73 +242,54 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             self.assertEqual(len(commands), 1)
             self.assertNotIn(str(sdk), str(commands))
 
-    def test_configure_partition_cli_rejects_missing_stage_token_before_touching_inputs(self):
+    def test_configure_partition_cli_is_disabled_before_touching_inputs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            repo = root / "repo"
-            archive = repo / "firmware" / ".target_logging" / "run-unique"
             sdkconfig = root / "shared" / "sdkconfig"
             csv_path = root / "shared" / "partitions.csv"
             sdkconfig.parent.mkdir()
-            sdkconfig.write_text("SENTINEL_CONFIG", encoding="utf-8")
-            csv_path.write_text("SENTINEL_CSV", encoding="utf-8")
-            forbidden = [sdkconfig, csv_path]
-            stderr = io.StringIO()
-            with self._forbidden_access_guards(forbidden), \
-                    mock.patch.object(sys, "argv", [
-                        str(MODULE_PATH), "--configure-partition", str(sdkconfig), str(csv_path),
-                        "--archive", str(archive), "--stage-manifest",
-                        str(archive / "stage" / "runner-stage-token.json"), "--repo", str(repo),
-                    ]), contextlib.redirect_stderr(stderr):
-                result = MODULE.main()
-            self.assertEqual(result, 2)
-            self.assertIn("runner stage token", stderr.getvalue())
-            self.assertEqual(sdkconfig.read_text(encoding="utf-8"), "SENTINEL_CONFIG")
-            self.assertEqual(csv_path.read_text(encoding="utf-8"), "SENTINEL_CSV")
-
-    def test_configure_partition_cli_rejects_paths_outside_authorized_stage(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            repo = root / "repo"
-            archive = repo / "firmware" / ".target_logging" / "run-unique"
-            stage = archive / "stage"
-            stage.mkdir(parents=True)
-            token_path = MODULE.write_stage_authorization(archive, archive)
-            shared = root / "shared"
-            sdkconfig = shared / "sdkconfig"
-            csv_path = shared / "partitions.csv"
-            shared.mkdir()
             sdkconfig.write_text("SENTINEL_CONFIG", encoding="utf-8")
             csv_path.write_text("SENTINEL_CSV", encoding="utf-8")
             stderr = io.StringIO()
             with self._forbidden_access_guards([sdkconfig, csv_path]), \
                     mock.patch.object(sys, "argv", [
                         str(MODULE_PATH), "--configure-partition", str(sdkconfig), str(csv_path),
-                        "--archive", str(archive), "--stage-manifest", str(token_path), "--repo", str(repo),
                     ]), contextlib.redirect_stderr(stderr):
-                result = MODULE.main()
-            self.assertEqual(result, 2)
-            self.assertIn("outside the authorized archive stage", stderr.getvalue())
+                with self.assertRaises(SystemExit) as error:
+                    MODULE.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("unrecognized arguments", stderr.getvalue())
 
-    def test_configure_partition_cli_accepts_only_runner_authorized_stage_files(self):
+    def test_partition_helper_ignores_forged_authorization_and_never_touches_symlink_inputs(self):
         with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            archive = repo / "firmware" / ".target_logging" / "run-unique"
-            stage = archive / "stage"
-            sdkconfig = stage / MODULE.STAGE_CONFIG_RELATIVE
-            csv_path = stage / MODULE.STAGE_PARTITIONS_RELATIVE
-            sdkconfig.parent.mkdir(parents=True)
-            csv_path.parent.mkdir(parents=True)
-            sdkconfig.write_text('CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"\n', encoding="utf-8")
-            csv_path.write_text("csv", encoding="utf-8")
-            token_path = MODULE.write_stage_authorization(archive, archive)
-            with mock.patch.object(sys, "argv", [
-                str(MODULE_PATH), "--configure-partition", str(sdkconfig), str(csv_path),
-                "--archive", str(archive), "--stage-manifest", str(token_path), "--repo", str(repo),
-            ]):
-                self.assertEqual(MODULE.main(), 0)
-            self.assertIn(str(csv_path.resolve()).replace("\\", "/"),
-                          sdkconfig.read_text(encoding="utf-8"))
+            root = Path(temp)
+            repo = root / "repo"
+            shared = root / "shared"
+            shared.mkdir()
+            sentinel = shared / "config-sentinel"
+            sentinel.write_text("SENTINEL_CONFIG", encoding="utf-8")
+            # This lexical path represents an attacker-controlled symlink to
+            # sentinel; the guard proves the helper never follows or stats it.
+            sdkconfig = shared / "sdkconfig-symlink-sentinel"
+            csv_path = shared / "partitions.csv"
+            csv_path.write_text("SENTINEL_CSV", encoding="utf-8")
+            commands = []
+
+            def missing_manifest(command, **kwargs):
+                commands.append(command)
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"missing")
+
+            forged = {
+                "schema": "deskagent-stage-token-v1",
+                "sdkconfig_path": str(sdkconfig),
+                "partition_csv_path": str(csv_path),
+            }
+            with self._forbidden_access_guards([sdkconfig, csv_path, sentinel]), \
+                    mock.patch.object(MODULE.subprocess, "run", side_effect=missing_manifest):
+                with self.assertRaisesRegex(RuntimeError, "tracked SDK provenance manifest"):
+                    MODULE.configure_staged_partition_config(
+                        sdkconfig, csv_path, repo=repo, authorization=forged)
+            self.assertEqual(len(commands), 1)
 
     def test_bridge_direct_cli_refuses_before_sdk_filesystem_or_subprocess_access(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -610,38 +601,18 @@ class IsolatedFirmwareBuildTests(unittest.TestCase):
             self.assertEqual(record, registry[expected_active_repo_id])
             self.assertEqual(validated, record)
 
-    def test_partition_config_reasserts_absolute_staged_csv(self):
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp) / "repo"
-            archive = repo / "firmware" / ".target_logging" / "run"
-            stage = archive / "stage"
-            config = stage / MODULE.STAGE_CONFIG_RELATIVE
-            csv = stage / MODULE.STAGE_PARTITIONS_RELATIVE
-            config.parent.mkdir(parents=True)
-            csv.parent.mkdir(parents=True)
-            csv.write_text("csv", encoding="utf-8")
-            config.write_text('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"\n'
-                              'CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"\n', encoding="utf-8")
-            token_path = MODULE.write_stage_authorization(archive, archive)
-            authorization = MODULE.validate_partition_stage_token(config, csv, archive, token_path, repo)
-            MODULE.configure_staged_partition_config(config, csv, authorization=authorization)
-            resolved = csv.resolve().as_posix()
-            result = config.read_text(encoding="utf-8")
-            self.assertIn(f'CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="{resolved}"', result)
-            self.assertIn(f'CONFIG_PARTITION_TABLE_FILENAME="{resolved}"', result)
-            self.assertNotIn('CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"', result)
+    def test_partition_config_helper_stays_disabled_without_manifest(self):
+        with self.assertRaisesRegex(RuntimeError, "tracked SDK provenance manifest"):
+            MODULE.configure_staged_partition_config(Path("sdkconfig"), Path("partitions.csv"),
+                                                     repo=MODULE_PATH.parents[2])
 
-    def test_cli_arguments_require_stage_token_for_helper_and_archive_for_build(self):
-        helper = MODULE.parse_arguments(["--configure-partition", "sdkconfig", "partitions.csv",
-                                         "--archive", "firmware/.target_logging/run",
-                                         "--stage-manifest", "firmware/.target_logging/run/stage/runner-stage-token.json"])
-        self.assertEqual(helper.configure_partition, ["sdkconfig", "partitions.csv"])
-        self.assertEqual(helper.archive, Path("firmware/.target_logging/run"))
-
+    def test_cli_arguments_disable_partition_helper_and_require_archive_for_build(self):
         build = MODULE.parse_arguments(["--archive", "firmware/.target_logging/run"])
         self.assertEqual(build.archive, Path("firmware/.target_logging/run"))
-        self.assertIsNone(build.configure_partition)
 
+        with self.assertRaises(SystemExit) as helper_error:
+            MODULE.parse_arguments(["--configure-partition", "sdkconfig", "partitions.csv"])
+        self.assertEqual(helper_error.exception.code, 2)
         with self.assertRaises(SystemExit) as error:
             MODULE.parse_arguments([])
         self.assertEqual(error.exception.code, 2)
