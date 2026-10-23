@@ -308,18 +308,12 @@ static void camera_capture_release_bus(void)
 
 static int camera_capture_acquire_bus(int64_t deadline_us)
 {
-    uint64_t timeout_ticks = 0;
-    const uint64_t tick_period_us = (uint64_t)portTICK_PERIOD_MS * 1000ULL;
-    const uint64_t finite_max_ticks = (uint64_t)portMAX_DELAY - 1ULL;
-    if (!desk_watcher_camera_bus_deadline_ticks((uint64_t)deadline_us,
-                                                 (uint64_t)esp_timer_get_time(),
-                                                 tick_period_us,
-                                                 finite_max_ticks,
-                                                 &timeout_ticks)) {
+    if (esp_timer_get_time() >= deadline_us) {
         return DESK_HW_ERR_TIMEOUT;
     }
 
-    esp_err_t err = spi_device_acquire_bus(s_spi_dev, (TickType_t)timeout_ticks);
+    /* ESP-IDF's SPI master supports only portMAX_DELAY for bus acquisition. */
+    esp_err_t err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
     if (err != ESP_OK) {
         return desk_watcher_camera_bus_acquire_error(err, ESP_ERR_TIMEOUT,
                                                      DESK_HW_ERR_TIMEOUT,

@@ -55,15 +55,14 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
             cli_names,
         )
 
-    def test_bus_acquire_uses_remaining_capture_deadline_ticks(self):
+    def test_spi_bus_acquire_uses_only_idf_supported_infinite_wait(self):
         source_text = CAMERA_C.read_text(encoding="utf-8")
         bus_header = CAMERA_BUS_H.read_text(encoding="utf-8")
         capture = source_text.split("int desk_watcher_camera_capture(", 1)[1]
 
-        self.assertIn("desk_watcher_camera_bus_deadline_ticks", bus_header)
         self.assertGreaterEqual(capture.count("camera_capture_acquire_bus(camera_capture_deadline_us)"), 2)
         self.assertEqual(capture.count("return camera_capture_release(acquire_rc, (int64_t)camera_capture_overall_deadline_us);"), 2)
-        self.assertNotIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", capture)
+        self.assertIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", source_text)
         self.assertIn("desk_watcher_camera_bus_acquire_error", bus_header)
         acquire = source_text.split("static int camera_capture_acquire_bus(", 1)[1].split("\n}", 1)[0]
         self.assertIn("desk_watcher_camera_bus_acquire_error(err, ESP_ERR_TIMEOUT", acquire)
@@ -71,8 +70,12 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
                         acquire.index("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)"))
         self.assertIn("DESK_HW_ERR_TIMEOUT", acquire)
         self.assertIn("DESK_WATCHER_CAMERA_ERR_SPI", acquire)
+        self.assertLess(acquire.index("if (esp_timer_get_time() >= deadline_us)"),
+                        acquire.index("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)"))
         self.assertIn("if (esp_timer_get_time() >= deadline_us)", acquire)
         self.assertIn("camera_capture_release_bus()", acquire)
+        self.assertNotIn("timeout_ticks", acquire)
+        self.assertNotIn("desk_watcher_camera_bus_deadline_ticks", acquire)
 
         compiler = shutil.which("gcc")
         if compiler is None:
@@ -81,6 +84,8 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
         harness = r'''#include <assert.h>
 #include <stdint.h>
 #include "desk_watcher_camera_bus.h"
+
+int mock_spi_device_acquire_bus(uint32_t wait) { return wait == UINT32_MAX ? 0 : -1; }
 
 int main(void) {
     uint64_t ticks = 999;
@@ -110,6 +115,10 @@ int main(void) {
     assert(!desk_watcher_camera_spi_deadline_available(50000, 50000, 1200, 12000000, 20000));
     assert(desk_watcher_camera_bus_acquire_error(-7, -7, -3, -24) == -3);
     assert(desk_watcher_camera_bus_acquire_error(-8, -7, -3, -24) == -24);
+    /* Pinned ESP-IDF rejects finite waits; only portMAX_DELAY is supported. */
+    const uint32_t portMAX_DELAY = UINT32_MAX;
+    assert(mock_spi_device_acquire_bus(portMAX_DELAY) == 0);
+    assert(mock_spi_device_acquire_bus(1) != 0);
     return 0;
 }
 '''
