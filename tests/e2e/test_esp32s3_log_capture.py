@@ -47,6 +47,18 @@ class TestEsp32S3LogCapture(unittest.TestCase):
         self.assertEqual(events[6]["state"], "connected")
         self.assertEqual(events[7]["metrics"], {"free_heap": 12345, "psram_free": 67890})
 
+    def test_wakenet_classifier_accepts_structured_keyword_identifiers(self) -> None:
+        parser = IncrementalLogParser(clock=lambda: "2026-10-22T00:00:00Z")
+
+        events = parser.feed(
+            b"I audio keyword_detected score=0.91\n"
+            b"I audio wake_word detected score=0.92\n"
+            b"I audio debug_keyword_detected_count=4\n"
+            b"I audio prefix_wake_word_suffix=1\n"
+        )
+
+        self.assertEqual([event["category"] for event in events], ["wakenet", "wakenet"])
+
     def test_structured_outputs_redact_pairing_codes_and_tokens_but_raw_bytes_are_exact(self) -> None:
         secret_line = b"I MQTT pairing_code=654321 access_token=secret-token state=connected\r\n"
         with tempfile.TemporaryDirectory() as temp_dir:

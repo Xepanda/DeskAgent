@@ -24,7 +24,7 @@ DEFAULT_OUTPUT_DIR = Path(".target_logging/serial-capture")
 READ_SIZE = 4096
 
 _CLASSIFIERS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("wakenet", re.compile(r"(?<![A-Za-z0-9])(?:wakenet|wake\s*word|wakeword|keyword\s+detected)(?![A-Za-z0-9])|唤醒", re.I)),
+    ("wakenet", re.compile(r"(?<![A-Za-z0-9_])(?:wakenet|wake[\s_-]*word|wakeword|keyword[\s_-]+detected)(?![A-Za-z0-9_])|唤醒", re.I)),
     ("asr", re.compile(r"(?<![A-Za-z0-9])ASR(?![A-Za-z0-9])|speech\s+recogn(?:ition|ized)|识别结果", re.I)),
     ("tts", re.compile(r"\bTTS\b|text[- ]to[- ]speech|playback[_ ]+(?:start|started|done)|speaker[_ ]+play", re.I)),
     ("camera", re.compile(r"(?<![A-Za-z0-9])(?:camera|PTL|SPI|CRC|capture)(?![A-Za-z0-9])|相机", re.I)),
