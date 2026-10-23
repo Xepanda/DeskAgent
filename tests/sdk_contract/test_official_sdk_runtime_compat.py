@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import os
 import subprocess
@@ -122,6 +123,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 's_pair_websocket_port = 8765; }\n'
                 'void desk_sdk_test_set_legacy_connected(void) { s_client_connected = true; }\n'
                 'uint32_t desk_sdk_test_ws_generation(void) { return ws_lifecycle_generation(); }\n'
+                'unsigned desk_sdk_test_ws_audio_inflight(void) { pthread_mutex_lock(&s_ws_lifecycle_mutex); '
+                'unsigned count = s_ws_audio_commands_inflight; pthread_mutex_unlock(&s_ws_lifecycle_mutex); return count; }\n'
                 'int desk_sdk_test_commit_hello_ack(uint32_t generation) { '
                 'return ws_commit_hardware_hello_ack(generation) ? 1 : 0; }\n'
                 'void desk_sdk_test_arm_hello_pending(uint32_t generation) { pthread_mutex_lock(&s_ws_lifecycle_mutex); '
@@ -333,6 +336,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.lib.desk_sdk_test_set_legacy_connected.argtypes = []
         cls.lib.desk_sdk_test_ws_generation.restype = ctypes.c_uint32
         cls.lib.desk_sdk_test_ws_generation.argtypes = []
+        cls.lib.desk_sdk_test_ws_audio_inflight.restype = ctypes.c_uint
+        cls.lib.desk_sdk_test_ws_audio_inflight.argtypes = []
         cls.lib.desk_sdk_test_commit_hello_ack.restype = ctypes.c_int
         cls.lib.desk_sdk_test_commit_hello_ack.argtypes = [ctypes.c_uint32]
         cls.lib.desk_sdk_test_arm_hello_pending.restype = None
@@ -2479,6 +2484,71 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(self.lib.desk_sdk_test_audio_stale_stop_calls(), 0)
         self.assertEqual(self.lib.desk_sdk_test_ws_generation(), generation_before + 1)
 
+    def test_stale_audio_generation_cannot_cancel_current_playback(self) -> None:
+        """Old-session PCM and poll callbacks must not stop a newer session's HAL owner."""
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_advance_ws_generation()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        generation = self.lib.desk_sdk_test_ws_generation()
+        pcm = b"\x12\x34" * 160
+        begin = {"type": "ctrl.audio.stream.begin", "code": 0,
+                 "request_id": "audio-current-generation", "data": {
+                     "stream_id": 808, "total_bytes": len(pcm),
+                     "sample_rate_hz": 24000, "channels": 1,
+                     "sample_width_bytes": 2,
+                     "audio_sha256": hashlib.sha256(pcm).hexdigest()}}
+        begin_out = ctypes.create_string_buffer(1024)
+        self.assertEqual(self._process_ws_command(json.dumps(begin).encode(), begin_out), 0)
+        self.assertEqual(json.loads(begin_out.value)["type"], "sys.ack")
+        self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 1)
+
+        inject = self.lib.desk_sdk_test_audio_inject
+        inject.restype = ctypes.c_int
+        inject.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
+        stale_frame = build_wspk(FRAME_AUDIO, FLAG_FIRST | FLAG_LAST, 808, 0, pcm)
+        old_generation = generation - 1
+
+        self.lib.desk_sdk_bridge_audio_poll(old_generation)
+        self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 1,
+                         "a delayed old-session poll must not cancel current playback")
+        self.assertEqual(self.lib.desk_sdk_test_audio_stop_calls(), 0)
+
+        self.assertNotEqual(inject(stale_frame, len(stale_frame), old_generation), 0)
+        self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 1,
+                         "a delayed old-session frame must not cancel current playback")
+        self.assertEqual(self.lib.desk_sdk_test_audio_stop_calls(), 0)
+
+        self.assertEqual(inject(stale_frame, len(stale_frame), generation), 0,
+                         "the owning session must still be able to finish its stream")
+        self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 0)
+
+    def test_inactive_audio_frame_releases_generation_pin_for_teardown(self) -> None:
+        """Rejecting a current-generation frame with no stream must not strand teardown."""
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_advance_ws_generation()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        generation = self.lib.desk_sdk_test_ws_generation()
+        pcm = b"\x00\x00" * 160
+        frame = build_wspk(FRAME_AUDIO, FLAG_FIRST | FLAG_LAST, 809, 0, pcm)
+        inject = self.lib.desk_sdk_test_audio_inject
+        inject.restype = ctypes.c_int
+        inject.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
+        inflight_before = self.lib.desk_sdk_test_ws_audio_inflight()
+
+        self.assertNotEqual(inject(frame, len(frame), generation), 0)
+        inflight_after = self.lib.desk_sdk_test_ws_audio_inflight()
+        try:
+            self.assertEqual(inflight_after, inflight_before,
+                             "no-stream rejection must release its lifecycle pin")
+        finally:
+            # Keep the shared test library usable if this regression assertion
+            # fails before the production early-return path is fixed.
+            for _ in range(max(0, inflight_after - inflight_before)):
+                self.lib.desk_sdk_ws_client_audio_command_release()
+
+        next_generation = self.lib.desk_sdk_test_advance_ws_generation()
+        self.assertEqual(next_generation, generation + 1)
+
     def test_audio_playback_stream_runs_over_pinned_runtime_loopback(self) -> None:
         """Exercise begin, multi-frame WSPK, HAL-backed credit, completion and cancel."""
         try:
@@ -2591,8 +2661,8 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                                      hashlib.sha256(bad_digest_pcm).hexdigest())
                     self.assertNotEqual(bad_sha_result["data"]["audio_sha256"], "0" * 64)
 
-                    # A frame from a prior connection generation fails the
-                    # active stream and reports stale_frame without faking a release.
+                    # A delayed frame from a prior generation is rejected
+                    # without canceling the stream owned by the current session.
                     stale_pcm = b"\x23\x45" * 4096
                     await desktop.send(json.dumps({"type": "ctrl.audio.stream.begin", "code": 0,
                         "request_id": "audio-begin-stale", "data": {
@@ -2610,6 +2680,15 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     inject.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
                     old_generation = self.lib.desk_sdk_test_ws_generation() - 1
                     self.assertNotEqual(inject(stale_frame, len(stale_frame), old_generation), 0)
+                    self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 1,
+                                     "stale frame must not release the current session's owner")
+                    await desktop.send(json.dumps({"type": "ctrl.audio.stop", "code": 0,
+                        "request_id": "audio-stop-stale-owner", "data": {"stream_id": 73}}))
+                    stale_owner_stop = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual((stale_owner_stop["type"], stale_owner_stop["request_id"]),
+                                     ("sys.ack", "audio-stop-stale-owner"), stale_owner_stop)
+                    stale_owner_cancel = json.loads(await asyncio.wait_for(desktop.recv(), 2))
+                    self.assertEqual(stale_owner_cancel["data"]["reason"], "aborted", stale_owner_cancel)
                     self.assertEqual(self.lib.desk_sdk_test_audio_is_active(), 0)
 
                     # A duplicate/out-of-order packet is explicit failure.

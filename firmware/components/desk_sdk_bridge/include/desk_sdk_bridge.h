@@ -277,6 +277,8 @@ int desk_sdk_ws_client_poll(int timeout_ms);
 uint32_t desk_sdk_ws_client_generation(void);
 /* Pins a validated audio command to the live paired WebSocket lifecycle until release. */
 bool desk_sdk_ws_client_audio_command_acquire(uint32_t connection_generation);
+/* Pins a PCM callback/poll to the current lifecycle generation, including teardown drain polls. */
+bool desk_sdk_ws_client_audio_generation_acquire(uint32_t connection_generation);
 void desk_sdk_ws_client_audio_command_release(void);
 int desk_sdk_ws_client_send_text(const char *text);
 /* Queues the start ACK with a writer completion callback before live media. */
