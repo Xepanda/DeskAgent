@@ -43,6 +43,11 @@ bool desk_watcher_log_source_publish_camera_capture_empty(void);
 bool desk_watcher_log_source_try_dequeue(desk_watcher_log_record_t *out_record);
 bool desk_watcher_log_source_take_gap(desk_watcher_log_gap_t *out_gap);
 
+/* Observes one already-formatted TAL output line. CR-009 v1 has no approved
+ * text-to-event mapping, so this bounded observer intentionally drops every
+ * line without retaining its borrowed pointer or changing the event queue. */
+void desk_watcher_log_source_observe_tal_line(const char *formatted_line);
+
 #ifdef __cplusplus
 }
 #endif

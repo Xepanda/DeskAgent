@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "desk_hardware.h"
+#include "desk_watcher_log_source.h"
 #include "desk_tclaw_bridge.h"
 #include "desk_sdk_bridge.h"
 #include "tuya_config.h"
@@ -155,6 +156,7 @@ static void desk_tuya_log_output(const char *line)
     /* This SDK's ESP32 tkl_log_output ignores its varargs. Use a literal
      * string sink so '%' in an already formatted SDK line stays inert. */
     fputs(line, stdout);
+    desk_watcher_log_source_observe_tal_line(line);
 }
 #endif
 

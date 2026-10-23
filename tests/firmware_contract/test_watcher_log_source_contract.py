@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE_C = ROOT / "firmware/components/desk_hardware/src/desk_watcher_log_source.c"
 SOURCE_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_log_source.h"
 CAMERA_C = ROOT / "firmware/components/desk_hardware/src/desk_watcher_camera.c"
+APP_MAIN_C = ROOT / "firmware/main/src/app_main.c"
 
 
 class TestWatcherLogSourceContract(unittest.TestCase):
@@ -49,6 +50,25 @@ class TestWatcherLogSourceContract(unittest.TestCase):
         self.assertIn("s_source.count = 0U", disable)
         self.assertIn("s_source.has_gap = false", disable)
         self.assertNotIn("s_source.next_sequence =", disable)
+
+    def test_tal_text_is_observed_only_after_the_existing_stdout_sink(self):
+        header = SOURCE_H.read_text(encoding="utf-8")
+        source = SOURCE_C.read_text(encoding="utf-8")
+        app_main = APP_MAIN_C.read_text(encoding="utf-8")
+        self.assertIn("desk_watcher_log_source_observe_tal_line", header)
+        output = app_main.split("static void desk_tuya_log_output(", 1)[1].split("\n}", 1)[0]
+        sensitive_check = output.index("desk_log_line_has_sensitive_marker(line)")
+        sensitive_return = output.index("return;", sensitive_check)
+        stdout_sink = output.index("fputs(line, stdout)")
+        observer_call = output.index("desk_watcher_log_source_observe_tal_line(line)")
+        self.assertLess(sensitive_check, sensitive_return)
+        self.assertLess(sensitive_return, stdout_sink)
+        self.assertLess(stdout_sink, observer_call)
+        observer = source.split("void desk_watcher_log_source_observe_tal_line(", 1)[1].split(
+            "\n}", 1
+        )[0]
+        for forbidden in ("publish_camera_capture_empty", "malloc(", "ESP_LOG", "tal_log"):
+            self.assertNotIn(forbidden, observer)
 
 
 if __name__ == "__main__":

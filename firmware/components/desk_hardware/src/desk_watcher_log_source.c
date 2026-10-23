@@ -129,3 +129,10 @@ bool desk_watcher_log_source_take_gap(desk_watcher_log_gap_t *out_gap)
     SOURCE_UNLOCK();
     return available;
 }
+
+void desk_watcher_log_source_observe_tal_line(const char *formatted_line)
+{
+    /* No TAL text is an approved CR-009 v1 event. Do not inspect or retain the
+     * borrowed line; this is constant-time, allocation-free, and reentrant. */
+    (void)formatted_line;
+}
