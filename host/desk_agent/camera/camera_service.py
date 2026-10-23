@@ -94,6 +94,7 @@ class FrameCapturePipeline:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._generation = 0
         self._current_pan = 90.0
         self._current_tilt = 120.0
         self._consumer: Optional[Callable[[bytes, bool], None]] = None
@@ -112,6 +113,7 @@ class FrameCapturePipeline:
             if self._running:
                 return
             self._running = True
+            self._generation += 1
             # A disconnect can stop the pipeline while the source callback is
             # blocked in transport I/O. If the lease returns before that call
             # unwinds, resume the existing worker instead of creating a second
@@ -125,14 +127,15 @@ class FrameCapturePipeline:
         self.request_stop()
         with self._lock:
             thread = self._thread
-            if thread and thread.is_alive() and thread != threading.current_thread():
-                try:
-                    thread.join(timeout=0.2)
-                except Exception:
-                    pass
-            # Keep the reference while a blocked source callback is still
-            # running. A rapid lease reacquire can then resume this worker
-            # instead of starting a second concurrent caller for the source.
+        if thread and thread.is_alive() and thread != threading.current_thread():
+            try:
+                thread.join(timeout=0.2)
+            except Exception:
+                pass
+        # Keep the reference while a blocked source callback is still
+        # running. A rapid lease reacquire can then resume this worker
+        # instead of starting a second concurrent caller for the source.
+        with self._lock:
             if thread and not thread.is_alive():
                 self._thread = None
 
@@ -143,11 +146,13 @@ class FrameCapturePipeline:
         currently be blocked in transport I/O. Call ``stop`` later when joining
         the worker is safe and desired.
         """
-        # These assignments intentionally do not acquire _lock: stop() may hold
-        # it while joining the worker, so the disconnect callback must stay
-        # independent of that join and any in-flight frame-source call.
-        self._running = False
-        self._consumer = None
+        # Invalidate the current capture generation without waiting for an
+        # in-flight source callback. stop() joins only after releasing this
+        # lock, so a disconnect can promptly revoke the old callback result.
+        with self._lock:
+            self._running = False
+            self._consumer = None
+            self._generation += 1
 
     def update_coordinates(self, pan: float, tilt: float) -> None:
         with self._lock:
@@ -155,13 +160,19 @@ class FrameCapturePipeline:
             self._current_tilt = max(100.0, min(140.0, tilt))
 
     def _capture_loop(self) -> None:
-        while self._running:
+        while True:
+            with self._lock:
+                if not self._running:
+                    return
+                generation = self._generation
+                frame_source = self._frame_source
+                consumer = self._consumer
             try:
                 frame = None
                 is_hw = False
-                if self._frame_source:
+                if frame_source:
                     try:
-                        frame = self._frame_source()
+                        frame = frame_source()
                         if frame:
                             is_hw = True
                             # The callback contract carries bytes only, with no
@@ -177,11 +188,13 @@ class FrameCapturePipeline:
                     except Exception as src_err:
                         logger.debug("Hardware frame source error: %s", src_err)
 
-                if frame is not None and self._consumer and self._running:
+                with self._lock:
+                    generation_is_current = self._running and generation == self._generation
+                if frame is not None and consumer and generation_is_current:
                     try:
-                        self._consumer(frame, is_hw)
+                        consumer(frame, is_hw)
                     except TypeError:
-                        self._consumer(frame)
+                        consumer(frame)
             except Exception as e:
                 logger.warning("Frame capture error: %s", e)
             time.sleep(self._interval)
@@ -218,6 +231,7 @@ class CameraViewerService:
         self._latest_frame_metadata: Optional[dict[str, Any]] = None
         self._camera_session_generation: Optional[str] = None
         self._last_device_sequence: Optional[int] = None
+        self._capture_generation = 0
         self._active_stream_owners: set[str] = set()
         self.pipeline = FrameCapturePipeline(fps=10.0, allow_synthetic=False)
 
@@ -227,7 +241,15 @@ class CameraViewerService:
 
     def start_capture(self) -> None:
         """Starts the underlying capture pipeline."""
-        self.pipeline.start(self.push_frame)
+        with self._lock:
+            capture_generation = self._capture_generation
+        self.pipeline.start(
+            lambda frame, is_hardware: self.push_frame(
+                frame,
+                is_hardware,
+                capture_generation=capture_generation,
+            )
+        )
 
     def stop_capture(self) -> None:
         """Stops the underlying capture pipeline."""
@@ -265,8 +287,11 @@ class CameraViewerService:
                     "remaining_ms": int((self._lease_expires_at - now) * 1000),
                 }
 
+            if self._active_lease_owner is None:
+                self._capture_generation += 1
             self._active_lease_owner = client_id
             self._lease_expires_at = now + duration
+            capture_generation = self._capture_generation
 
             if target_fps is not None:
                 self.pipeline.fps = max(0.5, min(30.0, float(target_fps)))
@@ -285,7 +310,13 @@ class CameraViewerService:
             self.pipeline.stop()
             self._trigger_teardown(expired_owner, "expired")
         if self.auto_start_pipeline:
-            self.pipeline.start(self.push_frame)
+            self.pipeline.start(
+                lambda frame, is_hardware: self.push_frame(
+                    frame,
+                    is_hardware,
+                    capture_generation=capture_generation,
+                )
+            )
         return result
 
     def release_lease(self, client_id: str) -> bool:
@@ -293,6 +324,7 @@ class CameraViewerService:
         with self._lock:
             if self._active_lease_owner == client_id:
                 owner = self._active_lease_owner
+                self._capture_generation += 1
                 self._active_lease_owner = None
                 self._lease_expires_at = 0.0
                 self._latest_jpeg = None
@@ -321,6 +353,7 @@ class CameraViewerService:
         with self._lock:
             if self._active_lease_owner != client_id:
                 return False
+            self._capture_generation += 1
             self._active_lease_owner = None
             self._lease_expires_at = 0.0
             self._latest_jpeg = None
@@ -348,6 +381,7 @@ class CameraViewerService:
         """Clears expired owner/frame state; caller performs teardown after unlock."""
         if self._active_lease_owner and now >= self._lease_expires_at:
             owner = self._active_lease_owner
+            self._capture_generation += 1
             self._active_lease_owner = None
             self._lease_expires_at = 0.0
             self._latest_jpeg = None
@@ -373,6 +407,8 @@ class CameraViewerService:
         jpeg_data: bytes,
         is_hardware: bool = False,
         metadata: Optional[dict[str, Any]] = None,
+        *,
+        capture_generation: Optional[int] = None,
     ) -> None:
         """
         Receives captured JPEG frame from device hardware or fallback pipeline.
@@ -388,6 +424,8 @@ class CameraViewerService:
         if not self.is_lease_valid():
             return
         with self._lock:
+            if capture_generation is not None and capture_generation != self._capture_generation:
+                return
             if self._active_lease_owner and time.time() < self._lease_expires_at:
                 incoming_metadata = dict(metadata) if isinstance(metadata, dict) else None
                 incoming_session = incoming_metadata.get("session_generation") if incoming_metadata else None
