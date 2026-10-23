@@ -38,12 +38,41 @@ class Camera:
         return self.frame
 
 
+class TimeoutRecordingCamera(Camera):
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: list[float] = []
+
+    def capture(self, *, timeout: float) -> ImageFrame:
+        self.timeouts.append(timeout)
+        return super().capture(timeout=timeout)
+
+
 class Robot:
     def __init__(self, camera: Camera) -> None:
         self.camera = camera
 
 
 class OfficialRobotCameraAdapterTests(unittest.TestCase):
+    def test_default_capture_wait_exceeds_firmware_five_second_budget(self) -> None:
+        camera = TimeoutRecordingCamera()
+        camera.release.clear()
+        commands: list[tuple[str, float | None]] = []
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda name, _data, timeout: commands.append((name, timeout))
+            or {"type": "sys.ack", "code": 0},
+            ingest_frame=lambda _frame: None,
+        )
+        try:
+            self.assertTrue(adapter.acquire("viewer-timeout", 10000)["granted"])
+            self.assertTrue(camera.entered.wait(1))
+            self.assertEqual(camera.timeouts, [7.0])
+            self.assertEqual(commands, [("ctrl.camera.acquire", 1.0)])
+        finally:
+            camera.release.set()
+            adapter.close()
+
     def test_capture_cadence_is_capped_to_host_mjpeg_rate_on_acquire_and_renewal(self) -> None:
         camera = Camera()
         camera.release.clear()

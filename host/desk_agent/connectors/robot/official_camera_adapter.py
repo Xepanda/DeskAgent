@@ -29,7 +29,7 @@ class OfficialRobotCameraAdapter:
         send_command: Callable[[str, dict[str, Any], float | None], dict[str, Any]],
         ingest_frame: Callable[[bytes], None],
         max_jpeg_bytes: int = DEFAULT_MAX_JPEG_BYTES,
-        capture_timeout: float = 3.0,
+        capture_timeout: float = 7.0,
         clear_frame: Callable[[str], None] | None = None,
     ) -> None:
         if not 4 <= max_jpeg_bytes <= 128 * 1024:
