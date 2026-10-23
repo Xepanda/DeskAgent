@@ -157,12 +157,11 @@ static bool audio_preempt_quiesce(desk_resource_type_t resource,
     if (!timeout_ms) timeout_ms = TX_DMA_DRAIN_TIMEOUT_MS;
     if (current_owner == DESK_OWNER_SDK_REMOTE) {
         uint64_t handle = 0;
-        bool stream_active = false;
-        if (s_stream_lock && xSemaphoreTake(s_stream_lock, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-            stream_active = s_stream_ctx && s_stream_ctx->owner_held;
-            if (stream_active) handle = s_stream_ctx->handle;
-            xSemaphoreGive(s_stream_lock);
-        }
+        if (!s_stream_lock ||
+            xSemaphoreTake(s_stream_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return false;
+        bool stream_active = s_stream_ctx && s_stream_ctx->owner_held;
+        if (stream_active) handle = s_stream_ctx->handle;
+        xSemaphoreGive(s_stream_lock);
         if (stream_active) {
             return desk_watcher_audio_stream_stop(handle, timeout_ms) == DESK_HW_OK;
         }
