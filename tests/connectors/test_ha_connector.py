@@ -19,7 +19,7 @@ import threading
 import time
 import unittest
 from typing import Any, Mapping, Optional
-from host.desk_agent.connectors.ha.ha_connector import HAConnector
+from host.desk_agent.connectors.ha.ha_connector import HAConnector, _normalize_state_poll_interval_sec
 
 
 class MockWebSocketClient:
@@ -72,6 +72,25 @@ class TestHAConnector(unittest.TestCase):
         ha = HAConnector(base_url="http://127.0.0.1:59999", token="dummy-token", timeout_sec=0.5)
         with self.assertRaises(ConnectionError):
             ha.execute("light.desk", "turn_on")
+
+    def test_state_subscription_rejects_invalid_poll_interval_before_starting_workers(self) -> None:
+        """Invalid fallback intervals must not create a busy loop or poison the WS worker."""
+        for interval in (0, -0.1, float("nan"), float("inf"), True):
+            with self.subTest(interval=interval):
+                ha = HAConnector(base_url="http://ha.test:8123", token="token", mock_mode=True)
+                stop = None
+                try:
+                    with self.assertRaises(ValueError):
+                        stop = ha.subscribe_state_changes(lambda *args: None, interval_sec=interval)
+                finally:
+                    if stop is not None:
+                        stop()
+                self.assertEqual(ha._subscribers, [])
+                self.assertIsNone(ha._ws_thread)
+                ha.close()
+
+    def test_state_poll_interval_is_capped_to_keep_waits_platform_safe(self) -> None:
+        self.assertEqual(_normalize_state_poll_interval_sec(1e300), 300.0)
 
     # -------------------------------------------------------------------------
     # 2. Domain & Entity Allowlist / Denylist Tests
