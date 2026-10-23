@@ -578,7 +578,7 @@ class TestP2RemainingRemediations(unittest.TestCase):
                     else {"type": "sys.nack", "code": 500, "error": {"code": "SENSOR_FAULT", "message": "Camera HW fault"}}
                 )
                 with self.assertRaises(HTTPError) as ctx:
-                    with urlopen(f"http://127.0.0.1:{port}/snapshot") as resp:
+                    with urlopen(f"http://127.0.0.1:{port}/snapshot?client_id=snapshot-nack-case") as resp:
                         pass
                 self.assertEqual(ctx.exception.code, 503)
 
@@ -590,7 +590,7 @@ class TestP2RemainingRemediations(unittest.TestCase):
                 mock_robot.send_command.side_effect = lambda cmd, timeout=1.0: {"type": "sys.ack", "code": 0}
 
                 with self.assertRaises(HTTPError) as ctx:
-                    with urlopen(f"http://127.0.0.1:{port}/snapshot") as resp:
+                    with urlopen(f"http://127.0.0.1:{port}/snapshot?client_id=snapshot-stale-case") as resp:
                         pass
                 self.assertEqual(ctx.exception.code, 504)
 
@@ -601,7 +601,7 @@ class TestP2RemainingRemediations(unittest.TestCase):
                     return {"type": "sys.ack", "code": 0}
 
                 mock_robot.send_command.side_effect = mock_capture_and_ingest
-                with urlopen(f"http://127.0.0.1:{port}/snapshot") as resp:
+                with urlopen(f"http://127.0.0.1:{port}/snapshot?client_id=snapshot-fresh-case") as resp:
                     self.assertEqual(resp.status, 200)
                     data = resp.read()
                     self.assertEqual(data, b"\xff\xd8\xff\xe0BRAND_NEW_FRAME\xff\xd9")
