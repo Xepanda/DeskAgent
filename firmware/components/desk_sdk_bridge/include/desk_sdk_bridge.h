@@ -185,6 +185,18 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
                                      size_t max_buf_len,
                                      size_t *out_len);
 
+/** Pack one frozen CR-022 WJPG v1 header and complete JPEG payload.
+ * Returns -1 for invalid arguments/JPEG markers, -2 if the JPEG exceeds the
+ * WSPK payload budget, and -3 when the output buffer is too small.
+ */
+int desk_sdk_bridge_pack_wjpg_v1(uint32_t sequence,
+                                 uint32_t capture_timestamp_ms,
+                                 const uint8_t *jpeg,
+                                 size_t jpeg_len,
+                                 uint8_t *out_buf,
+                                 size_t max_buf_len,
+                                 size_t *out_len);
+
 /**
  * @brief Send a complete WSPK binary media frame over active socket connection or outbound cb.
  */

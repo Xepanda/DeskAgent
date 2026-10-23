@@ -92,6 +92,20 @@
 - **A6 `host/desk_agent/camera/` 与 `web/`：** 沿用 CR-006 的 Host multipart MJPEG、Bearer/lease owner 校验和 one-slot viewer；输出帧龄/序号/渲染速率指标、freshness timeout 清图、断线 unavailable 与重新连接状态。
 - **A7 `tests/e2e/`、`tools/verification/`、`docs/acceptance/`：** 做软件负例/背压/会话重放和故障恢复验证；设备可用后按表中数值完成真实源帧到浏览器闭环及 10 分钟连续测量。软件 fixture 只能算 L2。
 
+### A1 → A2 必需接口关口（未满足前 A2 必须 fail-closed）
+
+当前 `desk_arbiter_camera_is_lease_active()` 只能回答是否存在有效租约，不能证明当前 `client_id` 是 owner；ESP 上 `desk_hardware_camera_stream_start/pump()` 又明确返回 `DESK_HW_ERR_UNAVAILABLE`。因此 A2 不得只依赖全局 active 标志向任意 command sender 开流或返回成功 ACK。A1 在 `firmware/components/desk_hardware/` 必须先交付以下接口语义：
+
+1. 以现有 `desk_hardware_camera_stream_start/pump/stop` 为基础实现真实 ESP 路径，并增加 `desk_hardware_camera_stream_is_ready()`：
+   - `start()` 校验 callback/FPS、初始化并取得唯一 sensor/SPI owner；没有真实可用源、资源冲突或目标模式不支持时返回明确错误，绝不能启动合成/注入/mock producer。
+   - `is_ready()` 只有在收到至少一张来自实际 HX PTL capture 的完整、通过 JPEG/长度检查的新帧后才返回 true；A2 在 ready 前不得 ACK start。每个 pump/callback 帧附实际采集时的 monotonic 毫秒时间戳，不能使用 Host 发送时间或模拟递增时间。
+   - `pump()` 每次最多推进一个新物理采集，错误必须保留并向 A2 返回；它不能复用上一张 JPEG 充当下一帧。若按 15 FPS 调度做不到，保持失败并上报实际错误/耗时。
+   - `stop()` 幂等；返回成功前须阻止新采集、等待 in-flight SPI/回调退出、关闭 producer mode 并释放 SPI、DMA/JPEG buffer 与 arbiter owner；返回后保证不再有 callback。stop 错误不得被忽略。
+2. 在 arbiter 提供 `desk_arbiter_camera_lease_matches(const char *client_id)`（或等价且同样原子的 owner 查询）：必须在同一调用中检查 active、expiry 和精确 owner；过期租约当场失效并释放其 arbiter 锁。空/过长/不匹配 owner 返回 false，不泄露 owner 字符串。
+3. A2 每次 start、每帧发送前及 stop/release 时都校验 `lease_matches(client_id)`。显式 release 必须先停流再 ACK release；lease 到期、owner 释放或 Device channel disconnect 必须停止 producer、阻止后续帧并清理 stream/session generation。若 stop 未确认，A2 不得 ACK stream.stop/release 成功，也不得允许第二个 producer 占用硬件；设备/Host 重启依赖 lease TTL 和启动时清理恢复。
+
+该关口只明确 owner 间接口与 fail-closed 次序，不把 A1 的软件 hook 测试当成相机性能证据。源码/单测为 L2；实际 ready、帧时戳、资源释放和 15 FPS 能力仍需 L3/L4 测量。
+
 ### 验收分层
 
 1. **L1 源码/契约：** pinned SDK HEAD `8bc13967a06ef073459be47e930ff43ef37ee8fb`；核验 `protocol.py` WSPK frame types、`Robot._on_binary()` 的 FRAME_VIDEO 特殊路由、`ApplicationChannels` 原始帧回调、示例 `parseWjpgPacket()`、Runtime 提供 `mjpeg_websocket_url` 的代码；本仓 CR-004/006、`desk_sdk_bridge.c` capture handler 与 `desk_watcher_camera.c` PTL 路径。此等级只证明接口/设计依据。

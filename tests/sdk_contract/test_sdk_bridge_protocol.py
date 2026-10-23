@@ -352,6 +352,16 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_size_t),
         ]
+        cls.lib.desk_sdk_bridge_pack_wjpg_v1.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_pack_wjpg_v1.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
 
         cls.lib.desk_sdk_socket_server_start.restype = ctypes.c_int
         cls.lib.desk_sdk_socket_server_start.argtypes = [ctypes.c_uint16]
@@ -543,6 +553,7 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(caps, expected_caps)
         self.assertNotIn("audio.stream", caps)
         self.assertNotIn("audio_stream", caps)
+        self.assertNotIn("camera.stream.mjpeg.wspk.v1", caps)
 
     def test_ready_get_matches_capability_contract_with_roller_inputs(self) -> None:
         """Both endpoints expose the same capability list; inputs currently means roller only."""
@@ -1362,6 +1373,60 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(seq, 100)
         self.assertEqual(p_size, len(payload))
         self.assertEqual(raw[16:], payload)
+
+    def test_wjpg_v1_pack_preserves_sequence_timestamp_and_exact_jpeg(self) -> None:
+        """WJPG v1 is the frozen 20-byte LE header followed by one complete JPEG."""
+        import struct
+        from pathlib import Path
+
+        jpeg = (Path(__file__).parent / "fixtures" / "interop_4x3.jpg").read_bytes()
+        jpeg_buf = (ctypes.c_uint8 * len(jpeg)).from_buffer_copy(jpeg)
+        out_buf = (ctypes.c_uint8 * (20 + len(jpeg)))()
+        out_len = ctypes.c_size_t()
+        rc = self.lib.desk_sdk_bridge_pack_wjpg_v1(
+            0x78563412, 0x10203040, jpeg_buf, len(jpeg), out_buf,
+            len(out_buf), ctypes.byref(out_len),
+        )
+        self.assertEqual(rc, 0)
+        packet = bytes(out_buf[:out_len.value])
+        self.assertEqual(packet[:4], b"WJPG")
+        self.assertEqual(packet[4:6], b"\x01\x00")
+        self.assertEqual(struct.unpack("<HIII", packet[6:20]),
+                         (20, 0x78563412, 0x10203040, len(jpeg)))
+        self.assertEqual(packet[20:], jpeg)
+        self.assertEqual(self.lib.desk_sdk_bridge_pack_wjpg_v1(
+            1, 1, jpeg_buf, len(jpeg), out_buf, 20 + len(jpeg) - 1,
+            ctypes.byref(out_len)), -3)
+
+    def test_wjpg_v1_rejects_invalid_or_oversized_jpeg(self) -> None:
+        """WJPG output fails closed for invalid JPEG boundaries and WSPK over-limit data."""
+        invalid = b"not a jpeg"
+        invalid_buf = (ctypes.c_uint8 * len(invalid)).from_buffer_copy(invalid)
+        out = (ctypes.c_uint8 * 64)()
+        out_len = ctypes.c_size_t()
+        self.assertNotEqual(self.lib.desk_sdk_bridge_pack_wjpg_v1(
+            1, 1, invalid_buf, len(invalid), out, len(out), ctypes.byref(out_len)), 0)
+
+        too_big_len = 128 * 1024 - 20 + 1
+        too_big = bytearray(too_big_len)
+        too_big[:2] = b"\xff\xd8"
+        too_big[-2:] = b"\xff\xd9"
+        too_big_buf = (ctypes.c_uint8 * too_big_len).from_buffer(too_big)
+        self.assertEqual(self.lib.desk_sdk_bridge_pack_wjpg_v1(
+            2, 2, too_big_buf, too_big_len, out, len(out), ctypes.byref(out_len)), -2)
+
+    def test_camera_stream_commands_fail_closed_without_real_producer(self) -> None:
+        """No camera stream command succeeds while ESP has no real stream producer."""
+        for msg_type, data in (
+            ("ctrl.camera.stream.start", {"width": 640, "height": 480, "target_fps": 15}),
+            ("ctrl.camera.stream.stop", {"stream_id": 1}),
+            ("ctrl.camera.clock.ping", {"ping_id": 1, "host_send_monotonic_ms": 1}),
+        ):
+            with self.subTest(msg_type=msg_type):
+                response = self._process_cmd({"type": msg_type, "request_id": "req-camera-stream", "data": data})
+                self.assertEqual(response.get("type"), "sys.nack")
+                self.assertEqual(response.get("error", {}).get("code"), "CAMERA_STREAM_UNAVAILABLE")
+                self.assertEqual(response.get("request_id"), "req-camera-stream")
 
     def test_live_tcp_socket_communication(self) -> None:
         """Verifies live TCP socket server startup, connection, JSON command processing, and event dispatch."""

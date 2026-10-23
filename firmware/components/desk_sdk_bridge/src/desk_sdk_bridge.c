@@ -1309,6 +1309,34 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
     return 0;
 }
 
+int desk_sdk_bridge_pack_wjpg_v1(uint32_t sequence,
+                                 uint32_t capture_timestamp_ms,
+                                 const uint8_t *jpeg,
+                                 size_t jpeg_len,
+                                 uint8_t *out_buf,
+                                 size_t max_buf_len,
+                                 size_t *out_len)
+{
+    const size_t header_size = 20;
+    if (out_len) *out_len = 0;
+    if (!jpeg || !out_buf || !out_len || jpeg_len < 4) return -1;
+    if (jpeg_len > DESK_WSPK_MAX_PAYLOAD_SIZE - header_size) return -2;
+    if (jpeg[0] != 0xFF || jpeg[1] != 0xD8 ||
+        jpeg[jpeg_len - 2] != 0xFF || jpeg[jpeg_len - 1] != 0xD9) return -1;
+    if (max_buf_len < header_size + jpeg_len) return -3;
+
+    memcpy(out_buf, "WJPG", 4);
+    out_buf[4] = 1;
+    out_buf[5] = 0;
+    write_u16_le(&out_buf[6], (uint16_t)header_size);
+    write_u32_le(&out_buf[8], sequence);
+    write_u32_le(&out_buf[12], capture_timestamp_ms);
+    write_u32_le(&out_buf[16], (uint32_t)jpeg_len);
+    memcpy(&out_buf[header_size], jpeg, jpeg_len);
+    *out_len = header_size + jpeg_len;
+    return 0;
+}
+
 static uint16_t s_camera_session_id = 100;
 static uint32_t s_camera_seq = 0;
 
@@ -1755,6 +1783,22 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         desk_arbiter_camera_release_lease(client_id);
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"status\":\"accepted\",\"accepted\":true}}",
+                 rid);
+        return 0;
+    }
+
+    /* CR-022 streaming remains unavailable until A1 provides a real ESP
+     * producer/readiness hook and the paired-session lease-owner interface is
+     * available here. Never expose the host mock pump as a device stream. */
+    else if (strcmp(msg_type, "ctrl.camera.stream.start") == 0 ||
+             strcmp(msg_type, "ctrl.camera.stream.stop") == 0 ||
+             strcmp(msg_type, "ctrl.camera.clock.ping") == 0) {
+        char rid_scratch[128];
+        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.nack\",%s\"code\":503,\"error\":{"
+                 "\"code\":\"CAMERA_STREAM_UNAVAILABLE\","
+                 "\"message\":\"A real camera stream producer and paired lease-owner gate are not available\"}}",
                  rid);
         return 0;
     }
