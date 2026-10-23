@@ -35,7 +35,9 @@ plus two boundary guards:
 from __future__ import annotations
 
 import ctypes
+import math
 import os
+from pathlib import Path
 import subprocess
 import tempfile
 import unittest
@@ -147,6 +149,13 @@ class TestMotionDriverFaultPropagation(unittest.TestCase):
         cls.lib.desk_hardware_motion_get_position.argtypes = [
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_float),
+        ]
+
+        cls.lib.desk_hardware_get_last_mcu_frame.restype = ctypes.c_int
+        cls.lib.desk_hardware_get_last_mcu_frame.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
         ]
 
         cls.lib.desk_hardware_get_pan.restype = ctypes.c_float
@@ -446,6 +455,57 @@ class TestMotionDriverFaultPropagation(unittest.TestCase):
         pan, tilt = self._get_position()
         self.assertAlmostEqual(pan, 180.0, places=3)
         self.assertAlmostEqual(tilt, 100.0, places=3)
+
+    def test_nonfinite_targets_are_rejected_before_arbiter_serialization_or_driver(self) -> None:
+        """NaN and +/-Inf on either axis must stop at the public HAL boundary."""
+        state = self._install_driver()
+        tx_state = {"calls": 0}
+
+        @MCU_TX_CB
+        def on_mcu_tx(frame, length, user_data):
+            tx_state["calls"] += 1
+
+        _ALIVE.append(on_mcu_tx)
+        self.assertEqual(
+            self.lib.desk_hardware_register_mcu_tx_cb(on_mcu_tx, None), 0
+        )
+
+        nonfinite_values = (math.nan, math.inf, -math.inf)
+        for value in nonfinite_values:
+            with self.subTest(axis="pan", value=value):
+                rc = self.lib.desk_hardware_motion_move_to(value, 120.0, 300)
+                self.assertEqual(rc, DESK_HW_ERR_INVALID_ARG)
+            with self.subTest(axis="tilt", value=value):
+                rc = self.lib.desk_hardware_motion_move_to(90.0, value, 300)
+                self.assertEqual(rc, DESK_HW_ERR_INVALID_ARG)
+
+        self.assertEqual(self._owner(), DESK_OWNER_NONE)
+        self.assertEqual(state["move_calls"], 0)
+        self.assertEqual(tx_state["calls"], 0)
+        frame = (ctypes.c_uint8 * 64)()
+        frame_len = ctypes.c_size_t(999)
+        self.assertEqual(
+            self.lib.desk_hardware_get_last_mcu_frame(frame, len(frame), ctypes.byref(frame_len)),
+            0,
+        )
+        self.assertEqual(frame_len.value, 0, "invalid input must be rejected before serialization")
+
+    def test_nonfinite_rejection_precedes_clamp_arbiter_serialization_and_driver_in_source(self) -> None:
+        """Keep the public entry guard ahead of all stateful motion operations."""
+        source_path = Path(__file__).resolve().parents[2] / "firmware/components/desk_hardware/src/desk_hardware.c"
+        source = source_path.read_text(encoding="utf-8")
+        move_to = source.split("int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms)", 1)[1]
+        move_to = move_to.split("int desk_hardware_motion_stop(bool emergency)", 1)[0]
+        reject_index = move_to.index("if (!isfinite(pan_deg) || !isfinite(tilt_deg))")
+        clamp_index = move_to.index("/* Mechanical clamping */")
+        arbiter_index = move_to.index("desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL)")
+        serialize_index = move_to.index("desk_hardware_format_stm32_motion_packet(pan_deg, tilt_deg")
+        driver_index = move_to.index("s_board_driver_ops->motion_move(pan_deg, tilt_deg, duration_ms)")
+
+        self.assertLess(reject_index, clamp_index)
+        self.assertLess(reject_index, arbiter_index)
+        self.assertLess(reject_index, serialize_index)
+        self.assertLess(reject_index, driver_index)
 
     # ------------------------------------------------------------------
     # 7. boundary guard: documented strict pre-check preserved

@@ -33,9 +33,9 @@
 ### 2.2 公开入口角度处理
 
 - DeskAgent 公共硬件入口合同为：有限 pan/tilt 值在 `desk_hardware_motion_move_to` 入口按 pan `0..180°`、tilt `100..140°` 钳位；NaN 与正负无穷必须在钳位/序列化前拒绝。
-- 当前源码 `desk_hardware_motion_move_to()` 实现有限值范围钳位，但该函数本体未见 `isfinite` 检查；CLI 有单独的有限数解析检查，不能据此证明所有公开调用路径拒绝非有限值。Watcher board driver 对直接传入的越界值返回 invalid argument；其内部 pack helper 有 clamp。
+- 当前源码 `desk_hardware_motion_move_to()` 在范围钳位、仲裁、序列化和 board driver 调用前执行 `isfinite` 检查，并对有限值按上述范围钳位。新增 L2 回归覆盖 pan/tilt 两轴的 NaN、正无穷和负无穷，并检查无仲裁、序列化或驱动副作用；Watcher board driver 对直接传入的越界值返回 invalid argument，其内部 pack helper 有 clamp。
 
-契约已裁决为“公开硬件入口 clamp 有限值、拒绝非有限值”。当前缺少的是 API 对非有限值的实现证据；这是 DeskAgent 源码实现缺口，不是 STM32 实机兼容证据。不得把这一合同要求描述成已经在所有公开调用路径实现。
+源码和 L2 回归现已覆盖该公开入口的有限值钳位与非有限值拒绝。它们证明 DeskAgent 硬件抽象层的实现行为，不证明 STM32 peer 协议兼容、UART 收发或实机动作；CR-007 仍保持 OPEN。
 
 ---
 
@@ -114,7 +114,7 @@
 4. 当前 stop 无 ACK 且动作状态未知。在任何新的动作之前，须由现场人员通过独立目视/机械安全确认设备静止、执行器工作区域清空、可用物理断电/急停手段就位，并明确现场验证窗口。此前置条件未满足时不发动作命令。
 5. 仅在安全预检完成并有现场监督后，先采集可区分的原始 TX/RX（不发送动作的链路观察优先）；若后续最小动作验证获得明确授权且确认安全，每条命令都要求同序号、正确 CRC 的 STM32 响应和独立可见的动作/停止观察。任一超时、坏帧、错序、意外动作或无法确认静止即中止；不得把软件 stop 重试当作安全急停。
 
-**A0 结论：**DeskAgent 主机侧合同已统一为 `A5 5A` / CRC16-CCITT-FALSE / 32-bit sequence 关联与同序号重试；ACK 允许通用 ID 或 expected MOVE/STOP ID echo，且必须精确 ACK flags、4-byte payload、有效 CRC 和匹配 sequence。公开硬件入口合同要求有限角度 clamp、拒绝非有限输入；当前源码尚未证明所有公开调用路径都拒绝非有限值。仓库测试仅为 L2。当前设备两条动作命令均超时，没有 STM32 RX/ACK、固件身份或物理状态证据；CR-007 继续 OPEN，当前板协议兼容、动作执行与安全停止均未验证。
+**A0 结论：**DeskAgent 主机侧合同已统一为 `A5 5A` / CRC16-CCITT-FALSE / 32-bit sequence 关联与同序号重试；ACK 允许通用 ID 或 expected MOVE/STOP ID echo，且必须精确 ACK flags、4-byte payload、有效 CRC 和匹配 sequence。公开硬件入口源码在钳位/序列化前拒绝非有限输入，新增回归以 L2 覆盖 NaN/±Inf。该源码与测试不证明 STM32 peer 兼容或实机动作。当前设备两条动作命令均超时，没有 STM32 RX/ACK、固件身份或物理状态证据；CR-007 继续 OPEN，当前板协议兼容、动作执行与安全停止均未验证。
 
 ### 6.6 MOVE 歧义失败与自动 STOP 策略审查（2026-10-22）
 
