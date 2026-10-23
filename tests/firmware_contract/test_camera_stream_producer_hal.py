@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from pathlib import Path
 import subprocess
 import tempfile
 import threading
@@ -68,7 +69,10 @@ class CameraStreamProducerHalTests(unittest.TestCase):
         cls.lib.desk_hardware_camera_stream_start.restype = ctypes.c_int
         cls.lib.desk_hardware_camera_stream_pump.restype = ctypes.c_int
         cls.lib.desk_hardware_camera_stream_is_ready.restype = ctypes.c_bool
+        cls.lib.desk_hardware_camera_stream_is_available.restype = ctypes.c_bool
         cls.lib.desk_hardware_camera_stream_stop.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_inject_frame.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
+        cls.lib.desk_hardware_camera_inject_frame.restype = ctypes.c_int
         cls.lib.desk_hardware_test_set_camera_start_gate.argtypes = [START_GATE_CB]
         cls.lib.desk_hardware_test_set_camera_start_gate.restype = None
 
@@ -88,6 +92,29 @@ class CameraStreamProducerHalTests(unittest.TestCase):
         self._drivers.append(self.driver)
         self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(self.driver)), 0)
         return capture_cb
+
+    def test_native_mock_and_injected_frame_never_advertise_device_capability(self) -> None:
+        self.assertFalse(self.lib.desk_hardware_camera_stream_is_available())
+        self._install_capture_driver(lambda *args: -2)
+        self.assertFalse(self.lib.desk_hardware_camera_stream_is_available())
+        fixture = b"\xff\xd8native-only-fixture\xff\xd9"
+        self.assertEqual(self.lib.desk_hardware_camera_inject_frame(fixture, len(fixture), 1234), 0)
+        self.assertFalse(self.lib.desk_hardware_camera_stream_is_available())
+
+    def test_esp_capability_probe_requires_real_watcher_source_and_buffer_capacity(self) -> None:
+        repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        source = Path(repo_root, "firmware/components/desk_hardware/src/desk_hardware.c").read_text(
+            encoding="utf-8"
+        )
+        probe = source.split("bool desk_hardware_camera_stream_is_available(void)", 1)[1].split(
+            "int desk_hardware_camera_stream_start(", 1
+        )[0]
+        self.assertIn("defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)", probe)
+        self.assertIn("s_board_driver_ops != watcher_ops", probe)
+        self.assertIn("watcher_ops->camera_capture != desk_watcher_camera_capture", probe)
+        self.assertIn("!desk_watcher_camera_is_ready()", probe)
+        self.assertIn("heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)", probe)
+        self.assertIn("return false;", probe)
 
     def test_lease_match_requires_active_unexpired_exact_owner(self) -> None:
         self.assertEqual(self.lib.desk_arbiter_camera_acquire_lease(b"viewer-a", 1000), 0)

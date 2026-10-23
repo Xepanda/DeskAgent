@@ -25,6 +25,7 @@
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_board.h"
 #include "desk_watcher_audio.h"
+#include "desk_watcher_camera.h"
 #endif
 
 /* --- Motion & STM32 Link State --- */
@@ -1354,6 +1355,25 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
 #endif
 }
 
+bool desk_hardware_camera_stream_is_available(void)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    const desk_board_driver_ops_t *watcher_ops = desk_watcher_board_get_driver_ops();
+    if (!s_board_driver_initialized || !watcher_ops || s_board_driver_ops != watcher_ops ||
+        watcher_ops->camera_capture != desk_watcher_camera_capture ||
+        !desk_watcher_camera_is_ready()) {
+        return false;
+    }
+    /* This only confirms that one producer buffer can be allocated. It does not
+     * certify image dimensions, capture cadence, or sustained throughput. */
+    return heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) >=
+           CAMERA_MAX_JPEG_LEN;
+#else
+    /* Native injected/mock producers are test fixtures, never device capability. */
+    return false;
+#endif
+}
+
 int desk_hardware_camera_stream_start(const char *client_id, float target_fps,
                                       desk_camera_frame_cb_t cb, void *user_data)
 {
@@ -1377,6 +1397,14 @@ int desk_hardware_camera_stream_start(const char *client_id, float target_fps,
         camera_stream_state_unlock();
         return DESK_HW_ERR_UNAVAILABLE;
     }
+#ifdef ESP_PLATFORM
+    if (!desk_hardware_camera_stream_is_available()) {
+        camera_stream_state_lock();
+        s_cam_stream_starting = false;
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#endif
     if (!desk_arbiter_camera_lease_matches(client_id) ||
         desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR) != DESK_OWNER_LAN_CAMERA) {
         camera_stream_state_lock();

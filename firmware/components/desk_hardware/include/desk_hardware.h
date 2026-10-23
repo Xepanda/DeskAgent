@@ -208,6 +208,8 @@ void desk_hardware_reset_mcu_stats(void);
 
 /* Camera API */
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
+/** Source capability probe; does not claim a resolution, frame rate, or first-frame readiness. */
+bool desk_hardware_camera_stream_is_available(void);
 /** Start explicit-pump streaming bound to an already acquired camera lease owner. */
 int desk_hardware_camera_stream_start(const char *client_id, float target_fps,
                                       desk_camera_frame_cb_t cb, void *user_data);
