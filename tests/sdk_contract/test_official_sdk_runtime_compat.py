@@ -1391,6 +1391,96 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(ack["data"]["role"], "hardware")
         self.assertEqual(pairing.snapshot()["state"], "connected")
 
+    def test_production_pairing_udp_listener_connects_to_official_runtime(self) -> None:
+        """The production UDP poll path accepts a host request and dials its Runtime port."""
+        import time
+
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            sys.modules.setdefault("psutil", types.ModuleType("psutil"))
+        from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+        from watcherobot.runtime.daemon.connections.websocket_server import ExternalWebSocketServer
+
+        self.lib.desk_sdk_pairing_server_start.restype = ctypes.c_int
+        self.lib.desk_sdk_pairing_server_start.argtypes = [ctypes.c_ushort]
+        self.lib.desk_sdk_pairing_server_get_port.restype = ctypes.c_int
+        self.lib.desk_sdk_pairing_server_get_port.argtypes = []
+        self.lib.desk_sdk_pairing_server_stop.restype = ctypes.c_int
+        self.lib.desk_sdk_pairing_server_stop.argtypes = []
+        request_id = "21a9dbf05ea3443480e62076f79a3b12"
+        daemon_id = "f730f29e670c49f7a3320c4314eb9805"
+        pairing = DevicePairingSession(
+            daemon_instance_id=daemon_id,
+            request_id_factory=lambda: request_id,
+        )
+
+        async def exercise_runtime() -> None:
+            accepted = asyncio.Event()
+
+            async def authorize(hardware_hello, peer_ip: str) -> None:
+                await asyncio.wait_for(accepted.wait(), timeout=3)
+                pairing.connect_device(hardware_hello, peer_ip=peer_ip, now=2.0)
+
+            server = ExternalWebSocketServer(
+                host="127.0.0.1", port=0, hardware_hello_authorizer=authorize,
+            )
+            await server.start()
+            poll_stop = threading.Event()
+            poll_thread = None
+            host_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            host_udp.settimeout(3)
+            try:
+                pairing.start_pairing(
+                    pairing_code="123456", target_mode="python_sdk",
+                    websocket_port=server.bound_port, now=0.0,
+                )
+                self.assertEqual(self.lib.desk_sdk_pairing_server_start(0), 0)
+                pairing_port = self.lib.desk_sdk_pairing_server_get_port()
+                self.assertGreater(pairing_port, 0)
+
+                def poll_device_pairing() -> None:
+                    while not poll_stop.is_set():
+                        self.lib.desk_sdk_pairing_server_poll(20)
+
+                poll_thread = threading.Thread(target=poll_device_pairing, daemon=True)
+                poll_thread.start()
+                request = PairRequest(
+                    request_id=request_id, daemon_instance_id=daemon_id,
+                    pairing_code="123456", target_mode="python_sdk",
+                    websocket_port=server.bound_port,
+                )
+                host_udp.sendto(encode_udp_message(request), ("127.0.0.1", pairing_port))
+                response, _ = await asyncio.to_thread(host_udp.recvfrom, 2048)
+                pair_accept = parse_udp_message(response)
+                self.assertIsInstance(pair_accept, PairAccept)
+                pairing.accept_device(pair_accept, peer_ip="127.0.0.1", now=1.0)
+                accepted.set()
+
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if self.lib.desk_sdk_ws_client_is_connected():
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertTrue(
+                    self.lib.desk_sdk_ws_client_is_connected(),
+                    f"state={self.lib.desk_sdk_test_ws_state()}, "
+                    f"http={self.lib.desk_sdk_test_http_response().decode('utf-8', 'replace')!r}, "
+                    f"ack={self.lib.desk_sdk_test_last_ack().decode('utf-8', 'replace')!r}",
+                )
+                self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+                self.assertEqual(pairing.snapshot()["state"], "connected")
+            finally:
+                self.lib.desk_sdk_ws_client_close()
+                poll_stop.set()
+                if poll_thread is not None:
+                    poll_thread.join(timeout=2)
+                self.lib.desk_sdk_pairing_server_stop()
+                host_udp.close()
+                await server.stop()
+
+        asyncio.run(exercise_runtime())
+
     def test_c_firmware_client_runtime_commands_results_events_media_and_reconnect(self) -> None:
         """Connect the production C WebSocket client to the pinned Runtime and exchange real frames."""
         import time
@@ -1843,6 +1933,32 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         rc = self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(official_pair_req), out_buf, 1024)
         self.assertEqual(rc, 1)  # DESK_SDK_PAIRING_REJECTED
         self.assertEqual(out_buf.value, b"")
+
+    def test_official_udp_pairing_rejects_unsupported_protocol_and_version(self) -> None:
+        """Unknown pairing versions/protocols fail closed without consuming the code window."""
+        request = PairRequest(
+            request_id="21a9dbf05ea3443480e62076f79a3b12",
+            daemon_instance_id="f730f29e670c49f7a3320c4314eb9805",
+            pairing_code="123456",
+            target_mode="python_sdk",
+            websocket_port=8765,
+        )
+        official = json.loads(encode_udp_message(request))
+        unsupported = [
+            {**official, "version": "9.9"},
+            {**official, "protocol": "unknown-pairing"},
+            {key: value for key, value in official.items() if key != "protocol"},
+        ]
+        for payload in unsupported:
+            with self.subTest(protocol=payload.get("protocol"), version=payload.get("version")):
+                self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+                out_buf = ctypes.create_string_buffer(1024)
+                rc = self.lib.desk_sdk_bridge_process_pairing_udp(
+                    json.dumps(payload).encode("utf-8"), out_buf, len(out_buf),
+                )
+                self.assertEqual(rc, 1)
+                self.assertEqual(out_buf.value, b"")
+                self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
 
     def test_official_hardware_hello_does_not_negotiate_unimplemented_audio(self) -> None:
         """Hardware hello must not claim Opus uplink without its media path."""

@@ -29,7 +29,7 @@
 #define TAG "desk_watcher_motion"
 
 static bool s_motion_initialized = false;
-static uint32_t s_mcu_sequence = 0;
+static atomic_uint_least32_t s_mcu_sequence = ATOMIC_VAR_INIT(0);
 /* Local diagnostic for the one-shot STOP paired with the last ambiguous MOVE. */
 static atomic_int s_last_ambiguous_move_stop_result = ATOMIC_VAR_INIT(DESK_HW_ERR_UNAVAILABLE);
 /* UART2 may be shared with another initialized component. Only delete a
@@ -41,6 +41,14 @@ static bool s_uart_installed_by_motion = false;
 #ifdef ESP_PLATFORM
 static SemaphoreHandle_t s_motion_mutex = NULL;
 #endif
+
+/* API callers can race before they acquire the UART transaction mutex, so
+ * sequence allocation must be atomic independently of transport locking. */
+static uint32_t motion_next_sequence(void)
+{
+    return (uint32_t)(atomic_fetch_add_explicit(&s_mcu_sequence, 1U,
+                                                memory_order_relaxed) + 1U);
+}
 
 static uint16_t motion_calc_crc16(const uint8_t *data, size_t len)
 {
@@ -423,7 +431,7 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
     }
 
     uint8_t tx_buf[32];
-    uint32_t seq = ++s_mcu_sequence;
+    uint32_t seq = motion_next_sequence();
     size_t len = motion_pack_move(pan_deg, tilt_deg, duration_ms, seq, tx_buf);
     if (len == 0) return DESK_HW_ERR_INVALID_ARG;
     atomic_store_explicit(&s_last_ambiguous_move_stop_result,
@@ -434,7 +442,7 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
         /* Keep this inside the MOVE driver call: its caller still holds the
          * gimbal owner. Allocate a distinct sequence and never retry STOP. */
         uint8_t stop_buf[32];
-        uint32_t stop_seq = ++s_mcu_sequence;
+        uint32_t stop_seq = motion_next_sequence();
         size_t stop_len = motion_pack_stop(false, stop_seq, stop_buf);
         bool stop_may_have_sent = false;
         int stop_result = motion_send_and_wait_ack(
@@ -453,7 +461,7 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
 int desk_watcher_motion_stop(bool emergency)
 {
     uint8_t tx_buf[32];
-    uint32_t seq = ++s_mcu_sequence;
+    uint32_t seq = motion_next_sequence();
     size_t len = motion_pack_stop(emergency, seq, tx_buf);
     return motion_send_and_wait_ack(tx_buf, len, seq, true, NULL);
 }
