@@ -13,6 +13,8 @@ Implements real Home Assistant REST API interactions and WebSocket real-time eve
 
 from __future__ import annotations
 
+import copy
+import inspect
 import json
 import logging
 import math
@@ -77,7 +79,20 @@ DEFAULT_ALLOWED_SERVICES = frozenset({
 })
 
 ENTITY_ID_REGEX = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+SERVICE_ACTION_REGEX = re.compile(r"^[a-z0-9_]{1,64}$")
 MAX_STATE_CONFIRMATION_TIMEOUT_MS = 30_000
+MIN_STATE_POLL_INTERVAL_SEC = 1.0
+MAX_STATE_POLL_INTERVAL_SEC = 300.0
+# HA service payloads can select targets through fields other than entity_id.
+# Those selectors can widen an entity-scoped request to devices, areas, floors,
+# or labels, so the connector rejects them and requires one authorized entity.
+HA_TARGET_SELECTOR_PARAMETER_KEYS = frozenset({
+    "area_id",
+    "device_id",
+    "floor_id",
+    "label_id",
+    "target",
+})
 
 
 def _normalize_confirmation_timeout_ms(value: Any) -> float:
@@ -87,14 +102,50 @@ def _normalize_confirmation_timeout_ms(value: Any) -> float:
     return min(float(value), float(MAX_STATE_CONFIRMATION_TIMEOUT_MS))
 
 
+def _normalize_state_poll_interval_sec(value: Any) -> float:
+    """Keep full-state REST fallback between 1 second and a practical recovery bound."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < MIN_STATE_POLL_INTERVAL_SEC
+    ):
+        raise ValueError(f"interval_sec must be finite and at least {MIN_STATE_POLL_INTERVAL_SEC:g} second")
+    return min(float(value), MAX_STATE_POLL_INTERVAL_SEC)
+
+
 def _state_snapshot_changed(before: Optional[Mapping[str, Any]], after: Optional[Mapping[str, Any]]) -> Optional[bool]:
     """Compare HA-reported state and attributes; this does not establish physical device action."""
     if before is None or after is None:
         return None
     return (
         before.get("state") != after.get("state")
-        or before.get("attributes", {}) != after.get("attributes", {})
+        or _snapshot_attributes(before) != _snapshot_attributes(after)
     )
+
+
+def _snapshot_attributes(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return an independent, normalized copy of a snapshot's full attributes."""
+    attributes = snapshot.get("attributes")
+    return copy.deepcopy(dict(attributes)) if isinstance(attributes, Mapping) else {}
+
+
+def _notify_state_subscriber(
+    callback: Callable[..., None],
+    entity_id: str,
+    old_state: Optional[str],
+    new_state: Optional[str],
+    attributes: Optional[Mapping[str, Any]],
+) -> None:
+    """Dispatch the extended event while preserving existing three-argument consumers."""
+    try:
+        inspect.signature(callback).bind(entity_id, old_state, new_state, attributes)
+    except TypeError:
+        callback(entity_id, old_state, new_state)
+    except (ValueError, AttributeError):
+        callback(entity_id, old_state, new_state, attributes)
+    else:
+        callback(entity_id, old_state, new_state, attributes)
 
 KNOWN_ATTRIBUTE_KEYS = frozenset({
     "brightness",
@@ -253,6 +304,8 @@ class HAConnector:
 
     def is_service_allowed(self, domain: str, action: str) -> bool:
         """Enforces service-level permissions and denylists."""
+        if not isinstance(domain, str) or not isinstance(action, str) or not SERVICE_ACTION_REGEX.fullmatch(action):
+            return False
         full_svc = f"{domain}.{action}"
         if full_svc in self.denied_services or action in self.denied_services:
             return False
@@ -274,8 +327,13 @@ class HAConnector:
             new_st = item.get("state")
             old_item = self._cached_states.get(eid)
             old_st = old_item.get("state") if old_item else None
-            if old_st != new_st:
-                changes.append({"entity_id": eid, "old_state": old_st, "new_state": new_st})
+            if old_item is None or _state_snapshot_changed(old_item, item):
+                changes.append({
+                    "entity_id": eid,
+                    "old_state": old_st,
+                    "new_state": new_st,
+                    "attributes": _snapshot_attributes(item),
+                })
             self._cached_states[eid] = item
 
         # HA can remove an entity without returning a replacement state in
@@ -294,7 +352,7 @@ class HAConnector:
 
     def subscribe_state_changes(
         self,
-        callback: Callable[[str, Optional[str], Optional[str]], None],
+        callback: Callable[[str, Optional[str], Optional[str], Optional[Mapping[str, Any]]], None],
         interval_sec: float = 1.0,
     ) -> Callable[[], None]:
         """
@@ -303,6 +361,7 @@ class HAConnector:
         Falls back seamlessly to periodic REST snapshot polling if WebSocket is unavailable or disconnected.
         Returns a callable that stops the subscriber.
         """
+        interval_sec = _normalize_state_poll_interval_sec(interval_sec)
         with self._subscribers_lock:
             self._subscribers.append(callback)
 
@@ -342,7 +401,7 @@ class HAConnector:
 
     def _start_polling_fallback(
         self,
-        callback: Callable[[str, Optional[str], Optional[str]], None],
+        callback: Callable[[str, Optional[str], Optional[str], Optional[Mapping[str, Any]]], None],
         interval_sec: float = 1.0,
         run_only_when_ws_down: bool = False,
     ) -> Callable[[], None]:
@@ -356,7 +415,9 @@ class HAConnector:
                         res = self.reconcile_states()
                         for chg in res["reconciled_changes"]:
                             try:
-                                callback(chg["entity_id"], chg["old_state"], chg["new_state"])
+                                _notify_state_subscriber(
+                                    callback, chg["entity_id"], chg["old_state"], chg["new_state"], chg.get("attributes")
+                                )
                             except Exception as callback_err:
                                 # A consumer failure must not suppress other changes from
                                 # this snapshot. Reconciliation updates the cache first,
@@ -445,7 +506,9 @@ class HAConnector:
                     for change in report["reconciled_changes"]:
                         for cb in active_subs:
                             try:
-                                cb(change["entity_id"], change["old_state"], change["new_state"])
+                                        _notify_state_subscriber(
+                                            cb, change["entity_id"], change["old_state"], change["new_state"], change.get("attributes")
+                                        )
                             except Exception as cb_err:
                                 logger.exception("Error in HA reconnect state subscriber: %s", cb_err)
                 except Exception as rec_err:
@@ -471,24 +534,34 @@ class HAConnector:
                             if entity_id and self.is_entity_allowed(entity_id):
                                 old_obj = payload.get("old_state")
                                 new_obj = payload.get("new_state")
-                                old_st = old_obj.get("state") if isinstance(old_obj, dict) else None
-                                new_st = new_obj.get("state") if isinstance(new_obj, dict) else None
+                                cached_obj = self._cached_states.get(entity_id)
+                                old_snapshot = cached_obj if isinstance(cached_obj, Mapping) else old_obj
 
-                                if isinstance(new_obj, dict):
-                                    self._cached_states[entity_id] = new_obj
+                                if isinstance(new_obj, Mapping):
+                                    changed = old_snapshot is None or _state_snapshot_changed(old_snapshot, new_obj) is True
+                                    self._cached_states[entity_id] = dict(new_obj)
+                                    event_attributes: Optional[Mapping[str, Any]] = _snapshot_attributes(new_obj)
+                                    new_st = new_obj.get("state")
+                                    old_st = old_snapshot.get("state") if isinstance(old_snapshot, Mapping) else None
                                 else:
-                                    self._cached_states.pop(entity_id, None)
+                                    changed = isinstance(cached_obj, Mapping)
+                                    if changed:
+                                        self._cached_states.pop(entity_id, None)
+                                    event_attributes = None
+                                    new_st = None
+                                    old_st = cached_obj.get("state") if isinstance(cached_obj, Mapping) else None
 
-                                with self._state_condition:
-                                    self._state_condition.notify_all()
+                                if changed:
+                                    with self._state_condition:
+                                        self._state_condition.notify_all()
 
-                                with self._subscribers_lock:
-                                    active_subs = list(self._subscribers)
-                                for cb in active_subs:
-                                    try:
-                                        cb(entity_id, old_st, new_st)
-                                    except Exception as cb_err:
-                                        logger.exception("Error in state subscriber callback: %s", cb_err)
+                                    with self._subscribers_lock:
+                                        active_subs = list(self._subscribers)
+                                    for cb in active_subs:
+                                        try:
+                                            _notify_state_subscriber(cb, entity_id, old_st, new_st, event_attributes)
+                                        except Exception as cb_err:
+                                            logger.exception("Error in state subscriber callback: %s", cb_err)
 
             except Exception as exc:
                 self._ws_connected.clear()
@@ -612,8 +685,9 @@ class HAConnector:
         if not isinstance(state_data, dict):
             raise ConnectionError(f"Invalid state payload returned for {entity_id}: {state_data}")
 
-        # Update local snapshot cache
-        self._cached_states[entity_id] = state_data
+        # Keep the reconciliation baseline independent from both the injected
+        # transport object and the mutable snapshot returned to callers.
+        self._cached_states[entity_id] = copy.deepcopy(state_data)
         return state_data
 
     def get_all_states(self) -> list[dict[str, Any]]:
@@ -685,6 +759,8 @@ class HAConnector:
         - Verifies both target state and target attributes (explicit or inferred from parameters).
         - Returns structured result conforming to `domain_ha.json` contract.
         """
+        if not isinstance(action, str) or not SERVICE_ACTION_REGEX.fullmatch(action):
+            raise ValueError("action must be a 1-64 character lowercase Home Assistant service name")
         if not self.is_entity_allowed(entity_id):
             raise PermissionError(f"Entity '{entity_id}' is outside allowed domain/entity scope")
 
@@ -701,10 +777,17 @@ class HAConnector:
         service_path = f"/api/services/{domain}/{action}"
 
         body: dict[str, Any] = {"entity_id": entity_id}
-        if parameters:
-            if "entity_id" in parameters and parameters["entity_id"] != entity_id:
-                raise ValueError("parameters.entity_id cannot differ from the allowlisted target entity")
-            body.update(parameters)
+        if parameters is not None:
+            if not isinstance(parameters, Mapping):
+                raise ValueError("parameters must be an object")
+            if parameters:
+                if "entity_id" in parameters and parameters["entity_id"] != entity_id:
+                    raise ValueError("parameters.entity_id cannot differ from the allowlisted target entity")
+                extra_target_selectors = HA_TARGET_SELECTOR_PARAMETER_KEYS.intersection(parameters)
+                if extra_target_selectors:
+                    selectors = ", ".join(sorted(extra_target_selectors))
+                    raise ValueError(f"parameters cannot widen the allowlisted entity target: {selectors}")
+                body.update(parameters)
 
         # Resolve target state and attributes confirmation requirements
         expected_state: Optional[str] = None
