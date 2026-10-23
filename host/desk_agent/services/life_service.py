@@ -371,6 +371,29 @@ class LifeService:
                 FOREIGN KEY (notification_id) REFERENCES notification_receipts(notification_id)
                     ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS recovery_batches (
+                batch_id TEXT PRIMARY KEY,
+                summary_id TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending'
+            );
+
+            CREATE TABLE IF NOT EXISTS recovery_batch_items (
+                occurrence_id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
+                FOREIGN KEY (occurrence_id) REFERENCES occurrences(occurrence_id) ON DELETE CASCADE,
+                FOREIGN KEY (batch_id) REFERENCES recovery_batches(batch_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS recovery_summary_receipts (
+                summary_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                acknowledged_at TEXT NOT NULL,
+                FOREIGN KEY (summary_id) REFERENCES recovery_batches(summary_id) ON DELETE CASCADE
+            );
             """)
             try:
                 conn.execute("ALTER TABLE outbox ADD COLUMN next_retry_at TEXT;")
@@ -554,6 +577,10 @@ class LifeService:
                 FROM occurrences o
                 JOIN reminders r ON o.reminder_id = r.reminder_id
                 WHERE o.state = 'pending' AND o.scheduled_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM recovery_batch_items bi
+                      WHERE bi.occurrence_id = o.occurrence_id
+                  )
                 ORDER BY o.scheduled_at ASC
                 """,
                 (threshold,),
@@ -605,6 +632,236 @@ class LifeService:
 
             conn.commit()
             return due_list
+
+    def create_recovery_summary_batch(self, *, now_iso: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """Freeze one idempotent summary batch for overdue occurrences inside 24 hours.
+
+        This operation intentionally leaves occurrence lifecycle state untouched. The
+        durable membership relation prevents the regular CR-017 scheduler from
+        converting summarized occurrences into ringing alerts.
+        """
+        now_str = _normalize_utc_iso(now_iso or self._now_utc_str())
+        now_dt = datetime.fromisoformat(now_str.replace("Z", "+00:00")).astimezone(timezone.utc)
+        cutoff_dt = now_dt - timedelta(hours=24)
+        cutoff_str = cutoff_dt.isoformat().replace("+00:00", "Z")
+
+        with self._lock, self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._expire_recovery_summaries(conn, now_str)
+
+            # Older pending occurrences follow the existing missed/expired path;
+            # only the inclusive 24-hour window is eligible for a summary.
+            expired = conn.execute(
+                """SELECT o.occurrence_id, o.reminder_id, r.repeat_rule, r.timezone
+                   FROM occurrences o JOIN reminders r ON r.reminder_id = o.reminder_id
+                   WHERE o.state = 'pending' AND o.scheduled_at < ?""",
+                (cutoff_str,),
+            ).fetchall()
+            for row in expired:
+                conn.execute("UPDATE occurrences SET state = 'expired' WHERE occurrence_id = ?", (row["occurrence_id"],))
+                if row["repeat_rule"]:
+                    next_due = _next_occurrence_after(
+                        cutoff_str, row["repeat_rule"], now_str, row["timezone"]
+                    )
+                    if next_due:
+                        next_ts = int(datetime.fromisoformat(next_due.replace("Z", "+00:00")).timestamp())
+                        next_occ_id = f"occ-{row['reminder_id']}-{next_ts}"
+                        conn.execute(
+                            "INSERT OR IGNORE INTO occurrences (occurrence_id, reminder_id, scheduled_at, state) "
+                            "VALUES (?, ?, ?, 'pending')",
+                            (next_occ_id, row["reminder_id"], next_due),
+                        )
+                        conn.execute(
+                            "UPDATE reminders SET due_at = ?, status = 'scheduled', updated_at = ? WHERE reminder_id = ?",
+                            (next_due, now_str, row["reminder_id"]),
+                        )
+                else:
+                    conn.execute(
+                        "UPDATE reminders SET status = 'missed', updated_at = ? WHERE reminder_id = ? "
+                        "AND status NOT IN ('completed', 'cancelled', 'archived')",
+                        (now_str, row["reminder_id"]),
+                    )
+
+            rows = conn.execute(
+                """SELECT o.occurrence_id, o.reminder_id, o.scheduled_at,
+                          r.title, r.timezone
+                   FROM occurrences o JOIN reminders r ON r.reminder_id = o.reminder_id
+                   WHERE o.state = 'pending' AND o.scheduled_at <= ? AND o.scheduled_at >= ?
+                   ORDER BY o.scheduled_at ASC, o.occurrence_id ASC""",
+                (now_str, cutoff_str),
+            ).fetchall()
+            if not rows:
+                conn.commit()
+                return None
+
+            assigned: dict[str, str] = {}
+            for member in conn.execute(
+                "SELECT occurrence_id, batch_id FROM recovery_batch_items"
+            ).fetchall():
+                assigned[member["occurrence_id"]] = member["batch_id"]
+            unassigned = [row for row in rows if row["occurrence_id"] not in assigned]
+            if not unassigned:
+                batch_ids = {assigned[row["occurrence_id"]] for row in rows}
+                if len(batch_ids) == 1:
+                    result = self._recovery_batch_result(conn, next(iter(batch_ids)))
+                    conn.commit()
+                    return result
+                # Older batches are immutable; return the earliest eligible one
+                # when a scan spans multiple already-frozen recovery windows.
+                batch_id = assigned[rows[0]["occurrence_id"]]
+                result = self._recovery_batch_result(conn, batch_id)
+                conn.commit()
+                return result
+
+            members = unassigned
+            member_ids = [row["occurrence_id"] for row in members]
+            digest = hashlib.sha256("\n".join(member_ids).encode("utf-8")).hexdigest()[:32]
+            batch_id = f"recovery-batch-{digest}"
+            summary_id = f"summary-{digest}"
+            existing = conn.execute("SELECT batch_id FROM recovery_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+            if existing:
+                result = self._recovery_batch_result(conn, batch_id)
+                conn.commit()
+                return result
+
+            items = [
+                {
+                    "reminder_id": row["reminder_id"],
+                    "occurrence_id": row["occurrence_id"],
+                    "title": row["title"],
+                    "scheduled_at": _normalize_utc_iso(row["scheduled_at"]),
+                    "timezone": _validate_timezone_name(row["timezone"]),
+                }
+                for row in members
+            ]
+            visible_items = items[:20]
+            created_dt = now_dt
+            expires_at = (created_dt + timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+            payload = {
+                "summary_id": summary_id,
+                "batch_id": batch_id,
+                "created_at": now_str,
+                "expires_at": expires_at,
+                "items": visible_items,
+                "omitted_count": max(0, len(items) - len(visible_items)),
+            }
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            outbox_digest = hashlib.sha256(summary_id.encode("utf-8")).hexdigest()[:32]
+            outbox_id = f"outbox-summary-{outbox_digest}"
+
+            conn.execute(
+                "INSERT INTO recovery_batches (batch_id, summary_id, payload_json, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (batch_id, summary_id, payload_json, now_str, expires_at),
+            )
+            conn.executemany(
+                "INSERT INTO recovery_batch_items (occurrence_id, batch_id) VALUES (?, ?)",
+                [(occurrence_id, batch_id) for occurrence_id in member_ids],
+            )
+            conn.execute(
+                "INSERT INTO outbox (outbox_id, event_type, payload_json, state, retry_count, created_at) "
+                "VALUES (?, 'notification.summary.deliver', ?, 'pending', 0, ?)",
+                (outbox_id, payload_json, now_str),
+            )
+            result = {
+                "batch_id": batch_id,
+                "summary_id": summary_id,
+                "outbox_id": outbox_id,
+                "payload": payload,
+            }
+            conn.commit()
+            return result
+
+    @staticmethod
+    def _recovery_batch_result(conn: sqlite3.Connection, batch_id: str) -> Optional[dict[str, Any]]:
+        row = conn.execute(
+            "SELECT batch_id, summary_id, payload_json FROM recovery_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if not row:
+            return None
+        outbox = conn.execute(
+            "SELECT outbox_id FROM outbox WHERE event_type = 'notification.summary.deliver' "
+            "AND json_extract(payload_json, '$.summary_id') = ? ORDER BY created_at LIMIT 1",
+            (row["summary_id"],),
+        ).fetchone()
+        return {
+            "batch_id": row["batch_id"],
+            "summary_id": row["summary_id"],
+            "outbox_id": outbox["outbox_id"] if outbox else None,
+            "payload": json.loads(row["payload_json"]),
+        }
+
+    def get_recovery_summary_receipt(self, summary_id: str) -> Optional[dict[str, Any]]:
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT summary_id, source, acknowledged_at FROM recovery_summary_receipts WHERE summary_id = ?",
+                (summary_id,),
+            ).fetchone()
+            if row:
+                result = dict(row)
+                result["acknowledged"] = True
+                return result
+            batch = conn.execute(
+                "SELECT summary_id FROM recovery_batches WHERE summary_id = ?", (summary_id,)
+            ).fetchone()
+            return {"summary_id": summary_id, "acknowledged": False} if batch else None
+
+    def record_recovery_summary_ack(
+        self, event: Mapping[str, Any], *, now_iso: Optional[str] = None
+    ) -> str:
+        """Record a summary receipt only; it never completes a reminder occurrence."""
+        summary_id = event.get("summary_id")
+        source = event.get("source")
+        if event.get("type") != "notification.acknowledged" or not isinstance(summary_id, str) or not summary_id:
+            return "ignored"
+        if not isinstance(source, str) or not source:
+            return "ignored"
+        now_str = _normalize_utc_iso(now_iso or self._now_utc_str())
+        with self._lock, self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            batch = conn.execute(
+                "SELECT expires_at FROM recovery_batches WHERE summary_id = ?", (summary_id,)
+            ).fetchone()
+            if not batch:
+                conn.commit()
+                return "ignored"
+            expiry = datetime.fromisoformat(_normalize_utc_iso(batch["expires_at"]).replace("Z", "+00:00"))
+            now_dt = datetime.fromisoformat(now_str.replace("Z", "+00:00"))
+            if now_dt >= expiry:
+                self._expire_recovery_summaries(conn, now_str)
+                conn.commit()
+                return "ignored"
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO recovery_summary_receipts (summary_id, source, acknowledged_at) "
+                "VALUES (?, ?, ?)",
+                (summary_id, source, now_str),
+            ).rowcount
+            conn.execute(
+                "UPDATE recovery_batches SET state = 'acknowledged' WHERE summary_id = ? AND state != 'expired'",
+                (summary_id,),
+            )
+            conn.execute(
+                "UPDATE outbox SET state = 'acknowledged', next_retry_at = NULL "
+                "WHERE event_type = 'notification.summary.deliver' "
+                "AND json_extract(payload_json, '$.summary_id') = ? AND state != 'expired'",
+                (summary_id,),
+            )
+            conn.commit()
+            return "recorded" if inserted else "duplicate"
+
+    @staticmethod
+    def _expire_recovery_summaries(conn: sqlite3.Connection, now_iso: str) -> None:
+        """Stop pending summary delivery at the immutable summary TTL."""
+        conn.execute(
+            "UPDATE recovery_batches SET state = 'expired' WHERE expires_at <= ? AND state = 'pending'",
+            (now_iso,),
+        )
+        conn.execute(
+            "UPDATE outbox SET state = 'expired' WHERE event_type = 'notification.summary.deliver' "
+            "AND state IN ('pending', 'dispatching') AND json_extract(payload_json, '$.expires_at') <= ?",
+            (now_iso,),
+        )
 
     def get_all_occurrences(self, reminder_id: str) -> list[dict[str, Any]]:
         """Returns all occurrences for a reminder ordered by scheduled_at."""
@@ -716,6 +973,11 @@ class LifeService:
             # transaction committed. Only pending occurrences may produce a
             # new alert; otherwise a retry would enqueue duplicate playback.
             if row["occ_state"] != "pending":
+                return None
+            if topic == "reminder.alert" and conn.execute(
+                "SELECT 1 FROM recovery_batch_items WHERE occurrence_id = ?",
+                (occurrence_id,),
+            ).fetchone():
                 return None
 
             reminder_id = row["reminder_id"]
@@ -989,6 +1251,7 @@ class LifeService:
         now_str = now_iso or self._now_utc_str()
         with self._lock, self._get_connection() as conn:
             self._expire_stale_reminder_outbox(conn, now_str)
+            self._expire_recovery_summaries(conn, now_str)
             if include_delayed:
                 rows = conn.execute(
                     "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC"
@@ -1354,6 +1617,7 @@ class LifeService:
         now_str = now_iso or self._now_utc_str()
         with self._lock, self._get_connection() as conn:
             self._expire_stale_reminder_outbox(conn, now_str)
+            self._expire_recovery_summaries(conn, now_str)
             if include_delayed:
                 rows = conn.execute(
                     "SELECT * FROM outbox WHERE state = 'pending' ORDER BY created_at ASC LIMIT ?",

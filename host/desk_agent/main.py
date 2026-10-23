@@ -150,6 +150,13 @@ class DeskAgentHostApp:
         # Database and Services
         db_path = Path(self.config.get("storage", {}).get("db_path", "/var/lib/desk-agent/life_service.db"))
         self.life_service = LifeService(db_path)
+        try:
+            # One recovery scan per Host process start. Periodic reminder polling and
+            # SDK reconnects reuse the resulting immutable outbox batch.
+            self._startup_recovery_summary = self.life_service.create_recovery_summary_batch()
+        except Exception as exc:
+            self._startup_recovery_summary = None
+            logger.warning("Startup missed-reminder recovery scan failed (%s)", type(exc).__name__)
         ha_cfg = self.config.get("home_assistant", {})
         self.ha_connector = HAConnector(
             base_url=ha_cfg.get("base_url", "http://homeassistant.local:8123"),
@@ -495,6 +502,39 @@ class DeskAgentHostApp:
                                 self.life_service.record_outbox_failure(
                                     outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
                                 )
+                    elif topic == "notification.summary.deliver":
+                        if not self.managed_sdk_session or self.managed_notification_adapter is None:
+                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                            self.life_service.record_outbox_failure(
+                                outbox_id,
+                                "Managed SDK session is not ready for recovery summary",
+                                backoff_seconds=backoff,
+                                keep_pending=True,
+                            )
+                            continue
+                        try:
+                            result = self.managed_notification_adapter.deliver_summary(payload)
+                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                            # CR-018 is blocked: sys.ack/accepted is transport evidence only.
+                            # Preserve the same summary outbox item as pending/unknown to TTL.
+                            self.life_service.record_outbox_failure(
+                                outbox_id,
+                                "Recovery summary remains pending/unknown pending approved device persistence",
+                                backoff_seconds=backoff,
+                                keep_pending=True,
+                            )
+                            logger.info(
+                                "Recovery summary %s remains pending/unknown after transport attempt (state=%s)",
+                                payload.get("summary_id"), result.get("delivery_state", "unknown"),
+                            )
+                        except Exception as exc:
+                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                            self.life_service.record_outbox_failure(
+                                outbox_id,
+                                f"Managed recovery summary delivery unavailable: {type(exc).__name__}",
+                                backoff_seconds=backoff,
+                                keep_pending=True,
+                            )
                     elif topic in ("codex.completed", "codex.failed", "codex.interrupted"):
                         if self.managed_codex_feedback_adapter is not None:
                             try:
@@ -578,6 +618,12 @@ class DeskAgentHostApp:
                 if not self._scheduler_stop.is_set():
                     logger.warning("Error in reminder scheduler: %s", e)
             self._scheduler_stop.wait(1.0)
+
+    def _record_managed_notification_event(self, event: Mapping[str, Any]) -> str:
+        """Route CR-028 receipts by summary_id while preserving CR-017 behavior."""
+        if isinstance(event.get("summary_id"), str):
+            return self.life_service.record_recovery_summary_ack(event)
+        return self.life_service.record_managed_notification_event(event)
 
     def close(self) -> None:
         self._scheduler_stop.set()
@@ -1632,10 +1678,20 @@ async def _run_managed_application(config_path: Optional[str], host: str, port: 
             app.register_managed_sdk_network_log_session(context)
             lifecycle.add(app.network_log_consumer.on_disconnect)
             app.register_managed_sdk_codex_feedback_session(command_sender=transport.send_command)
+            pending_summaries = app.life_service.get_pending_outbox_messages(limit=1000, include_delayed=True)
+            known_summaries = {
+                item["payload"]["summary_id"]: item["payload"]["expires_at"]
+                for item in pending_summaries
+                if item.get("topic") == "notification.summary.deliver"
+                and isinstance(item.get("payload"), dict)
+                and isinstance(item["payload"].get("summary_id"), str)
+                and isinstance(item["payload"].get("expires_at"), str)
+            }
             notification_adapter = ManagedNotificationAdapter(
                 context,
-                app.life_service.record_managed_notification_event,
+                app._record_managed_notification_event,
                 known_notifications=app.life_service.get_active_notification_contexts(),
+                known_summaries=known_summaries,
             )
             app.managed_notification_adapter = notification_adapter
             host_loop_started = True

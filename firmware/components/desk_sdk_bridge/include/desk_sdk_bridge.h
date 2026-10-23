@@ -320,6 +320,14 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
 int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json);
 
 /**
+ * @brief Emit a CR-028 summary acknowledgement event correlated by stable summary_id.
+ *
+ * This only serializes the bridge event. Durable summary receipt/deduplication
+ * remains unavailable until the CR-018 device storage provider is approved.
+ */
+int desk_sdk_bridge_send_notification_summary_ack(const char *summary_id, const char *source);
+
+/**
  * @brief Format and dispatch hardware touch input event as contract EventEnvelope.
  */
 int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,

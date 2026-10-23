@@ -39,6 +39,7 @@ class _FakeCompanion:
 class _FakeNotificationAdapter:
     def __init__(self) -> None:
         self.notifications = []
+        self.summaries = []
         self.failures = []
 
     def deliver(self, notification):
@@ -52,6 +53,13 @@ class _FakeNotificationAdapter:
             "durable_acceptance_confirmed": False,
             "delivery_state": "unknown",
         }
+
+    def deliver_summary(self, summary):
+        self.summaries.append(summary)
+        failure = self.failures.pop(0) if self.failures else None
+        if failure is not None:
+            raise failure
+        return {"transport_acknowledged": True, "durable_acceptance_confirmed": False, "delivery_state": "unknown"}
 
     def close(self) -> None:
         pass
@@ -75,6 +83,117 @@ class ManagedNotificationOutboxTests(unittest.TestCase):
         app._delivery_thread.join(timeout=2)
         if app._delivery_thread.is_alive():
             raise AssertionError("background outbox worker did not stop")
+
+    def test_startup_scans_recovery_once_and_scheduler_poll_does_not_regenerate_batches(self) -> None:
+        from unittest.mock import patch
+        from host.desk_agent.services.life_service import LifeService
+
+        calls = []
+        original = LifeService.create_recovery_summary_batch
+
+        def tracked(service, **kwargs):
+            calls.append(kwargs)
+            return original(service, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ), patch.object(LifeService, "create_recovery_summary_batch", tracked):
+            config_path, _ = self._write_test_config(directory)
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            try:
+                self._stop_delivery_thread(app)
+                app._scheduler_stop = _OneIterationStop()
+                app._scheduler_loop()
+                self.assertEqual(len(calls), 1)
+            finally:
+                app.close()
+
+    def test_summary_transport_ack_stays_pending_and_without_managed_session_never_uses_audio(self) -> None:
+        from unittest.mock import patch
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ):
+            config_path, _ = self._write_test_config(directory)
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            try:
+                self._stop_delivery_thread(app)
+                now = datetime.now(timezone.utc)
+                app.life_service.create_reminder(
+                    reminder_id="rem-recovery-summary",
+                    title="Summary item",
+                    due_at=(now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                )
+                batch = app.life_service.create_recovery_summary_batch()
+                self.assertIsNotNone(batch)
+                outbox_id = batch["outbox_id"]
+                adapter = _FakeNotificationAdapter()
+                app.managed_notification_adapter = adapter
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+                row = app.life_service._get_connection().execute(
+                    "SELECT state, retry_count, next_retry_at, dispatched_at FROM outbox WHERE outbox_id = ?", (outbox_id,)
+                ).fetchone()
+                self.assertEqual((row["state"], row["retry_count"]), ("pending", 1))
+                self.assertIsNotNone(row["next_retry_at"])
+                self.assertIsNone(row["dispatched_at"])
+                self.assertEqual([item["summary_id"] for item in adapter.summaries], [batch["summary_id"]])
+                self.assertEqual(adapter.notifications, [])
+                self.assertEqual(app.life_service.get_all_occurrences("rem-recovery-summary")[0]["state"], "pending")
+
+                app.life_service._get_connection().execute(
+                    "UPDATE outbox SET next_retry_at = NULL WHERE outbox_id = ?", (outbox_id,)
+                )
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+                self.assertEqual([item["summary_id"] for item in adapter.summaries], [batch["summary_id"]] * 2)
+                retry_row = app.life_service._get_connection().execute(
+                    "SELECT state, retry_count, dispatched_at FROM outbox WHERE outbox_id = ?", (outbox_id,)
+                ).fetchone()
+                self.assertEqual((retry_row["state"], retry_row["retry_count"], retry_row["dispatched_at"]), ("pending", 2, None))
+
+                app.managed_sdk_session = False
+                app.managed_notification_adapter = None
+                app.register_announcement_channel(lambda *_args: self.fail("summary fell back to legacy audio"))
+                app.life_service._get_connection().execute(
+                    "UPDATE outbox SET next_retry_at = NULL WHERE outbox_id = ?", (outbox_id,)
+                )
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+                self.assertEqual(
+                    app.life_service._get_connection().execute(
+                        "SELECT state, dispatched_at FROM outbox WHERE outbox_id = ?", (outbox_id,)
+                    ).fetchone()["state"],
+                    "pending",
+                )
+                self.assertIsNone(app.life_service._get_connection().execute(
+                    "SELECT dispatched_at FROM outbox WHERE outbox_id = ?", (outbox_id,)
+                ).fetchone()["dispatched_at"])
+
+                ack = {
+                    "type": "notification.acknowledged",
+                    "summary_id": batch["summary_id"],
+                    "source": "button",
+                }
+                self.assertEqual(app._record_managed_notification_event(ack), "recorded")
+                self.assertEqual(app._record_managed_notification_event(ack), "duplicate")
+                self.assertTrue(app.life_service.get_recovery_summary_receipt(batch["summary_id"])["acknowledged"])
+                acknowledged_row = app.life_service._get_connection().execute(
+                    "SELECT state, next_retry_at, dispatched_at FROM outbox WHERE outbox_id = ?", (outbox_id,)
+                ).fetchone()
+                self.assertEqual(acknowledged_row["state"], "acknowledged")
+                self.assertIsNone(acknowledged_row["next_retry_at"])
+                self.assertIsNone(acknowledged_row["dispatched_at"])
+                self.assertEqual(app.life_service.get_all_occurrences("rem-recovery-summary")[0]["state"], "pending")
+
+                app.managed_sdk_session = True
+                app.managed_notification_adapter = adapter
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+                self.assertEqual(len(adapter.summaries), 2, "acknowledged summary must not be retried")
+            finally:
+                app.close()
 
     def test_managed_outbox_retries_same_id_and_never_marks_dispatched(self) -> None:
         from unittest.mock import patch

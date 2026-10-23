@@ -2129,6 +2129,42 @@ static unsigned desk_log_get_member(const char *object, const char *name, char *
     return matches;
 }
 
+static bool desk_log_get_member_span(const char *object, const char *name,
+                                     const char **value_start, size_t *value_len)
+{
+    if (!object || !name || !value_start || !value_len) return false;
+    desk_log_json_parser_t p = { .p = object, .depth = 0 };
+    desk_log_json_ws(&p);
+    if (*p.p++ != '{') return false;
+    desk_log_json_ws(&p);
+    unsigned matches = 0;
+    const char *found_start = NULL, *found_end = NULL;
+    if (*p.p == '}') return false;
+    for (;;) {
+        const char *key_start, *key_end;
+        if (!desk_log_json_string(&p, &key_start, &key_end)) return false;
+        desk_log_json_ws(&p);
+        if (*p.p++ != ':') return false;
+        desk_log_json_ws(&p);
+        const char *start = p.p;
+        if (!desk_log_json_value(&p)) return false;
+        const char *end = p.p;
+        if (desk_log_plain_key(key_start, key_end, name)) {
+            ++matches;
+            found_start = start;
+            found_end = end;
+        }
+        desk_log_json_ws(&p);
+        if (*p.p == '}') break;
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+    if (matches != 1) return false;
+    *value_start = found_start;
+    *value_len = (size_t)(found_end - found_start);
+    return true;
+}
+
 static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed, size_t allowed_count)
 {
     desk_log_json_parser_t p = { .p = object, .depth = 0 };
@@ -2401,6 +2437,135 @@ static int desk_sdk_notification_dispatch(const char *json_in, char *out_buf, si
     return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
 }
 
+static bool desk_sdk_summary_identifier_valid(const char *id)
+{
+    size_t len = id ? strlen(id) : 0;
+    if (len == 0 || len > 128) return false;
+    for (size_t i = 0; i < len; ++i) {
+        char c = id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) return false;
+    }
+    return true;
+}
+
+static bool desk_sdk_summary_count_valid(const char *raw)
+{
+    if (!raw || !raw[0]) return false;
+    uint64_t value = 0;
+    for (const char *p = raw; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        unsigned digit = (unsigned)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    return true;
+}
+
+static bool desk_sdk_summary_text_nonblank(const char *text)
+{
+    if (!text || !text[0]) return false;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p)
+        if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') return true;
+    return false;
+}
+
+static bool desk_sdk_summary_validate_items(const char *raw_items, size_t items_len)
+{
+    desk_log_json_parser_t p = { .p = raw_items, .depth = 0 };
+    if (*p.p++ != '[') return false;
+    desk_log_json_ws(&p);
+    uint64_t previous_us = 0;
+    unsigned count = 0;
+    if (*p.p == ']') return false;
+    for (;;) {
+        const char *start = p.p;
+        if (!desk_log_json_value(&p)) return false;
+        size_t raw_len = (size_t)(p.p - start);
+        if (raw_len >= 2048 || ++count > 20) return false;
+        char item[2048];
+        memcpy(item, start, raw_len); item[raw_len] = '\0';
+        static const char *const keys[] = {
+            "reminder_id", "occurrence_id", "title", "scheduled_at", "timezone"
+        };
+        char reminder_id[129] = "", occurrence_id[129] = "", title[1025] = "";
+        char scheduled_at[32] = "", timezone_name[65] = "";
+        uint64_t scheduled_us = 0;
+        if (!desk_log_object_keys_allowed(item, keys, sizeof(keys) / sizeof(keys[0])) ||
+            !desk_sdk_notification_get_string(item, "reminder_id", reminder_id, sizeof(reminder_id)) ||
+            !desk_sdk_notification_get_string(item, "occurrence_id", occurrence_id, sizeof(occurrence_id)) ||
+            !desk_sdk_notification_get_string(item, "title", title, sizeof(title)) ||
+            !desk_sdk_notification_get_string(item, "scheduled_at", scheduled_at, sizeof(scheduled_at)) ||
+            !desk_sdk_notification_get_string(item, "timezone", timezone_name, sizeof(timezone_name)) ||
+            strlen(reminder_id) > 128 || strlen(occurrence_id) > 128 ||
+            !desk_sdk_summary_text_nonblank(title) || strlen(title) > 256 ||
+            strlen(timezone_name) > 64 || !timezone_name[0] ||
+            !desk_sdk_notification_parse_timestamp(scheduled_at, &scheduled_us) ||
+            (count > 1 && scheduled_us < previous_us)) return false;
+        previous_us = scheduled_us;
+        desk_log_json_ws(&p);
+        if (*p.p == ']') { ++p.p; return count >= 1 && (size_t)(p.p - raw_items) == items_len; }
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+}
+
+static int desk_sdk_notification_summary_nack(char *out, size_t cap, const char *command_id,
+                                              const char *error, int code)
+{
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.nack\",\"code\":%d,\"data\":{\"type\":\"notification.summary.deliver\",\"command_id\":\"%s\",\"error\":\"%s\"}}",
+        code, command_id, error);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out_buf,
+                                                  size_t max_out_len)
+{
+    static const char *const root_keys[] = { "type", "code", "data" };
+    static const char *const data_keys[] = {
+        "summary_id", "batch_id", "created_at", "expires_at", "items", "omitted_count", "command_id"
+    };
+    char command_id[40] = "", command_raw[48] = "", root_code[16] = "";
+    const char *data = NULL;
+    size_t data_len = 0;
+    if (!desk_log_get_member_span(json_in, "data", &data, &data_len) || data_len == 0 ||
+        desk_log_get_member(data, "command_id", command_raw, sizeof(command_raw)) != 1 ||
+        !json_parse_top_level_str(data, "command_id", command_id, sizeof(command_id)) ||
+        !desk_sdk_notification_command_id_valid(command_id)) return -1;
+    if (!desk_log_object_keys_allowed(json_in, root_keys, sizeof(root_keys) / sizeof(root_keys[0])) ||
+        desk_log_get_member(json_in, "code", root_code, sizeof(root_code)) != 1 || strcmp(root_code, "0") != 0 ||
+        !desk_log_object_keys_allowed(data, data_keys, sizeof(data_keys) / sizeof(data_keys[0])))
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    if (!desk_sdk_ws_client_is_authenticated())
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "AUTH_REQUIRED", 401);
+
+    char summary_id[129] = "", batch_id[129] = "", created_at[32] = "", expires_at[32] = "";
+    char omitted_count[32] = "";
+    const char *items = NULL;
+    size_t items_len = 0;
+    uint64_t created_us = 0, expires_us = 0;
+    bool valid =
+        desk_sdk_notification_get_string(data, "summary_id", summary_id, sizeof(summary_id)) &&
+        desk_sdk_notification_get_string(data, "batch_id", batch_id, sizeof(batch_id)) &&
+        desk_sdk_summary_identifier_valid(summary_id) && desk_sdk_summary_identifier_valid(batch_id) &&
+        desk_sdk_notification_get_string(data, "created_at", created_at, sizeof(created_at)) &&
+        desk_sdk_notification_get_string(data, "expires_at", expires_at, sizeof(expires_at)) &&
+        desk_sdk_notification_parse_timestamp(created_at, &created_us) &&
+        desk_sdk_notification_parse_timestamp(expires_at, &expires_us) &&
+        expires_us > created_us && expires_us - created_us == 86400000000ULL &&
+        desk_log_get_member_span(data, "items", &items, &items_len) &&
+        desk_sdk_summary_validate_items(items, items_len) &&
+        desk_log_get_member(data, "omitted_count", omitted_count, sizeof(omitted_count)) == 1 &&
+        desk_sdk_summary_count_valid(omitted_count);
+    if (!valid)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+
+    /* CR-018 has no approved durable device store/provider for summary IDs.
+     * Preserve the stable payload ID at the bridge boundary and fail closed. */
+    return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "STORAGE_UNAVAILABLE", 503);
+}
+
 static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
 {
     desk_log_json_parser_t p = { .p = raw, .depth = 0 };
@@ -2421,13 +2586,16 @@ static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
  * TCP line server continues to use desk_sdk_bridge_process_command(). */
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len)
 {
-    char type_raw[96] = "", data[3072] = "", code_raw[16] = "";
+    char type_raw[96] = "", code_raw[16] = "";
+    char data[3072] = "";
     if (!json_in || strnlen(json_in, DESK_SDK_MAX_FRAME_LEN + 1U) > DESK_SDK_MAX_FRAME_LEN ||
         !desk_log_json_valid(json_in)) return -1;
-    if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1 ||
-        !desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;
+    if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1) return -1;
     char type[64] = "";
     if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "notification.summary.deliver") == 0)
+        return desk_sdk_notification_summary_dispatch(json_in, out_buf, max_out_len);
+    if (!desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;
     if (strcmp(type, "notification.deliver") == 0)
         return desk_sdk_notification_dispatch(json_in, out_buf, max_out_len, data);
     if (strcmp(type, "sys.log.subscribe") != 0 && strcmp(type, "sys.log.unsubscribe") != 0)
@@ -2560,6 +2728,23 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
     }
 
     return 0;
+}
+
+int desk_sdk_bridge_send_notification_summary_ack(const char *summary_id, const char *source)
+{
+    if (!desk_sdk_summary_identifier_valid(summary_id) || !source) return -1;
+    size_t source_len = strlen(source);
+    if (source_len == 0 || source_len > 64) return -1;
+    for (size_t i = 0; i < source_len; ++i) {
+        char c = source[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) return -1;
+    }
+    char payload[256];
+    int n = snprintf(payload, sizeof(payload),
+                     "{\"summary_id\":\"%s\",\"source\":\"%s\"}", summary_id, source);
+    if (n < 0 || (size_t)n >= sizeof(payload)) return -1;
+    return desk_sdk_bridge_send_event("notification.acknowledged", payload);
 }
 
 int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,

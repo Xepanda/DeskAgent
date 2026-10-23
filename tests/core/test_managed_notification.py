@@ -59,6 +59,54 @@ def notification(**changes):
 
 
 class ManagedNotificationAdapterTests(unittest.TestCase):
+    def test_expired_summary_is_not_sent(self) -> None:
+        context = FakeContext()
+        summary = {
+            "summary_id": "summary-expired", "batch_id": "batch-expired",
+            "created_at": "2026-10-22T12:00:00Z", "expires_at": "2026-10-23T12:00:00Z",
+            "items": [{
+                "reminder_id": "rem-01", "occurrence_id": "occ-01", "title": "Water",
+                "scheduled_at": "2026-10-22T11:00:00Z", "timezone": "Asia/Shanghai",
+            }],
+            "omitted_count": 0,
+        }
+        adapter = ManagedNotificationAdapter(
+            context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK,
+            now_utc=lambda: datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc),
+        )
+        result = adapter.deliver_summary(summary)
+        self.assertEqual(result["delivery_state"], "expired")
+        self.assertEqual(context._transport.commands, [])
+        adapter.close()
+
+    def test_summary_uses_separate_command_and_summary_ack_identity(self) -> None:
+        context = FakeContext()
+        events = []
+        adapter = ManagedNotificationAdapter(
+            context, events.append, sdk_version="0.1.11", lock_path=LOCK,
+            known_summaries={"summary-01": "2026-10-24T12:00:00Z"},
+        )
+        summary = {
+            "summary_id": "summary-01",
+            "batch_id": "batch-01",
+            "created_at": "2026-10-23T12:00:00Z",
+            "expires_at": "2026-10-24T12:00:00Z",
+            "items": [{
+                "reminder_id": "rem-01", "occurrence_id": "occ-01", "title": "Water",
+                "scheduled_at": "2026-10-23T11:00:00Z", "timezone": "Asia/Shanghai",
+            }],
+            "omitted_count": 0,
+        }
+        result = adapter.deliver_summary(summary)
+        self.assertEqual(context._transport.commands, [("notification.summary.deliver", summary, 3.0)])
+        self.assertEqual(result["summary_id"], "summary-01")
+        self.assertEqual(result["delivery_state"], "unknown")
+        ack = {"type": "notification.acknowledged", "data": {"summary_id": "summary-01", "source": "button"}}
+        context._transport.emit(ack)
+        context._transport.emit(ack)
+        self.assertEqual(events, [{"type": "notification.acknowledged", "summary_id": "summary-01", "source": "button"}])
+        adapter.close()
+
     def test_pinned_command_ack_is_not_device_render_play_or_user_ack(self) -> None:
         context = FakeContext()
         adapter = ManagedNotificationAdapter(context, lambda _event: None, sdk_version="0.1.11", lock_path=LOCK)

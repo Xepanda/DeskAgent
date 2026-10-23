@@ -490,7 +490,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         rc = self.lib.desk_sdk_bridge_process_ws_command(
             json.dumps(command).encode("utf-8"), out, len(out)
         )
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 0, f"dispatch rc={rc} output={out.value!r}")
         return json.loads(out.value)
 
     def test_notification_deliver_requires_authenticated_websocket(self) -> None:
@@ -607,6 +607,94 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(response["type"], "sys.nack")
         self.assertEqual(response["code"], 404)
         self.assertEqual(response["error"]["code"], "UNKNOWN_OPERATION")
+
+    @staticmethod
+    def _notification_summary(command_id: str = "0123456789abcdef0123456789abcdef") -> dict:
+        return {
+            "type": "notification.summary.deliver",
+            "code": 0,
+            "data": {
+                "summary_id": "summary:recovery-20261023-01",
+                "batch_id": "batch:recovery-20261023-01",
+                "created_at": "2026-10-23T00:00:00Z",
+                "expires_at": "2026-10-24T00:00:00Z",
+                "items": [{
+                    "reminder_id": "reminder-1",
+                    "occurrence_id": "occurrence-1",
+                    "title": "Missed reminder",
+                    "scheduled_at": "2026-10-22T12:30:00Z",
+                    "timezone": "Asia/Shanghai",
+                }],
+                "omitted_count": 0,
+                "command_id": command_id,
+            },
+        }
+
+    def test_summary_command_is_strict_and_fails_closed_without_durable_provider(self) -> None:
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.assertEqual(self.lib.desk_hardware_notification_init(None, None), -100)
+        valid = self._notification_summary()
+        response = self._dispatch_notification_ws(valid)
+        self.assertEqual(response["type"], "sys.nack")
+        self.assertEqual(response["code"], 503)
+        self.assertEqual(response["data"]["type"], "notification.summary.deliver")
+        self.assertEqual(response["data"]["command_id"], valid["data"]["command_id"])
+        self.assertEqual(response["data"]["error"], "STORAGE_UNAVAILABLE")
+        retry = json.loads(json.dumps(valid))
+        retry["data"]["command_id"] = "fedcba9876543210fedcba9876543210"
+        retry_response = self._dispatch_notification_ws(retry)
+        self.assertEqual(retry_response["data"]["command_id"], retry["data"]["command_id"])
+        self.assertEqual(retry_response["data"]["error"], "STORAGE_UNAVAILABLE")
+        self.assertNotIn("summary_id", retry_response["data"])
+
+        malformed = []
+        extra = json.loads(json.dumps(valid)); extra["data"]["unexpected"] = True; malformed.append(extra)
+        bad_id = json.loads(json.dumps(valid)); bad_id["data"]["summary_id"] = "bad id"; malformed.append(bad_id)
+        empty_items = json.loads(json.dumps(valid)); empty_items["data"]["items"] = []; malformed.append(empty_items)
+        too_many = json.loads(json.dumps(valid)); too_many["data"]["items"] *= 21; malformed.append(too_many)
+        bad_time = json.loads(json.dumps(valid)); bad_time["data"]["created_at"] = "2026-02-30T00:00:00Z"; malformed.append(bad_time)
+        wrong_expiry = json.loads(json.dumps(valid)); wrong_expiry["data"]["expires_at"] = "2026-10-23T23:59:59Z"; malformed.append(wrong_expiry)
+        unsorted = json.loads(json.dumps(valid))
+        unsorted["data"]["items"] = [json.loads(json.dumps(valid["data"]["items"][0])) for _ in range(2)]
+        unsorted["data"]["items"][0]["scheduled_at"] = "2026-10-22T13:30:00Z"
+        unsorted["data"]["items"][1]["scheduled_at"] = "2026-10-22T12:30:00Z"; malformed.append(unsorted)
+        item_extra = json.loads(json.dumps(valid)); item_extra["data"]["items"][0]["body"] = "extra"; malformed.append(item_extra)
+        item_missing = json.loads(json.dumps(valid)); del item_missing["data"]["items"][0]["timezone"]; malformed.append(item_missing)
+        blank_title = json.loads(json.dumps(valid)); blank_title["data"]["items"][0]["title"] = "  "; malformed.append(blank_title)
+        negative_omitted = json.loads(json.dumps(valid)); negative_omitted["data"]["omitted_count"] = -1; malformed.append(negative_omitted)
+        bool_omitted = json.loads(json.dumps(valid)); bool_omitted["data"]["omitted_count"] = True; malformed.append(bool_omitted)
+        root_extra = json.loads(json.dumps(valid)); root_extra["unexpected"] = True; malformed.append(root_extra)
+        for index, command in enumerate(malformed):
+            command["data"]["command_id"] = f"{index + 1:032x}"
+            response = self._dispatch_notification_ws(command)
+            with self.subTest(malformed_index=index):
+                self.assertEqual(response["type"], "sys.nack")
+                self.assertEqual(response["code"], 400)
+                self.assertEqual(response["data"]["type"], "notification.summary.deliver")
+                self.assertEqual(response["data"]["command_id"], command["data"]["command_id"])
+                self.assertEqual(response["data"]["error"], "INVALID_ARGUMENT")
+
+    def test_summary_ack_event_keeps_summary_id_separate_from_transport_command_id(self) -> None:
+        emitted: list[bytes] = []
+
+        @OUTBOUND_CB
+        def on_outbound(data: int, length: int, _user_data: int) -> int:
+            emitted.append(ctypes.string_at(data, length))
+            return 0
+
+        self.lib.desk_sdk_bridge_register_outbound(on_outbound, None)
+        self.addCleanup(self.lib.desk_sdk_bridge_register_outbound, OUTBOUND_CB(), None)
+        self.assertEqual(self.lib.desk_sdk_bridge_send_notification_summary_ack(
+            b"summary:recovery-20261023-01", b"explicit_ui"), 0)
+        self.assertEqual(len(emitted), 1)
+        event = json.loads(emitted[0])
+        self.assertEqual(event["type"], "notification.acknowledged")
+        self.assertEqual(event["payload"], {
+            "summary_id": "summary:recovery-20261023-01", "source": "explicit_ui"})
+        self.assertNotIn("command_id", event["payload"])
+        self.assertEqual(self.lib.desk_sdk_bridge_send_notification_summary_ack(b"bad id", b"explicit_ui"), -1)
+        self.assertEqual(self.lib.desk_sdk_bridge_send_notification_summary_ack(
+            b"summary:recovery-20261023-01", b"bad source"), -1)
 
     def test_cr009_event_and_queue_full_gap_are_serialized_in_sequence_order(self) -> None:
         self.lib.desk_sdk_test_prepare_log_pair()
