@@ -281,6 +281,47 @@ class TestCameraService(unittest.TestCase):
         finally:
             cam.stop_capture()
 
+    def test_snapshot_waits_for_async_sdk_frame_without_local_capture_worker(self) -> None:
+        cam = CameraViewerService(auto_start_pipeline=False)
+        result = []
+
+        def request_snapshot() -> None:
+            result.append(cam.get_snapshot(wait_timeout_ms=500))
+
+        requester = threading.Thread(target=request_snapshot)
+        requester.start()
+        deadline = time.monotonic() + 0.5
+        while not cam.is_lease_valid() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.03)
+        cam.ingest_robot_frame(TEST_JPEG)
+        requester.join(1.0)
+
+        self.assertFalse(requester.is_alive(), "snapshot wait must be bounded")
+        self.assertEqual(len(result), 1)
+        self.assertIsNotNone(result[0], "a frame pushed by the independent SDK ingress must wake the snapshot request")
+        self.assertEqual(result[0]["jpeg_data"], TEST_JPEG)
+        self.assertTrue(result[0]["is_hardware"])
+        self.assertFalse(cam.is_lease_valid(), "ephemeral lease must be released after the snapshot")
+
+    def test_snapshot_wait_returns_unavailable_when_upstream_disconnects(self) -> None:
+        cam = CameraViewerService(auto_start_pipeline=False)
+        cam.acquire_lease("sdk-owner", lease_ms=2000)
+        result = []
+        requester = threading.Thread(
+            target=lambda: result.append(cam.get_snapshot("sdk-owner", wait_timeout_ms=1000))
+        )
+        requester.start()
+        time.sleep(0.03)
+
+        started = time.monotonic()
+        self.assertTrue(cam.invalidate_owner_on_upstream_disconnect("sdk-owner"))
+        requester.join(0.5)
+
+        self.assertFalse(requester.is_alive(), "disconnect notification should wake the single-frame wait")
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(result, [None], "a disconnected source must produce unavailable, never a cached image")
+
     def test_snapshot_cannot_borrow_another_clients_lease(self) -> None:
         cam = CameraViewerService()
         cam.acquire_lease("owner-A", lease_ms=1000)

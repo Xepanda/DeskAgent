@@ -619,13 +619,17 @@ class CameraViewerService:
         self,
         client_id: Optional[str] = None,
         auto_acquire_ms: int = 5000,
+        wait_timeout_ms: int = 250,
     ) -> Optional[dict[str, Any]]:
         """
         Retrieves a fresh snapshot JPEG frame.
         If client_id is provided and holds an active lease, returns the latest frame.
-        If no active lease is held, auto-acquires a short ephemeral lease and awaits
-        a fresh frame from the capture pipeline.
+        If no active lease is held, auto-acquires a short ephemeral lease. If the
+        latest frame is absent or stale, waits briefly for any producer (local
+        capture worker or asynchronous SDK ingress) to publish a fresh JPEG.
         """
+        if isinstance(wait_timeout_ms, bool) or not isinstance(wait_timeout_ms, int) or not 0 <= wait_timeout_ms <= 5000:
+            raise ValueError("wait_timeout_ms must be an integer between 0 and 5000")
         acquired_ephemeral = False
         if self.is_lease_valid():
             with self._lock:
@@ -641,16 +645,53 @@ class CameraViewerService:
             acquired_ephemeral = True
 
         try:
-            # Check latest frame, waiting briefly if a physical source is starting.
+            # SDK ingress is independent from pipeline._running. Wait on the
+            # same condition used by all producers instead of assuming that
+            # the local capture worker is responsible for delivering a frame.
             frame = self.get_latest_frame(effective_client)
-            if frame is None and self.pipeline._running:
-                deadline = time.time() + 0.25
-                while time.time() < deadline:
-                    time.sleep(0.02)
-                    frame = self.get_latest_frame(effective_client)
-                    if frame is not None:
-                        break
+            if frame is None and wait_timeout_ms:
+                frame = self._wait_for_fresh_frame(effective_client, wait_timeout_ms / 1000.0)
             return frame
         finally:
             if acquired_ephemeral:
                 self.release_lease(effective_client)
+
+    def _wait_for_fresh_frame(self, client_id: str, timeout_s: float) -> Optional[dict[str, Any]]:
+        """Wait for a fresh JPEG from any producer while this client owns the lease."""
+        deadline = time.monotonic() + timeout_s
+        expired_owner: Optional[str] = None
+        frame: Optional[dict[str, Any]] = None
+        with self._frame_changed:
+            while True:
+                now_wall = time.time()
+                if self._active_lease_owner != client_id:
+                    break
+                if now_wall >= self._lease_expires_at:
+                    expired_owner = self._expire_lease_locked(now_wall)
+                    break
+                age_ms = (time.monotonic() - self._latest_frame_monotonic) * 1000
+                if (
+                    self._latest_jpeg is not None
+                    and self._latest_frame_monotonic > 0
+                    and age_ms <= self.stale_threshold_ms
+                ):
+                    is_hw = self._is_hardware_frame
+                    frame = {
+                        "frame_seq": self._frame_seq,
+                        "jpeg_data": self._latest_jpeg,
+                        "frame_age_ms": max(0, int(age_ms)),
+                        "is_stale": False,
+                        "is_masked": False,
+                        "source": "hardware_sensor" if is_hw else "external_source",
+                        "is_hardware": is_hw,
+                        "metadata": dict(self._latest_frame_metadata or {}),
+                    }
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._frame_changed.wait(remaining)
+        if expired_owner:
+            self.pipeline.stop()
+            self._trigger_teardown(expired_owner, "expired")
+        return frame

@@ -1654,6 +1654,13 @@ class TestSdkBridgeProtocol(unittest.TestCase):
             "client_id": "stream-owner", "session_id": "paired-session", "command_id": "b" * 32,
             "data": {"stream_id": stream_id},
         }
+        aliased_stop = dict(stop)
+        aliased_stop["data"] = {"stream_id": stream_id + 0x10000}
+        rejected_alias = self._process_ws_cmd(aliased_stop)
+        self.assertEqual(rejected_alias.get("type"), "sys.nack",
+                         "out-of-range stream IDs must not alias a live uint16 stream")
+        self.assertTrue(self.lib.desk_sdk_bridge_camera_stream_is_active(),
+                        "rejecting an aliased ID must preserve the active stream")
         stopped = self._process_ws_cmd(stop)
         self.assertEqual(stopped.get("type"), "sys.ack")
         repeated = self._process_ws_cmd(stop)

@@ -167,7 +167,7 @@ int main(void) {
 
     def test_hardware_wrapper_propagates_camera_driver_error(self):
         source = HARDWARE_C.read_text(encoding="utf-8")
-        capture = source.split("int desk_hardware_camera_capture_jpeg(", 1)[1]
+        capture = source.split("static int camera_capture_jpeg_unlocked(", 1)[1]
         capture = capture.split("\n}", 1)[0]
         self.assertIn("return drv_ret;", capture)
         driver_path = capture.split("if (s_board_driver_ops", 1)[1].split("\n    }", 1)[0]

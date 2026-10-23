@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "com.epanda.desk-agent-r1",
+  "name": "Desk Agent R1 Host",
+  "version": "0.1.0",
+  "requires_watcherobot": ">=0.1.11,<0.2",
+  "dependencies": [
+    "jsonschema>=4.20,<5",
+    "requests>=2.31,<3",
+    "websockets>=14,<16",
+    "tzdata==2026.5"
+  ],
+  "description": "Desk Agent Host managed by the WatcheRobot SDK Runtime"
+}

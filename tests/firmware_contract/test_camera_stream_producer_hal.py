@@ -71,10 +71,17 @@ class CameraStreamProducerHalTests(unittest.TestCase):
         cls.lib.desk_hardware_camera_stream_is_ready.restype = ctypes.c_bool
         cls.lib.desk_hardware_camera_stream_is_available.restype = ctypes.c_bool
         cls.lib.desk_hardware_camera_stream_stop.restype = ctypes.c_int
+        cls.lib.desk_hardware_camera_capture_jpeg.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_uint32,
+        ]
+        cls.lib.desk_hardware_camera_capture_jpeg.restype = ctypes.c_int
         cls.lib.desk_hardware_camera_inject_frame.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32]
         cls.lib.desk_hardware_camera_inject_frame.restype = ctypes.c_int
         cls.lib.desk_hardware_test_set_camera_start_gate.argtypes = [START_GATE_CB]
         cls.lib.desk_hardware_test_set_camera_start_gate.restype = None
+        cls.lib.desk_hardware_test_set_camera_monotonic_us.argtypes = [ctypes.c_uint64]
+        cls.lib.desk_hardware_test_set_camera_monotonic_us.restype = None
 
     def setUp(self) -> None:
         self.lib.desk_hardware_init()
@@ -83,6 +90,7 @@ class CameraStreamProducerHalTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.lib.desk_hardware_test_set_camera_start_gate(START_GATE_CB())
+        self.lib.desk_hardware_test_set_camera_monotonic_us(0)
 
     def _install_capture_driver(self, capture):
         init = INIT_CB(lambda: 0)
@@ -115,6 +123,32 @@ class CameraStreamProducerHalTests(unittest.TestCase):
         self.assertIn("!desk_watcher_camera_is_ready()", probe)
         self.assertIn("heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)", probe)
         self.assertIn("return false;", probe)
+
+    def test_esp_stream_pump_uses_fresh_watcher_capture_and_real_monotonic_timestamp(self) -> None:
+        repo_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        hardware = Path(repo_root, "firmware/components/desk_hardware/src/desk_hardware.c").read_text(
+            encoding="utf-8"
+        )
+        board = Path(repo_root, "firmware/components/desk_hardware/src/desk_watcher_board.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(".camera_capture = desk_watcher_camera_capture", board)
+        start = hardware.split("int desk_hardware_camera_stream_start(", 1)[1].split(
+            "int desk_hardware_camera_stream_pump(", 1
+        )[0]
+        self.assertIn("desk_hardware_camera_stream_is_available()", start)
+        self.assertIn("heap_caps_malloc(CAMERA_MAX_JPEG_LEN", start)
+
+        pump = hardware.split("int desk_hardware_camera_stream_pump(", 1)[1].split(
+            "bool desk_hardware_camera_stream_is_ready(", 1
+        )[0]
+        self.assertIn("ops->camera_capture(capture_buf, CAMERA_MAX_JPEG_LEN, &jpeg_len, 1000)", pump)
+        self.assertIn("camera_is_complete_jpeg(capture_buf, jpeg_len)", pump)
+        self.assertIn("uint64_t mono_ms = ui_now_mono_us() / 1000u", pump)
+        self.assertNotIn("s_cam_stream_last_timestamp_ms + 1u", pump)
+        self.assertIn("cb(capture_buf, jpeg_len, timestamp_ms, user_data)", pump)
+        self.assertLess(pump.index("cb(capture_buf, jpeg_len, timestamp_ms, user_data)"),
+                        pump.index("s_cam_stream_ready = true"))
 
     def test_lease_match_requires_active_unexpired_exact_owner(self) -> None:
         self.assertEqual(self.lib.desk_arbiter_camera_acquire_lease(b"viewer-a", 1000), 0)
@@ -151,8 +185,10 @@ class CameraStreamProducerHalTests(unittest.TestCase):
         self.assertEqual(self.lib.desk_hardware_camera_stream_start(b"viewer-b", 15.0, cb, None), -5)
         self.assertEqual(self.lib.desk_hardware_camera_stream_start(b"viewer-a", 15.0, cb, None), 0)
         self.assertFalse(self.lib.desk_hardware_camera_stream_is_ready())
+        self.lib.desk_hardware_test_set_camera_monotonic_us(10_000_000)
         self.assertEqual(self.lib.desk_hardware_camera_stream_pump(), 0)
         self.assertTrue(self.lib.desk_hardware_camera_stream_is_ready())
+        self.lib.desk_hardware_test_set_camera_monotonic_us(10_001_000)
         self.assertEqual(self.lib.desk_hardware_camera_stream_pump(), 0)
         self.assertEqual(captures, [item[0] for item in callbacks])
         self.assertNotEqual(callbacks[0][0], callbacks[1][0])
@@ -164,6 +200,33 @@ class CameraStreamProducerHalTests(unittest.TestCase):
         self.assertNotEqual(self.lib.desk_hardware_camera_stream_pump(), 0)
         self.assertEqual(len(callbacks), 2)
         self.lib.desk_arbiter_camera_release_lease(b"viewer-a")
+
+    def test_nonadvancing_capture_clock_rejects_frame_without_fabricating_timestamp(self) -> None:
+        callbacks = []
+
+        def capture(out_buf, max_len, out_len, timeout_ms):
+            frame = (b"\xff\xd8\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+                     b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x00\xff\xd9")
+            ctypes.memmove(out_buf, frame, len(frame))
+            out_len[0] = len(frame)
+            return 0
+
+        self._install_capture_driver(capture)
+        self.assertEqual(self.lib.desk_arbiter_camera_acquire_lease(b"viewer-a", 5000), 0)
+        cb = FRAME_CB(lambda buf, length, timestamp, data: callbacks.append(timestamp))
+        self.assertEqual(self.lib.desk_hardware_camera_stream_start(b"viewer-a", 15.0, cb, None), 0)
+        self.lib.desk_hardware_test_set_camera_monotonic_us(20_000_000)
+        self.assertEqual(self.lib.desk_hardware_camera_stream_pump(), 0)
+        self.assertEqual(callbacks, [20_000])
+
+        self.assertEqual(self.lib.desk_hardware_camera_stream_pump(), -4)
+        self.assertEqual(callbacks, [20_000])
+        self.assertFalse(self.lib.desk_hardware_camera_stream_is_ready())
+
+        self.lib.desk_hardware_test_set_camera_monotonic_us(20_001_000)
+        self.assertEqual(self.lib.desk_hardware_camera_stream_pump(), 0)
+        self.assertEqual(callbacks, [20_000, 20_001])
+        self.assertEqual(self.lib.desk_hardware_camera_stream_stop(), 0)
 
     def test_lease_reassignment_during_capture_suppresses_old_owner_callback(self) -> None:
         callbacks = []
@@ -302,6 +365,42 @@ class CameraStreamProducerHalTests(unittest.TestCase):
         self.assertEqual(self.lib.desk_hardware_camera_stream_pump(), -2)
         self.assertTrue(self.lib.desk_arbiter_camera_lease_matches(b"viewer-a"))
         self.lib.desk_arbiter_camera_release_lease(b"viewer-a")
+
+    def test_single_capture_and_stream_producer_are_mutually_exclusive(self) -> None:
+        capture_entered = threading.Event()
+        allow_capture_to_finish = threading.Event()
+
+        def capture(out_buf, max_len, out_len, timeout_ms):
+            capture_entered.set()
+            allow_capture_to_finish.wait(2)
+            frame = (b"\xff\xd8\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+                     b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x00\xff\xd9")
+            ctypes.memmove(out_buf, frame, len(frame))
+            out_len[0] = len(frame)
+            return 0
+
+        self._install_capture_driver(capture)
+        self.assertEqual(self.lib.desk_arbiter_camera_acquire_lease(b"viewer-a", 5000), 0)
+        jpeg = (ctypes.c_uint8 * 128)()
+        jpeg_len = ctypes.c_size_t()
+        capture_result = []
+        capture_thread = threading.Thread(target=lambda: capture_result.append(
+            self.lib.desk_hardware_camera_capture_jpeg(jpeg, len(jpeg), ctypes.byref(jpeg_len), 1000)
+        ))
+        capture_thread.start()
+        self.assertTrue(capture_entered.wait(1))
+
+        cb = FRAME_CB(lambda *args: None)
+        self.assertEqual(self.lib.desk_hardware_camera_stream_start(b"viewer-a", 15.0, cb, None), -5)
+        allow_capture_to_finish.set()
+        capture_thread.join(1)
+        self.assertEqual(capture_result, [0])
+
+        self.assertEqual(self.lib.desk_hardware_camera_stream_start(b"viewer-a", 15.0, cb, None), 0)
+        self.assertEqual(self.lib.desk_hardware_camera_capture_jpeg(
+            jpeg, len(jpeg), ctypes.byref(jpeg_len), 1000
+        ), -5)
+        self.assertEqual(self.lib.desk_hardware_camera_stream_stop(), 0)
 
 
 if __name__ == "__main__":

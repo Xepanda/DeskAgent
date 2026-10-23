@@ -5,11 +5,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The native production source intentionally has no platform lock. Serialize
+ * each harness call so this test exercises event deduplication/order without
+ * introducing C data races that do not exist on ESP's critical-section path. */
+static pthread_mutex_t s_publish_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void *publish_same_mqtt_state(void *arg)
 {
     const bool connected = (bool)(uintptr_t)arg;
     for (size_t i = 0; i < 1000U; ++i) {
+        assert(pthread_mutex_lock(&s_publish_mutex) == 0);
         (void)desk_watcher_log_source_publish_tuya_mqtt_state(connected);
+        assert(pthread_mutex_unlock(&s_publish_mutex) == 0);
     }
     return NULL;
 }
@@ -18,7 +25,9 @@ static void *publish_audio_snapshot(void *arg)
 {
     const bool ready = (bool)(uintptr_t)arg;
     for (size_t i = 0; i < 1000U; ++i) {
+        assert(pthread_mutex_lock(&s_publish_mutex) == 0);
         (void)desk_watcher_log_source_publish_audio_driver_state(ready);
+        assert(pthread_mutex_unlock(&s_publish_mutex) == 0);
     }
     return NULL;
 }
@@ -89,11 +98,28 @@ int main(void)
                               (void *)(uintptr_t)false) == 0);
     }
     for (size_t i = 0; i < 8U; ++i) assert(pthread_join(threads[i], NULL) == 0);
-    record = take_one();
-    assert(record.event_id == DESK_WATCHER_LOG_EVENT_TUYA_MQTT_STATE);
-    record = take_one();
-    assert(record.event_id == DESK_WATCHER_LOG_EVENT_AUDIO_DRIVER_STATE_SNAPSHOT);
-    assert(record.state == DESK_WATCHER_LOG_STATE_NOT_READY);
+    bool saw_mqtt_state = false;
+    bool saw_audio_state = false;
+    for (size_t i = 0; i < 2U; ++i) {
+        record = take_one();
+        if (record.event_id == DESK_WATCHER_LOG_EVENT_TUYA_MQTT_STATE) {
+            assert(!saw_mqtt_state);
+            assert(record.component == DESK_WATCHER_LOG_COMPONENT_NETWORK);
+            assert(record.level == DESK_WATCHER_LOG_LEVEL_WARN);
+            assert(record.state == DESK_WATCHER_LOG_STATE_CONNECTED);
+            saw_mqtt_state = true;
+        } else if (record.event_id == DESK_WATCHER_LOG_EVENT_AUDIO_DRIVER_STATE_SNAPSHOT) {
+            assert(!saw_audio_state);
+            assert(record.component == DESK_WATCHER_LOG_COMPONENT_AUDIO);
+            assert(record.level == DESK_WATCHER_LOG_LEVEL_WARN);
+            assert(record.state == DESK_WATCHER_LOG_STATE_NOT_READY);
+            saw_audio_state = true;
+        } else {
+            assert(0);
+        }
+    }
+    assert(saw_mqtt_state);
+    assert(saw_audio_state);
     assert(!desk_watcher_log_source_try_dequeue(&record));
 
     /* Global 30/minute cap applies before sequence allocation; only queue-full

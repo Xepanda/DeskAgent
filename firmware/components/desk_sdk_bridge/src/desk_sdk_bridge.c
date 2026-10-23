@@ -2631,6 +2631,11 @@ static int desk_sdk_camera_stream_command(const char *json, char *out, size_t ca
 
     if (strcmp(type, "ctrl.camera.stream.stop") == 0) {
         int32_t stream_id = json_parse_int(data, "stream_id", -1);
+        /* The wire field is uint16. Reject wider values before any narrowing
+         * conversion so an unknown ID cannot alias and stop a live stream. */
+        if (stream_id <= 0 || stream_id > UINT16_MAX)
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "INVALID_SESSION", 404, 0, 0, false);
         pthread_mutex_lock(&s_camera_stream.mutex);
         bool match = stream_id > 0 && s_camera_stream.active &&
                      (uint16_t)stream_id == s_camera_stream.stream_id &&

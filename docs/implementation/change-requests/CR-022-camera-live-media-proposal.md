@@ -1,7 +1,7 @@
 # CR-022：相机实时 MJPEG 媒体流协议裁定
 
 - **裁定方：** A0 架构与协议
-- **状态：** **A0 ADJUDICATED / APPROVED FOR IMPLEMENTATION**（协议与产品目标已冻结；尚未实现、构建或实机验收）
+- **状态：** **A0 ADJUDICATED / APPROVED FOR IMPLEMENTATION**（协议与产品目标已冻结；当前源码已有 A1 相机 producer 与设备流路径实现，源码/软件证据不代表真实 HX 帧或 L3/L4 验收）
 - **授权依据：** 用户明确要求继续实现相机真实采集及视频/实时媒体推流，并授权“按冻结协议或经 A0 裁定的变更实现”。本裁定据此解除“只允许 2 FPS 快照”对实时媒体目标的限制。
 - **关联：** [CR-004](../cr-004-sdk-camera-frame-delivery.md)、[CR-006](../CR-006-host-mjpeg-camera-stream.md)、[CR-011](../CR-011-hx6538-transport-adjudication.md)、[CR-002](../cr-002-wspk-media-frame-limit.md)、`contracts/camera_frame_delivery.md`
 - **范围：** 冻结设备到 Host 的实时相机帧协议、Host 到浏览器的媒体路径、最低验收指标及资源/安全语义。允许 A1/A2/A3/A6 按 ownership 实现；不表示 HX6538 已达到指标，也不代表任何 L3/L4 通过。
@@ -86,7 +86,7 @@
 ## 5. Ownership 与验证
 
 - **A0（本裁定）：** 冻结 capability、消息、帧格式、实时目标与安全/资源语义；任何改变外层 WSPK、WJPG 字段、指标或路径的变更回到 A0。
-- **A1 `firmware/components/desk_hardware/`：** 实现真实新鲜帧 producer 和唯一相机仲裁；先证明 640×480、15 FPS/10 分钟、内存峰值与并发可行。当前 `desk_hardware_camera_stream_start/pump()` 在 ESP 路径返回 unavailable，`desk_watcher_camera_capture()` 为单次 PTL JPEG，因此源端实现是明确依赖，不得用循环 mock pump 声称完成。
+- **A1 `firmware/components/desk_hardware/`：** 源码已注册 `desk_watcher_camera_capture` 为 Watcher camera op，并接通真实采集 producer。HAL 按 real driver、首帧 ready 与 PSRAM 分配条件准入；每次 pump 调用真实 capture 并检查完整 JPEG，不以缓存帧或 mock 填充序列。仍须实测 640×480、15 FPS/10 分钟、内存峰值与并发能力；源码实现不等于 HX6538 真实帧或性能验收通过。
 - **A2 `firmware/components/desk_sdk_bridge/`：** 实现 `camera.stream.mjpeg.wspk.v1` capability、上述 start/stop ACK、WSPK `FRAME_IMAGE` WJPG v1 frame、授权/session gate、序号、背压/错误计数和 disconnect teardown；保持原 `camera.capture` 语义并互斥。
 - **A3 `host/desk_agent/connectors/robot/`：** 使用锁定 WatcheRobot SDK `ApplicationChannels` 的原始 binary callback，不创建第二个 Runtime；解析并关联 WSPK/WJPG、同步时钟、丢弃旧 generation、在有效 lease 内将 JPEG 交给 A6。既有 Robot `camera.capture()` adapter 只服务单帧模式。
 - **A6 `host/desk_agent/camera/` 与 `web/`：** 沿用 CR-006 的 Host multipart MJPEG、Bearer/lease owner 校验和 one-slot viewer；输出帧龄/序号/渲染速率指标、freshness timeout 清图、断线 unavailable 与重新连接状态。
@@ -94,9 +94,9 @@
 
 ### A1 → A2 必需接口关口（未满足前 A2 必须 fail-closed）
 
-当前 `desk_arbiter_camera_is_lease_active()` 只能回答是否存在有效租约，不能证明当前 `client_id` 是 owner；ESP 上 `desk_hardware_camera_stream_start/pump()` 又明确返回 `DESK_HW_ERR_UNAVAILABLE`。因此 A2 不得只依赖全局 active 标志向任意 command sender 开流或返回成功 ACK。A1 在 `firmware/components/desk_hardware/` 必须先交付以下接口语义：
+此前记录的 ESP stream `start/pump` 返回 `DESK_HW_ERR_UNAVAILABLE` 已过期。当前源码路径已连接真实 Watcher capture op，并以 real driver、ready 与 PSRAM 条件门控；pump 每次调用真实 capture 并验证 JPEG。A2 仍不得只依赖全局 active 标志向任意 command sender 开流或返回成功 ACK，必须遵守以下 owner 与生命周期语义：
 
-1. 以现有 `desk_hardware_camera_stream_start/pump/stop` 为基础实现真实 ESP 路径，并增加 `desk_hardware_camera_stream_is_ready()`；`start` 接收当前 `client_id` 并绑定整个 producer generation，pump 在采集前与 callback 前都必须复核该 owner：
+1. 现有 `desk_hardware_camera_stream_start/pump/stop` 与 `desk_hardware_camera_stream_is_ready()` 已有真实 ESP 采集路径；源码关口要求为 `start` 接收当前 `client_id` 并绑定整个 producer generation，pump 在采集前与 callback 前都复核该 owner：
    - `start()` 校验 callback/FPS、初始化并取得唯一 sensor/SPI owner；没有真实可用源、资源冲突或目标模式不支持时返回明确错误，绝不能启动合成/注入/mock producer。
    - `is_ready()` 只有在收到至少一张来自实际 HX PTL capture 的完整、通过 JPEG/长度检查的新帧后才返回 true；A2 在 ready 前不得 ACK start。每个 pump/callback 帧附实际采集时的 monotonic 毫秒时间戳，不能使用 Host 发送时间或模拟递增时间。
    - `pump()` 每次最多推进一个新物理采集，错误必须保留并向 A2 返回；它不能复用上一张 JPEG 充当下一帧。若按 15 FPS 调度做不到，保持失败并上报实际错误/耗时。
@@ -119,6 +119,6 @@
 - CR-004 和 `contracts/camera_frame_delivery.md`：目前 `camera.capture()` 为 request/response，SDK adapter 最高 2 FPS，Host 单帧新鲜度槽；不能满足上述实时门槛。
 - CR-006：已有 Host `/api/camera/stream` multipart relay、Bearer/lease owner 校验、单槽 latest-frame 和过期清图语义，可复用浏览器出口，不证明源端持续帧。
 - 固定 WatcheRobot SDK commit：`src/watcherobot/protocol.py` 定义 `FRAME_VIDEO=2`、`FRAME_IMAGE=3`；`src/watcherobot/robot.py::_on_binary()` 将 FRAME_VIDEO 专用于已启动的 face-tracking preview，将 FRAME_IMAGE 放入容量 1 的 image queue；`application/channels.py` 暴露原始 Application frame；`examples/sdk_media_lab/web/app.js::parseWjpgPacket()` 解析 WJPG v1 20-byte header；`runtime/daemon/runtime.py::device_status()` 暴露示例 `:82/ws/mjpeg` URL。该 SDK 示例 URL/ready 不能替代本产品认证。
-- 本仓 `firmware/components/desk_hardware/src/desk_hardware.c` 的 ESP stream start/pump 当前 unavailable；`desk_watcher_camera.c::desk_watcher_camera_capture()` 是带 SYNC/PTL deadline 的单次 JPEG 路径。**因此本裁定目前仅是 A0 协议决策（L1），连续物理 producer、FPS/分辨率/延迟、SPI/语音并发、实际 paired Runtime 收发和浏览器画面均待 A1/A2/A3/A6/A7 实现及硬件验收；不宣称直播已跑通。**
+- 本仓 `firmware/components/desk_hardware/src/desk_hardware.c` 已把 stream start/pump 接到 Watcher camera op `desk_watcher_camera_capture`：start 受 real driver、ready 与 PSRAM 条件门控，pump 每次执行真实 capture 并验证 JPEG。该结论仅为源码审查/软件路径证据（L1/L2）；**真实 HX6538 帧、分辨率/FPS/延迟、SPI/语音并发、实际 paired Runtime 收发和浏览器画面仍未通过 L3/L4 验收。**历史日志中 `rc=-25`、PTL header 零字节的失败也仍是现场取帧 blocker，不能由源码实现替代。
 
 - 当前 desk_sdk_bridge.c 的 ctrl.camera.capture 仍是每条命令分配缓冲、调用一次 desk_hardware_camera_capture_jpeg() 并发送一条 FRAME_IMAGE；其现有捕获缓冲为 64 KiB。该单帧路径不等价于本 CR 主动流，A2 需实现独立 stream handler 并复核有界 JPEG buffer。

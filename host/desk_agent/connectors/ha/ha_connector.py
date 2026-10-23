@@ -647,8 +647,9 @@ class HAConnector:
         if not isinstance(state_data, dict):
             raise ConnectionError(f"Invalid state payload returned for {entity_id}: {state_data}")
 
-        # Update local snapshot cache
-        self._cached_states[entity_id] = state_data
+        # Keep the reconciliation baseline independent from both the injected
+        # transport object and the mutable snapshot returned to callers.
+        self._cached_states[entity_id] = copy.deepcopy(state_data)
         return state_data
 
     def get_all_states(self) -> list[dict[str, Any]]:

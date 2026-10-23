@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -536,6 +537,33 @@ class RobotAdapterCorrelationTestCase(unittest.TestCase):
         self.assertEqual(res["code"], 408)
         self.assertEqual(res["status"], "timeout")
         self.assertLess(elapsed, 1.5, "fallback read must respect the timeout budget")
+
+    def test_fallback_deadline_ignores_forward_wall_clock_jump(self) -> None:
+        """A wall-clock sync must not expire a live request before its monotonic budget."""
+        adapter, _client, firmware_sock = self._make_workerless_adapter()
+
+        def firmware() -> None:
+            request = json.loads(firmware_sock.recv(4096).decode("utf-8").splitlines()[0])
+            time.sleep(0.05)
+            firmware_sock.sendall((json.dumps({
+                "type": "sys.ack",
+                "code": 0,
+                "request_id": request["request_id"],
+                "data": {"status": "accepted"},
+            }) + "\n").encode("utf-8"))
+
+        firmware_thread = threading.Thread(target=firmware, daemon=True)
+        firmware_thread.start()
+        # Before the fix, send_command reads these as [deadline base, current
+        # time], expiring immediately. A monotonic elapsed-time budget is
+        # unaffected by the simulated wall-clock correction.
+        with patch("host.desk_agent.connectors.robot.robot_adapter.time.time", side_effect=[100.0, 10_000.0]):
+            result = adapter.send_command(
+                {"type": "ctrl.motion.move", "request_id": "req-wall-jump-0001", "data": {}},
+                timeout=0.5,
+            )
+        firmware_thread.join(timeout=1.0)
+        self.assertEqual(result.get("type"), "sys.ack", result)
 
     def test_late_ack_does_not_linger_in_pending_map(self) -> None:
         adapter, _client, _firmware = self._make_adapter()

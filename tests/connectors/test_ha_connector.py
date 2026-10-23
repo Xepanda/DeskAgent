@@ -393,6 +393,30 @@ class TestHAConnector(unittest.TestCase):
         }])
         self.assertEqual(ha.reconcile_states()["reconciled_changes"], [])
 
+    def test_mutating_get_state_result_cannot_corrupt_reconciliation_baseline(self) -> None:
+        state = {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 100}}
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            if url.endswith("/api/states/light.desk"):
+                return 200, state
+            return 200, [state]
+
+        ha = HAConnector(base_url="http://ha.test:8123", token="token", transport=mock_transport)
+        returned_snapshot = ha.get_state("light.desk")
+        returned_snapshot["state"] = "off"
+        returned_snapshot["attributes"]["brightness"] = 0
+
+        state["state"] = "off"
+        state["attributes"]["brightness"] = 0
+        changes = ha.reconcile_states()["reconciled_changes"]
+
+        self.assertEqual(changes, [{
+            "entity_id": "light.desk",
+            "old_state": "on",
+            "new_state": "off",
+            "attributes": {"brightness": 0},
+        }])
+
     def test_reconcile_emits_new_entity_attributes_and_removal_once(self) -> None:
         state_data = []
 

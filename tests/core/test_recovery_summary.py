@@ -224,3 +224,19 @@ class TestRecoverySummary(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM recovery_batch_items").fetchone()[0], 0)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
         self.assertEqual(self.service.get_all_occurrences("rollback")[0]["state"], "pending")
+
+    def test_read_only_database_fails_closed_without_consuming_occurrences(self) -> None:
+        """CR-018: summary persistence errors must not be reported as queued."""
+        occurrence_id = self._reminder("readonly", "2026-10-23T11:00:00Z")
+        conn = self.service._get_connection()
+        conn.execute("PRAGMA query_only = ON")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        conn.execute("PRAGMA query_only = OFF")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM recovery_batches").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM recovery_batch_items").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(self.service.get_all_occurrences("readonly")[0]["occurrence_id"], occurrence_id)
+        self.assertEqual(self.service.get_all_occurrences("readonly")[0]["state"], "pending")

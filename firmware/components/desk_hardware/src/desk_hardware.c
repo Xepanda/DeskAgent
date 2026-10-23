@@ -135,8 +135,15 @@ static uint64_t ui_now_epoch_us(void)
     return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_usec;
 }
 
+#ifdef DESK_HARDWARE_TEST
+static uint64_t s_camera_test_mono_us;
+#endif
+
 static uint64_t ui_now_mono_us(void)
 {
+#ifdef DESK_HARDWARE_TEST
+    if (s_camera_test_mono_us != 0) return s_camera_test_mono_us;
+#endif
 #ifdef ESP_PLATFORM
     int64_t now = esp_timer_get_time();
     return now > 0 ? (uint64_t)now : 0;
@@ -188,6 +195,7 @@ static bool s_cam_stream_starting = false;
 static bool s_cam_stream_cancel_start = false;
 static bool s_cam_stream_stopping = false;
 static bool s_cam_stream_inflight = false;
+static bool s_cam_capture_inflight = false;
 static bool s_cam_stream_ready = false;
 static uint32_t s_cam_stream_last_timestamp_ms = 0;
 static float s_cam_target_fps = 0.0f;
@@ -199,6 +207,10 @@ static void (*s_camera_start_test_gate)(void);
 void desk_hardware_test_set_camera_start_gate(void (*gate)(void))
 {
     s_camera_start_test_gate = gate;
+}
+void desk_hardware_test_set_camera_monotonic_us(uint64_t now_us)
+{
+    s_camera_test_mono_us = now_us;
 }
 #endif
 #ifdef ESP_PLATFORM
@@ -968,6 +980,7 @@ int desk_hardware_init(void)
     s_cam_stream_cancel_start = false;
     s_cam_stream_stopping = false;
     s_cam_stream_inflight = false;
+    s_cam_capture_inflight = false;
     s_cam_stream_ready = false;
     s_cam_stream_last_timestamp_ms = 0;
     s_cam_cb = NULL;
@@ -1334,7 +1347,8 @@ int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, 
 #endif
 }
 
-int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
+static int camera_capture_jpeg_unlocked(uint8_t *out_buf, size_t max_len, size_t *out_len,
+                                        uint32_t timeout_ms)
 {
     if (out_len) *out_len = 0;
     if (!out_buf || !out_len) return DESK_HW_ERR_INVALID_ARG;
@@ -1380,6 +1394,27 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
 #endif
 }
 
+int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len,
+                                       uint32_t timeout_ms)
+{
+    camera_stream_state_lock();
+    if (s_cam_streaming || s_cam_stream_starting || s_cam_stream_stopping ||
+        s_cam_stream_inflight || s_cam_capture_inflight) {
+        camera_stream_state_unlock();
+        if (out_len) *out_len = 0;
+        return DESK_HW_ERR_BUSY;
+    }
+    s_cam_capture_inflight = true;
+    camera_stream_state_unlock();
+
+    int rc = camera_capture_jpeg_unlocked(out_buf, max_len, out_len, timeout_ms);
+
+    camera_stream_state_lock();
+    s_cam_capture_inflight = false;
+    camera_stream_state_unlock();
+    return rc;
+}
+
 bool desk_hardware_camera_stream_is_available(void)
 {
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
@@ -1405,7 +1440,8 @@ int desk_hardware_camera_stream_start(const char *client_id, float target_fps,
     if (!client_id || client_id[0] == '\0' || strlen(client_id) >= sizeof(s_cam_client_id) ||
         !cb || !isfinite(target_fps) || target_fps <= 0.0f) return DESK_HW_ERR_INVALID_ARG;
     camera_stream_state_lock();
-    if (s_cam_streaming || s_cam_stream_starting || s_cam_stream_stopping || s_cam_stream_inflight) {
+    if (s_cam_streaming || s_cam_stream_starting || s_cam_stream_stopping ||
+        s_cam_stream_inflight || s_cam_capture_inflight) {
         camera_stream_state_unlock();
         return DESK_HW_ERR_BUSY;
     }
@@ -1515,17 +1551,16 @@ int desk_hardware_camera_stream_pump(void)
             rc = DESK_HW_ERR_IO;
         } else {
             camera_stream_state_lock();
-            bool dispatch = s_cam_streaming && s_cam_cb == cb && s_cam_stream_buf == capture_buf;
             uint32_t timestamp_ms = (uint32_t)mono_ms;
+            bool stream_current = s_cam_streaming && s_cam_cb == cb && s_cam_stream_buf == capture_buf;
+            bool timestamp_fresh = s_cam_stream_last_timestamp_ms == 0 ||
+                                   (int32_t)(timestamp_ms - s_cam_stream_last_timestamp_ms) > 0;
+            bool dispatch = stream_current && timestamp_fresh;
             if (dispatch) {
-                if (s_cam_stream_last_timestamp_ms != 0 &&
-                    (int32_t)(timestamp_ms - s_cam_stream_last_timestamp_ms) <= 0) {
-                    timestamp_ms = s_cam_stream_last_timestamp_ms + 1u;
-                }
                 s_cam_stream_last_timestamp_ms = timestamp_ms;
-                s_cam_stream_ready = true;
             }
             camera_stream_state_unlock();
+            if (stream_current && !timestamp_fresh) rc = DESK_HW_ERR_IO;
             /* A lease may expire or be reassigned while the physical capture is in progress. */
             dispatch = dispatch && desk_arbiter_camera_lease_matches(client_id) &&
                        desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR) == DESK_OWNER_LAN_CAMERA;
@@ -1533,12 +1568,18 @@ int desk_hardware_camera_stream_pump(void)
                 camera_stream_state_lock();
                 s_cam_stream_ready = false;
                 camera_stream_state_unlock();
-                rc = DESK_HW_ERR_BUSY;
+                if (rc == DESK_HW_OK) rc = DESK_HW_ERR_BUSY;
             }
             if (dispatch) {
                 cb(capture_buf, jpeg_len, timestamp_ms, user_data);
+                camera_stream_state_lock();
+                if (s_cam_streaming && s_cam_cb == cb && s_cam_stream_buf == capture_buf &&
+                    s_cam_stream_last_timestamp_ms == timestamp_ms) {
+                    s_cam_stream_ready = true;
+                }
+                camera_stream_state_unlock();
             } else {
-                rc = DESK_HW_ERR_BUSY;
+                if (rc == DESK_HW_OK) rc = DESK_HW_ERR_BUSY;
             }
         }
     }

@@ -386,8 +386,11 @@ class RobotAdapter:
 
         try:
             # Wait for the response correlated to THIS request_id only.
-            deadline = time.time() + timeout
-            while time.time() < deadline and not self._stop_event.is_set():
+            # Wall-clock adjustments (for example WSL host-time sync) can jump
+            # forward during a short wait and expire every concurrent waiter.
+            # Deadlines are elapsed-time budgets, so use the monotonic clock.
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not self._stop_event.is_set():
                 with self._lock:
                     if req_id in self._pending_responses:
                         return self._pending_responses.pop(req_id)
@@ -399,7 +402,7 @@ class RobotAdapter:
                     # unbounded blocking recv(), and serialise readers so two
                     # waiters cannot split one coalesced ACK segment between
                     # them (which would hang the loser past its deadline).
-                    remaining = deadline - time.time()
+                    remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
                     if not self._fallback_recv_lock.acquire(timeout=min(remaining, 0.05)):
