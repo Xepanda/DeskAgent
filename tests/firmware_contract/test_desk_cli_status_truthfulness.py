@@ -254,7 +254,10 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
                              "static void cmd_peripherals(int argc, char *argv[])\n{")
         self.assertIn('argc == 2 && strcmp(argv[1], "stop") == 0', body)
         self.assertIn('argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)', body)
-        self.assertIn('Usage: body [status|move <pan_deg> <tilt_deg> [duration_ms]|stop]', body)
+        self.assertIn('Usage: body [status|probe|move <pan_deg> <tilt_deg> [duration_ms]|stop]', body)
+        self.assertIn('strcmp(argv[1], "probe") == 0', body)
+        self.assertIn('desk_watcher_motion_probe(&peer, 1000U)', body)
+        self.assertIn('no valid correlated HELLO_RSP', body)
         self.assertIn('return;\n    }\n    printf("Usage: body', body)
 
     def test_cli_rejects_truncated_lines_and_ignored_extra_arguments(self) -> None:

@@ -245,7 +245,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"display", "Display status or set expression: display [preset] [status]", cmd_display},
     {"audio", "Audio diagnostic: audio [status|sample|test|stop]", cmd_audio},
     {"camera", "Camera subsystem diagnostic: camera [status|capture]", cmd_camera},
-    {"body", "STM32 control: body [status|move <pan> <tilt> [duration_ms]|stop]", cmd_body},
+    {"body", "STM32 control: body [status|probe|move <pan> <tilt> [duration_ms]|stop]", cmd_body},
     {"peripherals", "Board peripherals status (RTC, LED, battery)", cmd_peripherals},
     {"input", "Read-only input driver status and event counters", cmd_input},
     {"network", "SDK TCP/UDP server status: network [status]", cmd_network},
@@ -510,6 +510,24 @@ static void cmd_camera(int argc, char *argv[])
 
 static void cmd_body(int argc, char *argv[])
 {
+    if (argc == 2 && strcmp(argv[1], "probe") == 0) {
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        desk_watcher_motion_peer_info_t peer = {0};
+        int rc = desk_watcher_motion_probe(&peer, 1000U);
+        if (rc == DESK_HW_OK) {
+            printf("STM32 HELLO valid: response_seq=%08lx fw=%u.%u.%u hw=%u caps=0x%02x sensors=0x%02x stream_profile=%u\r\n",
+                   (unsigned long)peer.response_seq,
+                   (unsigned)peer.fw_major, (unsigned)peer.fw_minor, (unsigned)peer.fw_patch,
+                   (unsigned)peer.hw_version, (unsigned)peer.capability_bitmap,
+                   (unsigned)peer.sensor_bitmap, (unsigned)peer.default_stream_profile);
+        } else {
+            printf("STM32 HELLO failed: rc=%d (no valid correlated HELLO_RSP)\r\n", rc);
+        }
+#else
+        printf("STM32 HELLO probe unavailable on host simulation.\r\n");
+#endif
+        return;
+    }
     if (argc >= 2 && strcmp(argv[1], "move") == 0) {
         float pan = 0.0f, tilt = 0.0f;
         uint32_t duration_ms = 500;
@@ -593,15 +611,17 @@ static void cmd_body(int argc, char *argv[])
         printf("  Timeouts: %lu; retries: %lu; last motion error: %s\r\n",
                (unsigned long)motion_diag.timeout_count, (unsigned long)motion_diag.retry_count,
                cli_motion_error_name(motion_diag.last_error));
+        printf("  Ignored non-HELLO/invalid probe frames: %lu\r\n",
+               (unsigned long)motion_diag.hello_ignored_frame_count);
         printf("  STM32 peer evidence: %s (since boot; no physical position feedback)\r\n",
                motion_diag.ack_count > 0 ? "valid ACK observed" : "no valid ACK observed");
 #else
         printf("  STM32 peer/ACK state: UNKNOWN (no board motion diagnostics API)\r\n");
 #endif
-        printf("  UART Protocol: A5 5A Class=0x02 Motion Frame\r\n");
+        printf("  Read-only probe: body probe (official COBS/0 SYS HELLO)\r\n");
         return;
     }
-    printf("Usage: body [status|move <pan_deg> <tilt_deg> [duration_ms]|stop]\r\n");
+    printf("Usage: body [status|probe|move <pan_deg> <tilt_deg> [duration_ms]|stop]\r\n");
 }
 
 static void cmd_peripherals(int argc, char *argv[])
