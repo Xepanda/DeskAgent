@@ -48,6 +48,20 @@ class TestRecoverySummary(unittest.TestCase):
         outbox = self.service.get_pending_outbox_messages(now_iso="2026-10-23T12:00:00Z")
         self.assertEqual([message["topic"] for message in outbox], ["notification.summary.deliver"])
 
+    def test_scan_excludes_cancelled_or_archived_reminders_even_if_occurrence_is_pending(self) -> None:
+        self._reminder("cancelled", "2026-10-23T11:00:00Z")
+        self._reminder("archived", "2026-10-23T11:30:00Z")
+        conn = self.service._get_connection()
+        conn.execute("UPDATE reminders SET status = 'cancelled' WHERE reminder_id = 'cancelled'")
+        conn.execute("UPDATE reminders SET status = 'archived' WHERE reminder_id = 'archived'")
+        conn.commit()
+
+        batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.assertIsNone(batch)
+        self.assertEqual(self.service.get_all_occurrences("cancelled")[0]["state"], "pending")
+        self.assertEqual(self.service.get_all_occurrences("archived")[0]["state"], "pending")
+
     def test_summary_orders_utc_limits_to_twenty_and_counts_omitted_exactly(self) -> None:
         for index in range(25):
             self._reminder(

@@ -686,7 +686,8 @@ class LifeService:
                 """SELECT o.occurrence_id, o.reminder_id, o.scheduled_at,
                           r.title, r.timezone
                    FROM occurrences o JOIN reminders r ON r.reminder_id = o.reminder_id
-                   WHERE o.state = 'pending' AND o.scheduled_at <= ? AND o.scheduled_at >= ?
+                   WHERE o.state = 'pending' AND r.status NOT IN ('completed', 'cancelled', 'archived')
+                     AND o.scheduled_at <= ? AND o.scheduled_at >= ?
                    ORDER BY o.scheduled_at ASC, o.occurrence_id ASC""",
                 (now_str, cutoff_str),
             ).fetchall()
