@@ -1838,10 +1838,10 @@ class LifeService:
             if row["state"] == "cancelled":
                 return
             is_summary_delivery = row["event_type"] == "notification.summary.deliver"
-            if is_summary_delivery and row["state"] != "dispatching":
-                # A summary failure belongs only to the claim currently being
-                # delivered. ACK/expiry/cancellation are terminal and must not
-                # be overwritten by a late adapter result.
+            if is_summary_delivery and row["state"] not in {"pending", "dispatching"}:
+                # Pre-claim availability failures may back off a pending item;
+                # post-claim adapter failures may back off a dispatching item.
+                # ACK/expiry/cancellation are terminal and must not be revived.
                 return
             new_retries = row["retry_count"] + 1
             if row["event_type"] == "reminder.alert":
@@ -1874,8 +1874,8 @@ class LifeService:
                 conn.execute(
                     "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
                     "WHERE outbox_id = ? AND event_type = 'notification.summary.deliver' "
-                    "AND state = 'dispatching'",
-                    (new_retries, new_state, next_retry, outbox_id),
+                    "AND state = ?",
+                    (new_retries, new_state, next_retry, outbox_id, row["state"]),
                 )
             else:
                 conn.execute(
