@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import subprocess
@@ -2584,6 +2585,103 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(response.get("type"), "sys.nack")
         self.assertEqual(response.get("error", {}).get("code"), "UNKNOWN_OPERATION")
         self.assertNotEqual(response.get("code"), 0)
+
+    def test_notification_status_callback_is_wired_to_authenticated_ws(self) -> None:
+        """Bridge init wires the real HAL callback; deliver ACK is not a status event."""
+        events: list[dict] = []
+
+        @OUTBOUND_CB
+        def outbound_handler(data_ptr, length, _user_data):
+            events.append(json.loads(ctypes.string_at(data_ptr, length).decode("utf-8")))
+            return 0
+
+        self.lib.desk_sdk_bridge_register_outbound(outbound_handler, None)
+        self.addCleanup(lambda: self.lib.desk_sdk_bridge_register_outbound(
+            ctypes.cast(None, OUTBOUND_CB), None))
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_sdk_test_ws_clear_control_queue()
+        response = self._process_ws_cmd({
+            "type": "notification.deliver", "code": 0,
+            "data": {
+                "notification_id": "bridge-init-notify-001",
+                "reminder_id": "reminder-001",
+                "occurrence_id": "bridge-init-notify-001",
+                "title": "Callback wiring",
+                "scheduled_at": "2035-01-02T10:00:00Z",
+                "expires_at": "2035-01-02T11:00:00Z",
+                "is_catchup": False,
+                "command_id": "0123456789abcdef0123456789abcdef",
+            },
+        })
+        self.assertEqual(response["type"], "sys.ack")
+        self.assertEqual(events, [{
+            "type": "notification.status",
+            "data": {"notification_id": "bridge-init-notify-001", "status": "accepted"},
+        }])
+
+    def test_firmware_poll_processes_at_most_one_pending_notification(self) -> None:
+        """One poll expires one record even if the test WebSocket has no live socket."""
+        class NotificationStatus(ctypes.Structure):
+            _fields_ = [
+                ("notification_id", ctypes.c_char * 65),
+                ("status", ctypes.c_int),
+                ("error_code", ctypes.c_int),
+                ("acknowledged", ctypes.c_bool),
+                ("ack_source", ctypes.c_char * 32),
+            ]
+
+        get_status = self.lib.desk_hardware_notification_get_status
+        get_status.restype = ctypes.c_int
+        get_status.argtypes = [ctypes.c_char_p, ctypes.POINTER(NotificationStatus)]
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_sdk_test_ws_clear_control_queue()
+        now = datetime.now(timezone.utc)
+        scheduled = (now - timedelta(seconds=2)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        expires = (now + timedelta(seconds=2)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        for index in (1, 2):
+            notification_id = f"poll-expire-{index}"
+            response = self._process_ws_cmd({
+                "type": "notification.deliver", "code": 0,
+                "data": {
+                    "notification_id": notification_id,
+                    "reminder_id": f"reminder-{index}",
+                    "occurrence_id": notification_id,
+                    "title": "Poll queue item",
+                    "scheduled_at": scheduled,
+                    "expires_at": expires,
+                    "is_catchup": False,
+                    "command_id": f"{index:032x}",
+                },
+            })
+            self.assertEqual(response["type"], "sys.ack")
+        time.sleep(max(0, (datetime.fromisoformat(expires.replace("Z", "+00:00")) -
+                           datetime.now(timezone.utc)).total_seconds()) + 0.05)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_firmware_poll(0)
+        first = NotificationStatus()
+        second = NotificationStatus()
+        self.assertEqual(get_status(b"poll-expire-1", ctypes.byref(first)), 0)
+        self.assertEqual(get_status(b"poll-expire-2", ctypes.byref(second)), 0)
+        self.assertEqual(first.status, 4)  # DESK_NOTIFICATION_EXPIRED
+        self.assertEqual(second.status, 0)  # DESK_NOTIFICATION_ACCEPTED
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_firmware_poll(0)
+        self.assertEqual(get_status(b"poll-expire-2", ctypes.byref(second)), 0)
+        self.assertEqual(second.status, 4)
+
+        # Source guard keeps future refactors from moving this work outside the poll loop.
+        source_path = os.path.join(
+            os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..")),
+            "firmware", "components", "desk_sdk_bridge", "src", "desk_sdk_bridge.c",
+        )
+        with open(source_path, encoding="utf-8") as source_file:
+            source = source_file.read()
+        poll_start = source.index("int desk_firmware_poll(int timeout_ms)")
+        poll_end = source.index("#ifdef ESP_PLATFORM", poll_start)
+        poll_body = source[poll_start:poll_end]
+        self.assertEqual(poll_body.count("desk_hardware_notification_process_pending()"), 1)
+        self.assertIn("desk_hardware_notification_init(", source)
 
     def test_notification_status_serializer_emits_contract_events_on_websocket_path(self) -> None:
         """Every notification status maps to one typed event, never raw display text."""

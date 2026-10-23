@@ -83,6 +83,8 @@ static bool desk_sdk_log_command_id_valid(const char *id);
 static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed,
                                          size_t allowed_count);
 static bool desk_sdk_log_pairing_is_complete(void);
+static void desk_sdk_notification_status_callback(
+    const desk_notification_status_event_t *event, void *user_data);
 static void desk_sdk_summary_ack_callback(const char *summary_id, const char *source,
                                           void *user_data);
 
@@ -1350,6 +1352,10 @@ int desk_sdk_bridge_init(void)
     desk_sdk_ws_client_close();
     if (desk_hardware_register_roller_delta_cb(desk_sdk_roller_input_observer, NULL) != DESK_HW_OK) {
         printf("[SDK-INPUT] roller observer registration failed\n");
+        return -1;
+    }
+    if (desk_hardware_notification_init(desk_sdk_notification_status_callback, NULL) != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION][ERROR] hardware notification init failed\n");
         return -1;
     }
     if (desk_hardware_notification_register_summary_ack_callback(
@@ -3332,6 +3338,23 @@ static void desk_sdk_summary_ack_callback(const char *summary_id, const char *so
     (void)desk_sdk_bridge_send_notification_summary_ack(summary_id, source);
 }
 
+static void desk_sdk_notification_status_callback(
+    const desk_notification_status_event_t *event, void *user_data)
+{
+    (void)user_data;
+    if (!event) return;
+    /* User acknowledgement has its own contract event and is never a status. */
+    if (event->status == DESK_NOTIFICATION_ACKNOWLEDGED) {
+        printf("[SDK-NOTIFICATION][WARN] acknowledgement callback has no device event mapping\n");
+        return;
+    }
+    int rc = desk_sdk_bridge_send_notification_status(event->notification_id, event->status);
+    if (rc != 0) {
+        printf("[SDK-NOTIFICATION][WARN] status send failed id=%s status=%d rc=%d\n",
+               event->notification_id, (int)event->status, rc);
+    }
+}
+
 static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out_buf,
                                                   size_t max_out_len)
 {
@@ -4336,6 +4359,11 @@ int desk_firmware_poll(int timeout_ms)
     desk_sdk_socket_server_poll(half);
     desk_sdk_pairing_server_poll(half);
     desk_sdk_ws_client_poll(half);
+    int notification_rc = desk_hardware_notification_process_pending();
+    if (notification_rc != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION][WARN] pending notification processing failed rc=%d\n",
+               notification_rc);
+    }
     return 0;
 }
 
