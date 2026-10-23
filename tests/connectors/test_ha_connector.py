@@ -642,6 +642,38 @@ class TestHAConnector(unittest.TestCase):
         self.assertGreaterEqual(len(state_reads), 2)  # Baseline and bounded confirmation reads.
         self.assertTrue(all(timeout <= 0.08 + 1e-9 for timeout in state_reads), state_reads)
 
+    def test_execute_reports_entity_unavailable_after_accepted_service_without_claiming_transition(self) -> None:
+        """A service can be accepted while the entity disappears before HA state confirmation."""
+        state_reads = 0
+
+        def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
+            nonlocal state_reads
+            if method == "POST":
+                return 200, []
+            if method == "GET":
+                state_reads += 1
+                if state_reads == 1:
+                    return 200, {"entity_id": "light.desk", "state": "off", "attributes": {}}
+                # Match HA's /api/states/{entity_id} response when the entity
+                # is removed or becomes unavailable after the accepted call.
+                return 404, {"message": "Entity not found"}
+            return 500, None
+
+        ha = HAConnector(
+            base_url="http://ha.test:8123", token="token", timeout_sec=0.5, transport=mock_transport,
+        )
+        result = ha.execute(
+            "light.desk", "turn_on",
+            wait_for_state={"expected_state": "on", "timeout_ms": 80},
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertIsNone(result["observed_state"])
+        self.assertFalse(result["state_confirmed"])
+        self.assertIsNone(result["state_changed"])
+        self.assertIsNone(result["physical_action_confirmed"])
+        self.assertGreaterEqual(state_reads, 2)
+
     def test_execute_with_wait_for_state_timeout(self) -> None:
         """When state does NOT reach expected_state before timeout, state_confirmed is False."""
         def mock_transport(method: str, url: str, headers: Mapping[str, str], payload: Optional[Mapping[str, Any]], timeout: float):
