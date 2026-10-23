@@ -189,6 +189,8 @@ class DeskAgentHostApp:
         self._managed_camera_raw_observer_remove: Optional[Callable[[], None]] = None
         self._camera_stream_metadata_lock = threading.Lock()
         self._latest_camera_stream_metadata: Optional[dict[str, Any]] = None
+        self._snapshot_rate_limit_lock = threading.Lock()
+        self._last_snapshot_request_at: dict[str, float] = {}
 
         codex_cfg = self.config.get("codex", {})
         companion_url = codex_cfg.get("companion_url") or self.config.get("codex_companion", {}).get("endpoint")
@@ -1051,7 +1053,7 @@ class DeskAgentHostApp:
         """Preserve stream metadata at the A3-to-A6 seam while updating A6's JPEG slot."""
         with self._camera_stream_metadata_lock:
             self._latest_camera_stream_metadata = dict(metadata)
-        self.camera_service.ingest_robot_frame(jpeg)
+        self.camera_service.ingest_robot_frame(jpeg, metadata)
 
     def _clear_camera_stream_metadata(self) -> None:
         lock = getattr(self, "_camera_stream_metadata_lock", None)
@@ -1070,6 +1072,31 @@ class DeskAgentHostApp:
         if self._managed_camera_raw_observer_remove is not None:
             self._managed_camera_raw_observer_remove()
             self._managed_camera_raw_observer_remove = None
+
+    @staticmethod
+    def _admit_snapshot_request(app: Any, client_id: str) -> tuple[bool, float]:
+        """Enforce one single-frame snapshot request per client every 500 ms."""
+        lock = getattr(app, "_snapshot_rate_limit_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            app._snapshot_rate_limit_lock = lock
+            app._last_snapshot_request_at = {}
+        now = time.monotonic()
+        with lock:
+            recent = app._last_snapshot_request_at
+            previous = recent.get(client_id)
+            if previous is not None and now - previous < 0.5:
+                return False, max(0.0, 0.5 - (now - previous))
+            if len(recent) >= 1024:
+                cutoff = now - 60.0
+                for key, stamp in tuple(recent.items()):
+                    if stamp < cutoff:
+                        recent.pop(key, None)
+            if len(recent) >= 1024 and client_id not in recent:
+                oldest = min(recent, key=recent.get)
+                recent.pop(oldest, None)
+            recent[client_id] = now
+            return True, 0.0
 
     def register_managed_sdk_codex_feedback_session(
         self,
@@ -1364,10 +1391,11 @@ def make_request_handler(app: DeskAgentHostApp):
                 # Extract client_id from query params if present
                 client_id = None
                 if "?" in self.path:
-                    query = self.path.split("?", 1)[1]
-                    for param in query.split("&"):
-                        if param.startswith("client_id="):
-                            client_id = param.split("=", 1)[1]
+                    query_values = parse_qs(
+                        urlsplit(self.path).query, keep_blank_values=True
+                    ).get("client_id", [])
+                    if query_values:
+                        client_id = query_values[0]
 
                 is_snapshot_path = (
                     self.path == "/snapshot"
@@ -1376,6 +1404,7 @@ def make_request_handler(app: DeskAgentHostApp):
                     or self.path.startswith("/snapshot.jpg?")
                     or self.path.startswith("/api/camera/snapshot")
                 )
+                is_single_frame_path = self.path.startswith("/api/camera/frame")
 
                 is_stream_path = (
                     self.path == "/api/camera/stream"
@@ -1469,6 +1498,28 @@ def make_request_handler(app: DeskAgentHostApp):
                             stream.close()
                     return
 
+                if is_snapshot_path or is_single_frame_path:
+                    effective_client = client_id or "snapshot-viewer"
+                    admitted, retry_after = DeskAgentHostApp._admit_snapshot_request(
+                        app, effective_client
+                    )
+                    if not admitted:
+                        self.send_response(429)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Camera-Mode", "snapshot-preview")
+                        self.send_header("X-Camera-Description", "Snapshot preview, maximum 2 FPS")
+                        self.send_header("X-Camera-Max-FPS", "2")
+                        self.send_header("Retry-After", str(max(1, int(retry_after + 0.999))))
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "error": "SNAPSHOT_RATE_LIMITED",
+                            "message": "Snapshot preview is limited to 2 FPS; LIVE stream is available at /api/camera/stream.",
+                            "max_fps": 2,
+                            "retry_after_ms": int(retry_after * 1000 + 0.999),
+                        }).encode())
+                        return
+
                 if is_snapshot_path:
                     ephemeral_lease_acquired = False
                     if app.camera_service.is_lease_valid():
@@ -1480,7 +1531,6 @@ def make_request_handler(app: DeskAgentHostApp):
                             return
                         effective_client = client_id
                     else:
-                        effective_client = client_id or "snapshot-viewer"
                         acq = app.camera_service.acquire_lease(effective_client, lease_ms=5000)
                         if not acq.get("granted"):
                             self.send_response(403)
@@ -1600,6 +1650,9 @@ def make_request_handler(app: DeskAgentHostApp):
                         self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
                         self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
                         self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
+                        self.send_header("X-Camera-Mode", "snapshot-preview")
+                        self.send_header("X-Camera-Description", "Snapshot preview, maximum 2 FPS")
+                        self.send_header("X-Camera-Max-FPS", "2")
                         self.end_headers()
                         self.wfile.write(frame_info["jpeg_data"])
                     finally:
@@ -1648,6 +1701,9 @@ def make_request_handler(app: DeskAgentHostApp):
                     self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
                     self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
                     self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
+                    self.send_header("X-Camera-Mode", "snapshot-preview")
+                    self.send_header("X-Camera-Description", "Snapshot preview, maximum 2 FPS")
+                    self.send_header("X-Camera-Max-FPS", "2")
                     self.end_headers()
                     self.wfile.write(frame_info["jpeg_data"])
             else:

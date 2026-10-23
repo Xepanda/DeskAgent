@@ -217,8 +217,8 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
                 self.on_lease_released = None
                 self.frames = []
 
-            def ingest_robot_frame(self, jpeg):
-                self.frames.append(jpeg)
+            def ingest_robot_frame(self, jpeg, metadata=None):
+                self.frames.append((jpeg, metadata))
 
             def invalidate_owner_on_upstream_disconnect(self, owner):
                 with self._lock:
@@ -274,8 +274,10 @@ class OfficialCameraStreamIngressTests(unittest.TestCase):
         jpeg = jpeg_fixture()
         raw = packet(jpeg)
         observer("device", raw)
-        self.assertEqual(app.camera_service.frames, [jpeg])
+        self.assertEqual(len(app.camera_service.frames), 1)
+        self.assertEqual(app.camera_service.frames[0][0], jpeg)
         metadata = app.latest_camera_stream_metadata
+        self.assertEqual(app.camera_service.frames[0][1], metadata)
         self.assertEqual(metadata["sequence"], 1)
         self.assertIn("capture_timestamp_ms", metadata)
         self.assertIn("host_receive_monotonic_ms", metadata)

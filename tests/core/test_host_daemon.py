@@ -55,6 +55,12 @@ class TestHostDaemon(unittest.TestCase):
         cls.server_thread.start()
         time.sleep(0.1)
 
+    def setUp(self) -> None:
+        # This class shares one Host across tests; keep the production per-client
+        # limiter while isolating each test's client history.
+        with self.app._snapshot_rate_limit_lock:
+            self.app._last_snapshot_request_at.clear()
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
@@ -634,7 +640,7 @@ class TestHostDaemon(unittest.TestCase):
             error.exception.close()
 
     def test_snapshot_endpoint_retrieval(self) -> None:
-        """Verifies GET /snapshot returns fresh JPEG with anti-caching and frame headers."""
+        """Snapshot responses identify the low-rate preview API explicitly."""
         jpeg = b"\xff\xd8host-test-image\xff\xd9"
         self.app.camera_service.set_hardware_frame_source(lambda: jpeg)
         snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
@@ -644,7 +650,47 @@ class TestHostDaemon(unittest.TestCase):
                 self.assertEqual(snap_resp.headers.get("Content-Type"), "image/jpeg")
                 self.assertIn("no-cache", snap_resp.headers.get("Cache-Control", ""))
                 self.assertIsNotNone(snap_resp.headers.get("X-Frame-Seq"))
+                self.assertEqual(snap_resp.headers.get("X-Camera-Mode"), "snapshot-preview")
+                self.assertEqual(snap_resp.headers.get("X-Camera-Max-FPS"), "2")
+                self.assertIn("maximum 2 FPS", snap_resp.headers.get("X-Camera-Description", ""))
                 self.assertEqual(snap_resp.read(), jpeg)
+        finally:
+            self.app.camera_service.set_hardware_frame_source(None)
+
+    def test_snapshot_is_limited_to_2_fps_per_client_and_recovers(self) -> None:
+        jpeg_prefix = b"\xff\xd8snapshot-rate-limit-"
+        frame_id = [0]
+
+        def next_jpeg():
+            frame_id[0] += 1
+            return jpeg_prefix + bytes([frame_id[0] % 255]) + b"\xff\xd9"
+
+        self.app.camera_service.set_hardware_frame_source(next_jpeg)
+        client_id = "snapshot-rate-limit-regression"
+        first_url = f"http://127.0.0.1:{self.port}/snapshot?client_id={client_id}"
+        alias_url = f"http://127.0.0.1:{self.port}/api/camera/snapshot?client_id={client_id}"
+        try:
+            with urlopen(first_url) as first:
+                self.assertEqual(first.status, 200)
+
+            with self.assertRaises(HTTPError) as limited:
+                urlopen(alias_url)
+            self.assertEqual(limited.exception.code, 429)
+            self.assertEqual(limited.exception.headers.get("X-Camera-Mode"), "snapshot-preview")
+            self.assertEqual(limited.exception.headers.get("X-Camera-Max-FPS"), "2")
+            self.assertTrue(limited.exception.headers.get("Retry-After"))
+            body = json.loads(limited.exception.read().decode("utf-8"))
+            self.assertEqual(body["error"], "SNAPSHOT_RATE_LIMITED")
+            self.assertIn("LIVE", body["message"])
+            limited.exception.close()
+
+            admitted, _ = DeskAgentHostApp._admit_snapshot_request(
+                self.app, "snapshot-rate-limit-independent-client"
+            )
+            self.assertTrue(admitted)
+            time.sleep(0.51)
+            with urlopen(first_url) as recovered:
+                self.assertEqual(recovered.status, 200)
         finally:
             self.app.camera_service.set_hardware_frame_source(None)
 
@@ -1068,6 +1114,16 @@ class TestCameraStreamRoute(unittest.TestCase):
         self.assertTrue(self.service.iterator_closed)
         self.assertFalse(any(call[0] == "release" for call in self.service.calls))
         self.assertEqual(self.service.active_lease_owner, "viewer-1")
+
+    def test_live_stream_is_not_subject_to_snapshot_rate_limit(self) -> None:
+        self.service.end_after_first = True
+        for _ in range(2):
+            request = Request(self.url, headers={"Authorization": "Bearer stream-test-token"})
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("multipart/x-mixed-replace", response.headers.get("Content-Type", ""))
+                self.assertIn(b"first", response.read())
+        self.assertEqual(len([call for call in self.service.calls if call[0] == "iter"]), 2)
 
     def test_stream_fails_closed_when_no_bearer_token_is_configured(self) -> None:
         self.app.config["auth_token"] = None
