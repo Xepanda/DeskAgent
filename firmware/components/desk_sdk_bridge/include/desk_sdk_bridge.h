@@ -22,6 +22,7 @@ extern "C" {
 #include <stddef.h>
 #include "desk_hardware.h"
 #include "desk_arbiter.h"
+#include "desk_notification.h"
 
 /**
  * @brief Capabilities declared by Desk Agent firmware to the Python SDK.
@@ -350,6 +351,17 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
  * remains unavailable until the CR-018 device storage provider is approved.
  */
 int desk_sdk_bridge_send_notification_summary_ack(const char *summary_id, const char *source);
+
+/**
+ * @brief Emit one CR-017 notification status event through the SDK event path.
+ *
+ * Serializes only notification_id and the stable status enum name; it never
+ * infers rendered/played from a command ACK or sends notification text.
+ * @return 0 when queued, -1 for invalid ID/status, unauthenticated session,
+ *         or send failure.
+ */
+int desk_sdk_bridge_send_notification_status(const char *notification_id,
+                                             desk_notification_status_t status);
 
 /**
  * @brief Format and dispatch hardware touch input event as contract EventEnvelope.

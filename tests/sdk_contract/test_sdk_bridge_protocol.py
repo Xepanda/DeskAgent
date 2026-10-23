@@ -2585,6 +2585,76 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(response.get("error", {}).get("code"), "UNKNOWN_OPERATION")
         self.assertNotEqual(response.get("code"), 0)
 
+    def test_notification_status_serializer_emits_contract_events_on_websocket_path(self) -> None:
+        """Every notification status maps to one typed event, never raw display text."""
+        statuses = (
+            "accepted", "rendered", "played", "failed", "expired", "unknown",
+        )
+        events: list[dict] = []
+
+        @OUTBOUND_CB
+        def outbound_handler(data_ptr, length, _user_data):
+            events.append(json.loads(ctypes.string_at(data_ptr, length).decode("utf-8")))
+            return 0
+
+        self.lib.desk_sdk_bridge_send_notification_status.restype = ctypes.c_int
+        self.lib.desk_sdk_bridge_send_notification_status.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        self.lib.desk_sdk_bridge_register_outbound(outbound_handler, None)
+        self.addCleanup(lambda: self.lib.desk_sdk_bridge_register_outbound(
+            ctypes.cast(None, OUTBOUND_CB), None))
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_sdk_test_ws_clear_control_queue()
+        self.lib.desk_sdk_ws_client_is_authenticated.restype = ctypes.c_bool
+        self.lib.desk_sdk_ws_client_is_authenticated.argtypes = []
+        self.assertTrue(self.lib.desk_sdk_ws_client_is_authenticated())
+
+        for status_value in range(len(statuses)):
+            self.assertEqual(
+                self.lib.desk_sdk_bridge_send_notification_status(b"occurrence-001", status_value),
+                0,
+            )
+            # The real writer drains this bounded queue asynchronously.
+            self.lib.desk_sdk_test_ws_clear_control_queue()
+
+        self.assertEqual(len(events), len(statuses))
+        for event, status in zip(events, statuses, strict=True):
+            self.assertEqual(event["type"], "notification.status")
+            self.assertEqual(event["data"], {
+                "notification_id": "occurrence-001",
+                "status": status,
+            })
+            self.assertNotIn("text", event["data"])
+
+    def test_notification_status_serializer_rejects_invalid_id_and_status(self) -> None:
+        """Invalid IDs and enum values are rejected without emitting an event."""
+        events: list[bytes] = []
+
+        @OUTBOUND_CB
+        def outbound_handler(data_ptr, length, _user_data):
+            events.append(ctypes.string_at(data_ptr, length))
+            return 0
+
+        self.lib.desk_sdk_bridge_send_notification_status.restype = ctypes.c_int
+        self.lib.desk_sdk_bridge_send_notification_status.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        self.lib.desk_sdk_bridge_register_outbound(outbound_handler, None)
+        self.addCleanup(lambda: self.lib.desk_sdk_bridge_register_outbound(
+            ctypes.cast(None, OUTBOUND_CB), None))
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_sdk_test_ws_clear_control_queue()
+
+        for invalid_id in (None, b"", b"bad id", b'bad"id', b"x" * 65):
+            self.assertEqual(
+                self.lib.desk_sdk_bridge_send_notification_status(invalid_id, 0), -1
+            )
+        for invalid_status in (-1, 6, 7, 999):
+            self.assertEqual(
+                self.lib.desk_sdk_bridge_send_notification_status(b"occurrence-001", invalid_status),
+                -1,
+            )
+        self.assertEqual(events, [])
+
     def test_hello_auth_failure_nack_echoes_request_id(self) -> None:
         """The 401 nack must correlate to its request_id like any other response."""
         self.lib.desk_sdk_bridge_set_auth_required(True)

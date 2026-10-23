@@ -3674,6 +3674,43 @@ int desk_sdk_bridge_send_notification_summary_ack(const char *summary_id, const 
     return desk_sdk_bridge_send_event("notification.acknowledged", payload);
 }
 
+static bool desk_sdk_notification_id_valid(const char *notification_id)
+{
+    size_t len = notification_id ? strlen(notification_id) : 0;
+    if (len == 0 || len > DESK_NOTIFICATION_ID_MAX) return false;
+    for (size_t i = 0; i < len; ++i) {
+        char c = notification_id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) return false;
+    }
+    return true;
+}
+
+int desk_sdk_bridge_send_notification_status(const char *notification_id,
+                                             desk_notification_status_t status)
+{
+    static const char *const status_names[] = {
+        "accepted", "rendered", "played", "failed", "expired", "unknown",
+    };
+    if (!desk_sdk_notification_id_valid(notification_id) ||
+        status < DESK_NOTIFICATION_ACCEPTED || status > DESK_NOTIFICATION_UNKNOWN) return -1;
+
+    if (!desk_sdk_ws_client_is_authenticated()) return -1;
+
+    char event_json[192];
+    int n = snprintf(event_json, sizeof(event_json),
+                     "{\"type\":\"notification.status\",\"data\":{"
+                     "\"notification_id\":\"%s\",\"status\":\"%s\"}}",
+                     notification_id, status_names[status]);
+    if (n < 0 || (size_t)n >= sizeof(event_json)) return -1;
+    int rc = desk_sdk_ws_client_send_text(event_json);
+    if (rc != 0) return rc;
+    if (s_outbound_cb) {
+        s_outbound_cb(event_json, (size_t)n, s_outbound_user_data);
+    }
+    return 0;
+}
+
 int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
                                      desk_touch_action_t action,
                                      char *out_event_json,
