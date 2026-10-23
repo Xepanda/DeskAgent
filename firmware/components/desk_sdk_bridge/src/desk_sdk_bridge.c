@@ -82,6 +82,7 @@ static bool desk_sdk_camera_stream_available(void);
 static bool desk_sdk_log_command_id_valid(const char *id);
 static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed,
                                          size_t allowed_count);
+static bool desk_sdk_log_pairing_is_complete(void);
 
 static uint64_t desk_sdk_camera_worker_now_ms(void)
 {
@@ -150,11 +151,28 @@ static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
 static bool desk_sdk_is_lower_hex_64(const char *s);
 
+#ifdef DESK_SDK_TESTING
+void desk_sdk_test_prepare_log_pair(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    s_paired = true;
+    strcpy(s_pair_request_id, "11111111111111111111111111111111");
+    strcpy(s_pair_daemon_instance_id, "22222222222222222222222222222222");
+    strcpy(s_active_pairing_token,
+           "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    strcpy(s_pair_target_mode, "python_sdk");
+    strcpy(s_pair_host, "127.0.0.1");
+    s_pair_websocket_port = 8765;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+}
+#endif
+
 /* CR-009 L2 stream lease. Only structured A1 records are serialized. */
 static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool s_local_log_enabled = false;
 static bool s_log_stream_active = false;
-static bool s_log_camera_only = false;
+static uint8_t s_log_component_mask = 0;
+static bool s_log_audio_snapshot_pending = false;
 static char s_log_stream_id[33] = "";
 static char s_log_min_level[8] = "WARN";
 static char s_log_boot_id[33] = "";
@@ -176,6 +194,8 @@ void desk_sdk_bridge_set_local_log_enabled(bool enabled)
     s_local_log_enabled = enabled;
     if (!enabled) {
         s_log_stream_active = false;
+        s_log_component_mask = 0;
+        s_log_audio_snapshot_pending = false;
         s_log_stream_id[0] = '\0';
         desk_sdk_log_source_reset_locked();
     }
@@ -186,7 +206,8 @@ void desk_sdk_bridge_log_session_closed(void)
 {
     pthread_mutex_lock(&s_log_mutex);
     s_log_stream_active = false;
-    s_log_camera_only = false;
+    s_log_component_mask = 0;
+    s_log_audio_snapshot_pending = false;
     s_log_stream_id[0] = '\0';
     desk_sdk_log_source_reset_locked();
     pthread_mutex_unlock(&s_log_mutex);
@@ -218,20 +239,92 @@ int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len)
             (unsigned long long)s_log_pending_gap.dropped_count);
         s_log_has_pending_gap = false;
     } else if (s_log_has_pending_record) {
-        if (s_log_pending_record.event_id != DESK_WATCHER_LOG_EVENT_CAMERA_CAPTURE_EMPTY) {
+        const char *component = NULL, *event_id = NULL, *state = NULL;
+        const char *level = NULL;
+        uint8_t component_bit = 0;
+        const desk_watcher_log_record_t *record = &s_log_pending_record;
+        switch (record->event_id) {
+        case DESK_WATCHER_LOG_EVENT_CAMERA_CAPTURE_EMPTY:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_CAMERA &&
+                record->level == DESK_WATCHER_LOG_LEVEL_WARN &&
+                record->state == DESK_WATCHER_LOG_STATE_NONE) {
+                component = "camera"; event_id = "CAMERA_CAPTURE_EMPTY";
+                level = "WARN"; component_bit = 1U << 0;
+            }
+            break;
+        case DESK_WATCHER_LOG_EVENT_AUDIO_DRIVER_STATE_SNAPSHOT:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_AUDIO &&
+                record->level == DESK_WATCHER_LOG_LEVEL_WARN &&
+                (record->state == DESK_WATCHER_LOG_STATE_READY ||
+                 record->state == DESK_WATCHER_LOG_STATE_NOT_READY)) {
+                component = "audio"; event_id = "AUDIO_DRIVER_STATE_SNAPSHOT";
+                level = "WARN"; component_bit = 1U << 1;
+                state = record->state == DESK_WATCHER_LOG_STATE_READY ? "READY" : "NOT_READY";
+            }
+            break;
+        case DESK_WATCHER_LOG_EVENT_TUYA_MQTT_STATE:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_NETWORK &&
+                record->level == DESK_WATCHER_LOG_LEVEL_WARN &&
+                (record->state == DESK_WATCHER_LOG_STATE_CONNECTED ||
+                 record->state == DESK_WATCHER_LOG_STATE_DISCONNECTED)) {
+                component = "network"; event_id = "TUYA_MQTT_STATE";
+                level = "WARN"; component_bit = 1U << 2;
+                state = record->state == DESK_WATCHER_LOG_STATE_CONNECTED ? "CONNECTED" : "DISCONNECTED";
+            }
+            break;
+        case DESK_WATCHER_LOG_EVENT_STM32_ACK_TIMEOUT:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_STM32 &&
+                record->level == DESK_WATCHER_LOG_LEVEL_ERROR &&
+                record->state == DESK_WATCHER_LOG_STATE_NONE) {
+                component = "stm32"; event_id = "STM32_ACK_TIMEOUT";
+                level = "ERROR"; component_bit = 1U << 3;
+            }
+            break;
+        default:
+            break;
+        }
+        if (!event_id || (s_log_component_mask &&
+                          !(s_log_component_mask & component_bit))) {
             s_log_has_pending_record = false;
             pthread_mutex_unlock(&s_log_mutex);
             return 0;
         }
-        n = snprintf(out_json, out_len,
-            "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"WARN\",\"component\":\"camera\",\"event_id\":\"CAMERA_CAPTURE_EMPTY\",\"fields\":{}}}",
-            s_log_stream_id, s_log_boot_id,
-            (unsigned long long)s_log_pending_record.sequence,
-            (unsigned long long)s_log_pending_record.uptime_ms);
+        if (state) {
+            n = snprintf(out_json, out_len,
+                "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"%s\",\"component\":\"%s\",\"event_id\":\"%s\",\"fields\":{\"state\":\"%s\"}}}",
+                s_log_stream_id, s_log_boot_id,
+                (unsigned long long)record->sequence, (unsigned long long)record->uptime_ms,
+                level, component, event_id, state);
+        } else {
+            n = snprintf(out_json, out_len,
+                "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"%s\",\"component\":\"%s\",\"event_id\":\"%s\",\"fields\":{}}}",
+                s_log_stream_id, s_log_boot_id,
+                (unsigned long long)record->sequence, (unsigned long long)record->uptime_ms,
+                level, component, event_id);
+        }
         s_log_has_pending_record = false;
     }
     pthread_mutex_unlock(&s_log_mutex);
     return n > 0 && (size_t)n < out_len ? n : (n < 0 ? -1 : 0);
+}
+
+void desk_sdk_bridge_log_subscribe_ack_sent(void)
+{
+    pthread_mutex_lock(&s_log_mutex);
+    bool publish_snapshot = s_log_audio_snapshot_pending && s_local_log_enabled &&
+        s_log_stream_active && desk_sdk_ws_client_is_authenticated() &&
+        desk_sdk_log_pairing_is_complete() && desk_watcher_log_source_is_enabled();
+    s_log_audio_snapshot_pending = false;
+    pthread_mutex_unlock(&s_log_mutex);
+    if (publish_snapshot) {
+#if defined(DESK_SDK_TESTING) || defined(DESK_SDK_OPENSSL_TESTING)
+        /* Host contract builds have no ESP32 audio source; exercise the same
+         * post-ACK queue transition with the typed readiness producer. */
+        (void)desk_watcher_log_source_publish_audio_driver_state(false);
+#else
+        (void)desk_hardware_publish_audio_driver_state_snapshot();
+#endif
+    }
 }
 
 #define DESK_SDK_PAIRING_CODE_TTL_MS (5ULL * 60ULL * 1000ULL)
@@ -3171,19 +3264,33 @@ static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out
     return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "STORAGE_UNAVAILABLE", 503);
 }
 
-static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
+static bool desk_log_component_filter_valid(const char *raw, uint8_t *component_mask)
 {
+    static const char *const names[] = {"camera", "audio", "network", "stm32"};
+    if (!component_mask) return false;
     desk_log_json_parser_t p = { .p = raw, .depth = 0 };
     desk_log_json_ws(&p);
     if (*p.p++ != '[') return false;
     desk_log_json_ws(&p);
-    if (*p.p == ']') { ++p.p; desk_log_json_ws(&p); *camera_only = false; return *p.p == '\0'; }
-    const char *start, *end;
-    if (!desk_log_json_string(&p, &start, &end) || !desk_log_plain_key(start, end, "camera")) return false;
-    desk_log_json_ws(&p);
+    uint8_t mask = 0;
+    if (*p.p != ']') {
+        for (;;) {
+            const char *start, *end;
+            if (!desk_log_json_string(&p, &start, &end)) return false;
+            size_t index;
+            for (index = 0; index < sizeof(names) / sizeof(names[0]); ++index)
+                if (desk_log_plain_key(start, end, names[index])) break;
+            if (index == sizeof(names) / sizeof(names[0]) || (mask & (1U << index))) return false;
+            mask |= (uint8_t)(1U << index);
+            desk_log_json_ws(&p);
+            if (*p.p == ']') break;
+            if (*p.p++ != ',') return false;
+            desk_log_json_ws(&p);
+        }
+    }
     if (*p.p++ != ']') return false;
     desk_log_json_ws(&p);
-    *camera_only = true;
+    *component_mask = mask;
     return *p.p == '\0';
 }
 
@@ -3307,11 +3414,11 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
             pthread_mutex_unlock(&s_log_mutex);
             return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
         }
-        /* v1 currently has only the camera component. Accept omitted/empty or
-         * exactly ["camera"]; reject every other shape rather than widening. */
-        bool camera_only = false;
+        /* CR-033 closes the v1 component filter to these four structured
+         * sources; reject unknown names, duplicates, and non-string shapes. */
+        uint8_t component_mask = 0;
         unsigned component_count = desk_log_get_member(data, "components", field_raw, sizeof(field_raw));
-        if (component_count > 1 || (component_count == 1 && !desk_log_component_filter_valid(field_raw, &camera_only))) {
+        if (component_count > 1 || (component_count == 1 && !desk_log_component_filter_valid(field_raw, &component_mask))) {
                 pthread_mutex_unlock(&s_log_mutex);
                 return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
         }
@@ -3322,7 +3429,8 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
         generate_dynamic_token(s_log_stream_id, sizeof(s_log_stream_id));
         if (!s_log_boot_id[0]) generate_dynamic_token(s_log_boot_id, sizeof(s_log_boot_id));
         s_log_stream_active = true;
-        s_log_camera_only = camera_only;
+        s_log_component_mask = component_mask;
+        s_log_audio_snapshot_pending = true;
         strcpy(s_log_min_level, min_level);
         s_log_has_pending_record = false;
         s_log_has_pending_gap = false;
@@ -3331,10 +3439,12 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
             "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.subscribe\",\"command_id\":\"%s\",\"accepted\":true,\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"next_sequence\":%llu,\"min_level\":\"%s\",\"components\":%s}}",
             command_id, s_log_stream_id, s_log_boot_id,
             (unsigned long long)desk_watcher_log_source_next_sequence(),
-            s_log_min_level, s_log_camera_only ? "[\"camera\"]" : "[]");
+            s_log_min_level, component_mask ? field_raw : "[]");
         if (n < 0 || (size_t)n >= max_out_len) {
             s_log_stream_active = false;
             s_log_stream_id[0] = '\0';
+            s_log_component_mask = 0;
+            s_log_audio_snapshot_pending = false;
             desk_sdk_log_source_reset_locked();
         }
         pthread_mutex_unlock(&s_log_mutex);
@@ -3349,6 +3459,8 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
     }
     s_log_stream_active = false;
     s_log_stream_id[0] = '\0';
+    s_log_component_mask = 0;
+    s_log_audio_snapshot_pending = false;
     desk_sdk_log_source_reset_locked();
     int n = snprintf(out_buf, max_out_len,
         "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.unsubscribe\",\"command_id\":\"%s\",\"accepted\":true}}",

@@ -22,6 +22,12 @@ def camera_empty(sequence: int = 1) -> dict:
     }
 
 
+def diagnostic_event(component: str, event_id: str, fields: dict, sequence: int = 1) -> dict:
+    event = camera_empty(sequence)
+    event["data"].update(component=component, event_id=event_id, fields=fields)
+    return event
+
+
 def queue_full_gap(first: int = 3, last: int = 5, count: int = 3) -> dict:
     return {
         "type": "sys.log.gap",
@@ -59,6 +65,47 @@ class NetworkLogConsumerTests(unittest.TestCase):
         stored = consumer.drain()
         self.assertEqual(stored, [camera_empty()])
         self.assertNotIn("private", str(stored))
+
+    def test_accepts_all_cr033_events_with_exact_fields(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        events = [
+            camera_empty(),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY"}, 2),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "NOT_READY"}, 3),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTED"}, 4),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "DISCONNECTED"}, 5),
+            diagnostic_event("stm32", "STM32_ACK_TIMEOUT", {}, 6),
+        ]
+        for event in events:
+            with self.subTest(event=event):
+                self.assertTrue(consumer.ingest(event, authorized=True))
+        self.assertEqual(consumer.drain(), events)
+
+    def test_rejects_cr033_wrong_component_level_fields_and_state(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        invalid = [
+            diagnostic_event("camera", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY"}),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY", "extra": 1}),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "ready"}),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": 1}),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTING"}),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTED", "ip": "192.0.2.1"}),
+            diagnostic_event("stm32", "STM32_ACK_TIMEOUT", {"command": "move"}),
+        ]
+        for event in invalid:
+            with self.subTest(event=event):
+                self.assertFalse(consumer.ingest(event, authorized=True))
+        self.assertEqual(consumer.snapshot()["rejected"], len(invalid))
+        self.assertEqual(consumer.drain(), [])
+
+    def test_cr033_events_remain_unaccepted_without_enable_and_authorization(self) -> None:
+        event = diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTED"})
+        default_off = NetworkLogConsumer()
+        self.assertFalse(default_off.ingest(event, authorized=True))
+        enabled = NetworkLogConsumer(enabled=True)
+        self.assertFalse(enabled.ingest(event, authorized=False))
+        self.assertFalse(enabled.ingest(event, authorized="true"))
+        self.assertEqual(enabled.snapshot()["queued"], 0)
 
     def test_rejects_unknown_event_version_level_component_and_nonempty_fields(self) -> None:
         consumer = NetworkLogConsumer(enabled=True)

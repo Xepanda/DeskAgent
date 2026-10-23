@@ -201,6 +201,9 @@ static void tuya_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *e
         break;
 
     case TUYA_EVENT_MQTT_CONNECTED:
+#ifdef ESP_PLATFORM
+        (void)desk_watcher_log_source_publish_tuya_mqtt_state(true);
+#endif
         desk_provisioning_apply_event(desk_provisioning_current_state(), DESK_PROVISIONING_EVENT_MQTT_ONLINE);
         desk_cli_update_provisioning_status(desk_provisioning_stage_name(desk_provisioning_current_state()->stage),
                                             desk_provisioning_current_state()->error_stage,
@@ -216,6 +219,9 @@ static void tuya_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *e
         break;
 
     case TUYA_EVENT_MQTT_DISCONNECT:
+#ifdef ESP_PLATFORM
+        (void)desk_watcher_log_source_publish_tuya_mqtt_state(false);
+#endif
         desk_provisioning_apply_event(desk_provisioning_current_state(), DESK_PROVISIONING_EVENT_MQTT_OFFLINE);
         desk_cli_update_provisioning_status(desk_provisioning_stage_name(desk_provisioning_current_state()->stage),
                                             desk_provisioning_current_state()->error_stage,

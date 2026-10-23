@@ -114,6 +114,9 @@ int desk_hardware_audio_record_read(int16_t *pcm_buf, size_t samples, size_t *re
 int desk_hardware_audio_record_stop(void);
 int desk_hardware_audio_record_inject(const int16_t *pcm_buf, size_t samples);
 int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status);
+/* Publish one allowlisted readiness snapshot only while the structured event
+ * source is enabled. Returns false for disabled/non-Watcher sources. */
+bool desk_hardware_publish_audio_driver_state_snapshot(void);
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
 int desk_hardware_audio_play_stop(void);
 
@@ -168,6 +171,9 @@ int desk_hardware_get_last_mcu_frame(uint8_t *out_buf, size_t max_len, size_t *o
 
 /* Motion / Gimbal API */
 int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms);
+/* Called only by actual ACK deadline-expiry paths; increments the timeout
+ * counter and offers the CR-033 rate-limited enum event. */
+void desk_hardware_record_mcu_ack_timeout(void);
 int desk_hardware_motion_stop(bool emergency);
 int desk_hardware_motion_get_position(float *out_pan, float *out_tilt);
 int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint32_t duration_ms,

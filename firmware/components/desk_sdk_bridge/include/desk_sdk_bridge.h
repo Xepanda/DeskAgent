@@ -277,6 +277,8 @@ int desk_sdk_ws_client_send_text(const char *text);
 int desk_sdk_ws_client_send_camera_start_ack(const char *text);
 /** Best-effort control-queue enqueue for input observer context; fail-fast. */
 int desk_sdk_ws_client_send_text_nonblocking(const char *text);
+/** Enqueue the accepted structured-log subscription ACK with a writer completion hook. */
+int desk_sdk_ws_client_send_log_subscribe_ack(const char *text);
 int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len);
 bool desk_sdk_ws_client_is_connected(void);
 /**
@@ -302,6 +304,8 @@ void desk_sdk_bridge_camera_start_ack_sent(void);
 bool desk_sdk_bridge_camera_stream_is_active(void);
 /* Internal A2 writer seam: returns one serialized v1 event/gap, or 0 if idle. */
 int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len);
+/* Called by the single WS writer only after the subscribe ACK was sent successfully. */
+void desk_sdk_bridge_log_subscribe_ack_sent(void);
 
 /**
  * @brief Parse top-level string field from JSON payload.

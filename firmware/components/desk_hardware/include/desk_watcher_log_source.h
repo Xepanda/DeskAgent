@@ -14,15 +14,43 @@ extern "C" {
 
 #define DESK_WATCHER_LOG_SOURCE_CAPACITY 16U
 #define DESK_WATCHER_LOG_SOURCE_MAX_RECORD_BYTES 192U
+#define DESK_WATCHER_LOG_SOURCE_MAX_EVENTS_PER_MINUTE 30U
+#define DESK_WATCHER_LOG_SOURCE_RATE_WINDOW_MS 60000U
 
 typedef enum {
     DESK_WATCHER_LOG_EVENT_CAMERA_CAPTURE_EMPTY = 1,
+    DESK_WATCHER_LOG_EVENT_AUDIO_DRIVER_STATE_SNAPSHOT = 2,
+    DESK_WATCHER_LOG_EVENT_TUYA_MQTT_STATE = 3,
+    DESK_WATCHER_LOG_EVENT_STM32_ACK_TIMEOUT = 4,
 } desk_watcher_log_event_id_t;
+
+typedef enum {
+    DESK_WATCHER_LOG_COMPONENT_CAMERA = 1,
+    DESK_WATCHER_LOG_COMPONENT_AUDIO = 2,
+    DESK_WATCHER_LOG_COMPONENT_NETWORK = 3,
+    DESK_WATCHER_LOG_COMPONENT_STM32 = 4,
+} desk_watcher_log_component_t;
+
+typedef enum {
+    DESK_WATCHER_LOG_LEVEL_WARN = 1,
+    DESK_WATCHER_LOG_LEVEL_ERROR = 2,
+} desk_watcher_log_level_t;
+
+typedef enum {
+    DESK_WATCHER_LOG_STATE_NONE = 0,
+    DESK_WATCHER_LOG_STATE_READY = 1,
+    DESK_WATCHER_LOG_STATE_NOT_READY = 2,
+    DESK_WATCHER_LOG_STATE_CONNECTED = 3,
+    DESK_WATCHER_LOG_STATE_DISCONNECTED = 4,
+} desk_watcher_log_state_t;
 
 typedef struct {
     uint64_t sequence;
     uint64_t uptime_ms;
     desk_watcher_log_event_id_t event_id;
+    desk_watcher_log_component_t component;
+    desk_watcher_log_level_t level;
+    desk_watcher_log_state_t state;
 } desk_watcher_log_record_t;
 
 typedef struct {
@@ -37,9 +65,12 @@ void desk_watcher_log_source_set_enabled(bool enabled);
 bool desk_watcher_log_source_is_enabled(void);
 uint64_t desk_watcher_log_source_next_sequence(void);
 
-/* Publishes only the reviewed camera-empty enum event. No strings, raw logs,
- * dynamic allocation, waiting, or network I/O occur on the producer path. */
+/* Only the closed CR-033 event/field enums are accepted. No strings, raw logs,
+ * dynamic allocation, waiting, or network I/O occur on producer paths. */
 bool desk_watcher_log_source_publish_camera_capture_empty(void);
+bool desk_watcher_log_source_publish_audio_driver_state(bool ready);
+bool desk_watcher_log_source_publish_tuya_mqtt_state(bool connected);
+bool desk_watcher_log_source_publish_stm32_ack_timeout(void);
 bool desk_watcher_log_source_try_dequeue(desk_watcher_log_record_t *out_record);
 bool desk_watcher_log_source_take_gap(desk_watcher_log_gap_t *out_gap);
 

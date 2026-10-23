@@ -406,6 +406,7 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
     }
 
     xSemaphoreGive(s_motion_mutex);
+    desk_hardware_record_mcu_ack_timeout();
     return DESK_HW_ERR_TIMEOUT;
 #else
     (void)frame_data; (void)frame_len; (void)expected_seq; (void)allow_retries;

@@ -4,6 +4,7 @@
  */
 
 #include "desk_hardware.h"
+#include "desk_watcher_log_source.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +64,10 @@ static uint32_t s_mcu_ack_count = 0;
 static uint32_t s_mcu_nack_count = 0;
 static uint32_t s_mcu_timeout_count = 0;
 static uint32_t s_mcu_crc_error_count = 0;
+
+#define MCU_ACK_TIMEOUT_RATE_LIMIT_MS 60000U
+_Static_assert(MCU_ACK_TIMEOUT_RATE_LIMIT_MS == DESK_WATCHER_LOG_SOURCE_RATE_WINDOW_MS,
+               "CR-033 STM32 ACK limiter must match structured source window");
 
 static uint64_t mcu_get_time_ms(void)
 {
@@ -772,7 +777,7 @@ static int mcu_execute_transaction(const uint8_t *frame_data, size_t frame_len, 
         }
     }
 
-    s_mcu_timeout_count++;
+    desk_hardware_record_mcu_ack_timeout();
     s_pending_state = MCU_TX_TIMEOUT;
     return DESK_HW_ERR_TIMEOUT;
 }
@@ -1155,6 +1160,26 @@ int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status)
     return out_status->ready ? DESK_HW_OK : DESK_HW_ERR_UNAVAILABLE;
 #else
     return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+bool desk_hardware_publish_audio_driver_state_snapshot(void)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    if (!desk_watcher_log_source_is_enabled()) return false;
+    desk_hardware_audio_status_t status = {0};
+    (void)desk_hardware_audio_get_status(&status);
+    return desk_watcher_log_source_publish_audio_driver_state(status.ready);
+#else
+    return false;
+#endif
+}
+
+void desk_hardware_record_mcu_ack_timeout(void)
+{
+    ++s_mcu_timeout_count;
+#ifdef ESP_PLATFORM
+    (void)desk_watcher_log_source_publish_stm32_ack_timeout();
 #endif
 }
 

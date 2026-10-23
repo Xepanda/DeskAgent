@@ -96,6 +96,7 @@ typedef struct {
     uint32_t generation;
     bool close_after_send;
     bool camera_start_ack;
+    bool log_subscribe_ack;
     size_t len;
     uint8_t payload[WS_CONTROL_FRAME_MAX];
 } ws_outbound_frame_t;
@@ -184,6 +185,8 @@ static void *ws_writer_main(void *unused)
             }
             if (!stale && send_rc == 0 && frame->camera_start_ack)
                 desk_sdk_bridge_camera_start_ack_sent();
+            if (!stale && send_rc == 0 && frame->log_subscribe_ack)
+                desk_sdk_bridge_log_subscribe_ack_sent();
             pthread_mutex_lock(&s_ws_writer_mutex);
             memset(&s_ws_writer_current, 0, sizeof(s_ws_writer_current));
             pthread_mutex_unlock(&s_ws_writer_mutex);
@@ -267,6 +270,31 @@ static int ws_enqueue_frame_with_camera_ack(uint8_t opcode, const uint8_t *paylo
     s_ws_control_queue[tail].generation = ws_lifecycle_generation();
     s_ws_control_queue[tail].close_after_send = opcode == 0x8;
     s_ws_control_queue[tail].camera_start_ack = camera_start_ack;
+    s_ws_control_queue[tail].len = len;
+    memcpy(s_ws_control_queue[tail].payload, payload, len);
+    ++s_ws_control_count;
+    pthread_cond_signal(&s_ws_writer_cond);
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+    return 0;
+}
+
+static int ws_enqueue_log_subscribe_ack(uint8_t opcode, const uint8_t *payload, size_t len)
+{
+    if (!payload || len > WS_CONTROL_FRAME_MAX || ws_writer_start() != 0) {
+        if (len > WS_CONTROL_FRAME_MAX) ws_disconnect_and_schedule();
+        return -1;
+    }
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    if (s_ws_control_count == WS_CONTROL_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&s_ws_writer_mutex);
+        ws_disconnect_and_schedule();
+        return -1;
+    }
+    size_t tail = (s_ws_control_head + s_ws_control_count) % WS_CONTROL_QUEUE_CAPACITY;
+    s_ws_control_queue[tail].opcode = opcode;
+    s_ws_control_queue[tail].generation = ws_lifecycle_generation();
+    s_ws_control_queue[tail].close_after_send = opcode == 0x8;
+    s_ws_control_queue[tail].log_subscribe_ack = true;
     s_ws_control_queue[tail].len = len;
     memcpy(s_ws_control_queue[tail].payload, payload, len);
     ++s_ws_control_count;
@@ -853,6 +881,12 @@ int desk_sdk_ws_client_send_camera_start_ack(const char *text)
     return ws_enqueue_frame_with_camera_ack(0x1, (const uint8_t *)text, strlen(text), true);
 }
 
+int desk_sdk_ws_client_send_log_subscribe_ack(const char *text)
+{
+    if (!s_ws_ready || !text) return -1;
+    return ws_enqueue_log_subscribe_ack(0x1, (const uint8_t *)text, strlen(text));
+}
+
 int desk_sdk_ws_client_send_text_nonblocking(const char *text)
 {
     if (!text) return -1;
@@ -994,6 +1028,9 @@ int desk_sdk_ws_client_poll(int timeout_ms)
         if (strcmp(message_type, "ctrl.camera.stream.start") == 0 &&
             strstr(s_ws_response, "\"type\":\"sys.ack\""))
             return desk_sdk_ws_client_send_camera_start_ack(s_ws_response);
+        if (strcmp(message_type, "sys.log.subscribe") == 0 &&
+            strstr(s_ws_response, "\"type\":\"sys.ack\""))
+            return desk_sdk_ws_client_send_log_subscribe_ack(s_ws_response);
         return desk_sdk_ws_client_send_text(s_ws_response);
     }
     return 0;

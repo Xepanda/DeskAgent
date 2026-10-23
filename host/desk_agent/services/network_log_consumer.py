@@ -14,8 +14,13 @@ from typing import Any, Mapping, Optional
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
-_LEVELS = frozenset({"ERROR", "WARN", "INFO", "DEBUG"})
-_EVENT_ID = "CAMERA_CAPTURE_EMPTY"
+_EVENTS = {
+    ("camera", "CAMERA_CAPTURE_EMPTY"): {},
+    ("audio", "AUDIO_DRIVER_STATE_SNAPSHOT"): {"state": frozenset({"READY", "NOT_READY"})},
+    ("network", "TUYA_MQTT_STATE"): {"state": frozenset({"CONNECTED", "DISCONNECTED"})},
+    ("stm32", "STM32_ACK_TIMEOUT"): {},
+}
+_LEVELS = frozenset({"ERROR", "WARN"})
 _GAP_REASON = "QUEUE_FULL"
 _SCHEMA_VERSION = "1.0.0"
 _QUEUE_CAPACITY = 16
@@ -155,10 +160,23 @@ class NetworkLogConsumer:
             return None
         if not _is_nonnegative_int(data.get("uptime_ms")):
             return None
-        if data.get("level") not in _LEVELS or data.get("component") != "camera":
+        level = data.get("level")
+        component = data.get("component")
+        event_id = data.get("event_id")
+        if not isinstance(level, str) or level not in _LEVELS:
             return None
-        if data.get("event_id") != _EVENT_ID or data.get("fields") != {}:
+        if not isinstance(component, str) or not isinstance(event_id, str):
             return None
+        field_schema = _EVENTS.get((component, event_id))
+        fields = data.get("fields")
+        if field_schema is None or not isinstance(fields, Mapping) or set(fields) != set(field_schema):
+            return None
+        safe_fields: dict[str, str] = {}
+        for key, allowed_values in field_schema.items():
+            value = fields.get(key)
+            if not isinstance(value, str) or value not in allowed_values:
+                return None
+            safe_fields[key] = value
 
         event = {
             "type": "sys.log.event",
@@ -169,9 +187,9 @@ class NetworkLogConsumer:
                 "sequence": data["sequence"],
                 "uptime_ms": data["uptime_ms"],
                 "level": data["level"],
-                "component": "camera",
-                "event_id": _EVENT_ID,
-                "fields": {},
+                "component": component,
+                "event_id": event_id,
+                "fields": safe_fields,
             },
         }
         if "timestamp_utc" in data:

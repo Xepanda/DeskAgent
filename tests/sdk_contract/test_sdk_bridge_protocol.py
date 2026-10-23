@@ -249,6 +249,20 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         cls.lib.desk_sdk_bridge_process_ws_command.argtypes = [
             ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
         ]
+        cls.lib.desk_sdk_bridge_set_local_log_enabled.restype = None
+        cls.lib.desk_sdk_bridge_set_local_log_enabled.argtypes = [ctypes.c_bool]
+        cls.lib.desk_sdk_bridge_log_next_text.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_log_next_text.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        cls.lib.desk_sdk_bridge_log_subscribe_ack_sent.restype = None
+        cls.lib.desk_sdk_bridge_log_subscribe_ack_sent.argtypes = []
+        cls.lib.desk_watcher_log_source_publish_camera_capture_empty.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_camera_capture_empty.argtypes = []
+        cls.lib.desk_watcher_log_source_publish_audio_driver_state.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_audio_driver_state.argtypes = [ctypes.c_bool]
+        cls.lib.desk_watcher_log_source_publish_tuya_mqtt_state.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_tuya_mqtt_state.argtypes = [ctypes.c_bool]
+        cls.lib.desk_watcher_log_source_publish_stm32_ack_timeout.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_stm32_ack_timeout.argtypes = []
         cls.lib.desk_sdk_bridge_camera_start_ack_sent.restype = None
         cls.lib.desk_sdk_bridge_camera_start_ack_sent.argtypes = []
         cls.lib.desk_sdk_bridge_camera_session_closed.restype = None
@@ -447,8 +461,75 @@ class TestSdkBridgeProtocol(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.lib.desk_hardware_register_driver_ops(None)
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
         if hasattr(self, "_driver_ops_keepalive"):
             self._driver_ops_keepalive.clear()
+
+    def test_cr033_structured_event_allowlist_serializes_exact_fields(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        ack = self._process_ws_cmd({"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": "1234567890abcdef1234567890abcdef", "log_schema_version": "1.0.0",
+            "min_level": "WARN", "components": []}})
+        self.assertEqual(ack["type"], "sys.ack", ack)
+        records = [
+            (self.lib.desk_watcher_log_source_publish_camera_capture_empty, (),
+             "WARN", "camera", "CAMERA_CAPTURE_EMPTY", {}),
+            (self.lib.desk_watcher_log_source_publish_audio_driver_state, (True,),
+             "WARN", "audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY"}),
+            (self.lib.desk_watcher_log_source_publish_tuya_mqtt_state, (True,),
+             "WARN", "network", "TUYA_MQTT_STATE", {"state": "CONNECTED"}),
+            (self.lib.desk_watcher_log_source_publish_stm32_ack_timeout, (),
+             "ERROR", "stm32", "STM32_ACK_TIMEOUT", {}),
+        ]
+        for producer, args, level, component, event_id, fields in records:
+            with self.subTest(event_id=event_id):
+                self.assertTrue(producer(*args))
+                frame = ctypes.create_string_buffer(768)
+                self.assertGreater(self.lib.desk_sdk_bridge_log_next_text(frame, len(frame)), 0)
+                wire = json.loads(frame.value)
+                self.assertEqual(wire["type"], "sys.log.event")
+                data = wire["data"]
+                self.assertEqual(set(data), {"log_schema_version", "stream_id", "boot_id", "sequence",
+                                             "uptime_ms", "level", "component", "event_id", "fields"})
+                self.assertEqual(data["log_schema_version"], "1.0.0")
+                self.assertEqual((data["level"], data["component"], data["event_id"], data["fields"]),
+                                 (level, component, event_id, fields))
+
+    def test_cr033_audio_snapshot_waits_for_subscribe_ack_writer_completion(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        ack = self._process_ws_cmd({"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": "abcdefabcdefabcdefabcdefabcdefab", "log_schema_version": "1.0.0",
+            "min_level": "WARN", "components": []}})
+        self.assertEqual(ack["type"], "sys.ack")
+        frame = ctypes.create_string_buffer(768)
+        self.assertEqual(self.lib.desk_sdk_bridge_log_next_text(frame, len(frame)), 0)
+        self.lib.desk_sdk_bridge_log_subscribe_ack_sent()
+        self.assertGreater(self.lib.desk_sdk_bridge_log_next_text(frame, len(frame)), 0)
+        event = json.loads(frame.value)
+        self.assertEqual(event["data"]["event_id"], "AUDIO_DRIVER_STATE_SNAPSHOT")
+        self.assertEqual(event["data"]["fields"], {"state": "NOT_READY"})
+
+    def test_cr033_component_filter_is_limited_to_the_closed_allowlist(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        ack = self._process_ws_cmd({"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": "9876543210abcdef9876543210abcdef", "log_schema_version": "1.0.0",
+            "min_level": "WARN", "components": ["audio", "stm32"]}})
+        self.assertEqual(ack["type"], "sys.ack")
+        self.assertEqual(ack["data"]["components"], ["audio", "stm32"])
+        self.assertEqual(self._process_ws_cmd({"type": "sys.log.unsubscribe", "code": 0, "data": {
+            "command_id": "9876543210abcdef9876543210abcdf0", "log_schema_version": "1.0.0",
+            "stream_id": ack["data"]["stream_id"]}})["type"], "sys.ack")
+        rejected = self._process_ws_cmd({"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": "9876543210abcdef9876543210abcdf1", "log_schema_version": "1.0.0",
+            "min_level": "WARN", "components": ["raw"]}})
+        self.assertEqual(rejected["type"], "sys.nack")
+        self.assertEqual(rejected["data"]["error"], "INVALID_FILTER")
 
     def _process_cmd(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")

@@ -252,6 +252,12 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         cls.lib.desk_sdk_bridge_set_local_log_enabled.argtypes = [ctypes.c_bool]
         cls.lib.desk_watcher_log_source_publish_camera_capture_empty.restype = ctypes.c_bool
         cls.lib.desk_watcher_log_source_publish_camera_capture_empty.argtypes = []
+        cls.lib.desk_watcher_log_source_publish_audio_driver_state.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_audio_driver_state.argtypes = [ctypes.c_bool]
+        cls.lib.desk_watcher_log_source_publish_tuya_mqtt_state.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_tuya_mqtt_state.argtypes = [ctypes.c_bool]
+        cls.lib.desk_watcher_log_source_publish_stm32_ack_timeout.restype = ctypes.c_bool
+        cls.lib.desk_watcher_log_source_publish_stm32_ack_timeout.argtypes = []
         cls.lib.desk_sdk_bridge_log_next_text.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_log_next_text.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
         cls.lib.desk_sdk_test_deadline_write.restype = ctypes.c_int
@@ -728,6 +734,84 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             "last_dropped_sequence": first_sequence + 17, "dropped_count": 2, "reason": "QUEUE_FULL"})
         self.lib.desk_sdk_bridge_set_local_log_enabled(False)
 
+    def test_cr033_allowlisted_events_have_exact_wire_fields(self) -> None:
+        self.lib.desk_sdk_test_prepare_log_pair()
+        self.lib.desk_sdk_test_seed_ws_auth_latch()
+        self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+        subscribe = {"type": "sys.log.subscribe", "code": 0, "data": {
+            "command_id": "00000000000000000000000000000032",
+            "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}}
+        out = ctypes.create_string_buffer(1024)
+        self.assertEqual(self.lib.desk_sdk_bridge_process_ws_command(
+            json.dumps(subscribe).encode(), out, len(out)), 0)
+        expected = [
+            (self.lib.desk_watcher_log_source_publish_camera_capture_empty, (),
+             "WARN", "camera", "CAMERA_CAPTURE_EMPTY", {}),
+            (self.lib.desk_watcher_log_source_publish_audio_driver_state, (True,),
+             "WARN", "audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY"}),
+            (self.lib.desk_watcher_log_source_publish_tuya_mqtt_state, (True,),
+             "WARN", "network", "TUYA_MQTT_STATE", {"state": "CONNECTED"}),
+            (self.lib.desk_watcher_log_source_publish_stm32_ack_timeout, (),
+             "ERROR", "stm32", "STM32_ACK_TIMEOUT", {}),
+        ]
+        for producer, args, level, component, event_id, fields in expected:
+            with self.subTest(event_id=event_id):
+                self.assertTrue(producer(*args))
+                frame = ctypes.create_string_buffer(768)
+                self.assertGreater(self.lib.desk_sdk_bridge_log_next_text(frame, len(frame)), 0)
+                wire = json.loads(frame.value)
+                self.assertEqual(wire["type"], "sys.log.event")
+                data = wire["data"]
+                self.assertEqual(set(data), {"log_schema_version", "stream_id", "boot_id",
+                                             "sequence", "uptime_ms", "level", "component",
+                                             "event_id", "fields"})
+                self.assertEqual(data["log_schema_version"], "1.0.0")
+                self.assertEqual((data["level"], data["component"], data["event_id"], data["fields"]),
+                                 (level, component, event_id, fields))
+        self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+
+    def test_cr033_audio_snapshot_is_emitted_only_after_subscribe_ack_wire_send(self) -> None:
+        async def exercise() -> tuple[dict, dict]:
+            received: dict = {}
+            received_event: dict = {}
+            async def handler(websocket) -> None:
+                await websocket.recv()
+                await websocket.send(json.dumps({"type": "sys.ack", "code": 0,
+                    "data": {"type": "sys.client.hello", "role": "hardware",
+                             "session_state": "connected", "negotiated": {
+                                 "audio_uplink": {"codec": "opus", "sample_rate": 16000,
+                                     "channels": 1, "frame_duration_ms": 60,
+                                     "packetization": "one_opus_packet_per_wspk", "version": 1}}}},
+                    separators=(",", ":")))
+                await websocket.send(json.dumps({"type": "sys.log.subscribe", "code": 0,
+                    "data": {"command_id": "33333333333333333333333333333333",
+                             "log_schema_version": "1.0.0", "min_level": "WARN", "components": []}},
+                    separators=(",", ":")))
+                received.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+                received_event.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                self.lib.desk_sdk_test_prepare_log_pair()
+                self.lib.desk_sdk_bridge_set_local_log_enabled(True)
+                try:
+                    self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", port), 0)
+                    self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_connect_paired), 0)
+                    self.assertEqual(await asyncio.to_thread(self.lib.desk_sdk_ws_client_poll, 1000), 0)
+                finally:
+                    self.lib.desk_sdk_ws_client_close()
+                    self.lib.desk_sdk_bridge_set_local_log_enabled(False)
+            return received, received_event
+
+        ack, event = asyncio.run(exercise())
+        self.assertEqual(ack["type"], "sys.ack")
+        self.assertEqual(ack["data"]["type"], "sys.log.subscribe")
+        self.assertTrue(ack["data"]["accepted"])
+        self.assertEqual(event["type"], "sys.log.event")
+        self.assertEqual(event["data"]["event_id"], "AUDIO_DRIVER_STATE_SNAPSHOT")
+        self.assertEqual(event["data"]["component"], "audio")
+        self.assertEqual(event["data"]["fields"], {"state": "NOT_READY"})
+
     def test_cr009_deadline_writer_times_out_on_a_full_socket(self) -> None:
         sender, receiver = socket.socketpair()
         try:
@@ -916,6 +1000,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         async def exercise() -> dict:
             received: dict = {}
             received_event: dict = {}
+            received_camera_event: dict = {}
             async def handler(websocket) -> None:
                 hello = json.loads(await websocket.recv())
                 self.assertEqual(hello["type"], "sys.client.hello")
@@ -932,6 +1017,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                     separators=(",", ":")))
                 received.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
                 received_event.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
+                received_camera_event.update(json.loads(await asyncio.wait_for(websocket.recv(), timeout=2)))
 
             async with websockets.serve(handler, "127.0.0.1", 0) as server:
                 port = server.sockets[0].getsockname()[1]
@@ -945,7 +1031,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
                 await asyncio.sleep(0.05)
                 self.lib.desk_sdk_ws_client_close()
                 self.lib.desk_sdk_bridge_set_local_log_enabled(False)
-            return {"ack": received, "event": received_event}
+            return {"ack": received, "event": received_event, "camera_event": received_camera_event}
 
         response = asyncio.run(exercise())
         self.assertEqual(response["ack"]["type"], "sys.ack")
@@ -953,8 +1039,11 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         self.assertEqual(response["ack"]["data"]["command_id"], "11111111111111111111111111111111")
         self.assertTrue(response["ack"]["data"]["accepted"])
         self.assertEqual(response["event"]["type"], "sys.log.event")
-        self.assertEqual(response["event"]["data"]["event_id"], "CAMERA_CAPTURE_EMPTY")
+        self.assertEqual(response["event"]["data"]["event_id"], "AUDIO_DRIVER_STATE_SNAPSHOT")
+        self.assertEqual(response["event"]["data"]["fields"], {"state": "NOT_READY"})
         self.assertEqual(response["event"]["data"]["sequence"], response["ack"]["data"]["next_sequence"])
+        self.assertEqual(response["camera_event"]["data"]["event_id"], "CAMERA_CAPTURE_EMPTY")
+        self.assertEqual(response["camera_event"]["data"]["sequence"], response["event"]["data"]["sequence"] + 1)
 
     def test_cr009_rejects_malformed_or_ambiguous_json_filters(self) -> None:
         self.lib.desk_sdk_test_prepare_log_pair()
