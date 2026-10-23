@@ -1973,22 +1973,89 @@ class LifeService:
                 backup_conn.close()
         return target_str
 
+    @staticmethod
+    def _validate_restore_source(src_conn: sqlite3.Connection) -> None:
+        """Reject damaged or unrelated SQLite files before touching the live database."""
+        try:
+            integrity = [row[0] for row in src_conn.execute("PRAGMA integrity_check").fetchall()]
+            if integrity != ["ok"]:
+                raise ValueError("Invalid SQLite backup: integrity_check did not return ok")
+
+            required_columns = {
+                "reminders": {
+                    "reminder_id", "title", "due_at", "timezone", "repeat_rule", "priority",
+                    "status", "created_at", "updated_at",
+                },
+                "occurrences": {
+                    "occurrence_id", "reminder_id", "scheduled_at", "delivered_at", "state",
+                    "snoozed_from_occurrence_id",
+                },
+                "notes": {
+                    "note_id", "title", "content", "tags_json", "created_at", "updated_at",
+                },
+                "outbox": {
+                    "outbox_id", "event_type", "payload_json", "state", "retry_count", "created_at",
+                    "dispatched_at", "next_retry_at",
+                },
+                "notification_receipts": {
+                    "notification_id", "reminder_id", "occurrence_id", "expires_at", "delivery_status",
+                    "user_acknowledged", "ack_source", "acknowledged_at", "protocol_anomaly_count", "updated_at",
+                },
+                "notification_receipt_events": {
+                    "fingerprint", "notification_id", "event_type", "received_at",
+                },
+                "recovery_batches": {
+                    "batch_id", "summary_id", "payload_json", "created_at", "expires_at", "state",
+                },
+                "recovery_batch_items": {"occurrence_id", "batch_id"},
+                "recovery_summary_receipts": {"summary_id", "source", "acknowledged_at"},
+            }
+            tables = {
+                row[0] for row in src_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            missing_tables = set(required_columns) - tables
+            if missing_tables:
+                raise ValueError(
+                    "Invalid SQLite backup: required canonical tables are missing: "
+                    f"{', '.join(sorted(missing_tables))}"
+                )
+            for table, required in required_columns.items():
+                columns = {
+                    row[1] for row in src_conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                missing = required - columns
+                if missing:
+                    raise ValueError(
+                        f"Invalid SQLite backup: required table {table!r} is missing columns: "
+                        f"{', '.join(sorted(missing))}"
+                    )
+        except sqlite3.DatabaseError as exc:
+            raise ValueError(f"Invalid SQLite backup: integrity/schema validation failed: {exc}") from exc
+
     def restore(self, source_path: str | Path) -> bool:
         """Restores database from an online backup file."""
         source_str = str(source_path)
         if not Path(source_str).exists():
             raise FileNotFoundError(f"Backup file '{source_str}' not found")
         with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
-            src_conn = sqlite3.connect(source_str)
-            dest_conn = sqlite3.connect(self.db_path)
             try:
-                src_conn.backup(dest_conn)
+                src_conn = sqlite3.connect(source_str)
+            except sqlite3.DatabaseError as exc:
+                raise ValueError(f"Invalid SQLite backup: unable to open database: {exc}") from exc
+            try:
+                self._validate_restore_source(src_conn)
+                if self._conn is not None:
+                    self._conn.close()
+                    self._conn = None
+                dest_conn = sqlite3.connect(self.db_path)
+                try:
+                    src_conn.backup(dest_conn)
+                finally:
+                    dest_conn.close()
             finally:
                 src_conn.close()
-                dest_conn.close()
             # Reopen connection
             self._get_connection()
         return True

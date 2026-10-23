@@ -754,6 +754,73 @@ os._exit(0)
         self.assertIsNotNone(restored)
         self.assertEqual(restored["title"], "Backup Item 1")
 
+    def test_corrupt_sqlite_backup_fails_without_closing_or_replacing_live_database(self) -> None:
+        self.service.create_reminder("rem-restore-guard", "Keep me", "2026-10-15T12:00:00Z")
+        outbox_id = self.service.enqueue_outbox("test.restore.guard", {"value": "keep me"})
+        live_connection = self.service._get_connection()
+        corrupt_backup = Path(self.temp_dir.name) / "corrupt_backup.db"
+        corrupt_backup.write_bytes(b"this is not a SQLite database")
+
+        with self.assertRaisesRegex(ValueError, "(?i)(invalid sqlite backup|integrity)"):
+            self.service.restore(corrupt_backup)
+
+        self.assertIs(self.service._conn, live_connection, "failed restore must retain the live connection")
+        self.assertEqual(self.service.get_reminder("rem-restore-guard")["title"], "Keep me")
+        pending = self.service.get_pending_outbox(include_delayed=True)
+        self.assertIn(outbox_id, [item["outbox_id"] for item in pending])
+
+    def test_incomplete_sqlite_backup_fails_without_overwriting_live_data(self) -> None:
+        self.service.create_reminder("rem-schema-guard", "Keep schema data", "2026-10-15T12:00:00Z")
+        outbox_id = self.service.enqueue_outbox("test.restore.schema.guard", {"value": "keep me"})
+        live_connection = self.service._get_connection()
+        incomplete_backup = Path(self.temp_dir.name) / "incomplete_backup.db"
+        backup_conn = sqlite3.connect(incomplete_backup)
+        try:
+            backup_conn.execute("CREATE TABLE unrelated (value TEXT)")
+            backup_conn.commit()
+        finally:
+            backup_conn.close()
+
+        with self.assertRaisesRegex(ValueError, "(?i)(schema|backup)"):
+            self.service.restore(incomplete_backup)
+
+        self.assertIs(self.service._conn, live_connection, "failed restore must retain the live connection")
+        self.assertEqual(self.service.get_reminder("rem-schema-guard")["title"], "Keep schema data")
+        pending = self.service.get_pending_outbox(include_delayed=True)
+        self.assertIn(outbox_id, [item["outbox_id"] for item in pending])
+
+    def test_backup_missing_managed_state_schema_is_rejected_before_live_database_changes(self) -> None:
+        self.service.create_reminder("rem-managed-schema-guard", "Preserve me", "2026-10-15T12:00:00Z")
+        outbox_id = self.service.enqueue_outbox("test.restore.managed.schema.guard", {"value": "preserve me"})
+        live_connection = self.service._get_connection()
+        core_only_backup = Path(self.temp_dir.name) / "core_only_backup.db"
+        backup_conn = sqlite3.connect(core_only_backup)
+        try:
+            backup_conn.executescript("""
+                CREATE TABLE reminders (reminder_id TEXT PRIMARY KEY, title TEXT NOT NULL, due_at TEXT NOT NULL);
+                CREATE TABLE occurrences (
+                    occurrence_id TEXT PRIMARY KEY, reminder_id TEXT NOT NULL,
+                    scheduled_at TEXT NOT NULL, state TEXT NOT NULL
+                );
+                CREATE TABLE notes (note_id TEXT PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL);
+                CREATE TABLE outbox (
+                    outbox_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL, retry_count INTEGER NOT NULL, created_at TEXT NOT NULL
+                );
+            """)
+            integrity = backup_conn.execute("PRAGMA integrity_check").fetchall()
+            self.assertEqual(integrity, [("ok",)])
+        finally:
+            backup_conn.close()
+
+        with self.assertRaisesRegex(ValueError, "(?i)(schema|backup|notification_receipts|recovery_batches)"):
+            self.service.restore(core_only_backup)
+
+        self.assertIs(self.service._conn, live_connection, "failed restore must retain the live connection")
+        self.assertEqual(self.service.get_reminder("rem-managed-schema-guard")["title"], "Preserve me")
+        pending = self.service.get_pending_outbox(include_delayed=True)
+        self.assertIn(outbox_id, [item["outbox_id"] for item in pending])
+
     # -------------------------------------------------------------------------
     # 10. Outbox Exponential Backoff & Dead-Letter State
     # -------------------------------------------------------------------------
