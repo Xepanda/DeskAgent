@@ -1837,6 +1837,12 @@ class LifeService:
                 return
             if row["state"] == "cancelled":
                 return
+            is_summary_delivery = row["event_type"] == "notification.summary.deliver"
+            if is_summary_delivery and row["state"] != "dispatching":
+                # A summary failure belongs only to the claim currently being
+                # delivered. ACK/expiry/cancellation are terminal and must not
+                # be overwritten by a late adapter result.
+                return
             new_retries = row["retry_count"] + 1
             if row["event_type"] == "reminder.alert":
                 try:
@@ -1864,11 +1870,19 @@ class LifeService:
                 else:
                     next_retry = None
 
-            conn.execute(
-                "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
-                "WHERE outbox_id = ? AND state != 'cancelled'",
-                (new_retries, new_state, next_retry, outbox_id),
-            )
+            if is_summary_delivery:
+                conn.execute(
+                    "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
+                    "WHERE outbox_id = ? AND event_type = 'notification.summary.deliver' "
+                    "AND state = 'dispatching'",
+                    (new_retries, new_state, next_retry, outbox_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE outbox SET retry_count = ?, state = ?, next_retry_at = ? "
+                    "WHERE outbox_id = ? AND state != 'cancelled'",
+                    (new_retries, new_state, next_retry, outbox_id),
+                )
             conn.commit()
 
     def queue_outbox_message(self, topic: str, payload: Mapping[str, Any]) -> str:

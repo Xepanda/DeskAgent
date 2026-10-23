@@ -280,6 +280,58 @@ class TestRecoverySummary(unittest.TestCase):
         ).fetchone()
         self.assertEqual(outbox["state"], "cancelled")
 
+    def test_ack_during_claimed_delivery_remains_terminal_after_inflight_failure(self) -> None:
+        self._reminder("ack-inflight", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.assertTrue(
+            self.service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:01:00Z"
+            )
+        )
+        # Model an ACK received while the adapter call is still in flight.
+        self.assertEqual(
+            self.service.record_recovery_summary_ack(
+                {"type": "notification.acknowledged", "summary_id": batch["summary_id"], "source": "button"},
+                now_iso="2026-10-23T12:01:01Z",
+            ),
+            "recorded",
+        )
+        self.service.record_outbox_failure(batch["outbox_id"], "inflight result unknown", keep_pending=True)
+
+        outbox = self.service._get_connection().execute(
+            "SELECT state, next_retry_at FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+        ).fetchone()
+        self.assertEqual(outbox["state"], "acknowledged")
+        self.assertIsNone(outbox["next_retry_at"])
+        self.assertEqual(
+            self.service.get_pending_outbox_messages(include_delayed=True),
+            [],
+            "an acknowledged summary must not be resurrected after in-flight failure",
+        )
+
+    def test_unacknowledged_claimed_summary_remains_retryable_after_send_failure(self) -> None:
+        self._reminder("retry-inflight", "2026-10-23T11:00:00Z", "UTC")
+        with patch("host.desk_agent.services.life_service.zoneinfo.ZoneInfo", return_value=timezone.utc):
+            batch = self.service.create_recovery_summary_batch(now_iso="2026-10-23T12:00:00Z")
+
+        self.assertTrue(
+            self.service.claim_recovery_summary_delivery(
+                batch["outbox_id"], batch["summary_id"], now_iso="2026-10-23T12:01:00Z"
+            )
+        )
+        self.service.record_outbox_failure(batch["outbox_id"], "temporary send failure", keep_pending=True)
+
+        outbox = self.service._get_connection().execute(
+            "SELECT state FROM outbox WHERE outbox_id = ?", (batch["outbox_id"],)
+        ).fetchone()
+        self.assertEqual(outbox["state"], "pending")
+        self.assertEqual(
+            [item["outbox_id"] for item in self.service.get_pending_outbox_messages(include_delayed=True)],
+            [batch["outbox_id"]],
+        )
+
     def test_summary_batch_has_deterministic_ids_and_exact_24_hour_ttl(self) -> None:
         self._reminder("identity", "2026-10-23T11:00:00Z")
 
