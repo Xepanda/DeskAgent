@@ -385,9 +385,14 @@ static void ws_clear_outbound_queue(void)
 static int ws_wait(int fd, short events, int timeout_ms)
 {
     struct pollfd p = { .fd = fd, .events = events, .revents = 0 };
-    int rc;
-    do { rc = poll(&p, 1, timeout_ms); } while (rc < 0 && errno == EINTR);
-    return rc > 0 && (p.revents & events) ? 0 : -1;
+    for (;;) {
+        errno = 0;
+        int rc = poll(&p, 1, timeout_ms);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc < 0) return -1;
+        if (rc == 0) return 1;
+        return (p.revents & events) ? 0 : -1;
+    }
 }
 
 static int ws_wait_until(int fd, short events, uint64_t deadline)
@@ -410,6 +415,7 @@ static int ws_send_all(int fd, const uint8_t *p, size_t n)
 {
     size_t off = 0;
     while (off < n) {
+        errno = 0;
         ssize_t sent = send(fd, p + off, n - off, MSG_NOSIGNAL);
         if (sent > 0) { off += (size_t)sent; continue; }
         if (sent < 0 && errno == EINTR) continue;
@@ -855,6 +861,8 @@ static int ws_send_frame_deadline_fd(int fd, uint8_t opcode, const uint8_t *payl
 static int ws_read_frame(int timeout_ms, uint8_t *opcode, uint8_t *payload, size_t cap, size_t *out_len)
 {
     if (s_ws_fd < 0 || !opcode || !payload || !out_len) return -1;
+    errno = 0;
+    int wait_rc;
     for (;;) {
         if (s_ws_rx_len >= 2) {
             uint8_t b0 = s_ws_rx[0], b1 = s_ws_rx[1];
@@ -875,8 +883,11 @@ static int ws_read_frame(int timeout_ms, uint8_t *opcode, uint8_t *payload, size
             size_t used = h + (size_t)n; memmove(s_ws_rx, s_ws_rx + used, s_ws_rx_len - used); s_ws_rx_len -= used; return 0;
         }
 more:
-        if (ws_wait(s_ws_fd, POLLIN, timeout_ms) != 0) return 1;
+        wait_rc = ws_wait(s_ws_fd, POLLIN, timeout_ms);
+        if (wait_rc == 1) return 1;
+        if (wait_rc != 0) return -1;
         if (s_ws_rx_len == sizeof(s_ws_rx)) return -1;
+        errno = 0;
         ssize_t r = recv(s_ws_fd, s_ws_rx + s_ws_rx_len, sizeof(s_ws_rx) - s_ws_rx_len, 0);
         if (r <= 0) return -1;
         s_ws_rx_len += (size_t)r;
@@ -988,6 +999,8 @@ int desk_sdk_ws_client_connect_paired(void)
 {
     pthread_mutex_lock(&s_ws_connect_mutex);
     const char *connect_stage = "target";
+    const char *failure_reason = "transport_or_handshake_failure";
+    int failure_errno = 0;
     char host[INET_ADDRSTRLEN], hello[512], key[32], expected[48];
     uint8_t key_raw[16];
     uint16_t port;
@@ -1050,19 +1063,53 @@ int desk_sdk_ws_client_connect_paired(void)
     s_ws_hello_pending = true;
     s_ws_hello_pending_generation = connect_generation;
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
-    connect_stage = "hardware_hello_ack";
-    if (ws_send_frame(0x1, (const uint8_t *)hello, strlen(hello)) != 0) goto fail;
+    connect_stage = "hardware_hello_send";
+    errno = 0;
+    if (ws_send_frame(0x1, (const uint8_t *)hello, strlen(hello)) != 0) {
+        failure_reason = "hello_frame_send_error";
+        failure_errno = errno;
+        goto fail;
+    }
     uint8_t opcode; size_t ack_len;
-    if (ws_read_frame(3000, &opcode, s_ws_ack, sizeof(s_ws_ack)-1, &ack_len) != 0 || opcode != 0x1) goto fail;
+    connect_stage = "hardware_hello_read";
+    errno = 0;
+    int read_rc = ws_read_frame(3000, &opcode, s_ws_ack, sizeof(s_ws_ack)-1, &ack_len);
+    if (read_rc == 1) {
+        failure_reason = "hello_frame_read_timeout";
+        failure_errno = 0;
+        goto fail;
+    }
+    if (read_rc != 0) {
+        failure_reason = "hello_frame_read_error";
+        failure_errno = errno;
+        goto fail;
+    }
+    if (opcode != 0x1) {
+        failure_reason = "hello_non_text_opcode";
+        failure_errno = 0;
+        goto fail;
+    }
     s_ws_ack[ack_len] = 0;
-    if (!ws_hardware_hello_ack_valid((const char *)s_ws_ack)) goto fail;
+    if (!ws_hardware_hello_ack_valid((const char *)s_ws_ack)) {
+        failure_reason = "hello_ack_schema_rejected";
+        failure_errno = 0;
+        goto fail;
+    }
     connect_stage = "writer_start";
-    if (ws_writer_start() != 0) goto fail;
+    if (ws_writer_start() != 0) {
+        failure_reason = "writer_start_error";
+        failure_errno = 0;
+        goto fail;
+    }
     /* Commit only if no close/credential/policy/identity invalidation happened
      * while this connection was in flight. This remains protocol ACK evidence,
      * not cryptographic Runtime peer authentication. */
     connect_stage = "hello_commit";
-    if (!ws_commit_hardware_hello_ack(connect_generation)) goto fail;
+    if (!ws_commit_hardware_hello_ack(connect_generation)) {
+        failure_reason = "hello_commit_rejected";
+        failure_errno = 0;
+        goto fail;
+    }
     if (desk_sdk_bridge_pairing_confirmed() != 0)
         printf("[SDK-PAIR] binding persistence failed; current session remains volatile\n");
     s_reconnect_failures = 0;
@@ -1070,7 +1117,12 @@ int desk_sdk_ws_client_connect_paired(void)
     pthread_mutex_unlock(&s_ws_connect_mutex);
     return 0;
 fail:
-    printf("[SDK-WS] connect failed stage=%s errno=%d\n", connect_stage, errno);
+    if (failure_errno != 0)
+        printf("[SDK-WS] connect failed stage=%s reason=%s errno=%d\n",
+               connect_stage, failure_reason, failure_errno);
+    else
+        printf("[SDK-WS] connect failed stage=%s reason=%s\n",
+               connect_stage, failure_reason);
     ws_transport_close();
     if (s_pairing_target_valid) ws_schedule_reconnect();
     pthread_mutex_unlock(&s_ws_connect_mutex);
