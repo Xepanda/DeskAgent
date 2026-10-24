@@ -3981,7 +3981,94 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
                                                                max_out_len, 0);
 }
 
+/* Keep the legacy TCP envelope intact while correlating every WS response
+ * with the official SDK's data.command_id, including early error branches. */
+static int desk_sdk_bridge_dispatch_ws_command(const char *json_in, char *out_buf,
+                                               size_t max_out_len,
+                                               uint32_t connection_generation);
+
 int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
+                                                       char *out_buf,
+                                                       size_t max_out_len,
+                                                       uint32_t connection_generation)
+{
+    if (!json_in || !out_buf || !max_out_len ||
+        strnlen(json_in, DESK_SDK_MAX_FRAME_LEN + 1U) > DESK_SDK_MAX_FRAME_LEN ||
+        !desk_log_json_valid(json_in)) return -1;
+    const char *input_data = NULL;
+    size_t input_data_len = 0;
+    char command_id[65] = "", raw_id[96] = "";
+    bool official = false;
+    if (desk_log_get_member_span(json_in, "data", &input_data, &input_data_len) &&
+        input_data_len && *input_data == '{') {
+        unsigned count = desk_log_get_member(input_data, "command_id", raw_id, sizeof(raw_id));
+        const char *id_span;
+        size_t id_len;
+        if (count || desk_log_get_member_span(input_data, "command_id", &id_span, &id_len)) {
+            if (count != 1 || !json_parse_top_level_str(input_data, "command_id", command_id,
+                                                       sizeof(command_id)) || !command_id[0]) return -1;
+            for (const char *c = command_id; *c; ++c)
+                if (!isalnum((unsigned char)*c) && *c != '-' && *c != '_' && *c != ':' && *c != '.') return -1;
+            official = true;
+        }
+    }
+    int rc = desk_sdk_bridge_dispatch_ws_command(json_in, out_buf, max_out_len,
+                                                 connection_generation);
+    if (rc || !official) return rc;
+    if (!desk_log_json_valid(out_buf)) return -1;
+
+    char request_type[64] = "", response_type[64] = "";
+    (void)json_parse_top_level_str(json_in, "type", request_type, sizeof(request_type));
+    (void)json_parse_top_level_str(out_buf, "type", response_type, sizeof(response_type));
+    if (strcmp(request_type, "sys.sdk.ready.get") == 0 && strcmp(response_type, "sys.ack") == 0) {
+        const char *type_start;
+        size_t type_len;
+        static const char ready_type[] = "\"evt.sdk.ready\"";
+        if (!desk_log_get_member_span(out_buf, "type", &type_start, &type_len)) return -1;
+        size_t offset = (size_t)(type_start - out_buf), len = strlen(out_buf);
+        size_t replacement_len = sizeof(ready_type) - 1U;
+        if (len - type_len + replacement_len >= max_out_len) return -1;
+        memmove(out_buf + offset + replacement_len, out_buf + offset + type_len,
+                len - offset - type_len + 1U);
+        memcpy(out_buf + offset, ready_type, replacement_len);
+    }
+
+    const char *output_data;
+    size_t output_data_len;
+    bool has_data = desk_log_get_member_span(out_buf, "data", &output_data, &output_data_len);
+    if (has_data && (!output_data_len || *output_data != '{')) return -1;
+    if (has_data && desk_log_get_member(output_data, "command_id", raw_id, sizeof(raw_id))) {
+        char existing_id[65] = "";
+        return json_parse_top_level_str(output_data, "command_id", existing_id, sizeof(existing_id)) &&
+               strcmp(existing_id, command_id) == 0 ? 0 : -1;
+    }
+    char error_code[128] = "\"COMMAND_FAILED\"";
+    const char *error;
+    size_t error_len;
+    if (strcmp(response_type, "sys.nack") == 0 &&
+        desk_log_get_member_span(out_buf, "error", &error, &error_len) && error_len && *error == '{') {
+        if (desk_log_get_member(error, "code", error_code, sizeof(error_code)) != 1)
+            snprintf(error_code, sizeof(error_code), "\"COMMAND_FAILED\"");
+    }
+    const char *first_member = has_data ? output_data + 1U : NULL;
+    if (first_member) while (*first_member && isspace((unsigned char)*first_member)) ++first_member;
+    char fragment[256];
+    bool nack = strcmp(response_type, "sys.nack") == 0;
+    int n = snprintf(fragment, sizeof(fragment), "%s\"command_id\":\"%s\"%s%s%s%s",
+                     has_data ? "" : "\"data\":{", command_id,
+                     nack ? ",\"error\":" : "", nack ? error_code : "",
+                     has_data ? (*first_member != '}' ? "," : "") : "}",
+                     has_data ? "" : ",");
+    if (n < 0 || (size_t)n >= sizeof(fragment)) return -1;
+    size_t len = strlen(out_buf);
+    size_t offset = has_data ? (size_t)(output_data - out_buf) + 1U : 1U;
+    if (len + (size_t)n >= max_out_len) return -1;
+    memmove(out_buf + offset + (size_t)n, out_buf + offset, len - offset + 1U);
+    memcpy(out_buf + offset, fragment, (size_t)n);
+    return 0;
+}
+
+static int desk_sdk_bridge_dispatch_ws_command(const char *json_in,
                                                        char *out_buf,
                                                        size_t max_out_len,
                                                        uint32_t connection_generation)

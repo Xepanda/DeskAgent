@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -43,6 +44,7 @@ try:
         FRAME_AUDIO,
         FRAME_IMAGE,
         BinaryFrame,
+        build_command,
         build_wspk,
         parse_json_message,
         parse_wspk,
@@ -480,6 +482,20 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             payload, out, len(out), generation
         )
 
+    def test_official_build_command_ready_and_unknown_response(self) -> None:
+        for kind in ("sys.sdk.ready.get", "unsupported.command"):
+            cid = "a" * 32
+            out = ctypes.create_string_buffer(4096)
+            self.assertEqual(self._process_ws_command(build_command(kind, {}, cid).encode(), out), 0)
+            reply = json.loads(out.value)
+            self.assertEqual(reply["data"]["command_id"], cid)
+            if kind == "sys.sdk.ready.get":
+                self.assertEqual(reply["type"], "evt.sdk.ready")
+                self.assertIn("motion", reply["data"]["capabilities"])
+            else:
+                self.assertEqual(reply["type"], "sys.nack")
+                self.assertTrue(reply["data"]["error"])
+
     def test_websocket_client_starts_offline_and_refuses_unpaired_send(self) -> None:
         self.assertFalse(self.lib.desk_sdk_ws_client_is_connected())
         self.assertFalse(self.lib.desk_sdk_ws_client_is_authenticated())
@@ -750,14 +766,15 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
 
     @staticmethod
     def _notification_summary(command_id: str = "0123456789abcdef0123456789abcdef") -> dict:
+        created = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         return {
             "type": "notification.summary.deliver",
             "code": 0,
             "data": {
                 "summary_id": "summary:recovery-20261023-01",
                 "batch_id": "batch:recovery-20261023-01",
-                "created_at": "2026-10-23T00:00:00Z",
-                "expires_at": "2026-10-24T00:00:00Z",
+                "created_at": created.isoformat().replace("+00:00", "Z"),
+                "expires_at": (created + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
                 "items": [{
                     "reminder_id": "reminder-1",
                     "occurrence_id": "occurrence-1",
@@ -785,7 +802,7 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
         empty_items = json.loads(json.dumps(valid)); empty_items["data"]["items"] = []; malformed.append(empty_items)
         too_many = json.loads(json.dumps(valid)); too_many["data"]["items"] *= 21; malformed.append(too_many)
         bad_time = json.loads(json.dumps(valid)); bad_time["data"]["created_at"] = "2026-02-30T00:00:00Z"; malformed.append(bad_time)
-        wrong_expiry = json.loads(json.dumps(valid)); wrong_expiry["data"]["expires_at"] = "2026-10-23T23:59:59Z"; malformed.append(wrong_expiry)
+        wrong_expiry = json.loads(json.dumps(valid)); wrong_expiry["data"]["expires_at"] = (datetime.fromisoformat(valid["data"]["expires_at"].replace("Z", "+00:00")) - timedelta(seconds=1)).isoformat().replace("+00:00", "Z"); malformed.append(wrong_expiry)
         unsorted = json.loads(json.dumps(valid))
         unsorted["data"]["items"] = [json.loads(json.dumps(valid["data"]["items"][0])) for _ in range(2)]
         unsorted["data"]["items"][0]["scheduled_at"] = "2026-10-22T13:30:00Z"

@@ -532,6 +532,37 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(rejected["type"], "sys.nack")
         self.assertEqual(rejected["data"]["error"], "INVALID_FILTER")
 
+    def test_official_ws_ready_and_generic_response_correlation(self) -> None:
+        cid = "0123456789abcdef0123456789abcdef"
+        ready = self._process_ws_cmd({"type": "sys.sdk.ready.get", "code": 0,
+                                      "data": {"command_id": cid}})
+        self.assertEqual(ready["type"], "evt.sdk.ready")
+        self.assertEqual(ready["data"]["command_id"], cid)
+        self.assertIn("motion", ready["data"]["capabilities"])
+        pong = self._process_ws_cmd({"type": "sys.ping", "code": 0,
+                                     "data": {"command_id": cid}})
+        self.assertEqual(pong["data"]["command_id"], cid)
+        rejected = self._process_ws_cmd({"type": "unsupported.command", "code": 0,
+                                         "data": {"command_id": cid}})
+        self.assertEqual(rejected["type"], "sys.nack")
+        self.assertEqual(rejected["data"]["command_id"], cid)
+        self.assertTrue(rejected["data"]["error"])
+        # Legacy TCP requests retain their established envelope.
+        legacy = self._process_cmd({"type": "sys.sdk.ready.get", "request_id": "legacy"})
+        self.assertEqual(legacy["type"], "sys.ack")
+        self.assertNotIn("command_id", legacy["data"])
+
+    def test_official_ws_correlation_rejects_invalid_ids_and_small_output(self) -> None:
+        for cid in ('bad"id', "x" * 130, ""):
+            raw = json.dumps({"type": "sys.ping", "code": 0,
+                              "data": {"command_id": cid}}).encode()
+            out = ctypes.create_string_buffer(4096)
+            self.assertNotEqual(self.lib.desk_sdk_bridge_process_ws_command(raw, out, len(out)), 0)
+        raw = json.dumps({"type": "sys.ping", "code": 0,
+                          "data": {"command_id": "a" * 32}}).encode()
+        out = ctypes.create_string_buffer(50)
+        self.assertNotEqual(self.lib.desk_sdk_bridge_process_ws_command(raw, out, len(out)), 0)
+
     def _process_cmd(self, cmd_dict: dict) -> dict:
         cmd_str = json.dumps(cmd_dict).encode("utf-8")
         out_buf = ctypes.create_string_buffer(4096)
