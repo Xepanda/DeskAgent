@@ -26,6 +26,7 @@ VALID_SESSION_TOKEN = "0123456789abcdef" * 4
 
 # Hardware error codes (desk_hardware.h)
 DESK_HW_OK = 0
+DESK_HW_ERR_TIMEOUT = -3
 DESK_HW_ERR_STALL = -6
 
 # Resource enum definitions matching desk_arbiter.h
@@ -2870,6 +2871,87 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertEqual(response.get("type"), "sys.ack", response)
         self.assertEqual(response.get("request_id"), "req-camera-budget")
         self.assertEqual(captured.get("timeout_ms"), 5000)
+
+    def test_official_sdk_nested_camera_lease_owner_can_release_and_reassign(self) -> None:
+        """Official SDK puts client_id under data; release must free that lease."""
+        self.lib.desk_sdk_bridge_set_pairing_code(b"123456")
+        rc, pair_reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0, pair_reply)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+
+        first = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "request_id": "req-lease-first",
+            "data": {"client_id": "official-sdk-owner-a", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(first.get("type"), "sys.ack", first)
+        released = self._process_ws_cmd({
+            "type": "ctrl.camera.release", "request_id": "req-lease-release",
+            "data": {"client_id": "official-sdk-owner-a"},
+        })
+        self.assertEqual(released.get("type"), "sys.ack", released)
+        second = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "request_id": "req-lease-second",
+            "data": {"client_id": "official-sdk-owner-b", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(second.get("type"), "sys.ack", second)
+
+    def test_official_sdk_nested_camera_stream_envelope_reaches_availability_check(self) -> None:
+        """The official nested command envelope must pass camera stream validation."""
+        self.lib.desk_sdk_bridge_set_pairing_code(b"123456")
+        rc, pair_reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0, pair_reply)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+        acquired = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "request_id": "req-stream-lease",
+            "data": {"client_id": "official-sdk-stream", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(acquired.get("type"), "sys.ack", acquired)
+
+        response = self._process_ws_cmd({
+            "type": "ctrl.camera.stream.start",
+            "data": {
+                "command_id": "a" * 32,
+                "client_id": "official-sdk-stream",
+                "session_id": "official-sdk-session",
+                "width": 640,
+                "height": 480,
+                "target_fps": 15,
+            },
+        })
+        self.assertEqual(response.get("error", {}).get("code"), "CAMERA_STREAM_UNAVAILABLE", response)
+
+    def test_camera_capture_nack_preserves_hardware_timeout_code(self) -> None:
+        """A real capture error must not be flattened into generic RESOURCE_BUSY."""
+        self.lib.desk_sdk_bridge_set_pairing_code(b"123456")
+        rc, pair_reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0, pair_reply)
+        self.lib.desk_sdk_test_ws_seed_authenticated()
+        self.addCleanup(self.lib.desk_sdk_test_ws_reset)
+
+        @DRIVER_CAMERA_CAPTURE_CB
+        def camera_timeout(_out_buf, _max_len, _out_len, _timeout_ms):
+            return DESK_HW_ERR_TIMEOUT
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"camera_timeout_test_provider"
+        ops.camera_capture = ctypes.cast(camera_timeout, ctypes.c_void_p)
+        self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops)), 0)
+        self._driver_ops_keepalive = [(ops, camera_timeout)]
+        acquired = self._process_ws_cmd({
+            "type": "ctrl.camera.acquire", "client_id": "camera-timeout-owner",
+            "data": {"client_id": "camera-timeout-owner", "lease_duration_ms": 5000},
+        })
+        self.assertEqual(acquired.get("type"), "sys.ack", acquired)
+
+        response = self._process_ws_cmd({
+            "type": "ctrl.camera.capture", "request_id": "req-camera-timeout",
+            "client_id": "camera-timeout-owner", "data": {},
+        })
+        self.assertEqual(response.get("type"), "sys.nack", response)
+        self.assertEqual(response.get("error", {}).get("code"), "CAMERA_TIMEOUT", response)
+        self.assertEqual(response.get("error", {}).get("driver_rc"), DESK_HW_ERR_TIMEOUT, response)
 
 
     # ------------------------------------------------------------------

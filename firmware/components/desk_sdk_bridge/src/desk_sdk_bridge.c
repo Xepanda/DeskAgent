@@ -1185,6 +1185,18 @@ static bool json_extract_subobject(const char *json, const char *key, char *out_
     return false;
 }
 
+/* Official SDK commands put command fields in the top-level data object.
+ * Preserve legacy top-level compatibility without searching unrelated nested
+ * objects. */
+static bool json_parse_command_str(const char *json, const char *key,
+                                   char *out_val, size_t max_len)
+{
+    if (json_parse_top_level_str(json, key, out_val, max_len)) return true;
+    char data[1024];
+    if (!json_extract_subobject(json, "data", data, sizeof(data))) return false;
+    return json_parse_top_level_str(data, key, out_val, max_len);
+}
+
 /**
  * @brief Build the '"request_id":"<id>",' fragment for a response envelope.
  *
@@ -2247,11 +2259,23 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         if (cap_rc != DESK_HW_OK || jpeg_len == 0) {
             desk_psram_free(jpeg_buf);
             atomic_store(&s_camera_exclusive_state, 0);
+            const char *error = cap_rc == DESK_HW_ERR_INVALID_ARG ? "CAMERA_INVALID_ARGUMENT" :
+                                cap_rc == DESK_HW_ERR_UNAVAILABLE ? "CAMERA_UNAVAILABLE" :
+                                cap_rc == DESK_HW_ERR_TIMEOUT ? "CAMERA_TIMEOUT" :
+                                cap_rc == DESK_HW_ERR_IO ? "CAMERA_IO_ERROR" :
+                                cap_rc == DESK_HW_ERR_BUSY ? "CAMERA_BUSY" :
+                                cap_rc == DESK_HW_ERR_STALL ? "CAMERA_STALLED" :
+                                "CAMERA_CAPTURE_FAILED";
+            int response_code = cap_rc == DESK_HW_ERR_INVALID_ARG ? 400 :
+                                cap_rc == DESK_HW_ERR_UNAVAILABLE ? 503 :
+                                cap_rc == DESK_HW_ERR_TIMEOUT || cap_rc == DESK_HW_ERR_STALL ? 504 :
+                                cap_rc == DESK_HW_ERR_BUSY ? 409 :
+                                cap_rc == DESK_HW_ERR_IO ? 502 : 500;
             snprintf(out_buf, max_out_len,
-                     "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
-                     "\"code\":\"RESOURCE_BUSY\","
-                     "\"message\":\"Camera frame unavailable\"}}",
-                     rid);
+                     "{\"type\":\"sys.nack\",%s\"code\":%d,\"error\":{"
+                     "\"code\":\"%s\",\"driver_rc\":%d,"
+                     "\"message\":\"Camera hardware capture failed\"}}",
+                     rid, response_code, error, cap_rc);
             return 0;
         }
 
@@ -2716,9 +2740,9 @@ static int desk_sdk_camera_stream_command(const char *json, char *out, size_t ca
 {
     char command_id[40] = "", client_id[32] = "", session_id[65] = "";
     char data[512] = "";
-    (void)json_parse_top_level_str(json, "command_id", command_id, sizeof(command_id));
-    (void)json_parse_top_level_str(json, "client_id", client_id, sizeof(client_id));
-    (void)json_parse_top_level_str(json, "session_id", session_id, sizeof(session_id));
+    (void)json_parse_command_str(json, "command_id", command_id, sizeof(command_id));
+    (void)json_parse_command_str(json, "client_id", client_id, sizeof(client_id));
+    (void)json_parse_command_str(json, "session_id", session_id, sizeof(session_id));
     if (!desk_sdk_log_command_id_valid(command_id) || client_id[0] == '\0' || session_id[0] == '\0' ||
         !json_extract_subobject(json, "data", data, sizeof(data)))
         return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
@@ -2735,8 +2759,10 @@ static int desk_sdk_camera_stream_command(const char *json, char *out, size_t ca
                                             "NO_ACTIVE_LEASE", 403, 0, 0, false);
 
     if (strcmp(type, "ctrl.camera.stream.start") == 0) {
-        static const char *const keys[] = { "width", "height", "target_fps" };
-        if (!desk_log_object_keys_allowed(data, keys, 3) ||
+        static const char *const keys[] = {
+            "width", "height", "target_fps", "command_id", "client_id", "session_id"
+        };
+        if (!desk_log_object_keys_allowed(data, keys, 6) ||
             json_parse_int(data, "width", -1) != 640 ||
             json_parse_int(data, "height", -1) != 480 ||
             json_parse_int(data, "target_fps", -1) != 15)
@@ -2868,8 +2894,10 @@ static int desk_sdk_camera_stream_command(const char *json, char *out, size_t ca
                                             NULL, 0, (uint16_t)stream_id, 0, true);
     }
 
-    static const char *const ping_keys[] = { "ping_id", "host_send_monotonic_ms" };
-    if (!desk_log_object_keys_allowed(data, ping_keys, 2))
+    static const char *const ping_keys[] = {
+        "ping_id", "host_send_monotonic_ms", "command_id", "client_id", "session_id"
+    };
+    if (!desk_log_object_keys_allowed(data, ping_keys, 5))
         return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
                                             "INVALID_ARGUMENT", 400, 0, 0, false);
     pthread_mutex_lock(&s_camera_stream.mutex);
@@ -4346,7 +4374,7 @@ static int desk_sdk_bridge_dispatch_ws_command(const char *json_in,
         int rc = desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
         if (rc == 0 && strstr(out_buf, "\"type\":\"sys.ack\"")) {
             char client_id[32] = "";
-            if (json_parse_top_level_str(json_in, "client_id", client_id, sizeof(client_id)) && client_id[0] &&
+            if (json_parse_command_str(json_in, "client_id", client_id, sizeof(client_id)) && client_id[0] &&
                 desk_arbiter_camera_lease_matches(client_id)) {
                 pthread_mutex_lock(&s_ws_camera_owner_mutex);
                 snprintf(s_ws_camera_owner_id, sizeof(s_ws_camera_owner_id), "%s", client_id);
@@ -4357,7 +4385,7 @@ static int desk_sdk_bridge_dispatch_ws_command(const char *json_in,
     }
     if (strcmp(type, "ctrl.camera.release") == 0 || strcmp(type, "camera.release") == 0) {
         char client_id[32] = "";
-        (void)json_parse_top_level_str(json_in, "client_id", client_id, sizeof(client_id));
+        (void)json_parse_command_str(json_in, "client_id", client_id, sizeof(client_id));
         pthread_mutex_lock(&s_ws_camera_owner_mutex);
         bool owner_matches = client_id[0] && strcmp(client_id, s_ws_camera_owner_id) == 0;
         pthread_mutex_unlock(&s_ws_camera_owner_mutex);
