@@ -46,7 +46,7 @@ class TestWatcherUiInput(unittest.TestCase):
                       "DESK_TOUCH_ACTION_SCROLL_DOWN", "DESK_TOUCH_TARGET_SCREENTOUCH",
                       "DESK_TOUCH_ACTION_SHORT_PRESS"):
             self.assertIn(token, handler)
-        for page in ("HOME", "AUDIO", "CONNECTION", "DEVICE"):
+        for page in ("HOME", "AUDIO", "VOICE", "DEVICE"):
             self.assertIn(f"WATCHER_UI_PAGE_{page}", self.bridge)
         self.assertIn("desk_hardware_display_set_expression", self.bridge)
         self.assertIn("desk_hardware_audio_get_status", self.bridge)
@@ -77,11 +77,28 @@ class TestWatcherUiInput(unittest.TestCase):
         self.assertLess(update.index("snprintf(s_ui_home_preset"),
                         update.index("return watcher_ui_render()"))
 
-    def test_connection_page_labels_its_local_value_as_tclaw_shim_state(self) -> None:
+    def test_status_overlay_uses_short_product_labels_not_debug_details(self) -> None:
         render = function_body(self.bridge, "watcher_ui_render")
-        self.assertIn("TCLAW SHIM", render)
-        self.assertNotIn("VOICE CONNECTED", render)
-        self.assertNotIn("VOICE DISCONNECTED", render)
+        page_name = function_body(self.bridge, "watcher_ui_page_name")
+        for noisy in ("TCLAW SHIM", "MIC %s F%lu E%lu", "WATCHER S3 412X412", "MENU %s"):
+            self.assertNotIn(noisy, render)
+        self.assertIn('return "VOICE"', page_name)
+        self.assertNotIn("WATCHER_UI_PAGE_CONNECTION", self.bridge)
+
+    def test_dialogue_states_drive_short_mood_feedback(self) -> None:
+        speaking = function_body(self.bridge, "desk_tclaw_start_speaking")
+        self.assertIn('desk_tclaw_start_speaking_with_feedback(speech_text, "speaking", "Speaking")', speaking)
+
+        event_handler = function_body(self.bridge, "desk_tclaw_tuya_handle_cloud_event")
+        self.assertIn('desk_tclaw_update_ui_screen("error", "Try again")', event_handler)
+
+        disconnected = function_body(self.bridge, "desk_tclaw_on_tuya_mqtt_disconnected")
+        self.assertIn('desk_tclaw_update_ui_screen("offline", "Offline")', disconnected)
+
+        tool_response = function_body(self.bridge, "desk_tclaw_handle_tool_response")
+        self.assertIn("desk_tclaw_start_speaking_with_feedback", tool_response)
+        self.assertIn('is_success ? "happy" : "error"', tool_response)
+        self.assertIn('is_success ? "Done" : "Failed"', tool_response)
 
     def test_board_renderer_is_not_modified_for_status_pages(self) -> None:
         # UI pages must use the existing expression/status text interface.
