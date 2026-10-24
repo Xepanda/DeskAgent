@@ -14,6 +14,7 @@ class TestBackgroundWorkerLifecycle(unittest.TestCase):
         self.assertIn("uxTaskGetStackHighWaterMark(NULL)", worker)
         self.assertIn("atomic_compare_exchange_strong", worker)
         self.assertIn("atomic_load(&s_worker_stack_hwm)", worker)
+        self.assertIn('"desk_poll_worker", 24576', worker)
 
     def test_esp_writer_uses_scoped_psram_stack_configuration(self):
         source = (Path(__file__).resolve().parents[2] / "firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c").read_text(encoding="utf-8")

@@ -5015,7 +5015,7 @@ int desk_firmware_start_background_task(void)
     if (!atomic_compare_exchange_strong(&s_worker_state, &expected, 1))
         return expected == 1 ? 0 : -1;
     atomic_store(&s_worker_stack_hwm, 0);
-    BaseType_t ret = xTaskCreateWithCaps(firmware_worker_task, "desk_poll_worker", 8192, NULL, 5,
+    BaseType_t ret = xTaskCreateWithCaps(firmware_worker_task, "desk_poll_worker", 24576, NULL, 5,
                                          &s_worker_task_handle, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ret != pdPASS) atomic_store(&s_worker_state, 0);
     return ret == pdPASS ? 0 : -1;
