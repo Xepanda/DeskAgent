@@ -15,6 +15,18 @@ class TestBackgroundWorkerLifecycle(unittest.TestCase):
         self.assertIn("atomic_compare_exchange_strong", worker)
         self.assertIn("atomic_load(&s_worker_stack_hwm)", worker)
 
+    def test_esp_writer_uses_scoped_psram_stack_configuration(self):
+        source = (Path(__file__).resolve().parents[2] / "firmware/components/desk_sdk_bridge/src/desk_sdk_websocket.c").read_text(encoding="utf-8")
+        start = source.index("static int ws_writer_start(void)")
+        writer = source[start:source.index("static int ws_enqueue_frame_with_camera_ack", start)]
+        self.assertIn("MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT", writer)
+        configure = writer.index("esp_pthread_set_cfg(&writer_cfg)")
+        create = writer.index("pthread_create(")
+        restore = writer.index("esp_pthread_set_cfg(&previous)")
+        self.assertLess(configure, create)
+        self.assertLess(create, restore)
+        self.assertIn("create_rc != 0", writer)
+
     @unittest.skipUnless(shutil.which("gcc"), "native gcc required")
     def test_preemptive_create_runs_worker_before_handle_is_published(self):
         source = (Path(__file__).resolve().parents[2] / "firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c").read_text(encoding="utf-8")

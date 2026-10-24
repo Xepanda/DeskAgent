@@ -6,6 +6,8 @@
 #include <sys/poll.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_pthread.h"
+#include "esp_heap_caps.h"
 #else
 #include <poll.h>
 #endif
@@ -244,7 +246,29 @@ static int ws_writer_start(void)
 {
     pthread_mutex_lock(&s_ws_writer_mutex);
     if (!s_ws_writer_started) {
-        if (pthread_create(&s_ws_writer_thread, NULL, ws_writer_main, NULL) != 0) {
+#ifdef ESP_PLATFORM
+        /* Keep this long-lived network writer off the scarce internal SRAM.
+         * Configuration is caller-local and restored after this one creation. */
+        esp_pthread_cfg_t previous = esp_pthread_get_default_config();
+        (void)esp_pthread_get_cfg(&previous);
+        esp_pthread_cfg_t writer_cfg = previous;
+        writer_cfg.stack_size = 6144;
+        writer_cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+        writer_cfg.thread_name = "desk_ws_writer";
+        writer_cfg.inherit_cfg = false;
+        if (esp_pthread_set_cfg(&writer_cfg) != ESP_OK) {
+            pthread_mutex_unlock(&s_ws_writer_mutex);
+            return -1;
+        }
+#endif
+        int create_rc = pthread_create(&s_ws_writer_thread, NULL, ws_writer_main, NULL);
+#ifdef ESP_PLATFORM
+        (void)esp_pthread_set_cfg(&previous);
+        if (create_rc != 0)
+            printf("[SDK-WS] writer creation failed rc=%d internal_free=%lu\n", create_rc,
+                   (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#endif
+        if (create_rc != 0) {
             pthread_mutex_unlock(&s_ws_writer_mutex);
             return -1;
         }
@@ -954,6 +978,7 @@ int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len)
 int desk_sdk_ws_client_connect_paired(void)
 {
     pthread_mutex_lock(&s_ws_connect_mutex);
+    const char *connect_stage = "target";
     char host[INET_ADDRSTRLEN], hello[512], key[32], expected[48];
     uint8_t key_raw[16];
     uint16_t port;
@@ -970,6 +995,7 @@ int desk_sdk_ws_client_connect_paired(void)
     ws_random(key_raw, sizeof(key_raw));
     if (!ws_base64(key_raw, sizeof(key_raw), key, sizeof(key)) || ws_expected_accept(key, expected, sizeof(expected)) != 0) goto fail;
 
+    connect_stage = "tcp";
     s_ws_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (s_ws_fd < 0) goto fail;
     int flags = fcntl(s_ws_fd, F_GETFL, 0);
@@ -985,6 +1011,7 @@ int desk_sdk_ws_client_connect_paired(void)
         int so_error = 0; socklen_t so_len = sizeof(so_error);
         if (ws_wait(s_ws_fd, POLLOUT, 3000) != 0 || getsockopt(s_ws_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) != 0 || so_error != 0) goto fail;
     }
+    connect_stage = "http_upgrade";
     s_ws_state = DESK_SDK_WS_HANDSHAKE;
     char request[512];
     int q = snprintf(request, sizeof(request), "GET / HTTP/1.1\r\nHost: %s:%u\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n", host, port, key);
@@ -1014,21 +1041,25 @@ int desk_sdk_ws_client_connect_paired(void)
     s_ws_hello_pending = true;
     s_ws_hello_pending_generation = connect_generation;
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    connect_stage = "hardware_hello_ack";
     if (ws_send_frame(0x1, (const uint8_t *)hello, strlen(hello)) != 0) goto fail;
     uint8_t opcode; size_t ack_len;
     if (ws_read_frame(3000, &opcode, s_ws_ack, sizeof(s_ws_ack)-1, &ack_len) != 0 || opcode != 0x1) goto fail;
     s_ws_ack[ack_len] = 0;
     if (!ws_hardware_hello_ack_valid((const char *)s_ws_ack)) goto fail;
+    connect_stage = "writer_start";
     if (ws_writer_start() != 0) goto fail;
     /* Commit only if no close/credential/policy/identity invalidation happened
      * while this connection was in flight. This remains protocol ACK evidence,
      * not cryptographic Runtime peer authentication. */
+    connect_stage = "hello_commit";
     if (!ws_commit_hardware_hello_ack(connect_generation)) goto fail;
     s_reconnect_failures = 0;
     s_ws_retry_at = 0;
     pthread_mutex_unlock(&s_ws_connect_mutex);
     return 0;
 fail:
+    printf("[SDK-WS] connect failed stage=%s errno=%d\n", connect_stage, errno);
     ws_transport_close();
     if (s_pairing_target_valid) ws_schedule_reconnect();
     pthread_mutex_unlock(&s_ws_connect_mutex);
