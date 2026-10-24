@@ -121,6 +121,7 @@ if(DEFINED EXAMPLE_LIB)
             ${IDF_PATH}/components/esp_hw_support/include
             ${IDF_PATH}/components/esp_system/include
             ${IDF_PATH}/components/esp_app_format/include
+            ${IDF_PATH}/components/pthread/include
             ${IDF_PATH}/components/esp_rom/include
             ${IDF_PATH}/components/esp_rom/include/esp32s3
             ${IDF_PATH}/components/esp_rom/esp32s3/include

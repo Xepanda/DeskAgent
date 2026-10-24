@@ -10,4 +10,5 @@ idf_component_register(
         desk_tclaw
         lwip
         mbedtls
+        pthread
 )
