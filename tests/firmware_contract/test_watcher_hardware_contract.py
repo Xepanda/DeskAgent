@@ -62,6 +62,21 @@ class TestWatcherHardwareContract(unittest.TestCase):
 
         cls.lib = ctypes.CDLL(cls.so_path)
 
+        # SSCMA transport probe helpers (pure packet/reply logic; no SPI access).
+        cls.lib.desk_watcher_camera_sscma_encode_packet.argtypes = [
+            ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+        ]
+        cls.lib.desk_watcher_camera_sscma_encode_packet.restype = ctypes.c_int
+        cls.lib.desk_watcher_camera_sscma_parse_available.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_size_t),
+        ]
+        cls.lib.desk_watcher_camera_sscma_parse_available.restype = ctypes.c_int
+        cls.lib.desk_watcher_camera_sscma_parse_version_reply.argtypes = [
+            ctypes.POINTER(ctypes.c_char), ctypes.c_size_t, ctypes.c_void_p,
+        ]
+        cls.lib.desk_watcher_camera_sscma_parse_version_reply.restype = ctypes.c_int
+
         # Motion functions
         cls.lib.desk_watcher_motion_cobs_encode.argtypes = [
             ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
@@ -471,6 +486,47 @@ class TestWatcherHardwareContract(unittest.TestCase):
             bad_magic_body, len(body), ctypes.byref(out_ptr), ctypes.byref(out_sz)
         )
         self.assertEqual(rc_magic, -2)
+
+    def test_sscma_probe_packet_shapes_and_available_bounds(self) -> None:
+        payload = b"AT+VER?\r"
+        out = (ctypes.c_uint8 * 256)()
+        src = (ctypes.c_uint8 * len(payload))(*payload)
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_encode_packet(2, src, len(payload), out, 256), 0)
+        self.assertEqual(bytes(out[:4]), bytes([0x10, 0x02, 0, len(payload)]))
+        self.assertEqual(bytes(out[4:4 + len(payload)]), payload)
+        self.assertEqual(bytes(out[4 + len(payload):6 + len(payload)]), b"\xff\xff")
+        self.assertEqual(bytes(out[6 + len(payload):]), bytes(250 - len(payload)))
+
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_encode_packet(3, None, 0, out, 256), 0)
+        self.assertEqual(bytes(out[:6]), b"\x10\x03\x00\x00\xff\xff")
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_encode_packet(1, None, 512, out, 256), 0)
+        self.assertEqual(bytes(out[:6]), b"\x10\x01\x02\x00\xff\xff")
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_encode_packet(2, src, 251, out, 256), -1)
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_encode_packet(6, None, 0, out, 256), -1)
+
+        count = ctypes.c_size_t(0)
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_parse_available((ctypes.c_uint8 * 2)(0x01, 0x23), ctypes.byref(count)), 0)
+        self.assertEqual(count.value, 0x123)
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_parse_available((ctypes.c_uint8 * 2)(0xff, 0xff), ctypes.byref(count)), 0)
+        self.assertEqual(count.value, 0)
+
+    def test_sscma_probe_accepts_only_bounded_successful_ver_reply(self) -> None:
+        class Identity(ctypes.Structure):
+            _fields_ = [("at_api", ctypes.c_char * 24), ("software", ctypes.c_char * 48), ("hardware", ctypes.c_char * 24)]
+
+        identity = Identity()
+        valid = b'\r{"type":0,"name":"VER?","code":0,"data":{"at_api":"v1","software":"1.2.3","hardware":"HX6538"}}\n'
+        self.assertEqual(self.lib.desk_watcher_camera_sscma_parse_version_reply(ctypes.create_string_buffer(valid), len(valid), ctypes.byref(identity)), 0)
+        self.assertEqual(identity.software, b"1.2.3")
+        self.assertEqual(identity.hardware, b"HX6538")
+        for invalid in (
+            b'\r{"type":0,"name":"ID?","code":0,"data":{"id":"secret"}}\n',
+            b'\r{"type":0,"name":"VER?","code":1,"data":{}}\n',
+            b'{"type":0,"name":"VER?","code":0,"data":{}}\n',
+            valid + b"x",
+        ):
+            self.assertNotEqual(self.lib.desk_watcher_camera_sscma_parse_version_reply(ctypes.create_string_buffer(invalid), len(invalid), ctypes.byref(identity)), 0)
+        self.assertNotEqual(self.lib.desk_watcher_camera_sscma_parse_version_reply(ctypes.create_string_buffer(valid), 513, ctypes.byref(identity)), 0)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@
 #include "desk_watcher_log_source.h"
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 #ifdef ESP_PLATFORM
 #include "driver/spi_master.h"
@@ -159,6 +160,111 @@ static int camera_sync_is_active(bool *active)
     }
     *active = (in0 & PCA_PIN_SYNC_PORT0_MASK) != 0;
     return DESK_HW_OK;
+}
+
+#define SSCMA_SPI_PACKET_SIZE 256U
+#define SSCMA_SPI_MAX_PAYLOAD 250U
+#define SSCMA_SPI_FEATURE 0x10U
+#define SSCMA_SPI_READ 0x01U
+#define SSCMA_SPI_WRITE 0x02U
+#define SSCMA_SPI_AVAILABLE 0x03U
+#define SSCMA_PROBE_REPLY_MAX 512U
+#define SSCMA_SPI_WAIT_MS 2U
+
+int desk_watcher_camera_sscma_encode_packet(uint8_t operation, const uint8_t *payload,
+                                            size_t payload_len, uint8_t *out_packet,
+                                            size_t packet_capacity)
+{
+    if (!out_packet || packet_capacity < SSCMA_SPI_PACKET_SIZE ||
+        (operation != SSCMA_SPI_READ && operation != SSCMA_SPI_WRITE && operation != SSCMA_SPI_AVAILABLE) ||
+        (operation == SSCMA_SPI_WRITE && (payload_len > SSCMA_SPI_MAX_PAYLOAD || (payload_len && !payload))) ||
+        (operation == SSCMA_SPI_READ && (payload || payload_len > 4095U)) ||
+        (operation == SSCMA_SPI_AVAILABLE && payload_len != 0U)) return -1;
+    memset(out_packet, 0, SSCMA_SPI_PACKET_SIZE);
+    out_packet[0] = SSCMA_SPI_FEATURE;
+    out_packet[1] = operation;
+    out_packet[2] = (uint8_t)(payload_len >> 8);
+    out_packet[3] = (uint8_t)payload_len;
+    if (operation == SSCMA_SPI_WRITE && payload_len) memcpy(out_packet + 4, payload, payload_len);
+    size_t checksum_offset = operation == SSCMA_SPI_WRITE ? 4U + payload_len : 4U;
+    out_packet[checksum_offset] = 0xFFU;
+    out_packet[checksum_offset + 1U] = 0xFFU;
+    return 0;
+}
+
+int desk_watcher_camera_sscma_parse_available(const uint8_t reply[2], size_t *out_available)
+{
+    if (!reply || !out_available) return -1;
+    size_t value = ((size_t)reply[0] << 8) | reply[1];
+    *out_available = value == 0xFFFFU ? 0U : value;
+    return 0;
+}
+
+static int sscma_read_json_number(const char *json, const char *key, unsigned *value)
+{
+    char needle[24];
+    if (snprintf(needle, sizeof(needle), "\"%s\":", key) < 0) return -1;
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p < '0' || *p > '9') return -1;
+    unsigned v = 0;
+    do {
+        unsigned digit = (unsigned)(*p++ - '0');
+        if (v > (UINT_MAX - digit) / 10U) return -1;
+        v = v * 10U + digit;
+    } while (*p >= '0' && *p <= '9');
+    *value = v;
+    return 0;
+}
+
+static int sscma_read_json_string(const char *json, const char *key, char *out, size_t capacity)
+{
+    char needle[24];
+    if (!out || capacity == 0U || snprintf(needle, sizeof(needle), "\"%s\":", key) < 0) return -1;
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p++ != '\"') return -1;
+    size_t used = 0;
+    while (*p && *p != '\"') {
+        unsigned char c = (unsigned char)*p++;
+        /* Escaped JSON values are intentionally rejected: firmware version
+         * identifiers are plain ASCII and this keeps parsing bounded. */
+        if (c < 0x20U || c > 0x7EU || c == '\\' || used + 1U >= capacity) return -1;
+        out[used++] = (char)c;
+    }
+    if (*p != '\"' || used == 0U) return -1;
+    out[used] = '\0';
+    return 0;
+}
+
+int desk_watcher_camera_sscma_parse_version_reply(const char *reply, size_t reply_len,
+                                                  desk_watcher_camera_sscma_identity_t *out_identity)
+{
+    if (!reply || !out_identity || reply_len < 2U || reply_len > SSCMA_PROBE_REPLY_MAX ||
+        reply[0] != '\r' || reply[reply_len - 1U] != '\n' ||
+        memchr(reply, '\0', reply_len) != NULL) return -1;
+    char json[SSCMA_PROBE_REPLY_MAX];
+    size_t json_len = reply_len - 2U;
+    if (json_len == 0U || json_len >= sizeof(json)) return -1;
+    memcpy(json, reply + 1, json_len);
+    json[json_len] = '\0';
+    if (json[0] != '{' || json[json_len - 1U] != '}' ||
+        memchr(json, '\r', json_len) != NULL || memchr(json, '\n', json_len) != NULL) return -1;
+    unsigned type = UINT_MAX, code = UINT_MAX;
+    desk_watcher_camera_sscma_identity_t parsed = {0};
+    if (sscma_read_json_number(json, "type", &type) != 0 || type != 0U) return -1;
+    char name[8];
+    if (sscma_read_json_string(json, "name", name, sizeof(name)) != 0 || strcmp(name, "VER?") != 0 ||
+        sscma_read_json_number(json, "code", &code) != 0 || code != 0U ||
+        sscma_read_json_string(json, "at_api", parsed.at_api, sizeof(parsed.at_api)) != 0 ||
+        sscma_read_json_string(json, "software", parsed.software, sizeof(parsed.software)) != 0 ||
+        sscma_read_json_string(json, "hardware", parsed.hardware, sizeof(parsed.hardware)) != 0) return -1;
+    *out_identity = parsed;
+    return 0;
 }
 
 #ifdef ESP_PLATFORM
@@ -544,6 +650,113 @@ int desk_watcher_camera_init(void)
 #else
     s_camera_initialized = true;
     return DESK_HW_OK;
+#endif
+}
+
+#ifdef ESP_PLATFORM
+static esp_err_t camera_sscma_exchange_tx(const uint8_t packet[SSCMA_SPI_PACKET_SIZE],
+                                          uint8_t *reply, size_t reply_len)
+{
+    esp_err_t err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
+    if (err != ESP_OK) return err;
+    spi_transaction_t tx = { .length = SSCMA_SPI_PACKET_SIZE * 8U, .tx_buffer = packet };
+    vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
+    err = spi_device_transmit(s_spi_dev, &tx);
+    if (err == ESP_OK && reply && reply_len) {
+        vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
+        spi_transaction_t rx = { .length = reply_len * 8U, .rxlength = reply_len * 8U, .rx_buffer = reply };
+        err = spi_device_transmit(s_spi_dev, &rx);
+    }
+    spi_device_release_bus(s_spi_dev);
+    return err;
+}
+
+static esp_err_t camera_sscma_read(size_t reply_len, uint8_t *reply)
+{
+    uint8_t request[SSCMA_SPI_PACKET_SIZE];
+    if (!reply || reply_len == 0U || reply_len > 4095U ||
+        desk_watcher_camera_sscma_encode_packet(SSCMA_SPI_READ, NULL, reply_len,
+                                                request, sizeof(request)) != 0) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
+    if (err != ESP_OK) return err;
+    spi_transaction_t tx = { .length = sizeof(request) * 8U, .tx_buffer = request };
+    vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
+    err = spi_device_transmit(s_spi_dev, &tx);
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
+        spi_transaction_t rx = { .length = reply_len * 8U, .rxlength = reply_len * 8U, .rx_buffer = reply };
+        err = spi_device_transmit(s_spi_dev, &rx);
+    }
+    spi_device_release_bus(s_spi_dev);
+    return err;
+}
+
+static int camera_sscma_available(size_t *available)
+{
+    uint8_t packet[SSCMA_SPI_PACKET_SIZE], response[2] = {0};
+    if (desk_watcher_camera_sscma_encode_packet(SSCMA_SPI_AVAILABLE, NULL, 0,
+                                                packet, sizeof(packet)) != 0) return DESK_HW_ERR_INVALID_ARG;
+    esp_err_t err = camera_sscma_exchange_tx(packet, response, sizeof(response));
+    if (err != ESP_OK) return DESK_WATCHER_CAMERA_ERR_SPI;
+    return desk_watcher_camera_sscma_parse_available(response, available) == 0
+               ? DESK_HW_OK : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+}
+#endif
+
+int desk_watcher_camera_probe_sscma_identity(desk_watcher_camera_sscma_identity_t *out_identity)
+{
+    if (!out_identity) return DESK_HW_ERR_INVALID_ARG;
+    memset(out_identity, 0, sizeof(*out_identity));
+#ifdef ESP_PLATFORM
+    if (!s_camera_initialized || !s_spi_dev || !s_cam_mutex) return DESK_WATCHER_CAMERA_ERR_NOT_READY;
+    if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return DESK_HW_ERR_BUSY;
+
+    int rc = DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+    const uint8_t command[] = "AT+VER?\r";
+    uint8_t packet[SSCMA_SPI_PACKET_SIZE];
+    if (desk_watcher_camera_sscma_encode_packet(SSCMA_SPI_WRITE, command, sizeof(command) - 1U,
+                                                packet, sizeof(packet)) != 0) {
+        rc = DESK_HW_ERR_INVALID_ARG;
+        goto done;
+    }
+    if (camera_sscma_exchange_tx(packet, NULL, 0) != ESP_OK) {
+        rc = DESK_WATCHER_CAMERA_ERR_SPI;
+        goto done;
+    }
+
+    /* SSCMA replies are CR + JSON + LF. Bound both the wait and the payload;
+     * no RESET, MODE, SAMPLE, INVOKE or config command is sent. */
+    const int64_t deadline_us = esp_timer_get_time() + 2500000LL;
+    size_t available = 0;
+    bool sync_active = false;
+    while (esp_timer_get_time() < deadline_us) {
+        if (camera_sync_is_active(&sync_active) != DESK_HW_OK) {
+            rc = DESK_WATCHER_CAMERA_ERR_SYNC_IO;
+            goto done;
+        }
+        if (sync_active) {
+            rc = camera_sscma_available(&available);
+            if (rc != DESK_HW_OK) goto done;
+            if (available != 0U) break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (available < 2U || available > SSCMA_PROBE_REPLY_MAX) {
+        rc = available == 0U ? DESK_HW_ERR_TIMEOUT : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+        goto done;
+    }
+    uint8_t response[SSCMA_PROBE_REPLY_MAX];
+    if (camera_sscma_read(available, response) != ESP_OK) {
+        rc = DESK_WATCHER_CAMERA_ERR_SPI;
+        goto done;
+    }
+    rc = desk_watcher_camera_sscma_parse_version_reply((const char *)response, available, out_identity) == 0
+             ? DESK_HW_OK : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+done:
+    xSemaphoreGive(s_cam_mutex);
+    return rc;
+#else
+    return DESK_WATCHER_CAMERA_ERR_NOT_READY;
 #endif
 }
 

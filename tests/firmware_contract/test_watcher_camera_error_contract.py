@@ -17,6 +17,21 @@ CLI_C = ROOT / "firmware/components/desk_cli/src/desk_cli.c"
 
 
 class TestWatcherCameraErrorContract(unittest.TestCase):
+    def test_sscma_identity_probe_is_opt_in_bounded_and_read_only(self):
+        header = CAMERA_H.read_text(encoding="utf-8")
+        source = CAMERA_C.read_text(encoding="utf-8")
+        self.assertIn("desk_watcher_camera_probe_sscma_identity", header)
+        self.assertIn("desk_watcher_camera_sscma_encode_packet", source)
+        self.assertIn("desk_watcher_camera_sscma_parse_version_reply", source)
+        probe = source.split("int desk_watcher_camera_probe_sscma_identity(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("s_cam_mutex", probe)
+        self.assertIn("s_spi_dev", probe)
+        self.assertIn("AT+VER?\\r", probe)
+        for forbidden in ("WV1 MODE", "AT+SAMPLE", "AT+INVOKE", "AT+RESET", "spi_bus_add_device"):
+            self.assertNotIn(forbidden, probe)
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1].split("int desk_watcher_camera_deinit", 1)[0]
+        self.assertNotIn("probe_sscma", capture)
+
     def test_first_sync_readiness_deadline_has_camera_specific_error(self):
         header = CAMERA_H.read_text(encoding="utf-8")
         camera = CAMERA_C.read_text(encoding="utf-8")

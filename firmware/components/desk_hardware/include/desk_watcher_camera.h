@@ -42,10 +42,27 @@ typedef struct {
     size_t used;
 } desk_watcher_camera_resync_t;
 
+/* Sanitized fields from the optional, read-only SSCMA identity probe. */
+typedef struct {
+    char at_api[24];
+    char software[48];
+    char hardware[24];
+} desk_watcher_camera_sscma_identity_t;
+
 int desk_watcher_camera_init(void);
 int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
 int desk_watcher_camera_deinit(void);
 bool desk_watcher_camera_is_ready(void);
+/* Explicit one-shot probe only. Normal init/capture remain on the PTL path. */
+int desk_watcher_camera_probe_sscma_identity(desk_watcher_camera_sscma_identity_t *out_identity);
+
+/* Pure bounded SSCMA wire helpers, exposed for host contract tests. */
+int desk_watcher_camera_sscma_encode_packet(uint8_t operation, const uint8_t *payload,
+                                            size_t payload_len, uint8_t *out_packet,
+                                            size_t packet_capacity);
+int desk_watcher_camera_sscma_parse_available(const uint8_t reply[2], size_t *out_available);
+int desk_watcher_camera_sscma_parse_version_reply(const char *reply, size_t reply_len,
+                                                  desk_watcher_camera_sscma_identity_t *out_identity);
 
 /* PTL Header and Media Frame validation helpers */
 int desk_watcher_camera_parse_ptl_header(const uint8_t *header, size_t header_len, uint32_t *out_body_size);
