@@ -4993,36 +4993,47 @@ int desk_firmware_poll(int timeout_ms)
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 static TaskHandle_t s_worker_task_handle = NULL;
+/* xTaskCreateWithCaps may schedule the new task before publishing its output
+ * handle. Publish lifecycle state first; never use that handle as a run flag. */
+static atomic_int s_worker_state = 0; /* stopped=0, running=1, stopping=2 */
+static atomic_uint s_worker_stack_hwm = 0;
 static void firmware_worker_task(void *pvParameters)
 {
     (void)pvParameters;
-    while (s_worker_task_handle != NULL) {
+    while (atomic_load(&s_worker_state) == 1) {
         desk_firmware_poll(20);
+        atomic_store(&s_worker_stack_hwm, (uint32_t)uxTaskGetStackHighWaterMark(NULL));
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    atomic_store(&s_worker_stack_hwm, 0);
+    atomic_store(&s_worker_state, 0);
     vTaskDeleteWithCaps(NULL);
 }
 int desk_firmware_start_background_task(void)
 {
-    if (s_worker_task_handle != NULL) return 0;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&s_worker_state, &expected, 1))
+        return expected == 1 ? 0 : -1;
+    atomic_store(&s_worker_stack_hwm, 0);
     BaseType_t ret = xTaskCreateWithCaps(firmware_worker_task, "desk_poll_worker", 8192, NULL, 5,
                                          &s_worker_task_handle, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ret != pdPASS) atomic_store(&s_worker_state, 0);
     return ret == pdPASS ? 0 : -1;
 }
 void desk_firmware_stop_background_task(void)
 {
-    s_worker_task_handle = NULL;
+    int expected = 1;
+    (void)atomic_compare_exchange_strong(&s_worker_state, &expected, 2);
 }
 bool desk_firmware_is_background_task_running(void)
 {
-    return s_worker_task_handle != NULL;
+    return atomic_load(&s_worker_state) == 1;
 }
 uint32_t desk_firmware_background_task_stack_hwm(void)
 {
-    if (s_worker_task_handle != NULL) {
-        return (uint32_t)uxTaskGetStackHighWaterMark(s_worker_task_handle) * sizeof(StackType_t);
-    }
-    return 0;
+    /* ESP-IDF reports stack high-water marks in bytes. Sample only from the
+     * live worker itself so a diagnostic query can never scan a freed TCB. */
+    return atomic_load(&s_worker_stack_hwm);
 }
 #else
 #include <pthread.h>
