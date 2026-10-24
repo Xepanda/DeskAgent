@@ -521,6 +521,17 @@ static int motion_send_and_wait_ack(const uint8_t *frame_data, size_t frame_len,
 #endif
 }
 
+static int motion_ensure_peer(void)
+{
+    if (atomic_load_explicit(&s_peer_motion_capable, memory_order_relaxed))
+        return DESK_HW_OK;
+    desk_watcher_motion_peer_info_t peer = {0};
+    if (desk_watcher_motion_probe(&peer, MCU_ACK_TIMEOUT_MS) != DESK_HW_OK ||
+        (peer.capability_bitmap & MCU_CAPABILITY_MOTION) == 0u)
+        return DESK_HW_ERR_UNAVAILABLE;
+    return DESK_HW_OK;
+}
+
 int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms)
 {
     if (!isfinite(pan_deg) || !isfinite(tilt_deg) ||
@@ -528,8 +539,8 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
         tilt_deg < DESK_MOTION_TILT_MIN_DEG || tilt_deg > DESK_MOTION_TILT_MAX_DEG) {
         return DESK_HW_ERR_INVALID_ARG;
     }
-    if (!atomic_load_explicit(&s_peer_motion_capable, memory_order_relaxed))
-        return DESK_HW_ERR_UNAVAILABLE;
+    int peer_rc = motion_ensure_peer();
+    if (peer_rc != DESK_HW_OK) return peer_rc;
 
     uint8_t tx_buf[32];
     uint32_t seq = motion_next_sequence();
@@ -556,17 +567,22 @@ int desk_watcher_motion_move(float pan_deg, float tilt_deg, uint32_t duration_ms
                  stop_result);
 #endif
     }
+    if (result != DESK_HW_OK && result != DESK_HW_ERR_BUSY)
+        atomic_store_explicit(&s_peer_motion_capable, false, memory_order_relaxed);
     return result;
 }
 
 int desk_watcher_motion_stop(bool emergency)
 {
-    if (!atomic_load_explicit(&s_peer_motion_capable, memory_order_relaxed))
-        return DESK_HW_ERR_UNAVAILABLE;
+    int peer_rc = motion_ensure_peer();
+    if (peer_rc != DESK_HW_OK) return peer_rc;
     uint8_t tx_buf[32];
     uint32_t seq = motion_next_sequence();
     size_t len = motion_pack_stop(emergency, seq, tx_buf);
-    return motion_send_and_wait_ack(tx_buf, len, seq, MCU_MOTION_MSG_SERVO_STOP, true, NULL);
+    int result = motion_send_and_wait_ack(tx_buf, len, seq, MCU_MOTION_MSG_SERVO_STOP, true, NULL);
+    if (result != DESK_HW_OK && result != DESK_HW_ERR_BUSY)
+        atomic_store_explicit(&s_peer_motion_capable, false, memory_order_relaxed);
+    return result;
 }
 
 int desk_watcher_motion_get_last_ambiguous_move_stop_result(void)

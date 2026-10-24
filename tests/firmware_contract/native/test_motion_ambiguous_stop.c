@@ -45,6 +45,7 @@ static size_t s_response_offset;
 static uint8_t s_frames[12][64];
 static size_t s_frame_lens[12];
 static unsigned s_write_calls;
+static unsigned s_hello_write_calls;
 static unsigned s_stop_owner_checks;
 
 static uint16_t crc16(const uint8_t *data, size_t len)
@@ -151,6 +152,7 @@ int uart_write_bytes(int port, const char *data, size_t len)
     size_t raw_len = cobs_decode((const uint8_t *)data, len - 1, raw, sizeof(raw));
     assert(len > 1 && ((const uint8_t *)data)[len - 1] == 0 && raw_len >= 14);
     if (raw[3] == 1 && raw[4] == 1) { /* HELLO probe */
+        ++s_hello_write_calls;
         if (s_mode == TX_NO_HELLO) return (int)len;
         const uint8_t hello[] = {0, 1, 0, 0, 1,
                                  (uint8_t)(s_mode == TX_NO_MOTION_CAPABILITY ? 0 : 1),
@@ -224,6 +226,7 @@ static void reset_transport(tx_mode_t mode)
     s_response_len = 0;
     s_response_offset = 0;
     s_write_calls = 0;
+    s_hello_write_calls = 0;
     s_stop_owner_checks = 0;
     memset(s_frames, 0, sizeof(s_frames));
     memset(s_frame_lens, 0, sizeof(s_frame_lens));
@@ -291,6 +294,36 @@ int main(void)
 {
     desk_watcher_motion_diagnostics_t before;
     desk_watcher_motion_diagnostics_t after;
+    /* A product command must not need a prior diagnostic CLI probe. */
+    desk_hardware_init();
+    assert(desk_watcher_motion_init() == DESK_HW_OK);
+    assert(desk_hardware_register_driver_ops(&s_ops) == DESK_HW_OK);
+    reset_transport(TX_MOVE_ACK);
+    assert(desk_watcher_motion_move(-1.0f, 120.0f, 250) == DESK_HW_ERR_INVALID_ARG);
+    assert(s_hello_write_calls == 0 && s_write_calls == 0);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_OK);
+    assert(s_hello_write_calls == 1 && s_write_calls == 1);
+
+    /* A known capable peer is reused until a command fails. */
+    reset_transport(TX_MOVE_ACK);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_OK);
+    assert(s_hello_write_calls == 0 && s_write_calls == 1);
+    reset_transport(TX_FULL_NO_RESPONSE);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_TIMEOUT);
+    reset_transport(TX_MOVE_ACK);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_OK);
+    assert(s_hello_write_calls == 1 && s_write_calls == 1);
+
+    /* No HELLO or no motion capability must still prohibit motion writes. */
+    assert(desk_watcher_motion_deinit() == DESK_HW_OK);
+    assert(desk_watcher_motion_init() == DESK_HW_OK);
+    reset_transport(TX_NO_MOTION_CAPABILITY);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
+    assert(s_hello_write_calls == 1 && s_write_calls == 0);
+    reset_transport(TX_NO_HELLO);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
+    assert(s_hello_write_calls == 1 && s_write_calls == 0);
+
     begin_case(TX_NO_MOTION_CAPABILITY);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
     assert(s_write_calls == 0);
