@@ -39,8 +39,11 @@
 #include <stdatomic.h>
 #ifdef ESP_PLATFORM
 #include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
+#include "tal_kv.h"
 #elif defined(DESK_SDK_OPENSSL_TESTING)
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #endif
 
 static pthread_mutex_t s_ws_camera_owner_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -162,6 +165,14 @@ static char s_pair_daemon_instance_id[33] = "";
 static char s_pair_target_mode[32] = "";
 static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
+static char s_pair_protocol_version[4] = "1.0";
+static char s_binding_secret[65] = "";
+static bool s_pair_manual_pending = false;
+static char s_last_reunite_nonce[33] = "";
+static desk_sdk_pairing_store_ops_t s_pairing_store;
+static int desk_sdk_pairing_save_locked(void);
+static int desk_sdk_pairing_reunite_locked(const char *input, char *out, size_t capacity);
+
 static bool desk_sdk_is_lower_hex_64(const char *s);
 static int desk_sdk_audio_stream_begin_command(const char *json_in,
                                                char *out_buf, size_t max_out_len,
@@ -594,9 +605,9 @@ int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len)
     int n = snprintf(out_json, max_len,
         "{\"type\":\"sys.client.hello\",\"code\":0,\"data\":{"
         "\"role\":\"hardware\",\"pairing_protocol\":\"watcher-lan-pairing\","
-        "\"pairing_version\":\"1.0\",\"pair_request_id\":\"%s\","
+        "\"pairing_version\":\"%s\",\"pair_request_id\":\"%s\","
         "\"daemon_instance_id\":\"%s\",\"session_token\":\"%s\",\"mode\":\"%s\"}}",
-        s_pair_request_id, s_pair_daemon_instance_id, s_active_pairing_token,
+        s_pair_protocol_version, s_pair_request_id, s_pair_daemon_instance_id, s_active_pairing_token,
         s_pair_target_mode);
     pthread_mutex_unlock(&s_pairing_code_mutex);
     return n >= 0 && (size_t)n < max_len ? n : -1;
@@ -1542,6 +1553,10 @@ void desk_sdk_bridge_reset(void)
         s_pair_host[0] != '\0' || s_pair_websocket_port != 0;
     s_active_pairing_token[0] = '\0';
     s_paired = false;
+    s_binding_secret[0] = '\0';
+    s_last_reunite_nonce[0] = '\0';
+    s_pair_manual_pending = false;
+    snprintf(s_pair_protocol_version, sizeof(s_pair_protocol_version), "1.0");
     s_pair_request_id[0] = '\0';
     s_pair_daemon_instance_id[0] = '\0';
     s_pair_target_mode[0] = '\0';
@@ -1745,6 +1760,10 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     /* Fail-closed default: nothing is emitted unless validation fully passes. */
     udp_out[0] = '\0';
 
+    char udp_type[48] = "";
+    if (json_parse_top_level_str(udp_in, "type", udp_type, sizeof(udp_type)) &&
+        strcmp(udp_type, "link.reunite.request") == 0)
+        return desk_sdk_pairing_reunite_locked(udp_in, udp_out, max_out_len);
     char req_id[64] = "";
     char daemon_id[64] = "";
     char target_mode[32] = "";
@@ -1859,6 +1878,9 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
      * socket, so tear it down before mutating those fields. */
     desk_sdk_ws_client_close();
     s_paired = true;
+    s_pair_manual_pending = true;
+    s_last_reunite_nonce[0] = '\0';
+    snprintf(s_pair_protocol_version, sizeof(s_pair_protocol_version), "1.0");
     memcpy(s_pair_request_id, req_id, sizeof(s_pair_request_id));
     memcpy(s_pair_daemon_instance_id, daemon_id, sizeof(s_pair_daemon_instance_id));
     snprintf(s_pair_target_mode, sizeof(s_pair_target_mode), "%s", target_mode);
@@ -3063,7 +3085,7 @@ static bool desk_log_get_member_span(const char *object, const char *name,
 static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed, size_t allowed_count)
 {
     desk_log_json_parser_t p = { .p = object, .depth = 0 };
-    bool seen[8] = { false };
+    bool seen[16] = { false };
     if (allowed_count > sizeof(seen) / sizeof(seen[0])) return false;
     desk_log_json_ws(&p);
     if (*p.p++ != '{') return false;
@@ -3269,6 +3291,213 @@ static int desk_sdk_notification_result_nack(char *out, size_t cap, const char *
     if (rc == DESK_HW_ERR_UNAVAILABLE)
         return desk_sdk_notification_nack(out, cap, command_id, "NOTIFICATION_DELIVERY_FAILED", 503);
     return desk_sdk_notification_nack(out, cap, command_id, "NOTIFICATION_DELIVERY_FAILED", 500);
+}
+
+#define DESK_PAIRING_KV_KEY "desk_sdk_pair"
+#define DESK_PAIRING_RECORD_MAX 768U
+
+static int desk_sdk_pairing_hmac_hex(const char *key, const char *message, char out[65])
+{
+    uint8_t digest[32];
+#ifdef ESP_PLATFORM
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info || mbedtls_md_hmac(info, (const unsigned char *)key, strlen(key),
+                               (const unsigned char *)message, strlen(message), digest) != 0) return -1;
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    unsigned length = 0;
+    if (!HMAC(EVP_sha256(), key, (int)strlen(key), (const unsigned char *)message,
+              strlen(message), digest, &length) || length != sizeof(digest)) return -1;
+#else
+    (void)key; (void)message; (void)out;
+    return -1;
+#endif
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    out[64] = '\0';
+    memset(digest, 0, sizeof(digest));
+    return 0;
+}
+
+#ifdef ESP_PLATFORM
+static int desk_sdk_pairing_kv_read(uint8_t *buffer, size_t cap, size_t *length)
+{
+    uint8_t *value = NULL;
+    size_t size = 0;
+    int rc = tal_kv_get(DESK_PAIRING_KV_KEY, &value, &size);
+    if (rc != 0) return rc == OPRT_NOT_FOUND ? 1 : -1;
+    int result = value && size && size < cap ? 0 : -1;
+    if (result == 0) { memcpy(buffer, value, size); *length = size; }
+    if (value) { memset(value, 0, size); tal_kv_free(value); }
+    return result;
+}
+static int desk_sdk_pairing_kv_write(const uint8_t *buffer, size_t length)
+{
+    return tal_kv_set(DESK_PAIRING_KV_KEY, buffer, length);
+}
+static int desk_sdk_pairing_kv_remove(void)
+{
+    uint8_t *value = NULL; size_t length = 0;
+    int rc = tal_kv_get(DESK_PAIRING_KV_KEY, &value, &length);
+    if (value) { memset(value, 0, length); tal_kv_free(value); }
+    if (rc == OPRT_NOT_FOUND) return 0;
+    /* Delete even an unreadable/corrupt record when the user explicitly forgets. */
+    return tal_kv_del(DESK_PAIRING_KV_KEY);
+}
+#endif
+
+int desk_sdk_bridge_configure_pairing_store(const desk_sdk_pairing_store_ops_t *ops)
+{
+    if (ops && (!ops->read || !ops->write || !ops->remove)) return -1;
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    if (ops) s_pairing_store = *ops;
+    else memset(&s_pairing_store, 0, sizeof(s_pairing_store));
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return 0;
+}
+
+static int desk_sdk_pairing_save_locked(void)
+{
+    if (!s_pairing_store.write) return 0;
+    if (!desk_sdk_is_lower_hex_64(s_binding_secret)) return -1;
+    char record[DESK_PAIRING_RECORD_MAX];
+    int n = snprintf(record, sizeof(record),
+        "{\"version\":1,\"binding_secret\":\"%s\",\"host\":\"%s\",\"port\":%u,"
+        "\"request_id\":\"%s\",\"daemon_id\":\"%s\",\"token\":\"%s\",\"mode\":\"%s\",\"protocol\":\"%s\"}",
+        s_binding_secret, s_pair_host, s_pair_websocket_port, s_pair_request_id,
+        s_pair_daemon_instance_id, s_active_pairing_token, s_pair_target_mode, s_pair_protocol_version);
+    int rc = n > 0 && (size_t)n < sizeof(record)
+        ? s_pairing_store.write((const uint8_t *)record, (size_t)n) : -1;
+    memset(record, 0, sizeof(record));
+    return rc;
+}
+
+int desk_sdk_bridge_pairing_confirmed(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    int rc = -1;
+    if (s_paired && desk_sdk_ws_client_is_authenticated()) {
+        rc = 0;
+        if (s_pair_manual_pending) {
+            rc = desk_sdk_pairing_hmac_hex(s_active_pairing_token, "watcher-link-binding-v1", s_binding_secret);
+            if (rc == 0) s_pair_manual_pending = false;
+        }
+        if (rc == 0) rc = desk_sdk_pairing_save_locked();
+    }
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return rc;
+}
+
+int desk_sdk_bridge_pairing_storage_init(void)
+{
+#ifdef ESP_PLATFORM
+    if (!s_pairing_store.read) s_pairing_store = (desk_sdk_pairing_store_ops_t){
+        desk_sdk_pairing_kv_read, desk_sdk_pairing_kv_write, desk_sdk_pairing_kv_remove};
+#endif
+    if (!s_pairing_store.read) return 0;
+    char record[DESK_PAIRING_RECORD_MAX] = "";
+    size_t length = 0;
+    int rc = s_pairing_store.read((uint8_t *)record, sizeof(record), &length);
+    if (rc == 1) return 0;
+    if (rc != 0 || !length || length >= sizeof(record) || memchr(record, '\0', length)) {
+        memset(record, 0, sizeof(record)); return -1;
+    }
+    record[length] = '\0';
+    char secret[65] = "", host[INET_ADDRSTRLEN] = "", request[33] = "", daemon[33] = "";
+    char token[65] = "", mode[32] = "", protocol[4] = "", raw[24] = "";
+    struct in_addr address;
+    static const char *const keys[] = {"version", "binding_secret", "host", "port", "request_id",
+                                      "daemon_id", "token", "mode", "protocol"};
+    /* The fixed record has nine fields; validate JSON plus uniqueness of every
+     * field below. Do not mount, erase, or reformat storage on corrupt input. */
+    bool valid = desk_log_json_valid(record) &&
+        desk_log_object_keys_allowed(record, keys, sizeof(keys)/sizeof(keys[0]));
+    for (size_t i = 0; valid && i < sizeof(keys)/sizeof(keys[0]); ++i) {
+        const char *span; size_t span_len;
+        valid = desk_log_get_member_span(record, keys[i], &span, &span_len);
+    }
+    valid = valid && desk_log_get_member(record, "version", raw, sizeof(raw)) == 1 && strcmp(raw, "1") == 0 &&
+        json_parse_top_level_str(record, "binding_secret", secret, sizeof(secret)) && desk_sdk_is_lower_hex_64(secret) &&
+        json_parse_top_level_str(record, "host", host, sizeof(host)) && inet_pton(AF_INET, host, &address) == 1 &&
+        json_parse_top_level_str(record, "request_id", request, sizeof(request)) && desk_sdk_is_lower_hex_32(request) &&
+        json_parse_top_level_str(record, "daemon_id", daemon, sizeof(daemon)) && desk_sdk_is_lower_hex_32(daemon) &&
+        json_parse_top_level_str(record, "token", token, sizeof(token)) && desk_sdk_is_lower_hex_64(token) &&
+        json_parse_top_level_str(record, "mode", mode, sizeof(mode)) &&
+            (strcmp(mode, "python_sdk") == 0 || strcmp(mode, "desktop_link") == 0) &&
+        json_parse_top_level_str(record, "protocol", protocol, sizeof(protocol)) &&
+            (strcmp(protocol, "1.0") == 0 || strcmp(protocol, "1.1") == 0);
+    int port = json_parse_int(record, "port", -1);
+    valid = valid && port > 0 && port <= 65535;
+    if (valid) {
+        desk_sdk_ws_client_close();
+        pthread_mutex_lock(&s_pairing_code_mutex);
+        memcpy(s_binding_secret, secret, sizeof(secret)); memcpy(s_pair_host, host, sizeof(host));
+        memcpy(s_pair_request_id, request, sizeof(request)); memcpy(s_pair_daemon_instance_id, daemon, sizeof(daemon));
+        memcpy(s_active_pairing_token, token, sizeof(token)); memcpy(s_pair_target_mode, mode, sizeof(mode));
+        memcpy(s_pair_protocol_version, protocol, sizeof(protocol));
+        s_pair_websocket_port = (uint16_t)port; s_pair_manual_pending = false; s_paired = true;
+        pthread_mutex_unlock(&s_pairing_code_mutex);
+        desk_sdk_ws_client_resume_pairing();
+    }
+    memset(record, 0, sizeof(record)); memset(secret, 0, sizeof(secret)); memset(token, 0, sizeof(token));
+    return valid ? 1 : -1;
+}
+
+int desk_sdk_bridge_forget_pairing(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    int rc = s_pairing_store.remove ? s_pairing_store.remove() : 0;
+    if (rc == 0) { s_paired = false; s_pair_manual_pending = false; s_binding_secret[0] = '\0'; }
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    if (rc != 0) return -1;
+    desk_sdk_bridge_reset();
+    return 0;
+}
+
+static int desk_sdk_pairing_reunite_locked(const char *input, char *out, size_t cap)
+{
+    static const char *const fields[] = {"type", "protocol", "version", "request_id",
+        "daemon_instance_id", "nonce", "target_mode", "websocket_port"};
+    char type[48] = "", proto[32] = "", version[8] = "", request[33] = "", daemon[33] = "";
+    char nonce[33] = "", mode[32] = "", raw_port[16] = "", mac[65] = "", token[65] = "";
+    if (strnlen(input, 2049) > 2048 || !desk_sdk_is_lower_hex_64(s_binding_secret) || !desk_log_json_valid(input) ||
+        !desk_log_object_keys_allowed(input, fields, sizeof(fields)/sizeof(fields[0]))) return DESK_SDK_PAIRING_REJECTED;
+    if (!json_parse_top_level_str(input, "type", type, sizeof(type)) || strcmp(type, "link.reunite.request") ||
+        !json_parse_top_level_str(input, "protocol", proto, sizeof(proto)) || strcmp(proto, "watcher-lan-pairing") ||
+        !json_parse_top_level_str(input, "version", version, sizeof(version)) || strcmp(version, "1.1") ||
+        !json_parse_top_level_str(input, "request_id", request, sizeof(request)) || !desk_sdk_is_lower_hex_32(request) ||
+        !json_parse_top_level_str(input, "daemon_instance_id", daemon, sizeof(daemon)) || !desk_sdk_is_lower_hex_32(daemon) ||
+        !json_parse_top_level_str(input, "nonce", nonce, sizeof(nonce)) || !desk_sdk_is_lower_hex_32(nonce) ||
+        !json_parse_top_level_str(input, "target_mode", mode, sizeof(mode)) || strcmp(mode, s_pair_target_mode) ||
+        desk_log_get_member(input, "websocket_port", raw_port, sizeof(raw_port)) != 1) return DESK_SDK_PAIRING_REJECTED;
+    char *end = NULL;
+    long port = strtol(raw_port, &end, 10);
+    if (!end || *end || port < 1 || port > 65535) return DESK_SDK_PAIRING_REJECTED;
+    char challenge[224];
+    int n = snprintf(challenge, sizeof(challenge), "watcher-link-reunite-v1|%s|%s|%s|%s",
+                     request, nonce, daemon, mode);
+    if (n <= 0 || (size_t)n >= sizeof(challenge) || desk_sdk_pairing_hmac_hex(s_binding_secret, challenge, mac))
+        return DESK_SDK_PAIRING_REJECTED;
+    bool duplicate = s_paired && strcmp(request, s_pair_request_id) == 0 &&
+        strcmp(daemon, s_pair_daemon_instance_id) == 0 && strcmp(nonce, s_last_reunite_nonce) == 0;
+    if (duplicate) memcpy(token, s_active_pairing_token, sizeof(token));
+    else generate_dynamic_token(token, sizeof(token));
+    n = snprintf(out, cap, "{\"type\":\"link.reunite.accept\",\"protocol\":\"watcher-lan-pairing\","
+        "\"version\":\"1.1\",\"request_id\":\"%s\",\"daemon_instance_id\":\"%s\",\"nonce\":\"%s\","
+        "\"target_mode\":\"%s\",\"response_mac\":\"%s\",\"session_token\":\"%s\"}",
+        request, daemon, nonce, mode, mac, token);
+    if (n <= 0 || (size_t)n >= cap) { out[0] = '\0'; memset(token, 0, sizeof(token)); return DESK_SDK_PAIRING_REJECTED; }
+    if (duplicate) { memset(token, 0, sizeof(token)); memset(mac, 0, sizeof(mac)); return DESK_SDK_PAIRING_OK; }
+    desk_sdk_ws_client_close();
+    memcpy(s_last_reunite_nonce, nonce, sizeof(nonce));
+    memcpy(s_pair_request_id, request, sizeof(request)); memcpy(s_pair_daemon_instance_id, daemon, sizeof(daemon));
+    memcpy(s_pair_target_mode, mode, sizeof(mode)); memcpy(s_active_pairing_token, token, sizeof(token));
+    s_pair_websocket_port = (uint16_t)port; s_paired = true; s_pair_manual_pending = false;
+    snprintf(s_pair_protocol_version, sizeof(s_pair_protocol_version), "1.1");
+    memset(token, 0, sizeof(token)); memset(mac, 0, sizeof(mac));
+    return DESK_SDK_PAIRING_OK;
 }
 
 static bool desk_sdk_notification_command_id_valid(const char *id)
@@ -4942,8 +5171,17 @@ int desk_sdk_pairing_server_poll(int timeout_ms)
             static DESK_PROTOCOL_BSS char s_pairing_reply[2048];
             /* Fail-closed: a rejected pairing writes no reply at all
              * (interfaces.md 6.4.4 -- no wire message type is defined). */
+            uint32_t previous_generation = desk_sdk_ws_client_generation();
+            bool previous_connected = desk_sdk_ws_client_is_connected();
             if (desk_sdk_bridge_process_pairing_udp(s_pairing_buf, s_pairing_reply, sizeof(s_pairing_reply)) == DESK_SDK_PAIRING_OK &&
                 s_pairing_reply[0] != '\0') {
+                bool unchanged_connection = previous_connected && desk_sdk_ws_client_is_connected() &&
+                    previous_generation == desk_sdk_ws_client_generation();
+                if (unchanged_connection) {
+                    sendto(s_pairing_udp_fd, s_pairing_reply, strlen(s_pairing_reply), 0,
+                           (struct sockaddr *)&client_addr, addr_len);
+                    return 0;
+                }
                 pthread_mutex_lock(&s_pairing_code_mutex);
                 desk_sdk_ws_client_close();
                 inet_ntop(AF_INET, &client_addr.sin_addr, s_pair_host, sizeof(s_pair_host));

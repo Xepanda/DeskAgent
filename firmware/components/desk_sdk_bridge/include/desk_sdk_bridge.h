@@ -264,6 +264,20 @@ int desk_sdk_bridge_build_hardware_hello(char *out_json, size_t max_len);
 int desk_sdk_bridge_get_pairing_target(char *host, size_t host_len,
                                        uint16_t *port);
 
+/* Persistent pairing storage. Read returns 0 for data, 1 for no record, <0
+ * for failure. The production backend uses the already initialized Tuya KV. */
+typedef struct {
+    int (*read)(uint8_t *buffer, size_t capacity, size_t *length);
+    int (*write)(const uint8_t *buffer, size_t length);
+    int (*remove)(void);
+} desk_sdk_pairing_store_ops_t;
+int desk_sdk_bridge_configure_pairing_store(const desk_sdk_pairing_store_ops_t *ops);
+/* Call after tal_kv_init: 1 restored, 0 absent/disabled, -1 corrupt/error. */
+int desk_sdk_bridge_pairing_storage_init(void);
+int desk_sdk_bridge_pairing_confirmed(void);
+int desk_sdk_bridge_forget_pairing(void);
+void desk_sdk_ws_client_resume_pairing(void);
+
 /* RFC6455 device client used by the firmware poll loop. */
 typedef enum {
     DESK_SDK_WS_OFFLINE = 0,

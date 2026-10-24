@@ -482,6 +482,117 @@ class TestOfficialSdkRuntimeCompat(unittest.TestCase):
             payload, out, len(out), generation
         )
 
+    def test_pairing_kv_restore_official_reunite_and_forget(self) -> None:
+        from watcherobot.runtime.daemon.pairing.protocol import (
+            LinkReuniteRequest, derive_binding_secret, reunite_response_mac,
+        )
+        read_cb = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t,
+                                  ctypes.POINTER(ctypes.c_size_t))
+        write_cb = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t)
+        remove_cb = ctypes.CFUNCTYPE(ctypes.c_int)
+        class Store(ctypes.Structure):
+            _fields_ = [("read", read_cb), ("write", write_cb), ("remove", remove_cb)]
+        saved = []
+        failures = {"read": False, "write": False, "remove": False}
+        @read_cb
+        def read(buffer, cap, length):
+            if failures["read"]: return -1
+            if not saved: return 1
+            if len(saved[0]) >= cap: return -1
+            ctypes.memmove(buffer, saved[0], len(saved[0]))
+            length[0] = len(saved[0])
+            return 0
+        @write_cb
+        def write(buffer, length):
+            if failures["write"]: return -1
+            saved[:] = [ctypes.string_at(buffer, length)]
+            return 0
+        @remove_cb
+        def remove():
+            if failures["remove"]: return -1
+            saved.clear()
+            return 0
+        ops = Store(read, write, remove)
+        self.lib.desk_sdk_bridge_configure_pairing_store.argtypes = [ctypes.c_void_p]
+        self.assertEqual(self.lib.desk_sdk_bridge_configure_pairing_store(ctypes.byref(ops)), 0)
+        try:
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_storage_init(), 0)
+            pair = PairRequest("a" * 32, "b" * 32, "123456", "python_sdk", 8765)
+            out = ctypes.create_string_buffer(2048)
+            self.assertEqual(self.lib.desk_sdk_bridge_process_pairing_udp(encode_udp_message(pair), out, len(out)), 0)
+            accepted = parse_udp_message(out.value)
+            self.assertFalse(saved)  # Commit binding only after HardwareHello ACK.
+            self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", 8765), 0)
+            self.lib.desk_sdk_test_seed_ws_auth_latch()
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_confirmed(), 0)
+            self.assertEqual(len(saved), 1)
+            self.assertNotIn(b"pairing_code", saved[0])
+            binding = derive_binding_secret(accepted.session_token)
+            self.lib.desk_sdk_bridge_reset()
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_storage_init(), 1)
+            hello = ctypes.create_string_buffer(1024)
+            self.assertGreater(self.lib.desk_sdk_bridge_build_hardware_hello(hello, len(hello)), 0)
+            self.assertEqual(json.loads(hello.value)["data"]["pair_request_id"], pair.request_id)
+            for digit in ("c", "d"):
+                request = LinkReuniteRequest(digit * 32, "e" * 32, "f" * 32, "python_sdk", 8765)
+                wire = encode_udp_message(request)
+                self.assertEqual(self.lib.desk_sdk_bridge_process_pairing_udp(wire, out, len(out)), 0)
+                resumed = parse_udp_message(out.value)
+                from watcherobot.runtime.daemon.pairing.session import DevicePairingSession
+                session = DevicePairingSession(daemon_instance_id=request.daemon_instance_id)
+                session.start_reunite_scan(request_id=request.request_id, nonce=request.nonce,
+                    target_mode="python_sdk", websocket_port=8765, binding_secret=binding, now=0)
+                session.accept_reunite(resumed, peer_ip="127.0.0.1", now=1)
+                self.assertEqual(resumed.response_mac, reunite_response_mac(binding,
+                    request_id=request.request_id, nonce=request.nonce,
+                    daemon_instance_id=request.daemon_instance_id, target_mode="python_sdk"))
+                self.assertNotEqual(resumed.session_token, accepted.session_token)
+                first_reply = out.value
+                self.assertEqual(self.lib.desk_sdk_bridge_process_pairing_udp(wire, out, len(out)), 0)
+                self.assertEqual(out.value, first_reply)  # Retransmitted challenges must not rotate the token.
+                malformed = json.loads(wire)
+                malformed["target_mode"] = "desktop_link"
+                self.assertNotEqual(self.lib.desk_sdk_bridge_process_pairing_udp(json.dumps(malformed).encode(), out, len(out)), 0)
+                self.assertEqual(out.value, b"")
+                self.assertGreater(self.lib.desk_sdk_bridge_build_hardware_hello(hello, len(hello)), 0)
+                self.assertEqual(json.loads(hello.value)["data"]["pairing_version"], "1.1")
+                session.connect_device(parse_hardware_hello(hello.value), peer_ip="127.0.0.1", now=2)
+                self.assertEqual(session.state.value, "connected")
+                self.assertEqual(self.lib.desk_sdk_test_set_pairing_target(b"127.0.0.1", 8765), 0)
+                self.lib.desk_sdk_test_seed_ws_auth_latch()
+                self.assertEqual(self.lib.desk_sdk_bridge_pairing_confirmed(), 0)
+                self.lib.desk_sdk_bridge_reset()
+                self.assertEqual(self.lib.desk_sdk_bridge_pairing_storage_init(), 1)
+            corrupt = saved[0]
+            failures["write"] = True
+            self.lib.desk_sdk_test_seed_ws_auth_latch()
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_confirmed(), -1)
+            self.assertEqual(saved[0], corrupt)
+            failures["write"] = False
+            self.lib.desk_sdk_bridge_reset()
+            failures["read"] = True
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_storage_init(), -1)
+            self.assertEqual(saved[0], corrupt)
+            failures["read"] = False
+            saved[:] = [b'{"version":99}']
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_storage_init(), -1)
+            self.assertLess(self.lib.desk_sdk_bridge_build_hardware_hello(hello, len(hello)), 0)
+            self.assertEqual(saved[0], b'{"version":99}')  # Never format/delete corrupt storage.
+            saved[:] = [corrupt]
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_storage_init(), 1)
+            failures["remove"] = True
+            self.assertEqual(self.lib.desk_sdk_bridge_forget_pairing(), -1)
+            self.assertTrue(saved)
+            failures["remove"] = False
+            self.assertEqual(self.lib.desk_sdk_bridge_forget_pairing(), 0)
+            self.assertFalse(saved)
+            self.assertEqual(self.lib.desk_sdk_bridge_pairing_storage_init(), 0)
+            self.assertNotEqual(self.lib.desk_sdk_bridge_process_pairing_udp(wire, out, len(out)), 0)
+            self.assertEqual(out.value, b"")
+        finally:
+            self.lib.desk_sdk_bridge_configure_pairing_store(None)
+            self.lib.desk_sdk_bridge_reset()
+
     def test_official_build_command_ready_and_unknown_response(self) -> None:
         for kind in ("sys.sdk.ready.get", "unsupported.command"):
             cid = "a" * 32

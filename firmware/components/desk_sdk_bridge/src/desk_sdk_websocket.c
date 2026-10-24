@@ -891,6 +891,15 @@ void desk_sdk_ws_client_close(void)
     s_ws_retry_at = 0;
 }
 
+void desk_sdk_ws_client_resume_pairing(void)
+{
+    char host[INET_ADDRSTRLEN]; uint16_t port;
+    if (desk_sdk_bridge_get_pairing_target(host, sizeof(host), &port) == 0) {
+        s_pairing_target_valid = true;
+        s_ws_retry_at = time(NULL) + 1;
+    }
+}
+
 bool desk_sdk_ws_client_is_connected(void)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
@@ -1054,6 +1063,8 @@ int desk_sdk_ws_client_connect_paired(void)
      * not cryptographic Runtime peer authentication. */
     connect_stage = "hello_commit";
     if (!ws_commit_hardware_hello_ack(connect_generation)) goto fail;
+    if (desk_sdk_bridge_pairing_confirmed() != 0)
+        printf("[SDK-PAIR] binding persistence failed; current session remains volatile\n");
     s_reconnect_failures = 0;
     s_ws_retry_at = 0;
     pthread_mutex_unlock(&s_ws_connect_mutex);

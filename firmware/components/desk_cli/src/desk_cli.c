@@ -251,7 +251,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"network", "SDK TCP/UDP server status: network [status]", cmd_network},
     {"wifi", "Read-only Wi-Fi status: wifi [status]", cmd_wifi},
     {"provisioning", "Read-only Tuya provisioning state", cmd_provisioning},
-    {"pairing", "Explicit SDK pairing window: pairing <open|close>", cmd_pairing},
+    {"pairing", "Explicit SDK pairing window: pairing <open|close|forget>", cmd_pairing},
 };
 
 #ifdef ESP_PLATFORM
@@ -740,6 +740,13 @@ static void cmd_pairing(int argc, char *argv[])
         }
         return;
     }
+    if (argc == 2 && strcmp(argv[1], "forget") == 0) {
+        int rc = desk_sdk_bridge_forget_pairing();
+        if (rc == 0 && pairing_expiry_timer_ensure() == 0)
+            desk_pairing_window_close(&s_pairing_window, &s_pairing_window_ops);
+        printf("Pairing forget %s; rc=%d.\r\n", rc == 0 ? "completed" : "failed", rc);
+        return;
+    }
     if (argc == 2 && (strcmp(argv[1], "close") == 0 || strcmp(argv[1], "cancel") == 0)) {
         if (pairing_expiry_timer_ensure() == 0) {
             desk_pairing_window_close(&s_pairing_window, &s_pairing_window_ops);
@@ -751,7 +758,7 @@ static void cmd_pairing(int argc, char *argv[])
         printf("Pairing window closed; code cleared.\r\n");
         return;
     }
-    printf("Usage: pairing <open|close>\r\n");
+    printf("Usage: pairing <open|close|forget>\r\n");
 #else
     (void)argc; (void)argv;
     printf("Pairing window is available only on the device.\r\n");

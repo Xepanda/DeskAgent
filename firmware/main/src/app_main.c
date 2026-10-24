@@ -394,6 +394,10 @@ static int desk_agent_main_worker(void)
         })) != 0) return -1;
 #endif
 
+    int pairing_restore_rc = desk_sdk_bridge_pairing_storage_init();
+    printf("[SDK-PAIR] binding restore state=%s\n",
+           pairing_restore_rc > 0 ? "restored" : pairing_restore_rc == 0 ? "not_found" : "invalid_or_unavailable");
+
     int authorize_init_rc = tuya_authorize_init();
     if (desk_boot_check("tuya_authorize_init", authorize_init_rc) != 0) return -1;
     int authorize_rc = tuya_authorize_read(&s_tuya_license);

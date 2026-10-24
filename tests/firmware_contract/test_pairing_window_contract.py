@@ -126,7 +126,7 @@ class TestPairingWindowContract(unittest.TestCase):
 
     def test_cli_is_the_explicit_operator_entry_and_never_prints_code(self):
         source = CLI.read_text(encoding="utf-8")
-        self.assertIn('{"pairing", "Explicit SDK pairing window: pairing <open|close>", cmd_pairing}', source)
+        self.assertIn('{"pairing", "Explicit SDK pairing window: pairing <open|close|forget>", cmd_pairing}', source)
         command = source.rsplit("static void cmd_pairing(int argc, char *argv[])", 1)[1].split(
             "static void cmd_wifi", 1
         )[0]
