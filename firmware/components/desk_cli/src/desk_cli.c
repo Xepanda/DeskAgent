@@ -244,7 +244,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"system", "Full system diagnostic overview (chip, heap, states)", cmd_system},
     {"display", "Display status or set expression: display [preset] [status]", cmd_display},
     {"audio", "Audio diagnostic: audio [status|sample|test|stop]", cmd_audio},
-    {"camera", "Camera subsystem diagnostic: camera [status|capture]", cmd_camera},
+    {"camera", "Camera subsystem diagnostic: camera [status|probe|capture]", cmd_camera},
     {"body", "STM32 control: body [status|probe|move <pan> <tilt> [duration_ms]|stop]", cmd_body},
     {"peripherals", "Board peripherals status (RTC, LED, battery)", cmd_peripherals},
     {"input", "Read-only input driver status and event counters", cmd_input},
@@ -487,6 +487,18 @@ static void cmd_audio(int argc, char *argv[])
 
 static void cmd_camera(int argc, char *argv[])
 {
+    if (argc >= 2 && strcmp(argv[1], "probe") == 0) {
+        desk_watcher_camera_sscma_identity_t identity = {0};
+        int rc = desk_watcher_camera_probe_sscma_identity(&identity);
+        printf("Camera Identity Probe: rc=%d (%s)\r\n", rc,
+               rc == DESK_HW_OK ? "ok" : cli_camera_capture_error_name(rc));
+        if (rc == DESK_HW_OK) {
+            printf("  SSCMA AT API : %s\r\n", identity.at_api);
+            printf("  SSCMA SW     : %s\r\n", identity.software);
+            printf("  SSCMA HW     : %s\r\n", identity.hardware);
+        }
+        return;
+    }
     if (argc >= 2 && strcmp(argv[1], "capture") == 0) {
         static DESK_DIAG_BSS uint8_t jpeg_buf[8192];
         size_t out_len = 0;
@@ -495,6 +507,7 @@ static void cmd_camera(int argc, char *argv[])
                rc, rc == DESK_HW_OK ? "ok" : cli_camera_capture_error_name(rc),
                rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
     } else {
+        printf("Usage: camera [status|probe|capture]\r\n");
         printf("Camera Subsystem:\r\n");
         printf("  Arbiter Camera Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR));
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)

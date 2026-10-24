@@ -177,6 +177,17 @@ class TestDeskCliStatusTruthfulness(unittest.TestCase):
         self.assertIn('rc=%d (%s)', camera)
         self.assertIn("cli_camera_capture_error_name(rc)", camera)
 
+    def test_camera_probe_cli_is_explicit_and_does_not_capture(self) -> None:
+        camera = function_body(self.source, "static void cmd_camera(int argc, char *argv[])\n{",
+                               "static void cmd_body(int argc, char *argv[])\n{")
+        probe = camera.split('strcmp(argv[1], "probe") == 0', 1)[1].split("return;", 1)[0]
+        self.assertIn("desk_watcher_camera_probe_sscma_identity(&identity)", probe)
+        self.assertIn("identity.at_api", probe)
+        self.assertIn("identity.software", probe)
+        self.assertIn("identity.hardware", probe)
+        self.assertNotIn("identity.id", probe)
+        self.assertNotIn("capture_jpeg", probe)
+
     def test_body_move_parses_required_args_and_delegates_limits_and_result_to_hal(self) -> None:
         body = function_body(self.source, "static void cmd_body(int argc, char *argv[])\n{",
                              "static void cmd_peripherals(int argc, char *argv[])\n{")
