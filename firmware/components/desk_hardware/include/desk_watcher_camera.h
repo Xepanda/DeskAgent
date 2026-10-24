@@ -42,11 +42,26 @@ typedef struct {
     size_t used;
 } desk_watcher_camera_resync_t;
 
+#define DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX 512U
+
+typedef enum {
+    DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION = 0,
+    DESK_WATCHER_CAMERA_SSCMA_QUERY_ID = 1,
+} desk_watcher_camera_sscma_query_t;
+
+typedef struct {
+    uint8_t raw_response[DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX];
+    size_t raw_response_len;
+    desk_watcher_camera_sscma_query_t query;
+} desk_watcher_camera_sscma_reply_t;
+
 /* Sanitized fields from the optional, read-only SSCMA identity probe. */
 typedef struct {
     char at_api[24];
     char software[48];
     char hardware[24];
+    uint8_t raw_response[DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX];
+    size_t raw_response_len;
 } desk_watcher_camera_sscma_identity_t;
 
 int desk_watcher_camera_init(void);
@@ -54,6 +69,8 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
 int desk_watcher_camera_deinit(void);
 bool desk_watcher_camera_is_ready(void);
 /* Explicit one-shot probe only. Normal init/capture remain on the PTL path. */
+int desk_watcher_camera_probe_sscma_query(desk_watcher_camera_sscma_query_t query,
+                                          desk_watcher_camera_sscma_reply_t *out_reply);
 int desk_watcher_camera_probe_sscma_identity(desk_watcher_camera_sscma_identity_t *out_identity);
 
 /* Pure bounded SSCMA wire helpers, exposed for host contract tests. */
@@ -61,6 +78,7 @@ int desk_watcher_camera_sscma_encode_packet(uint8_t operation, const uint8_t *pa
                                             size_t payload_len, uint8_t *out_packet,
                                             size_t packet_capacity);
 int desk_watcher_camera_sscma_parse_available(const uint8_t reply[2], size_t *out_available);
+int desk_watcher_camera_sscma_validate_reply(const uint8_t *reply, size_t reply_len);
 int desk_watcher_camera_sscma_parse_version_reply(const char *reply, size_t reply_len,
                                                   desk_watcher_camera_sscma_identity_t *out_identity);
 

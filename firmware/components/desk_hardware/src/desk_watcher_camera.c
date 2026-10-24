@@ -168,7 +168,7 @@ static int camera_sync_is_active(bool *active)
 #define SSCMA_SPI_READ 0x01U
 #define SSCMA_SPI_WRITE 0x02U
 #define SSCMA_SPI_AVAILABLE 0x03U
-#define SSCMA_PROBE_REPLY_MAX 512U
+#define SSCMA_PROBE_REPLY_MAX DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX
 #define SSCMA_SPI_WAIT_MS 2U
 
 int desk_watcher_camera_sscma_encode_packet(uint8_t operation, const uint8_t *payload,
@@ -197,6 +197,14 @@ int desk_watcher_camera_sscma_parse_available(const uint8_t reply[2], size_t *ou
     if (!reply || !out_available) return -1;
     size_t value = ((size_t)reply[0] << 8) | reply[1];
     *out_available = value == 0xFFFFU ? 0U : value;
+    return 0;
+}
+
+int desk_watcher_camera_sscma_validate_reply(const uint8_t *reply, size_t reply_len)
+{
+    if (!reply || reply_len < 2U || reply_len > DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX ||
+        reply[0] != '\r' || reply[reply_len - 1U] != '\n' ||
+        memchr(reply, '\0', reply_len) != NULL) return -1;
     return 0;
 }
 
@@ -244,9 +252,9 @@ static int sscma_read_json_string(const char *json, const char *key, char *out, 
 int desk_watcher_camera_sscma_parse_version_reply(const char *reply, size_t reply_len,
                                                   desk_watcher_camera_sscma_identity_t *out_identity)
 {
-    if (!reply || !out_identity || reply_len < 2U || reply_len > SSCMA_PROBE_REPLY_MAX ||
-        reply[0] != '\r' || reply[reply_len - 1U] != '\n' ||
-        memchr(reply, '\0', reply_len) != NULL) return -1;
+    if (!out_identity || desk_watcher_camera_sscma_validate_reply((const uint8_t *)reply, reply_len) != 0) {
+        return -1;
+    }
     char json[SSCMA_PROBE_REPLY_MAX];
     size_t json_len = reply_len - 2U;
     if (json_len == 0U || json_len >= sizeof(json)) return -1;
@@ -703,61 +711,126 @@ static int camera_sscma_available(size_t *available)
 }
 #endif
 
-int desk_watcher_camera_probe_sscma_identity(desk_watcher_camera_sscma_identity_t *out_identity)
+int desk_watcher_camera_probe_sscma_query(desk_watcher_camera_sscma_query_t query,
+                                          desk_watcher_camera_sscma_reply_t *out_reply)
 {
-    if (!out_identity) return DESK_HW_ERR_INVALID_ARG;
-    memset(out_identity, 0, sizeof(*out_identity));
+    if (!out_reply || (query != DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION &&
+                       query != DESK_WATCHER_CAMERA_SSCMA_QUERY_ID)) return DESK_HW_ERR_INVALID_ARG;
+    memset(out_reply, 0, sizeof(*out_reply));
+    out_reply->query = query;
 #ifdef ESP_PLATFORM
     if (!s_camera_initialized || !s_spi_dev || !s_cam_mutex) return DESK_WATCHER_CAMERA_ERR_NOT_READY;
     if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return DESK_HW_ERR_BUSY;
 
-    int rc = DESK_WATCHER_CAMERA_ERR_PROTOCOL;
-    const uint8_t command[] = "AT+VER?\r";
-    uint8_t packet[SSCMA_SPI_PACKET_SIZE];
-    if (desk_watcher_camera_sscma_encode_packet(SSCMA_SPI_WRITE, command, sizeof(command) - 1U,
-                                                packet, sizeof(packet)) != 0) {
-        rc = DESK_HW_ERR_INVALID_ARG;
-        goto done;
-    }
-    if (camera_sscma_exchange_tx(packet, NULL, 0) != ESP_OK) {
-        rc = DESK_WATCHER_CAMERA_ERR_SPI;
+    int rc = DESK_WATCHER_CAMERA_ERR_CONTROL;
+    bool mode_change_attempted = false;
+    desk_watcher_camera_control_state_t saved_state = {0};
+    const bool saved_idle_recovery = s_camera_needs_idle_recovery;
+    const int64_t overall_deadline_us = esp_timer_get_time() + 12000000LL;
+    const int64_t query_deadline_us = overall_deadline_us - 3500000LL;
+    if (camera_control_status_until(&saved_state, overall_deadline_us) != 0 ||
+        saved_state.result != 0U || saved_state.error != 0U || saved_state.debug != 0U ||
+        saved_state.mode > 4U || saved_state.mode == 3U) {
+        rc = DESK_WATCHER_CAMERA_ERR_CONTROL;
         goto done;
     }
 
-    /* SSCMA replies are CR + JSON + LF. Bound both the wait and the payload;
-     * no RESET, MODE, SAMPLE, INVOKE or config command is sent. */
-    const int64_t deadline_us = esp_timer_get_time() + 2500000LL;
+    /* Serialize against capture/deinit, put the shared HX PTL engine in idle,
+     * and remember enough state to restore it on every later exit. */
+    if (saved_state.mode != 0U || saved_state.model != 0U || saved_idle_recovery) {
+        mode_change_attempted = true;
+        if (camera_control_mode_until(0U, 0U, overall_deadline_us) != 0) {
+            rc = DESK_WATCHER_CAMERA_ERR_CONTROL;
+            goto restore;
+        }
+        s_camera_needs_idle_recovery = false;
+    }
+
+    const uint8_t version_command[] = "AT+VER?\r";
+    const uint8_t id_command[] = "AT+ID?\r";
+    const uint8_t *command = query == DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION
+                                 ? version_command : id_command;
+    const size_t command_len = query == DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION
+                                   ? sizeof(version_command) - 1U : sizeof(id_command) - 1U;
+    uint8_t packet[SSCMA_SPI_PACKET_SIZE];
+    rc = DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+    if (desk_watcher_camera_sscma_encode_packet(SSCMA_SPI_WRITE, command, command_len,
+                                                packet, sizeof(packet)) != 0) {
+        rc = DESK_HW_ERR_INVALID_ARG;
+        goto restore;
+    }
+    if (camera_sscma_exchange_tx(packet, NULL, 0) != ESP_OK) {
+        rc = DESK_WATCHER_CAMERA_ERR_SPI;
+        goto restore;
+    }
+
+    /* SSCMA replies are bounded CR + response + LF. No reset, sample,
+     * invoke, identity value logging, or persistent config write is issued. */
     size_t available = 0;
     bool sync_active = false;
-    while (esp_timer_get_time() < deadline_us) {
+    while (esp_timer_get_time() < query_deadline_us) {
         if (camera_sync_is_active(&sync_active) != DESK_HW_OK) {
             rc = DESK_WATCHER_CAMERA_ERR_SYNC_IO;
-            goto done;
+            goto restore;
         }
         if (sync_active) {
             rc = camera_sscma_available(&available);
-            if (rc != DESK_HW_OK) goto done;
+            if (rc != DESK_HW_OK) goto restore;
             if (available != 0U) break;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (available < 2U || available > SSCMA_PROBE_REPLY_MAX) {
+    if (available < 2U || available > DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX) {
         rc = available == 0U ? DESK_HW_ERR_TIMEOUT : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
-        goto done;
+        goto restore;
     }
-    uint8_t response[SSCMA_PROBE_REPLY_MAX];
-    if (camera_sscma_read(available, response) != ESP_OK) {
+    if (camera_sscma_read(available, out_reply->raw_response) != ESP_OK) {
         rc = DESK_WATCHER_CAMERA_ERR_SPI;
-        goto done;
+        goto restore;
     }
-    rc = desk_watcher_camera_sscma_parse_version_reply((const char *)response, available, out_identity) == 0
+    out_reply->raw_response_len = available;
+    rc = desk_watcher_camera_sscma_validate_reply(out_reply->raw_response, available) == 0
              ? DESK_HW_OK : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+    goto restore;
+restore:
+    if (mode_change_attempted) {
+        if (camera_control_mode_until(saved_state.mode, saved_state.model, overall_deadline_us) != 0) {
+            s_camera_needs_idle_recovery = true;
+            rc = DESK_WATCHER_CAMERA_ERR_CONTROL;
+        } else {
+            s_camera_needs_idle_recovery = saved_idle_recovery;
+        }
+    } else {
+        s_camera_needs_idle_recovery = saved_idle_recovery;
+    }
 done:
     xSemaphoreGive(s_cam_mutex);
     return rc;
 #else
     return DESK_WATCHER_CAMERA_ERR_NOT_READY;
 #endif
+}
+
+int desk_watcher_camera_probe_sscma_identity(desk_watcher_camera_sscma_identity_t *out_identity)
+{
+    if (!out_identity) return DESK_HW_ERR_INVALID_ARG;
+    memset(out_identity, 0, sizeof(*out_identity));
+    desk_watcher_camera_sscma_reply_t reply;
+    int rc = desk_watcher_camera_probe_sscma_query(DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION, &reply);
+    out_identity->raw_response_len = reply.raw_response_len;
+    if (reply.raw_response_len != 0U) {
+        memcpy(out_identity->raw_response, reply.raw_response, reply.raw_response_len);
+    }
+    if (rc != DESK_HW_OK) return rc;
+    desk_watcher_camera_sscma_identity_t parsed = {0};
+    if (desk_watcher_camera_sscma_parse_version_reply((const char *)reply.raw_response,
+                                                       reply.raw_response_len, &parsed) != 0) {
+        return DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+    }
+    memcpy(out_identity->at_api, parsed.at_api, sizeof(out_identity->at_api));
+    memcpy(out_identity->software, parsed.software, sizeof(out_identity->software));
+    memcpy(out_identity->hardware, parsed.hardware, sizeof(out_identity->hardware));
+    return DESK_HW_OK;
 }
 
 static uint32_t ptl_media_crc32(const void *data, size_t size)

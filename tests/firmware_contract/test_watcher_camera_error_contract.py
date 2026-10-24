@@ -23,12 +23,21 @@ class TestWatcherCameraErrorContract(unittest.TestCase):
         self.assertIn("desk_watcher_camera_probe_sscma_identity", header)
         self.assertIn("desk_watcher_camera_sscma_encode_packet", source)
         self.assertIn("desk_watcher_camera_sscma_parse_version_reply", source)
-        probe = source.split("int desk_watcher_camera_probe_sscma_identity(", 1)[1].split("\n}", 1)[0]
+        probe = source.split("int desk_watcher_camera_probe_sscma_query(", 1)[1].split("\n}", 1)[0]
         self.assertIn("s_cam_mutex", probe)
         self.assertIn("s_spi_dev", probe)
         self.assertIn("AT+VER?\\r", probe)
+        self.assertIn("AT+ID?\\r", probe)
+        self.assertIn("camera_control_status_until", probe)
+        self.assertIn("camera_control_mode_until(0U, 0U", probe)
+        self.assertIn("camera_control_mode_until(saved_state.mode, saved_state.model", probe)
+        self.assertIn("DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX", probe)
+        self.assertIn("out_reply->raw_response_len = available", probe)
         for forbidden in ("WV1 MODE", "AT+SAMPLE", "AT+INVOKE", "AT+RESET", "spi_bus_add_device"):
             self.assertNotIn(forbidden, probe)
+        identity = source.split("int desk_watcher_camera_probe_sscma_identity(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("desk_watcher_camera_probe_sscma_query", identity)
+        self.assertIn("raw_response", identity)
         capture = source.split("int desk_watcher_camera_capture(", 1)[1].split("int desk_watcher_camera_deinit", 1)[0]
         self.assertNotIn("probe_sscma", capture)
 
