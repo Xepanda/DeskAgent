@@ -662,8 +662,21 @@ int desk_watcher_motion_probe(desk_watcher_motion_peer_info_t *out, uint32_t tim
         if (received <= 0) continue;
         atomic_fetch_add_explicit(&s_diag_rx_bytes, (uint32_t)received, memory_order_relaxed);
         result = desk_watcher_motion_hello_rx_feed(&rx, byte, out);
+        bool wrong_sequence = false;
+        if (result == DESK_HW_OK && out->response_seq != seq) {
+            /* A valid HELLO from another transaction is not proof that this
+             * probe reached the peer. Ignore stale/spontaneous responses and
+             * continue waiting for this request's correlated response. */
+            atomic_fetch_add_explicit(&s_diag_wrong_sequence_count, 1U, memory_order_relaxed);
+            atomic_fetch_add_explicit(&s_diag_hello_ignored_count, 1U, memory_order_relaxed);
+            atomic_store_explicit(&s_diag_last_error,
+                                  DESK_WATCHER_MOTION_ERROR_WRONG_SEQUENCE,
+                                  memory_order_relaxed);
+            wrong_sequence = true;
+            result = DESK_HW_ERR_BUSY;
+        }
         if (result == DESK_HW_OK) break;
-        if (byte == 0u) {
+        if (byte == 0u && !wrong_sequence) {
             atomic_fetch_add_explicit(&s_diag_hello_ignored_count, 1U, memory_order_relaxed);
             atomic_store_explicit(&s_diag_last_error, DESK_WATCHER_MOTION_ERROR_INVALID_RESPONSE,
                                   memory_order_relaxed);

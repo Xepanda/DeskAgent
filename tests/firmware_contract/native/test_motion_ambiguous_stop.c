@@ -34,6 +34,7 @@ typedef enum {
     TX_BAD_CRC,
     TX_NO_MOTION_CAPABILITY,
     TX_NO_HELLO,
+    TX_WRONG_HELLO_SEQ,
 } tx_mode_t;
 
 static tx_mode_t s_mode;
@@ -159,7 +160,8 @@ int uart_write_bytes(int port, const char *data, size_t len)
                                  0, 0, 1};
         uint32_t req_seq = (uint32_t)raw[6] | ((uint32_t)raw[7] << 8) |
                            ((uint32_t)raw[8] << 16) | ((uint32_t)raw[9] << 24);
-        make_response(2, req_seq, hello, sizeof(hello));
+        make_response(2, req_seq + (s_mode == TX_WRONG_HELLO_SEQ ? 1U : 0U),
+                      hello, sizeof(hello));
         return (int)len;
     }
     assert(s_write_calls < 12);
@@ -278,7 +280,8 @@ static void begin_case(tx_mode_t mode)
     reset_transport(mode);
     desk_watcher_motion_peer_info_t peer;
     int probe_rc = desk_watcher_motion_probe(&peer, 20);
-    assert(probe_rc == (mode == TX_NO_HELLO ? DESK_HW_ERR_TIMEOUT : DESK_HW_OK));
+    assert(probe_rc == ((mode == TX_NO_HELLO || mode == TX_WRONG_HELLO_SEQ)
+                            ? DESK_HW_ERR_TIMEOUT : DESK_HW_OK));
     if (probe_rc == DESK_HW_OK)
         assert((peer.capability_bitmap & 1u) == (mode == TX_NO_MOTION_CAPABILITY ? 0u : 1u));
     s_release_calls = 0;
@@ -323,12 +326,19 @@ int main(void)
     reset_transport(TX_NO_HELLO);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
     assert(s_hello_write_calls == 1 && s_write_calls == 0);
+    reset_transport(TX_WRONG_HELLO_SEQ);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
+    assert(s_hello_write_calls == 1 && s_write_calls == 0);
 
     begin_case(TX_NO_MOTION_CAPABILITY);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
     assert(s_write_calls == 0);
     assert_single_hal_release();
     begin_case(TX_NO_HELLO);
+    assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
+    assert(s_write_calls == 0);
+    assert_single_hal_release();
+    begin_case(TX_WRONG_HELLO_SEQ);
     assert(desk_hardware_motion_move_to(90.0f, 120.0f, 250) == DESK_HW_ERR_UNAVAILABLE);
     assert(s_write_calls == 0);
     assert_single_hal_release();
