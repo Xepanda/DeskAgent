@@ -791,12 +791,18 @@ int desk_tclaw_handle_tool_response(const char *request_id,
 
     s_turn_count++;
     char spoken[1024];
+    const char *feedback_preset = "error";
+    const char *feedback_label = "Failed";
     if (strcmp(eff_status, "accepted") == 0) {
         snprintf(spoken, sizeof(spoken), "Action accepted successfully: %s",
                  (eff_result && strlen(eff_result) > 0) ? eff_result : "OK");
+        feedback_preset = "thinking";
+        feedback_label = "Accepted";
     } else if (strcmp(eff_status, "succeeded") == 0) {
         snprintf(spoken, sizeof(spoken), "Action completed successfully: %s",
                  (eff_result && strlen(eff_result) > 0) ? eff_result : "OK");
+        feedback_preset = "happy";
+        feedback_label = "Done";
     } else {
         snprintf(spoken, sizeof(spoken), "Action encountered an error: %s",
                  (eff_error && strlen(eff_error) > 0) ? eff_error : "Error");
@@ -806,9 +812,7 @@ int desk_tclaw_handle_tool_response(const char *request_id,
     s_pending_request_id[0] = '\0';
     s_pending_tool_start_ms = 0;
 
-    return desk_tclaw_start_speaking_with_feedback(spoken,
-                                                   is_success ? "happy" : "error",
-                                                   is_success ? "Done" : "Failed");
+    return desk_tclaw_start_speaking_with_feedback(spoken, feedback_preset, feedback_label);
 }
 
 int desk_tclaw_handle_tool_timeout(const char *request_id)

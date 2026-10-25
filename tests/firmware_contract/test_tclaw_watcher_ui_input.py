@@ -96,9 +96,19 @@ class TestWatcherUiInput(unittest.TestCase):
         self.assertIn('desk_tclaw_update_ui_screen("offline", "Offline")', disconnected)
 
         tool_response = function_body(self.bridge, "desk_tclaw_handle_tool_response")
-        self.assertIn("desk_tclaw_start_speaking_with_feedback", tool_response)
-        self.assertIn('is_success ? "happy" : "error"', tool_response)
-        self.assertIn('is_success ? "Done" : "Failed"', tool_response)
+        self.assertIn('strcmp(eff_status, "accepted") == 0', tool_response)
+        self.assertIn('feedback_preset = "thinking"', tool_response)
+        self.assertIn('feedback_label = "Accepted"', tool_response)
+        self.assertIn('strcmp(eff_status, "succeeded") == 0', tool_response)
+        self.assertIn('feedback_preset = "happy"', tool_response)
+        self.assertIn('feedback_label = "Done"', tool_response)
+        self.assertIn('const char *feedback_preset = "error"', tool_response)
+        self.assertIn('const char *feedback_label = "Failed"', tool_response)
+        self.assertIn('is_success ? (eff_result ? eff_result : "{}")', tool_response)
+        self.assertIn('"Action accepted successfully: %s"', tool_response)
+        self.assertIn('"Action completed successfully: %s"', tool_response)
+        self.assertIn("desk_tclaw_start_speaking_with_feedback(spoken, feedback_preset, feedback_label)",
+                      tool_response)
 
     def test_board_renderer_is_not_modified_for_status_pages(self) -> None:
         # UI pages must use the existing expression/status text interface.
