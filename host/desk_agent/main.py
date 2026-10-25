@@ -440,18 +440,23 @@ class DeskAgentHostApp:
                                     persisted_receipt.get("delivery_status", "unknown")
                                     if persisted_receipt else "unknown"
                                 )
-                                if delivery_status != "unknown":
+                                user_acknowledged = bool(
+                                    persisted_receipt.get("user_acknowledged", False)
+                                    if persisted_receipt else False
+                                )
+                                if delivery_status != "unknown" or user_acknowledged:
                                     backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
                                     self.life_service.record_outbox_failure(
                                         outbox_id,
-                                        "Managed notification has a persisted device stage; awaiting expiry",
+                                        "Managed notification has a persisted device stage or user acknowledgement; awaiting expiry",
                                         backoff_seconds=backoff,
                                         keep_pending=True,
                                     )
                                     logger.info(
-                                        "Managed reminder %s already has device stage %s; no replay sent",
+                                        "Managed reminder %s already has device stage %s or user acknowledgement=%s; no replay sent",
                                         outbox_id,
                                         delivery_status,
+                                        user_acknowledged,
                                     )
                                     continue
                                 result = self.managed_notification_adapter.deliver(notification)
