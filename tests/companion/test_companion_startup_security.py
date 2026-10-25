@@ -191,6 +191,11 @@ class TestSettingsResolutionAndServerConstruction(unittest.TestCase):
         """The repo-committed example must be loopback-only with no usable token."""
         with open(EXAMPLE_CONFIG, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        self.assertNotIn(
+            "default_model",
+            cfg,
+            "model selection is delegated to the signed-in Codex app-server unless explicitly supplied per task",
+        )
         self.assertTrue(is_loopback_host(cfg.get("host")), "example must bind loopback")
         self.assertFalse(
             (cfg.get("auth_token") or "").strip(),
