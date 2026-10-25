@@ -7,6 +7,7 @@ Codex Companion Router, Camera Leased Viewer, and Envelope RPC Dispatcher.
 from __future__ import annotations
 
 import argparse
+import base64
 import asyncio
 import copy
 import ipaddress
@@ -45,6 +46,8 @@ from host.desk_agent.camera.camera_service import (
     CameraStreamLeaseError,
     CameraViewerService,
 )
+from host.desk_agent.camera.vision_service import VisionService
+from host.desk_agent.camera.patrol_service import PatrolService, PatrolBusyError
 from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
 from host.desk_agent.connectors.robot.official_camera_adapter import (
     MAX_WSPK_FRAME_BYTES,
@@ -176,6 +179,19 @@ class DeskAgentHostApp:
             default_lease_ms=cam_cfg.get("default_lease_ms", 10000),
             auto_start_pipeline=cam_cfg.get("auto_start_pipeline", False),
             allow_synthetic=cam_cfg.get("allow_synthetic", False),
+        )
+        vision_cfg = self.config.get("vision", {})
+        self.vision_service = VisionService(
+            api_key=vision_cfg.get("api_key"),
+            api_url=vision_cfg.get("api_url"),
+            model=vision_cfg.get("model", "gpt-4o-mini"),
+        )
+        self.patrol_service = PatrolService(
+            vision_service=self.vision_service,
+            move_fn=self._patrol_move_callback,
+            stop_fn=self._patrol_stop_callback,
+            snapshot_fn=self._patrol_snapshot_callback,
+            settle_delay_s=cam_cfg.get("patrol_settle_delay_s", 0.5),
         )
         network_log_cfg = self.config.get("network_logs", {})
         self.network_log_consumer = NetworkLogConsumer(
@@ -687,6 +703,11 @@ class DeskAgentHostApp:
                 self.companion.close()
             except Exception:
                 pass
+        if getattr(self, "patrol_service", None) and hasattr(self.patrol_service, "stop_patrol"):
+            try:
+                self.patrol_service.stop_patrol(timeout=0.5)
+            except Exception:
+                pass
         self.camera_service.stop_capture()
         self.life_service.close()
 
@@ -749,6 +770,13 @@ class DeskAgentHostApp:
         self.router.register("resource.camera.release", self._handle_camera_release)
         self.router.register("resource.motion.move", self._handle_motion_move)
         self.router.register("resource.motion.stop", self._handle_motion_stop)
+
+        # Camera Vision & Patrol
+        self.router.register("camera.analyze_snapshot", self._handle_camera_analyze_snapshot)
+        self.router.register("camera.patrol.start", self._handle_camera_patrol_start)
+        self.router.register("camera.patrol.stop", self._handle_camera_patrol_stop)
+        self.router.register("camera.patrol.status", self._handle_camera_patrol_status)
+        self.router.register("camera.patrol.history", self._handle_camera_patrol_history)
 
     def _handle_ha_get_state(self, req: RequestEnvelope) -> ResponseEnvelope:
         entity_id = req.arguments["entity_id"]
@@ -1429,6 +1457,104 @@ class DeskAgentHostApp:
         )
 
 
+
+    # Patrol & Vision callbacks and RPC handlers
+    def _patrol_move_callback(self, pan: float, tilt: float, duration_ms: int) -> bool:
+        clamped_pan = max(0.0, min(180.0, pan))
+        clamped_tilt = max(100.0, min(140.0, tilt))
+        self.camera_service.update_motion_coordinates(clamped_pan, clamped_tilt)
+        if self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_motion_move"):
+            try:
+                ack = self._robot_client.send_motion_move(clamped_pan, clamped_tilt, duration_ms)
+                status, accepted, _, _, _ = self._motion_outcome(ack)
+                return accepted
+            except Exception as e:
+                logger.warning("Patrol move error: %s", e)
+                return False
+        return True
+
+    def _patrol_stop_callback(self) -> bool:
+        if self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_motion_stop"):
+            try:
+                ack = self._robot_client.send_motion_stop(True)
+                status, accepted, _, _, _ = self._motion_outcome(ack)
+                return accepted
+            except Exception as e:
+                logger.warning("Patrol stop error: %s", e)
+                return False
+        return True
+
+    def _patrol_snapshot_callback(self) -> Optional[bytes]:
+        client_id = f"patrol-snap-{uuid.uuid4().hex[:6]}"
+        res = self.camera_service.acquire_lease(client_id, lease_ms=3000)
+        if not res.get("granted"):
+            return None
+        ephemeral_gen = res.get("lease_generation")
+        try:
+            if self.official_camera_stream_ingress is not None:
+                self.official_camera_stream_ingress.acquire(client_id, 3000, target_fps=10.0)
+            elif self.official_camera_adapter is not None:
+                self.official_camera_adapter.acquire(client_id, 3000, target_fps=10.0)
+            elif self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+                try:
+                    self._robot_client.send_command({"type": "ctrl.camera.capture"}, timeout=1.0)
+                except Exception:
+                    pass
+
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                frame_info = self.camera_service.get_latest_frame(client_id)
+                if frame_info and frame_info.get("jpeg_data"):
+                    return frame_info["jpeg_data"]
+                time.sleep(0.05)
+            return None
+        finally:
+            self.camera_service.release_lease(client_id, expected_generation=ephemeral_gen)
+
+    def _handle_camera_analyze_snapshot(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments or {}
+        jpeg_base64 = args.get("jpeg_base64")
+        prompt = args.get("prompt")
+
+        if jpeg_base64:
+            try:
+                jpeg_bytes = base64.b64decode(jpeg_base64)
+            except Exception as e:
+                return ResponseEnvelope.create_error(req.request_id, "INVALID_ARGUMENTS", f"Invalid base64 payload: {e}")
+        else:
+            jpeg_bytes = self._patrol_snapshot_callback()
+            if not jpeg_bytes:
+                return ResponseEnvelope.create_error(req.request_id, "CAMERA_FRAME_UNAVAILABLE", "No camera snapshot frame available")
+
+        result = self.vision_service.analyze_jpeg(jpeg_bytes, prompt=prompt)
+        return ResponseEnvelope.create_success(req.request_id, result.to_dict())
+
+    def _handle_camera_patrol_start(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments or {}
+        waypoints = args.get("waypoints")
+        duration_ms = args.get("duration_ms", 800)
+        try:
+            res = self.patrol_service.start_patrol(waypoints=waypoints, duration_ms=duration_ms)
+            return ResponseEnvelope.create_success(req.request_id, res)
+        except PatrolBusyError as e:
+            return ResponseEnvelope.create_error(req.request_id, "RESOURCE_BUSY", str(e))
+        except Exception as e:
+            return ResponseEnvelope.create_error(req.request_id, "OPERATION_FAILED", str(e))
+
+    def _handle_camera_patrol_stop(self, req: RequestEnvelope) -> ResponseEnvelope:
+        res = self.patrol_service.stop_patrol()
+        return ResponseEnvelope.create_success(req.request_id, res)
+
+    def _handle_camera_patrol_status(self, req: RequestEnvelope) -> ResponseEnvelope:
+        res = self.patrol_service.get_status()
+        return ResponseEnvelope.create_success(req.request_id, res)
+
+    def _handle_camera_patrol_history(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments or {}
+        limit = args.get("limit", 10)
+        res = self.patrol_service.get_history(limit=limit)
+        return ResponseEnvelope.create_success(req.request_id, {"reports": res})
+
 def make_request_handler(app: DeskAgentHostApp):
     web_dir = Path(__file__).parent / "web"
     index_html_path = web_dir / "index.html"
@@ -1486,6 +1612,23 @@ def make_request_handler(app: DeskAgentHostApp):
                     "device_id": app.config.get("device_id", "desk-agent-r1-host"),
                 }).encode()
                 self.wfile.write(resp)
+            elif self.path in ("/api/camera/patrol/status", "/api/camera/patrol/latest", "/api/camera/patrol/history"):
+                if not self._check_auth():
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": "Unauthorized: invalid or missing bearer token"}')
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                if self.path == "/api/camera/patrol/status":
+                    payload = app.patrol_service.get_status()
+                elif self.path == "/api/camera/patrol/latest":
+                    payload = {"report": app.patrol_service.get_latest_report()}
+                else:
+                    payload = {"reports": app.patrol_service.get_history()}
+                self.wfile.write(json.dumps(payload).encode("utf-8"))
             elif (
                 self.path == "/snapshot"
                 or self.path.startswith("/snapshot?")
@@ -1877,7 +2020,33 @@ def make_request_handler(app: DeskAgentHostApp):
                 self.wfile.write(b'{"error": "Unauthorized: invalid or missing bearer token"}')
                 return
 
-            if self.path == "/api/rpc":
+            if self.path in ("/api/camera/analyze", "/api/camera/patrol/start", "/api/camera/patrol/stop"):
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+                try:
+                    payload = json.loads(body) if body else {}
+                except Exception:
+                    payload = {}
+                if self.path == "/api/camera/analyze":
+                    op = "camera.analyze_snapshot"
+                elif self.path == "/api/camera/patrol/start":
+                    op = "camera.patrol.start"
+                else:
+                    op = "camera.patrol.stop"
+                req = RequestEnvelope(
+                    schema_version="1.0.0",
+                    request_id="req-" + str(int(time.time() * 1000)),
+                    client_id="http-client",
+                    operation=op,
+                    arguments=payload,
+                    expires_at=datetime.now(timezone.utc).isoformat(),
+                )
+                resp = app.router.dispatch(req)
+                self.send_response(200 if resp.status == "succeeded" else 400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(resp.to_json().encode("utf-8"))
+            elif self.path == "/api/rpc":
                 content_len = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_len).decode("utf-8")
                 try:

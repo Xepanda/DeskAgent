@@ -69,6 +69,58 @@
         <li>待办: 审查 G1 最小贯通真机测试数据</li>
       </ul>
     </div>
+
+    <!-- AI Vision & Patrol Card -->
+    <div class="card" style="margin-top: 20px; grid-column: span 2;">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <h3 style="margin: 0;">📸 云端单帧视觉识别与预设点巡看 (AI Vision & Patrol)</h3>
+        <span class="badge" id="patrolBadge">巡看就绪</span>
+      </div>
+      <p style="font-size: 12px; color: #94a3b8; margin: 8px 0 15px 0;">
+        ℹ️ 说明：严格执行单帧抓拍与预设点位巡看分析；系统不存储连续视频流或监控录像。
+      </p>
+
+      <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+        <button class="btn" id="btnSingleAnalyze" onclick="captureAndAnalyzeVision()">🔍 单帧抓拍并识别</button>
+        <button class="btn" id="btnStartPatrol" onclick="startPresetPatrol()">🚀 开始预设巡看 (左/中/右)</button>
+        <button class="btn btn-stop" id="btnStopPatrol" onclick="stopPresetPatrol()" disabled>■ 停止巡看</button>
+      </div>
+
+      <!-- 单帧识别结果面板 -->
+      <div id="singleVisionPanel" style="background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px; margin-bottom: 15px; display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <strong>🎯 单帧场景识别结果:</strong>
+          <span class="badge badge-green" id="visionSceneTag">场景: 未知</span>
+        </div>
+        <p id="visionDescText" style="font-size: 13px; color: #e2e8f0; margin: 5px 0;"></p>
+        <div id="visionTagsContainer" style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px;"></div>
+      </div>
+
+      <!-- 巡看报告展示区域 -->
+      <div id="patrolGallery" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px;">
+        <div class="card" style="background: #0f172a; padding: 12px; border: 1px solid #334155;">
+          <h4 style="margin: 0 0 8px 0; color: #38bdf8;">◀ 左侧 (45°)</h4>
+          <div id="wpThumb0" style="height: 160px; background: #000; border-radius: 6px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 8px;">
+            <span style="font-size: 12px; color: #64748b;">待巡看采集</span>
+          </div>
+          <div id="wpText0" style="font-size: 12px; color: #94a3b8;">未巡看</div>
+        </div>
+        <div class="card" style="background: #0f172a; padding: 12px; border: 1px solid #334155;">
+          <h4 style="margin: 0 0 8px 0; color: #38bdf8;">▲ 正中 (90°)</h4>
+          <div id="wpThumb1" style="height: 160px; background: #000; border-radius: 6px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 8px;">
+            <span style="font-size: 12px; color: #64748b;">待巡看采集</span>
+          </div>
+          <div id="wpText1" style="font-size: 12px; color: #94a3b8;">未巡看</div>
+        </div>
+        <div class="card" style="background: #0f172a; padding: 12px; border: 1px solid #334155;">
+          <h4 style="margin: 0 0 8px 0; color: #38bdf8;">▶ 右侧 (135°)</h4>
+          <div id="wpThumb2" style="height: 160px; background: #000; border-radius: 6px; display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 8px;">
+            <span style="font-size: 12px; color: #64748b;">待巡看采集</span>
+          </div>
+          <div id="wpText2" style="font-size: 12px; color: #94a3b8;">未巡看</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -481,6 +533,103 @@
       }
       acquireCameraLease();
     });
+    let patrolPollTimer = null;
+
+    async function captureAndAnalyzeVision() {
+      const btn = document.getElementById("btnSingleAnalyze");
+      btn.disabled = true;
+      btn.innerText = "⏳ 正在识别...";
+      const panel = document.getElementById("singleVisionPanel");
+      panel.style.display = "block";
+      document.getElementById("visionDescText").innerText = "正在从相机获取最新单帧并调用多模态模型分析...";
+      document.getElementById("visionTagsContainer").innerHTML = "";
+
+      const res = await rpcCall("camera.analyze_snapshot", {});
+      btn.disabled = false;
+      btn.innerText = "🔍 单帧抓拍并识别";
+
+      if (res.status === "succeeded" && res.result) {
+        const data = res.result;
+        document.getElementById("visionSceneTag").innerText = "场景: " + (data.scene || "已识别");
+        document.getElementById("visionDescText").innerText = data.description || "无详细描述";
+        const tagsContainer = document.getElementById("visionTagsContainer");
+        tagsContainer.innerHTML = "";
+        (data.tags || []).forEach(t => {
+          const span = document.createElement("span");
+          span.className = "badge";
+          span.style.background = "#334155";
+          span.innerText = t;
+          tagsContainer.appendChild(span);
+        });
+        (data.objects || []).forEach(o => {
+          const span = document.createElement("span");
+          span.className = "badge badge-green";
+          span.innerText = `${o.name} (${Math.round((o.confidence || 0) * 100)}%)`;
+          tagsContainer.appendChild(span);
+        });
+      } else {
+        const err = res.error ? res.error.message : "抓拍分析失败";
+        document.getElementById("visionSceneTag").innerText = "错误";
+        document.getElementById("visionDescText").innerText = "⚠️ " + err;
+      }
+    }
+
+    async function startPresetPatrol() {
+      document.getElementById("btnStartPatrol").disabled = true;
+      document.getElementById("btnStopPatrol").disabled = false;
+      document.getElementById("patrolBadge").innerText = "巡看中...";
+      document.getElementById("patrolBadge").className = "badge badge-green";
+
+      const res = await rpcCall("camera.patrol.start", { duration_ms: 800 });
+      if (res.status === "succeeded") {
+        clearInterval(patrolPollTimer);
+        patrolPollTimer = setInterval(pollPatrolStatus, 1000);
+      } else {
+        alert("启动巡看失败: " + (res.error ? res.error.message : "未知错误"));
+        document.getElementById("btnStartPatrol").disabled = false;
+        document.getElementById("btnStopPatrol").disabled = true;
+        document.getElementById("patrolBadge").innerText = "错误";
+      }
+    }
+
+    async function stopPresetPatrol() {
+      document.getElementById("btnStopPatrol").disabled = true;
+      await rpcCall("camera.patrol.stop", {});
+      pollPatrolStatus();
+    }
+
+    async function pollPatrolStatus() {
+      const res = await rpcCall("camera.patrol.status", {});
+      if (res.status === "succeeded" && res.result) {
+        const status = res.result;
+        const running = status.is_running;
+        document.getElementById("btnStartPatrol").disabled = running;
+        document.getElementById("btnStopPatrol").disabled = !running;
+
+        const active = status.active_patrol || status.latest_report;
+        if (active) {
+          document.getElementById("patrolBadge").innerText = active.status === "running" ? `巡看中 (${(status.current_waypoint_index + 1)}/${status.total_waypoints})` : (active.status === "completed" ? "巡看完成" : active.status);
+          const waypoints = active.waypoints || [];
+          waypoints.forEach((wp, idx) => {
+            if (idx < 3) {
+              const thumbEl = document.getElementById("wpThumb" + idx);
+              const textEl = document.getElementById("wpText" + idx);
+              if (wp.jpeg_base64) {
+                thumbEl.innerHTML = `<img src="data:image/jpeg;base64,${wp.jpeg_base64}" style="width:100%; height:100%; object-fit:cover; border-radius:4px;" alt="${wp.name}" />`;
+              }
+              const scene = wp.analysis ? wp.analysis.scene : "未分析";
+              const desc = wp.analysis ? wp.analysis.description : (wp.error || "等待采集");
+              textEl.innerHTML = `<strong>${wp.name}</strong><br/>场景: ${scene}<br/>${desc}`;
+            }
+          });
+        }
+
+        if (!running) {
+          clearInterval(patrolPollTimer);
+        }
+      }
+    }
+
     window.addEventListener("pagehide", () => { releaseCameraLease(true); });
   </script>
 </body>
