@@ -83,6 +83,7 @@ if(DEFINED EXAMPLE_LIB)
     if(NOT TARGET ai_audio)
         message(FATAL_ERROR "Watcher profile requires TuyaOpen target 'ai_audio'")
     endif()
+    _desk_tclaw_replace_source(ai_audio "ai_audio/src/ai_audio_input.c")
     foreach(_tclaw_overlay_target ai_mcp ai_agent)
         target_include_directories(${_tclaw_overlay_target} BEFORE PUBLIC
             "${TCLAW_SOURCE_ROOT}/overlay/ai_components/${_tclaw_overlay_target}/include"

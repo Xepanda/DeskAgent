@@ -263,7 +263,7 @@ class SubprocessJsonRpcTransport(JsonRpcTransport):
 
         return self._proc
 
-    def send_request(self, method: str, params: Mapping[str, Any], timeout: float = 10.0) -> dict[str, Any]:
+    def send_request(self, method: str, params: Mapping[str, Any], timeout: float = 60.0) -> dict[str, Any]:
         with self._lock:
             proc = self._ensure_proc()
             self._req_counter += 1

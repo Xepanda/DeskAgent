@@ -20,6 +20,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #endif
@@ -297,7 +299,12 @@ int desk_watcher_input_init(void)
     }
 
     s_input_task_running = true;
-    BaseType_t ret = xTaskCreate(watcher_input_worker_task, "watcher_input", 2048, NULL, 3, &s_input_task_handle);
+    #if defined(CONFIG_ENABLE_EXT_RAM) || defined(CONFIG_ESP32S3_SPIRAM_SUPPORT)
+    BaseType_t ret = xTaskCreateWithCaps(watcher_input_worker_task, "watcher_input", 4096, NULL, 3,
+                                         &s_input_task_handle, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    BaseType_t ret = xTaskCreate(watcher_input_worker_task, "watcher_input", 4096, NULL, 3, &s_input_task_handle);
+#endif
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create input polling task");
         s_input_task_running = false;

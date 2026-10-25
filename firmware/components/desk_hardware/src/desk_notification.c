@@ -4,6 +4,9 @@
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
+#ifdef ESP_PLATFORM
+#include "tal_time_service.h"
+#endif
 
 #define NOTIFICATION_RECORDS_MAX 16
 #define NOTIFICATION_SOUND_SAMPLES 1600
@@ -98,9 +101,16 @@ static bool parse_utc(const char *text, uint64_t *out_epoch_us)
 
 static uint64_t now_epoch_us(void)
 {
+#ifdef ESP_PLATFORM
+    /* IoTOS keeps its synchronized UTC clock separately from libc's clock. */
+    SYS_TICK_T now_ms = tal_time_get_posix_ms();
+    if (now_ms < 1577836800000ull) return 0;
+    return (uint64_t)now_ms * 1000u;
+#else
     struct timeval now;
     if (gettimeofday(&now, NULL) != 0 || now.tv_sec < 1577836800) return 0;
     return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_usec;
+#endif
 }
 
 static bool valid_text(const char *value, size_t capacity)
@@ -355,6 +365,16 @@ int desk_hardware_notification_register_summary_ack_callback(
 int desk_hardware_notification_process_pending(void)
 {
     if (!s_initialized) return DESK_HW_ERR_UNAVAILABLE;
+
+    bool has_pending = false;
+    for (unsigned i = 0; i < NOTIFICATION_RECORDS_MAX; ++i) {
+        if (s_records[i].occupied && s_records[i].pending) {
+            has_pending = true;
+            break;
+        }
+    }
+    if (!has_pending) return DESK_HW_OK;
+
     uint64_t now = now_epoch_us();
     if (!now) return DESK_HW_ERR_UNAVAILABLE;
     for (unsigned i = 0; i < NOTIFICATION_RECORDS_MAX; ++i) {
