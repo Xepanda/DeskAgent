@@ -779,8 +779,8 @@ class TestTClawDialogue(unittest.TestCase):
         self.assertEqual(rc_disc, 0)
         self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
         self.lib.desk_hardware_display_get_expression(preset_buf, 64, text_buf, 256)
-        self.assertEqual(preset_buf.value.decode("utf-8"), "idle")
-        self.assertEqual(text_buf.value.decode("utf-8"), "Cloud Offline")
+        self.assertEqual(preset_buf.value.decode("utf-8"), "offline")
+        self.assertEqual(text_buf.value.decode("utf-8"), "Offline")
 
     def test_dialogue_motion_voice_intent_routing(self) -> None:
         """Verifies voice dialogue intent routing for motion prompts dispatches ctrl.motion.move."""

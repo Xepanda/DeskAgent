@@ -190,18 +190,18 @@ typedef struct {
 /* === Property Management Functions === */
 #define MCP_PROP_END NULL
 
-#define MCP_PROP_INT(name, desc) \
+#define MCP_PROP_INT(prop_name, desc) \
     &(MCP_PROPERTY_DEF_T){ \
-    .name = name, \
+    .name = prop_name, \
     .type = MCP_PROPERTY_TYPE_INTEGER, \
     .description = desc, \
     .has_default = FALSE, \
     .has_range = FALSE \
 }
 
-#define MCP_PROP_INT_DEF(name, desc, def_val)  \
+#define MCP_PROP_INT_DEF(prop_name, desc, def_val)  \
     &(MCP_PROPERTY_DEF_T){ \
-    .name = name, \
+    .name = prop_name, \
     .type = MCP_PROPERTY_TYPE_INTEGER, \
     .description = desc, \
     .has_default = TRUE, \
