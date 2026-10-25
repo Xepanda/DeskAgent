@@ -578,5 +578,59 @@ class ManagedNotificationOutboxTests(unittest.TestCase):
                 app.close()
 
 
+    def test_receipt_acknowledgement_survives_retry_claim_and_blocks_replay(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ):
+            config_path, _ = self._write_test_config(directory)
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            try:
+                self._stop_delivery_thread(app)
+                adapter = _FakeNotificationAdapter()
+                app.managed_notification_adapter = adapter
+                app.life_service.create_reminder(
+                    reminder_id="rem-receipt-retry-integration",
+                    title="Receipt retry integration",
+                    due_at="2099-02-03T04:05:00Z",
+                )
+                occurrence_id = app.life_service.get_all_occurrences(
+                    "rem-receipt-retry-integration"
+                )[0]["occurrence_id"]
+                created = app.life_service.trigger_occurrence_to_outbox(occurrence_id)
+                outbox_id = created["outbox_id"]
+                item = app.life_service.get_pending_outbox_messages(include_delayed=True)[0]
+                notification = app.life_service.build_reminder_notification(item)
+                self.assertEqual(app.life_service.ensure_notification_receipt(notification), "ready")
+                self.assertEqual(app.life_service.record_managed_notification_event({
+                    "type": "notification.status", "notification_id": occurrence_id, "status": "played",
+                }), "recorded")
+                ack = {
+                    "type": "notification.acknowledged",
+                    "notification_id": occurrence_id,
+                    "source": "button",
+                }
+                self.assertEqual(app.life_service.record_managed_notification_event(ack), "recorded")
+
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+
+                self.assertEqual(adapter.notifications, [])
+                receipt = app.life_service.get_notification_receipt(occurrence_id)
+                self.assertEqual(receipt["delivery_status"], "played")
+                self.assertTrue(receipt["user_acknowledged"])
+                outbox = app.life_service._get_connection().execute(
+                    "SELECT state, retry_count, next_retry_at, dispatched_at FROM outbox WHERE outbox_id = ?",
+                    (outbox_id,),
+                ).fetchone()
+                self.assertEqual(outbox["state"], "pending")
+                self.assertEqual(outbox["retry_count"], 1)
+                self.assertIsNotNone(outbox["next_retry_at"])
+                self.assertIsNone(outbox["dispatched_at"])
+            finally:
+                app.close()
+
+
 if __name__ == "__main__":
     unittest.main()
