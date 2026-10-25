@@ -44,6 +44,7 @@ class TestMcpToolBridgeContract(unittest.TestCase):
             "-fPIC",
             "-O2",
             "-Wall",
+            "-DDESK_SDK_TESTING",
             f"-I{repo_root}/firmware/components/desk_sdk_bridge/include",
             f"-I{repo_root}/firmware/components/desk_hardware/include",
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
@@ -102,6 +103,15 @@ class TestMcpToolBridgeContract(unittest.TestCase):
 
         cls.lib.desk_sdk_bridge_cleanup_expired_requests.restype = ctypes.c_int
         cls.lib.desk_sdk_bridge_cleanup_expired_requests.argtypes = [ctypes.c_uint32]
+
+        cls.lib.desk_sdk_bridge_wait_tool_response.restype = ctypes.c_int
+        cls.lib.desk_sdk_bridge_wait_tool_response.argtypes = [
+            ctypes.c_char_p, ctypes.c_uint32,
+            ctypes.c_char_p, ctypes.c_size_t,
+            ctypes.c_char_p, ctypes.c_size_t,
+        ]
+        cls.lib.desk_sdk_test_pending_result_bytes.restype = ctypes.c_size_t
+        cls.lib.desk_sdk_test_pending_result_bytes.argtypes = []
 
         cls.lib.desk_sdk_bridge_get_last_heartbeat_time.restype = ctypes.c_uint32
         cls.lib.desk_sdk_bridge_get_last_heartbeat_time.argtypes = []
@@ -256,6 +266,115 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         self.lib.desk_sdk_bridge_get_request_status(req_id.encode("utf-8"), st_buf, ctypes.sizeof(st_buf))
         self.assertEqual(st_buf.value.decode("utf-8"), "completed")
         self.assertFalse(self.lib.desk_sdk_bridge_has_pending_request(req_id.encode("utf-8")))
+
+    def test_large_utf8_result_round_trips_and_small_wait_buffer_is_retryable(self) -> None:
+        req_id = "req-large-utf8-result"
+        self.assertEqual(self.lib.desk_sdk_bridge_dispatch_tool_request(json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "operation": "test.large_result", "arguments": {},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }).encode("utf-8")), 0)
+        chinese = "设备结果已完整返回" * 80
+        host_response = json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "status": "succeeded", "result": {"message": chinese},
+        }, ensure_ascii=False).encode("utf-8")
+        self.assertGreater(len(host_response), 512)
+        self.assertLessEqual(len(host_response), 12 * 1024)
+        self.assertEqual(self.lib.desk_sdk_bridge_handle_tool_response(host_response), 0)
+
+        status = ctypes.create_string_buffer(32)
+        too_small = ctypes.create_string_buffer(512)
+        rc = self.lib.desk_sdk_bridge_wait_tool_response(
+            req_id.encode("utf-8"), 1, status, len(status), too_small, len(too_small)
+        )
+        self.assertEqual(rc, -2, "undersized buffers must fail without consuming a response")
+
+        result = ctypes.create_string_buffer(16 * 1024 + 1)
+        rc = self.lib.desk_sdk_bridge_wait_tool_response(
+            req_id.encode("utf-8"), 1, status, len(status), result, len(result)
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(status.value.decode("utf-8"), "succeeded")
+        self.assertEqual(json.loads(result.value.decode("utf-8")), {"message": chinese})
+        self.assertEqual(self.lib.desk_sdk_test_pending_result_bytes(), 0)
+
+    def test_12k_host_page_result_is_preserved(self) -> None:
+        req_id = "req-large-page-result"
+        self.assertEqual(self.lib.desk_sdk_bridge_dispatch_tool_request(json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "operation": "codex.page.read", "arguments": {},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }).encode("utf-8")), 0)
+        page = "x" * (10 * 1024)
+        host_response = json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "status": "succeeded", "result": {"page": page},
+        }, ensure_ascii=False).encode("utf-8")
+        self.assertGreater(len(host_response), 10 * 1024)
+        self.assertLessEqual(len(host_response), 12 * 1024)
+        self.assertEqual(self.lib.desk_sdk_bridge_handle_tool_response(host_response), 0)
+
+        status = ctypes.create_string_buffer(32)
+        result = ctypes.create_string_buffer(16 * 1024 + 1)
+        self.assertEqual(self.lib.desk_sdk_bridge_wait_tool_response(
+            req_id.encode("utf-8"), 1, status, len(status), result, len(result)
+        ), 0)
+        self.assertEqual(json.loads(result.value.decode("utf-8")), {"page": page})
+
+    def test_oversize_host_envelope_is_rejected_without_completing_request(self) -> None:
+        req_id = "req-oversize-envelope"
+        self.assertEqual(self.lib.desk_sdk_bridge_dispatch_tool_request(json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "operation": "test.oversize", "arguments": {},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }).encode("utf-8")), 0)
+        oversized = json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "status": "succeeded", "result": {"page": "x" * (13 * 1024)},
+        }).encode("utf-8")
+        self.assertGreater(len(oversized), 12 * 1024)
+        self.assertEqual(self.lib.desk_sdk_bridge_handle_tool_response(oversized), -3)
+        status = ctypes.create_string_buffer(32)
+        self.assertEqual(self.lib.desk_sdk_bridge_get_request_status(
+            req_id.encode("utf-8"), status, len(status)
+        ), 0)
+        self.assertEqual(status.value.decode("utf-8"), "pending")
+        self.assertEqual(self.lib.desk_sdk_test_pending_result_bytes(), 0)
+
+    def test_timeout_clear_and_late_generation_response_release_large_results(self) -> None:
+        req_id = "req-timeout-release-result"
+        self.assertEqual(self.lib.desk_sdk_bridge_dispatch_tool_request(json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "operation": "test.timeout", "arguments": {},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }).encode("utf-8")), 0)
+        accepted = json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id,
+            "status": "accepted", "result": {"working": "y" * 1200},
+        }).encode("utf-8")
+        self.assertEqual(self.lib.desk_sdk_bridge_handle_tool_response(accepted), 0)
+        self.assertGreater(self.lib.desk_sdk_test_pending_result_bytes(), 512)
+        time.sleep(0.01)
+        self.assertEqual(self.lib.desk_sdk_bridge_cleanup_expired_requests(1), 1)
+        self.assertEqual(self.lib.desk_sdk_test_pending_result_bytes(), 0)
+
+        # Session generation teardown clears remaining stored payloads; a late
+        # response from the old connection is no longer correlated.
+        self.assertEqual(self.lib.desk_sdk_bridge_dispatch_tool_request(json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id + "-next",
+            "operation": "test.disconnect", "arguments": {},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }).encode("utf-8")), 0)
+        pending_response = json.dumps({
+            "schema_version": "1.0.0", "request_id": req_id + "-next",
+            "status": "succeeded", "result": {"body": "z" * 900},
+        }).encode("utf-8")
+        self.assertEqual(self.lib.desk_sdk_bridge_handle_tool_response(pending_response), 0)
+        self.assertGreater(self.lib.desk_sdk_test_pending_result_bytes(), 0)
+        self.assertEqual(self.lib.desk_sdk_bridge_clear_pending_requests(), 0)
+        self.assertEqual(self.lib.desk_sdk_test_pending_result_bytes(), 0)
+        self.assertNotEqual(self.lib.desk_sdk_bridge_handle_tool_response(pending_response), 0)
 
     # -------------------------------------------------------------------------
     # 3. Codex MCP Tool Two-Phase Turn (Accepted -> Completed)

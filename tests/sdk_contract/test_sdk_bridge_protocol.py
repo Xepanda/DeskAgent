@@ -2984,6 +2984,34 @@ class TestSdkBridgeProtocol(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertEqual(reply, "", "no pair.accept may be emitted when unprovisioned")
 
+    def test_reunite_challenge_without_response_mac_does_not_consume_manual_pairing_window(self) -> None:
+        """A Runtime reunite request is not a manual pair request and cannot spend its code window."""
+        self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"123456"), 0)
+        reunite_request = json.dumps({
+            "type": "link.reunite.request",
+            "protocol": "watcher-lan-pairing",
+            "version": "1.1",
+            "request_id": "21a9dbf05ea3443480e62076f79a3b12",
+            "daemon_instance_id": "f730f29e670c49f7a3320c4314eb9805",
+            "nonce": "7d0e3a1e6c924de6a7f60f6ba42f3d8f",
+            "target_mode": "python_sdk",
+            "websocket_port": 8765,
+        }).encode("utf-8")
+
+        # Per the pinned SDK 1.1 request shape, the challenge has no MAC. The
+        # device must never issue a pair.accept or treat the challenge as one
+        # of the five failed manual pairing-code attempts.
+        for _ in range(5):
+            rc, reply = self._process_pairing(reunite_request)
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(reply, "")
+        self.assertTrue(self.lib.desk_sdk_bridge_is_pairing_code_configured())
+
+        # Manual pairing remains available after unsupported reunite traffic.
+        rc, reply = self._process_pairing(self._official_pair_request("123456"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(reply)["type"], "pair.accept")
+
     def test_pairing_rejected_on_wrong_code(self) -> None:
         """A mismatching pairing code must not yield a session token."""
         self.assertEqual(self.lib.desk_sdk_bridge_set_pairing_code(b"654321"), 0)
