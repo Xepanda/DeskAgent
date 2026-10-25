@@ -738,6 +738,16 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         return camera_capture_release(control_rc, (int64_t)camera_capture_overall_deadline_us);
     }
 
+    /* Exposure Stabilization Loop:
+     * On sensor wake-up (MODE 1 cold-start), the initial frame in the slave FIFO
+     * has 0-exposure / blank pixels (10..17). We drain frames for ~800 ms so the
+     * CMOS sensor's AEC/AGC convergence loop stabilizes and carries real scene exposure. */
+    const int64_t mode1_start_us = esp_timer_get_time();
+    const int64_t aec_converge_duration_us = 800000LL; /* 800 ms exposure convergence */
+    unsigned frame_attempt = 0;
+    while (esp_timer_get_time() < camera_capture_deadline_us) {
+        ++frame_attempt;
+
     /* SYNC is a readiness hint during aligned reads. During recovery, scan
      * the bounded stream even if the edge was lost with the malformed frame. */
     bool sync_ready = s_ptl_resynchronizing;
@@ -963,6 +973,20 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
         return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL, (int64_t)camera_capture_overall_deadline_us);
     }
 
+    if ((esp_timer_get_time() - mode1_start_us) < aec_converge_duration_us) {
+        ESP_LOGI(TAG, "Drained warmup frame #%u (elapsed=%lld ms, size=%u, jpeg=%u), waiting for AEC convergence...",
+                 frame_attempt, (long long)((esp_timer_get_time() - mode1_start_us) / 1000LL),
+                 (unsigned)body_size, (unsigned)jpeg_sz);
+        int64_t sync_drop_deadline = esp_timer_get_time() + 150000LL;
+        while (esp_timer_get_time() < sync_drop_deadline) {
+            bool active = false;
+            if (camera_sync_is_active(&active) == DESK_HW_OK && !active) break;
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        continue;
+    }
+
     if (jpeg_sz > max_len) {
         ESP_LOGE(TAG, "JPEG output buffer too small: jpeg_size=%u max_len=%u",
                  (unsigned)jpeg_sz, (unsigned)max_len);
@@ -975,6 +999,9 @@ int desk_watcher_camera_capture(uint8_t *out_buf, size_t max_len, size_t *out_le
     s_ptl_resynchronizing = false;
     memset(&s_ptl_scanner, 0, sizeof(s_ptl_scanner));
     return camera_capture_release(DESK_HW_OK, (int64_t)camera_capture_overall_deadline_us);
+    } /* End Exposure Stabilization Loop */
+
+    return camera_capture_release(DESK_HW_ERR_TIMEOUT, (int64_t)camera_capture_overall_deadline_us);
 #else
     return DESK_HW_ERR_UNAVAILABLE;
 #endif
