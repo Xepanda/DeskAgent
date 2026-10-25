@@ -20,6 +20,7 @@
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_input.h"
 #include "desk_watcher_camera.h"
+#include "mbedtls/base64.h"
 #include "desk_pairing_window.h"
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_audio.h"
@@ -488,12 +489,24 @@ static void cmd_audio(int argc, char *argv[])
 static void cmd_camera(int argc, char *argv[])
 {
     if (argc >= 2 && strcmp(argv[1], "capture") == 0) {
-        static DESK_DIAG_BSS uint8_t jpeg_buf[8192];
+        static DESK_DIAG_BSS uint8_t jpeg_buf[65536];
         size_t out_len = 0;
         int rc = desk_hardware_camera_capture_jpeg(jpeg_buf, sizeof(jpeg_buf), &out_len, 5000);
         printf("Camera Capture: rc=%d (%s), valid_frame=%s, out_len=%lu bytes\r\n",
                rc, rc == DESK_HW_OK ? "ok" : cli_camera_capture_error_name(rc),
                rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
+        if (rc == DESK_HW_OK && out_len > 0) {
+            size_t b64_len = 0;
+            mbedtls_base64_encode(NULL, 0, &b64_len, jpeg_buf, out_len);
+            char *b64_str = (char *)malloc(b64_len + 1);
+            if (b64_str) {
+                size_t actual_b64 = 0;
+                mbedtls_base64_encode((unsigned char *)b64_str, b64_len + 1, &actual_b64, jpeg_buf, out_len);
+                b64_str[actual_b64] = '\0';
+                printf("DESK_JPEG_BEGIN %lu\r\n%s\r\nDESK_JPEG_END\r\n", (unsigned long)out_len, b64_str);
+                free(b64_str);
+            }
+        }
     } else {
         printf("Camera Subsystem:\r\n");
         printf("  Arbiter Camera Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR));
