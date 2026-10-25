@@ -101,15 +101,64 @@ int main(void) {{
             )
             subprocess.run([str(binary)], check=True)
 
+    def test_probe_response_name_must_match_query_before_success(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        probe = source.split("int desk_watcher_camera_probe_sscma_query(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("desk_watcher_camera_sscma_validate_query_reply", probe)
+        self.assertIn("camera_sscma_discard_pending_reply(overall_deadline_us)", probe)
+        self.assertLess(
+            probe.index("camera_sscma_discard_pending_reply(overall_deadline_us)"),
+            probe.index("camera_sscma_exchange_tx(packet"),
+        )
+
+        compiler = shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("native gcc unavailable; run this contract under WSL/Linux")
+        harness = f'''#include <assert.h>
+#include <stdint.h>
+#include "{(ROOT / "firmware/components/desk_hardware/src/desk_watcher_camera.c").as_posix()}"
+
+int main(void) {{
+    static const char stale_version[] = "\\r{{\\"type\\":0,\\"name\\":\\"VER?\\",\\"code\\":0}}\\n";
+    static const char id_reply[] = "\\r{{\\"type\\":0,\\"name\\":\\"ID?\\",\\"code\\":0}}\\n";
+    static const char id_error[] = "\\r{{\\"type\\":0,\\"name\\":\\"ID?\\",\\"code\\":1}}\\n";
+    assert(desk_watcher_camera_sscma_validate_query_reply(
+               DESK_WATCHER_CAMERA_SSCMA_QUERY_ID,
+               (const uint8_t *)stale_version, sizeof(stale_version)-1U) != 0);
+    assert(desk_watcher_camera_sscma_validate_query_reply(
+               DESK_WATCHER_CAMERA_SSCMA_QUERY_ID,
+               (const uint8_t *)id_reply, sizeof(id_reply)-1U) == 0);
+    assert(desk_watcher_camera_sscma_validate_query_reply(
+               DESK_WATCHER_CAMERA_SSCMA_QUERY_ID,
+               (const uint8_t *)id_error, sizeof(id_error)-1U) == 1);
+    return 0;
+}}
+'''
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_file = Path(temp_dir) / "camera_sscma_query_reply_test.c"
+            binary = Path(temp_dir) / "camera_sscma_query_reply_test"
+            source_file.write_text(harness, encoding="utf-8")
+            include_args = [
+                arg
+                for include_dir in sorted((ROOT / "firmware/components").glob("*/include"))
+                for arg in ("-I", str(include_dir))
+            ]
+            subprocess.run(
+                [compiler, "-std=c11", *include_args, "-ffunction-sections", "-fdata-sections",
+                 str(source_file), "-Wl,--gc-sections", "-o", str(binary)],
+                cwd=ROOT, check=True,
+            )
+            subprocess.run([str(binary)], check=True)
+
     def test_probe_bounds_wait_and_restores_after_all_query_errors(self):
         source = SOURCE.read_text(encoding="utf-8")
         probe = source.split("int desk_watcher_camera_probe_sscma_query(", 1)[1].split("\n}", 1)[0]
         self.assertIn("query_deadline_us = overall_deadline_us - 3500000LL", probe)
         self.assertIn("while (esp_timer_get_time() < query_deadline_us)", probe)
         self.assertIn("available < 2U || available > DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX", probe)
-        self.assertIn("camera_sscma_validate_reply(out_reply->raw_response, available)", probe)
-        self.assertIn("? DESK_HW_OK : DESK_WATCHER_CAMERA_ERR_PROTOCOL", probe)
-        self.assertIn("available == 0U ? DESK_HW_ERR_TIMEOUT", probe)
+        self.assertIn("camera_sscma_validate_query_reply(", probe)
+        self.assertIn("response_mismatch = true", probe)
+        self.assertIn("response_mismatch ? DESK_WATCHER_CAMERA_ERR_PROTOCOL : DESK_HW_ERR_TIMEOUT", probe)
         self.assertIn("goto restore", probe)
         self.assertIn("restore:", probe)
         restore = probe.split("restore:", 1)[1].split("done:", 1)[0]
@@ -117,6 +166,31 @@ int main(void) {{
         self.assertIn("s_camera_needs_idle_recovery = true", restore)
         self.assertIn("rc = DESK_WATCHER_CAMERA_ERR_CONTROL", restore)
         self.assertIn("xSemaphoreGive(s_cam_mutex)", probe.split("done:", 1)[1])
+
+    def test_same_name_late_reply_fails_closed_without_transaction_or_reset_proof(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        probe = source.split("int desk_watcher_camera_probe_sscma_query(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("no transaction ID", probe)
+        self.assertIn("no verified target acknowledgment", probe)
+        self.assertIn("rc = DESK_WATCHER_CAMERA_ERR_PROTOCOL", probe)
+        self.assertNotIn("response_received = true", probe)
+        self.assertLess(probe.index("out_reply->raw_response_len = available"),
+                        probe.index("desk_watcher_camera_sscma_validate_query_reply("))
+
+    def test_stale_reply_drain_is_time_byte_and_chunk_bounded(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        drain = source.split("static int camera_sscma_discard_pending_reply(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("SSCMA_SPI_DRAIN_TIMEOUT_US", source)
+        self.assertIn("SSCMA_SPI_DRAIN_MAX_BYTES", drain)
+        self.assertIn("SSCMA_SPI_DRAIN_CHUNK_BYTES", drain)
+        self.assertIn("camera_sscma_read(chunk_size, discard, drain_deadline_us)", drain)
+        self.assertIn("DESK_HW_ERR_TIMEOUT", drain)
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_PROTOCOL", drain)
+        read = source.split("static esp_err_t camera_sscma_read(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", read)
+        self.assertIn("camera_sscma_available(&available, drain_deadline_us)", drain)
+        exchange = source.split("static esp_err_t camera_sscma_exchange_tx(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("esp_timer_get_time() >= deadline_us", exchange)
 
 
 if __name__ == "__main__":

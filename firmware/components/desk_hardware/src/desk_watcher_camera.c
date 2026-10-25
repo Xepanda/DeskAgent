@@ -63,6 +63,9 @@
 #define CAM_PTL_RESYNC_TIMEOUT_MS 50U
 #define CAM_PTL_RESYNC_CHUNK_SIZE 16U
 #define CAM_PTL_RESYNC_MAX_CHUNKS 256U
+#define SSCMA_SPI_DRAIN_TIMEOUT_US 250000LL
+#define SSCMA_SPI_DRAIN_MAX_BYTES 4096U
+#define SSCMA_SPI_DRAIN_CHUNK_BYTES 256U
 
 /* PTL and Media Protocol definitions */
 #define HX_PTL_BASE_HEADER_SIZE   7U
@@ -247,6 +250,29 @@ static int sscma_read_json_string(const char *json, const char *key, char *out, 
     if (*p != '\"' || used == 0U) return -1;
     out[used] = '\0';
     return 0;
+}
+
+int desk_watcher_camera_sscma_validate_query_reply(desk_watcher_camera_sscma_query_t query,
+                                                   const uint8_t *reply, size_t reply_len)
+{
+    if ((query != DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION &&
+         query != DESK_WATCHER_CAMERA_SSCMA_QUERY_ID) ||
+        desk_watcher_camera_sscma_validate_reply(reply, reply_len) != 0) return -1;
+    const size_t json_len = reply_len - 2U;
+    if (json_len == 0U || json_len >= DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX) return -1;
+    char json[DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX];
+    memcpy(json, reply + 1U, json_len);
+    json[json_len] = '\0';
+    if (json[0] != '{' || json[json_len - 1U] != '}' ||
+        memchr(json, '\r', json_len) != NULL || memchr(json, '\n', json_len) != NULL) return -1;
+    char name[8];
+    unsigned type = UINT_MAX, code = UINT_MAX;
+    if (sscma_read_json_number(json, "type", &type) != 0 || type != 0U ||
+        sscma_read_json_number(json, "code", &code) != 0 ||
+        sscma_read_json_string(json, "name", name, sizeof(name)) != 0) return -1;
+    const char *expected = query == DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION ? "VER?" : "ID?";
+    if (strcmp(name, expected) != 0) return -1;
+    return code == 0U ? 0 : 1;
 }
 
 int desk_watcher_camera_sscma_parse_version_reply(const char *reply, size_t reply_len,
@@ -663,15 +689,35 @@ int desk_watcher_camera_init(void)
 
 #ifdef ESP_PLATFORM
 static esp_err_t camera_sscma_exchange_tx(const uint8_t packet[SSCMA_SPI_PACKET_SIZE],
-                                          uint8_t *reply, size_t reply_len)
+                                          uint8_t *reply, size_t reply_len,
+                                          int64_t deadline_us)
 {
+    /* The pinned ESP-IDF port only supports portMAX_DELAY for bus acquire.
+     * Enforce the operation deadline before and after the blocking acquire. */
+    if (esp_timer_get_time() >= deadline_us) return ESP_ERR_TIMEOUT;
     esp_err_t err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
     if (err != ESP_OK) return err;
     spi_transaction_t tx = { .length = SSCMA_SPI_PACKET_SIZE * 8U, .tx_buffer = packet };
+    if (esp_timer_get_time() >= deadline_us) {
+        spi_device_release_bus(s_spi_dev);
+        return ESP_ERR_TIMEOUT;
+    }
     vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
+    if (esp_timer_get_time() >= deadline_us) {
+        spi_device_release_bus(s_spi_dev);
+        return ESP_ERR_TIMEOUT;
+    }
     err = spi_device_transmit(s_spi_dev, &tx);
     if (err == ESP_OK && reply && reply_len) {
+        if (esp_timer_get_time() >= deadline_us) {
+            spi_device_release_bus(s_spi_dev);
+            return ESP_ERR_TIMEOUT;
+        }
         vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
+        if (esp_timer_get_time() >= deadline_us) {
+            spi_device_release_bus(s_spi_dev);
+            return ESP_ERR_TIMEOUT;
+        }
         spi_transaction_t rx = { .length = reply_len * 8U, .rxlength = reply_len * 8U, .rx_buffer = reply };
         err = spi_device_transmit(s_spi_dev, &rx);
     }
@@ -679,19 +725,34 @@ static esp_err_t camera_sscma_exchange_tx(const uint8_t packet[SSCMA_SPI_PACKET_
     return err;
 }
 
-static esp_err_t camera_sscma_read(size_t reply_len, uint8_t *reply)
+static esp_err_t camera_sscma_read(size_t reply_len, uint8_t *reply, int64_t deadline_us)
 {
     uint8_t request[SSCMA_SPI_PACKET_SIZE];
     if (!reply || reply_len == 0U || reply_len > 4095U ||
         desk_watcher_camera_sscma_encode_packet(SSCMA_SPI_READ, NULL, reply_len,
                                                 request, sizeof(request)) != 0) return ESP_ERR_INVALID_ARG;
+    /* The pinned ESP-IDF port only supports portMAX_DELAY for bus acquire.
+     * Enforce the operation deadline before and after the blocking acquire. */
+    if (esp_timer_get_time() >= deadline_us) return ESP_ERR_TIMEOUT;
     esp_err_t err = spi_device_acquire_bus(s_spi_dev, portMAX_DELAY);
     if (err != ESP_OK) return err;
     spi_transaction_t tx = { .length = sizeof(request) * 8U, .tx_buffer = request };
+    if (esp_timer_get_time() >= deadline_us) {
+        spi_device_release_bus(s_spi_dev);
+        return ESP_ERR_TIMEOUT;
+    }
     vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
     err = spi_device_transmit(s_spi_dev, &tx);
     if (err == ESP_OK) {
+        if (esp_timer_get_time() >= deadline_us) {
+            spi_device_release_bus(s_spi_dev);
+            return ESP_ERR_TIMEOUT;
+        }
         vTaskDelay(pdMS_TO_TICKS(SSCMA_SPI_WAIT_MS));
+        if (esp_timer_get_time() >= deadline_us) {
+            spi_device_release_bus(s_spi_dev);
+            return ESP_ERR_TIMEOUT;
+        }
         spi_transaction_t rx = { .length = reply_len * 8U, .rxlength = reply_len * 8U, .rx_buffer = reply };
         err = spi_device_transmit(s_spi_dev, &rx);
     }
@@ -699,15 +760,47 @@ static esp_err_t camera_sscma_read(size_t reply_len, uint8_t *reply)
     return err;
 }
 
-static int camera_sscma_available(size_t *available)
+static int camera_sscma_available(size_t *available, int64_t deadline_us)
 {
     uint8_t packet[SSCMA_SPI_PACKET_SIZE], response[2] = {0};
     if (desk_watcher_camera_sscma_encode_packet(SSCMA_SPI_AVAILABLE, NULL, 0,
                                                 packet, sizeof(packet)) != 0) return DESK_HW_ERR_INVALID_ARG;
-    esp_err_t err = camera_sscma_exchange_tx(packet, response, sizeof(response));
+    esp_err_t err = camera_sscma_exchange_tx(packet, response, sizeof(response), deadline_us);
+    if (err == ESP_ERR_TIMEOUT) return DESK_HW_ERR_TIMEOUT;
     if (err != ESP_OK) return DESK_WATCHER_CAMERA_ERR_SPI;
     return desk_watcher_camera_sscma_parse_available(response, available) == 0
                ? DESK_HW_OK : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+}
+
+static int camera_sscma_discard_pending_reply(int64_t overall_deadline_us)
+{
+    uint8_t discard[SSCMA_SPI_DRAIN_CHUNK_BYTES];
+    const int64_t now_us = esp_timer_get_time();
+    int64_t drain_deadline_us = now_us + SSCMA_SPI_DRAIN_TIMEOUT_US;
+    if (drain_deadline_us > overall_deadline_us) drain_deadline_us = overall_deadline_us;
+    size_t drained_bytes = 0U;
+    while (esp_timer_get_time() < drain_deadline_us) {
+        bool sync_active = false;
+        if (camera_sync_is_active(&sync_active) != DESK_HW_OK) return DESK_WATCHER_CAMERA_ERR_SYNC_IO;
+        if (!sync_active) return DESK_HW_OK;
+        size_t available = 0;
+        int rc = camera_sscma_available(&available, drain_deadline_us);
+        if (rc != DESK_HW_OK) return rc;
+        if (available == 0U) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        if (drained_bytes >= SSCMA_SPI_DRAIN_MAX_BYTES) return DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+        size_t chunk_size = available;
+        if (chunk_size > sizeof(discard)) chunk_size = sizeof(discard);
+        if (chunk_size > SSCMA_SPI_DRAIN_MAX_BYTES - drained_bytes)
+            chunk_size = SSCMA_SPI_DRAIN_MAX_BYTES - drained_bytes;
+        esp_err_t read_err = camera_sscma_read(chunk_size, discard, drain_deadline_us);
+        if (read_err == ESP_ERR_TIMEOUT) return DESK_HW_ERR_TIMEOUT;
+        if (read_err != ESP_OK) return DESK_WATCHER_CAMERA_ERR_SPI;
+        drained_bytes += chunk_size;
+    }
+    return DESK_HW_ERR_TIMEOUT;
 }
 #endif
 
@@ -746,6 +839,11 @@ int desk_watcher_camera_probe_sscma_query(desk_watcher_camera_sscma_query_t quer
         s_camera_needs_idle_recovery = false;
     }
 
+    /* Drop any reply left by an earlier one-shot query before sending a new
+     * command. Both operations use the existing SSCMA SPI transport. */
+    rc = camera_sscma_discard_pending_reply(overall_deadline_us);
+    if (rc != DESK_HW_OK) goto restore;
+
     const uint8_t version_command[] = "AT+VER?\r";
     const uint8_t id_command[] = "AT+ID?\r";
     const uint8_t *command = query == DESK_WATCHER_CAMERA_SSCMA_QUERY_VERSION
@@ -759,8 +857,9 @@ int desk_watcher_camera_probe_sscma_query(desk_watcher_camera_sscma_query_t quer
         rc = DESK_HW_ERR_INVALID_ARG;
         goto restore;
     }
-    if (camera_sscma_exchange_tx(packet, NULL, 0) != ESP_OK) {
-        rc = DESK_WATCHER_CAMERA_ERR_SPI;
+    esp_err_t write_err = camera_sscma_exchange_tx(packet, NULL, 0, query_deadline_us);
+    if (write_err != ESP_OK) {
+        rc = write_err == ESP_ERR_TIMEOUT ? DESK_HW_ERR_TIMEOUT : DESK_WATCHER_CAMERA_ERR_SPI;
         goto restore;
     }
 
@@ -768,29 +867,51 @@ int desk_watcher_camera_probe_sscma_query(desk_watcher_camera_sscma_query_t quer
      * invoke, identity value logging, or persistent config write is issued. */
     size_t available = 0;
     bool sync_active = false;
+    bool response_mismatch = false;
     while (esp_timer_get_time() < query_deadline_us) {
         if (camera_sync_is_active(&sync_active) != DESK_HW_OK) {
             rc = DESK_WATCHER_CAMERA_ERR_SYNC_IO;
             goto restore;
         }
         if (sync_active) {
-            rc = camera_sscma_available(&available);
+            rc = camera_sscma_available(&available, query_deadline_us);
             if (rc != DESK_HW_OK) goto restore;
-            if (available != 0U) break;
+            if (available != 0U) {
+                if (available < 2U || available > DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX) {
+                    rc = DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+                    goto restore;
+                }
+                esp_err_t read_err = camera_sscma_read(available, out_reply->raw_response,
+                                                       query_deadline_us);
+                if (read_err != ESP_OK) {
+                    rc = read_err == ESP_ERR_TIMEOUT ? DESK_HW_ERR_TIMEOUT
+                                                     : DESK_WATCHER_CAMERA_ERR_SPI;
+                    goto restore;
+                }
+                out_reply->raw_response_len = available;
+                const int reply_rc = desk_watcher_camera_sscma_validate_query_reply(
+                    query, out_reply->raw_response, available);
+                if (reply_rc >= 0) {
+                    /* SSCMA exposes no transaction ID and the transport reset
+                     * implementation has no verified target acknowledgment.
+                     * A same-name late reply cannot be proven to belong to this
+                     * request, so never report a probe as successful. */
+                    if (reply_rc != 0) {
+                        rc = DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+                        goto restore;
+                    }
+                    rc = DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+                    goto restore;
+                }
+                /* The differently named response has been consumed as stale;
+                 * keep waiting for this query's reply until the same deadline. */
+                out_reply->raw_response_len = 0U;
+                response_mismatch = true;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (available < 2U || available > DESK_WATCHER_CAMERA_SSCMA_REPLY_MAX) {
-        rc = available == 0U ? DESK_HW_ERR_TIMEOUT : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
-        goto restore;
-    }
-    if (camera_sscma_read(available, out_reply->raw_response) != ESP_OK) {
-        rc = DESK_WATCHER_CAMERA_ERR_SPI;
-        goto restore;
-    }
-    out_reply->raw_response_len = available;
-    rc = desk_watcher_camera_sscma_validate_reply(out_reply->raw_response, available) == 0
-             ? DESK_HW_OK : DESK_WATCHER_CAMERA_ERR_PROTOCOL;
+    rc = response_mismatch ? DESK_WATCHER_CAMERA_ERR_PROTOCOL : DESK_HW_ERR_TIMEOUT;
     goto restore;
 restore:
     if (mode_change_attempted) {

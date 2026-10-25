@@ -79,6 +79,8 @@ int desk_watcher_camera_sscma_encode_packet(uint8_t operation, const uint8_t *pa
                                             size_t packet_capacity);
 int desk_watcher_camera_sscma_parse_available(const uint8_t reply[2], size_t *out_available);
 int desk_watcher_camera_sscma_validate_reply(const uint8_t *reply, size_t reply_len);
+int desk_watcher_camera_sscma_validate_query_reply(desk_watcher_camera_sscma_query_t query,
+                                                   const uint8_t *reply, size_t reply_len);
 int desk_watcher_camera_sscma_parse_version_reply(const char *reply, size_t reply_len,
                                                   desk_watcher_camera_sscma_identity_t *out_identity);
 
