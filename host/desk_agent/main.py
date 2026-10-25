@@ -719,6 +719,8 @@ class DeskAgentHostApp:
         self.router.register("ha.get_state", self._handle_ha_get_state)
         self.router.register("ha.execute", self._handle_ha_execute)
         self.router.register("ha.list_changes", self._handle_ha_list_changes)
+        self.router.register("ha.list_entities", self._handle_ha_list_entities)
+        self.router.register("ha.resolve_entity_name", self._handle_ha_resolve_entity_name)
 
         # Life - Reminders & Notes
         self.router.register("reminder.create", self._handle_reminder_create)
@@ -740,6 +742,7 @@ class DeskAgentHostApp:
         self.router.register("codex.get_pending_approvals", self._handle_codex_get_pending_approvals)
         self.router.register("codex.list_approvals", self._handle_codex_get_pending_approvals)
         self.router.register("codex.list_workspaces", self._handle_codex_list_workspaces)
+        self.router.register("codex.cancel", self._handle_codex_cancel)
 
         # Camera & Hardware resources
         self.router.register("resource.camera.acquire", self._handle_camera_acquire)
@@ -764,6 +767,64 @@ class DeskAgentHostApp:
 
     def _handle_ha_list_changes(self, req: RequestEnvelope) -> ResponseEnvelope:
         return ResponseEnvelope.create_success(req.request_id, {"changes": list(self._ha_state_changes)})
+
+    def _handle_ha_list_entities(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments
+        domain = args.get("domain") or None
+        query = args.get("query") or None
+        try:
+            limit = int(args.get("limit", 5))
+            offset = int(args.get("offset", 0))
+        except (ValueError, TypeError):
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="INVALID_ARGUMENTS",
+                message="limit and offset must be integers",
+            )
+        if limit < 1 or limit > 10 or offset < 0:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="INVALID_ARGUMENTS",
+                message="limit must be between 1 and 10 and offset must be non-negative",
+            )
+        try:
+            all_items = self.ha_connector.list_entities(domain=domain, query=query)
+        except ValueError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="INVALID_ARGUMENTS",
+                message=str(exc),
+            )
+        total = len(all_items)
+        page = all_items[offset : offset + limit]
+        return ResponseEnvelope.create_success(
+            req.request_id,
+            {
+                "items": page,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": (offset + len(page)) < total,
+            },
+        )
+
+    def _handle_ha_resolve_entity_name(self, req: RequestEnvelope) -> ResponseEnvelope:
+        name = req.arguments.get("name")
+        if not name or not isinstance(name, str) or not name.strip():
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="INVALID_ARGUMENTS",
+                message="name must be a non-empty string",
+            )
+        try:
+            res = self.ha_connector.resolve_entity_name(name.strip())
+            return ResponseEnvelope.create_success(req.request_id, res)
+        except ValueError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="INVALID_ARGUMENTS",
+                message=str(exc),
+            )
 
     def _handle_reminder_create(self, req: RequestEnvelope) -> ResponseEnvelope:
         args = req.arguments
@@ -917,6 +978,38 @@ class DeskAgentHostApp:
 
     def _handle_codex_list_workspaces(self, req: RequestEnvelope) -> ResponseEnvelope:
         return ResponseEnvelope.create_success(req.request_id, {"workspaces": list(self.companion.workspaces.keys())})
+
+    def _handle_codex_cancel(self, req: RequestEnvelope) -> ResponseEnvelope:
+        args = req.arguments
+        task_id = args.get("task_id")
+        if not task_id or not isinstance(task_id, str):
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="INVALID_ARGUMENTS",
+                message="task_id is required",
+            )
+        reason = args.get("reason")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 256):
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="INVALID_ARGUMENTS",
+                message="reason must be a string up to 256 characters",
+            )
+        try:
+            res = self.companion.cancel_task(task_id, reason=reason)
+            return ResponseEnvelope.create_success(req.request_id, res)
+        except KeyError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="RESOURCE_NOT_FOUND",
+                message=str(exc),
+            )
+        except RuntimeError as exc:
+            return ResponseEnvelope.create_error(
+                req.request_id,
+                code="OPERATION_FAILED",
+                message=str(exc),
+            )
 
     def _handle_camera_acquire(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")

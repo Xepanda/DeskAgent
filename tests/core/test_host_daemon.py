@@ -460,6 +460,159 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(data2["status"], "succeeded")
             self.assertEqual(data2["result"]["task_id"], "tsk-host-codex-01")
 
+    def test_rpc_ha_list_entities_and_resolve_name(self) -> None:
+        """Verify ha.list_entities (with pagination) and ha.resolve_entity_name via Host RPC."""
+        orig_mock_states = getattr(self.app.ha_connector, "_mock_states", None)
+        orig_mock_mode = getattr(self.app.ha_connector, "mock_mode", False)
+        self.app.ha_connector.mock_mode = True
+        self.app.ha_connector._mock_states = {
+            "light.desk": {"entity_id": "light.desk", "state": "off", "attributes": {"friendly_name": "Desk Lamp", "supported_features": 1}},
+            "light.ceiling": {"entity_id": "light.ceiling", "state": "on", "attributes": {"friendly_name": "Ceiling Light"}},
+            "switch.desk": {"entity_id": "switch.desk", "state": "off", "attributes": {"friendly_name": "Desk Lamp"}},
+            "light.reading": {"entity_id": "light.reading", "state": "off", "attributes": {"friendly_name": "Reading Lamp"}},
+        }
+        try:
+            # 1. Paged list entities
+            payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-ha-list-01",
+                "operation": "ha.list_entities",
+                "arguments": {"domain": "light", "limit": 2, "offset": 0},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            req = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "succeeded")
+                res = data["result"]
+                self.assertEqual(res["total"], 3)
+                self.assertEqual(len(res["items"]), 2)
+                self.assertTrue(res["has_more"])
+
+            # 2. Offset pagination
+            payload["request_id"] = "req-ha-list-02"
+            payload["arguments"] = {"domain": "light", "limit": 2, "offset": 2}
+            req = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "succeeded")
+                res = data["result"]
+                self.assertEqual(len(res["items"]), 1)
+                self.assertFalse(res["has_more"])
+
+            # 3. Resolve unique name
+            resolve_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-ha-resolve-01",
+                "operation": "ha.resolve_entity_name",
+                "arguments": {"name": "Ceiling Light"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            req = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(resolve_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "succeeded")
+                self.assertEqual(data["result"]["status"], "resolved")
+                self.assertEqual(data["result"]["entity"]["entity_id"], "light.ceiling")
+
+            # 4. Resolve ambiguous name (must report candidates without guessing)
+            resolve_payload["request_id"] = "req-ha-resolve-02"
+            resolve_payload["arguments"] = {"name": "Desk Lamp"}
+            req = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(resolve_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "succeeded")
+                self.assertEqual(data["result"]["status"], "ambiguous")
+                self.assertIsNone(data["result"]["entity"])
+                self.assertEqual(len(data["result"]["candidates"]), 2)
+
+            # 5. Not found
+            resolve_payload["request_id"] = "req-ha-resolve-03"
+            resolve_payload["arguments"] = {"name": "Nonexistent Light"}
+            req = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(resolve_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+                self.assertEqual(data["status"], "succeeded")
+                self.assertEqual(data["result"]["status"], "not_found")
+        finally:
+            self.app.ha_connector.mock_mode = orig_mock_mode
+            if orig_mock_states is not None:
+                self.app.ha_connector._mock_states = orig_mock_states
+
+    def test_rpc_codex_cancel_route(self) -> None:
+        """Verify codex.cancel route validation and error mapping."""
+        # 1. Missing task_id
+        payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-codex-cancel-01",
+            "operation": "codex.cancel",
+            "arguments": {},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "failed")
+            self.assertEqual(data["error"]["code"], "INVALID_ARGUMENTS")
+
+        # 2. Reason exceeds 256 chars
+        payload["request_id"] = "req-codex-cancel-02"
+        payload["arguments"] = {"task_id": "tsk-001", "reason": "a" * 257}
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "failed")
+            self.assertEqual(data["error"]["code"], "INVALID_ARGUMENTS")
+
+        # 3. Nonexistent task returns RESOURCE_NOT_FOUND
+        payload["request_id"] = "req-codex-cancel-03"
+        payload["arguments"] = {"task_id": "tsk-nonexistent-999"}
+        req = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            self.assertEqual(data["status"], "failed")
+            self.assertEqual(data["error"]["code"], "RESOURCE_NOT_FOUND")
+
     def test_camera_acquire_and_frame_endpoint(self) -> None:
         """A lease without an attached physical camera source must not yield a fake JPEG."""
         # 1. Acquire lease
