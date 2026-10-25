@@ -1328,6 +1328,43 @@ class TestHAConnector(unittest.TestCase):
                 app.close()
 
 
+    def test_list_entities_filters_unauthorized_and_returns_discovery_fields(self) -> None:
+        ha = HAConnector(
+            mock_mode=True,
+            allowed_domains=["light", "lock"],
+            allowed_entities=["light.desk", "light.private", "lock.front"],
+            denied_entities=["light.private"],
+        )
+        ha._mock_states = {
+            "light.desk": {"entity_id": "light.desk", "state": "off", "attributes": {"friendly_name": "Desk Lamp", "supported_features": 1}},
+            "light.private": {"entity_id": "light.private", "state": "on", "attributes": {"friendly_name": "Private Lamp"}},
+            "lock.front": {"entity_id": "lock.front", "state": "locked", "attributes": {"friendly_name": "Front Door"}},
+            "camera.entry": {"entity_id": "camera.entry", "state": "idle", "attributes": {"friendly_name": "Entry Camera"}},
+        }
+        self.assertEqual(ha.list_entities(domain="light", query="lamp"), [{
+            "entity_id": "light.desk", "friendly_name": "Desk Lamp", "domain": "light",
+            "state": "off", "supported_features": 1,
+        }])
+        self.assertEqual(ha.list_entities(query="Private Lamp"), [])
+        self.assertNotIn("lock.front", [item["entity_id"] for item in ha.list_entities()])
+        self.assertFalse(ha.is_service_allowed("lock", "unlock"))
+
+    def test_friendly_name_resolution_requires_unique_allowed_match(self) -> None:
+        ha = HAConnector(mock_mode=True, allowed_domains=["light", "switch"])
+        ha._mock_states = {
+            "light.desk": {"entity_id": "light.desk", "state": "off", "attributes": {"friendly_name": "Desk Lamp"}},
+            "switch.desk": {"entity_id": "switch.desk", "state": "on", "attributes": {"friendly_name": "Desk Lamp"}},
+            "light.corner": {"entity_id": "light.corner", "state": "off", "attributes": {"friendly_name": "Corner Lamp"}},
+        }
+        ambiguous = ha.resolve_entity_name("Desk Lamp")
+        self.assertEqual(ambiguous["status"], "ambiguous")
+        self.assertIsNone(ambiguous["entity"])
+        self.assertEqual({item["entity_id"] for item in ambiguous["candidates"]}, {"light.desk", "switch.desk"})
+        resolved = ha.resolve_entity_name("Corner Lamp")
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertEqual(resolved["entity"]["entity_id"], "light.corner")
+
+
 if __name__ == "__main__":
     unittest.main()
 
