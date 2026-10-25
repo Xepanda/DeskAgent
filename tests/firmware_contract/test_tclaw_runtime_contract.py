@@ -132,6 +132,81 @@ class TestTclawRuntimeContract(unittest.TestCase):
         self.assertIn("desk_sdk_bridge_dispatch_tool_request", adapter,
                       "Native tool execution must dispatch request envelope to SDK bridge")
 
+    def test_native_motion_tools_require_real_board_callbacks_and_use_builtin_dispatch(self) -> None:
+        adapter = (ROOT / "firmware/main/src/tclaw_runtime_adapter.c").read_text(encoding="utf-8")
+        registration = adapter.split("int desk_tclaw_runtime_register_mcp_tools(void)", 1)[1].split(
+            "static OPERATE_RET __desk_mcp_tools_on_mqtt", 1
+        )[0]
+        motion_result = adapter.split("static OPERATE_RET __motion_set_response", 1)[1].split(
+            "static OPERATE_RET __tool_motion_move", 1
+        )[0]
+        self.assertIn("static OPERATE_RET __tool_motion_move", adapter)
+        self.assertIn("static OPERATE_RET __tool_motion_stop", adapter)
+        move = adapter.split("static OPERATE_RET __tool_motion_move", 1)[1].split(
+            "static OPERATE_RET __tool_motion_stop", 1
+        )[0]
+        stop = adapter.split("static OPERATE_RET __tool_motion_stop", 1)[1].split(
+            "int desk_tclaw_runtime_register_mcp_tools", 1
+        )[0]
+
+        self.assertIn("desk_hardware_get_driver_ops()", registration)
+        self.assertIn("if (ops && ops->motion_move)", registration)
+        self.assertIn("if (ops && ops->motion_stop)", registration)
+        self.assertIn("ops->motion_move", registration)
+        self.assertIn('"motion_move"', registration)
+        self.assertIn("ops->motion_stop", registration)
+        self.assertIn('"motion_stop"', registration)
+        self.assertIn('MCP_PROP_INT_RANGE("pan_deg"', registration)
+        self.assertIn('MCP_PROP_INT_RANGE("tilt_deg"', registration)
+        self.assertIn('MCP_PROP_INT_DEF_RANGE("duration_ms"', registration)
+        self.assertNotIn('"servo_set"', registration)
+        for field in ("pan_deg", "tilt_deg", "duration_ms"):
+            self.assertIn(f'__get_int_prop(properties, "{field}"', move)
+        self.assertIn("DESK_MOTION_PAN_MIN_DEG", move)
+        self.assertIn("DESK_MOTION_PAN_MAX_DEG", move)
+        self.assertIn("DESK_MOTION_TILT_MIN_DEG", move)
+        self.assertIn("DESK_MOTION_TILT_MAX_DEG", move)
+        self.assertIn('"ctrl.motion.move"', move)
+        self.assertIn("desk_tclaw_execute_tool", move)
+        self.assertIn("DESK_HW_ERR_BUSY", motion_result)
+        self.assertIn("DESK_HW_ERR_TIMEOUT", motion_result)
+        self.assertIn("physical completion is not confirmed", move)
+        self.assertIn('__get_bool_prop(properties, "emergency"', stop)
+        self.assertIn('"ctrl.motion.stop"', stop)
+        self.assertIn("desk_tclaw_execute_tool", stop)
+        self.assertIn("physical stop is not confirmed", stop)
+
+        bridge = (ROOT / "firmware/components/desk_tclaw/src/desk_tclaw_bridge.c").read_text(
+            encoding="utf-8"
+        )
+        builtin_move = bridge.split('if (strcmp(operation, "motion.move")', 1)[1].split(
+            "/* 2. Motion Stop Tool */", 1
+        )[0]
+        builtin_stop = bridge.split('else if (strcmp(operation, "motion.stop")', 1)[1].split(
+            "/* 3. Camera Capture Tool", 1
+        )[0]
+        self.assertIn("DESK_MOTION_PAN_MIN_DEG", builtin_move)
+        self.assertIn("DESK_MOTION_PAN_MAX_DEG", builtin_move)
+        self.assertIn("DESK_MOTION_TILT_MIN_DEG", builtin_move)
+        self.assertIn("DESK_MOTION_TILT_MAX_DEG", builtin_move)
+        self.assertIn('"INVALID_ARGUMENT"', builtin_move)
+        self.assertLess(builtin_move.index('"INVALID_ARGUMENT"'),
+                        builtin_move.index("desk_arbiter_acquire"))
+        self.assertIn('"OPERATION_TIMEOUT"', builtin_move)
+        self.assertIn('"OPERATION_TIMEOUT"', builtin_stop)
+        self.assertIn('"RESOURCE_BUSY"', builtin_stop)
+        dialogue_tests = (ROOT / "tests/firmware_contract/test_tclaw_dialogue.py").read_text(
+            encoding="utf-8"
+        )
+        for case in ("test_builtin_motion_tool_cr002_compliance",
+                     "test_builtin_motion_arbitration_rejection",
+                     "test_builtin_motion_rejects_out_of_range_target"):
+            self.assertIn(case, dialogue_tests)
+        stm32_tests = (ROOT / "tests/firmware_contract/test_stm32_body_protocol.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("test_07_timeout_and_sequence_preservation_invariant", stm32_tests)
+
 
 if __name__ == "__main__":
     unittest.main()

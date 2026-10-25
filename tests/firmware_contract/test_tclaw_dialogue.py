@@ -50,6 +50,22 @@ DESK_HW_ERR_IO = -4
 DESK_HW_ERR_BUSY = -5
 
 TOOL_DISPATCH_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+MOTION_MOVE_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_uint32)
+MOTION_STOP_CB = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_bool)
+
+
+class DeskBoardDriverOps(ctypes.Structure):
+    _fields_ = [
+        ("driver_name", ctypes.c_char_p),
+        ("init", ctypes.c_void_p),
+        ("audio_record_read", ctypes.c_void_p),
+        ("audio_play_pcm", ctypes.c_void_p),
+        ("motion_move", MOTION_MOVE_CB),
+        ("motion_stop", MOTION_STOP_CB),
+        ("camera_capture", ctypes.c_void_p),
+        ("display_expression", ctypes.c_void_p),
+        ("deinit", ctypes.c_void_p),
+    ]
 
 
 class DeskTclawSelfTest(ctypes.Structure):
@@ -99,6 +115,8 @@ class TestTClawDialogue(unittest.TestCase):
         # Setup signatures
         cls.lib.desk_hardware_init.restype = ctypes.c_int
         cls.lib.desk_hardware_init.argtypes = []
+        cls.lib.desk_hardware_register_driver_ops.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_driver_ops.argtypes = [ctypes.POINTER(DeskBoardDriverOps)]
 
         cls.lib.desk_arbiter_get_owner.restype = ctypes.c_int
         cls.lib.desk_arbiter_get_owner.argtypes = [ctypes.c_int]
@@ -548,6 +566,52 @@ class TestTClawDialogue(unittest.TestCase):
         # Release SYSTEM_ALERT lock
         self.lib.desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_SYSTEM_ALERT)
         self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_MOTION_GIMBAL), DESK_OWNER_NONE)
+
+    def test_builtin_motion_rejects_out_of_range_target(self) -> None:
+        resp_buf = ctypes.create_string_buffer(2048)
+        rc = self.lib.desk_tclaw_execute_tool(
+            b"req-mv-invalid",
+            b"ctrl.motion.move",
+            b'{"pan_deg":181,"tilt_deg":120,"duration_ms":300}',
+            resp_buf,
+            2048,
+        )
+        self.assertEqual(rc, DESK_HW_ERR_INVALID_ARG)
+        response = json.loads(resp_buf.value.decode("utf-8"))
+        self.assertEqual(response.get("status"), "failed")
+        self.assertEqual(response.get("error", {}).get("code"), "INVALID_ARGUMENT")
+
+    def test_builtin_motion_timeout_is_reported_for_move_and_stop(self) -> None:
+        @MOTION_MOVE_CB
+        def move_timeout(_pan_deg, _tilt_deg, _duration_ms):
+            return DESK_HW_ERR_TIMEOUT
+
+        @MOTION_STOP_CB
+        def stop_timeout(_emergency):
+            return DESK_HW_ERR_TIMEOUT
+
+        ops = DeskBoardDriverOps()
+        ops.driver_name = b"contract-timeout"
+        ops.motion_move = move_timeout
+        ops.motion_stop = stop_timeout
+        self.assertEqual(self.lib.desk_hardware_register_driver_ops(ctypes.byref(ops)), DESK_HW_OK)
+        try:
+            resp_buf = ctypes.create_string_buffer(2048)
+            for request_id, operation, arguments in (
+                (b"req-mv-timeout", b"ctrl.motion.move",
+                 b'{"pan_deg":90,"tilt_deg":120,"duration_ms":300}'),
+                (b"req-stop-timeout", b"ctrl.motion.stop", b'{"emergency":true}'),
+            ):
+                rc = self.lib.desk_tclaw_execute_tool(
+                    request_id, operation, arguments, resp_buf, 2048
+                )
+                self.assertEqual(rc, DESK_HW_ERR_TIMEOUT)
+                response = json.loads(resp_buf.value.decode("utf-8"))
+                self.assertEqual(response.get("status"), "failed")
+                self.assertEqual(response.get("error", {}).get("code"), "OPERATION_TIMEOUT")
+                self.assertTrue(response.get("error", {}).get("retryable"))
+        finally:
+            self.lib.desk_hardware_register_driver_ops(None)
 
     def test_builtin_camera_capture_real_and_unavailable(self) -> None:
         """Verifies camera tool fails closed when no frame is present, and succeeds when real JPEG is injected."""

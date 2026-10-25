@@ -108,6 +108,32 @@ static const char *__get_str_prop(const MCP_PROPERTY_LIST_T *props, const char *
     return NULL;
 }
 
+static bool __get_int_prop(const MCP_PROPERTY_LIST_T *props, const char *name, int *out)
+{
+    if (!props || !name || !out) return false;
+    const MCP_PROPERTY_T *p = ai_mcp_property_list_find(props, name);
+    if (!p || p->type != MCP_PROPERTY_TYPE_INTEGER) return false;
+    *out = p->default_val.int_val;
+    return true;
+}
+
+static bool __get_bool_prop(const MCP_PROPERTY_LIST_T *props, const char *name, bool *out)
+{
+    if (!name || !out) return false;
+    if (!props) {
+        *out = false;
+        return true;
+    }
+    const MCP_PROPERTY_T *p = ai_mcp_property_list_find(props, name);
+    if (!p) {
+        *out = false;
+        return true;
+    }
+    if (p->type != MCP_PROPERTY_TYPE_BOOLEAN) return false;
+    *out = p->default_val.bool_val;
+    return true;
+}
+
 static void __gen_mcp_req_id(const char *prefix, char *out_id, size_t out_len)
 {
     static uint32_t s_req_seq = 0;
@@ -531,10 +557,92 @@ static OPERATE_RET __tool_note_list(const MCP_PROPERTY_LIST_T *properties,
     return OPRT_COM_ERROR;
 }
 
+static OPERATE_RET __motion_set_response(int motion_rc,
+                                         MCP_RETURN_VALUE_T *ret_val,
+                                         const char *accepted_text,
+                                         const char *accepted_status)
+{
+    if (motion_rc == DESK_HW_OK) {
+        ai_mcp_return_value_set_str(ret_val, accepted_text);
+        (void)desk_hardware_display_set_expression("thinking", accepted_status);
+        return OPRT_OK;
+    }
+
+    (void)desk_hardware_display_set_expression("error", "Failed");
+    if (motion_rc == DESK_HW_ERR_INVALID_ARG) {
+        ai_mcp_return_value_set_str(ret_val,
+            "Invalid motion arguments: target or duration is outside supported limits.");
+        return OPRT_INVALID_PARM;
+    }
+    if (motion_rc == DESK_HW_ERR_BUSY) {
+        ai_mcp_return_value_set_str(ret_val, "Motion resource is busy; no motion command was accepted.");
+        return OPRT_COM_ERROR;
+    }
+    if (motion_rc == DESK_HW_ERR_TIMEOUT) {
+        ai_mcp_return_value_set_str(ret_val, "Motion command failed: STM32 acknowledgement timed out.");
+        return OPRT_COM_ERROR;
+    }
+
+    ai_mcp_return_value_set_str(ret_val, "Motion hardware is unavailable or reported a failure.");
+    return OPRT_COM_ERROR;
+}
+
+static OPERATE_RET __tool_motion_move(const MCP_PROPERTY_LIST_T *properties,
+                                      MCP_RETURN_VALUE_T *ret_val,
+                                      void *user_data)
+{
+    (void)user_data;
+    int pan_deg = 0;
+    int tilt_deg = 0;
+    int duration_ms = 0;
+    if (!__get_int_prop(properties, "pan_deg", &pan_deg) ||
+        !__get_int_prop(properties, "tilt_deg", &tilt_deg) ||
+        !__get_int_prop(properties, "duration_ms", &duration_ms) ||
+        pan_deg < DESK_MOTION_PAN_MIN_DEG || pan_deg > DESK_MOTION_PAN_MAX_DEG ||
+        tilt_deg < DESK_MOTION_TILT_MIN_DEG || tilt_deg > DESK_MOTION_TILT_MAX_DEG ||
+        duration_ms < 100 || duration_ms > 65535) {
+        return __motion_set_response(DESK_HW_ERR_INVALID_ARG, ret_val, NULL, NULL);
+    }
+
+    char req_id[48];
+    char arguments[128];
+    char response[1024];
+    __gen_mcp_req_id("motion", req_id, sizeof(req_id));
+    snprintf(arguments, sizeof(arguments),
+             "{\"pan_deg\":%d,\"tilt_deg\":%d,\"duration_ms\":%d}",
+             pan_deg, tilt_deg, duration_ms);
+    int motion_rc = desk_tclaw_execute_tool(req_id, "ctrl.motion.move",
+                                            arguments, response, sizeof(response));
+    return __motion_set_response(motion_rc, ret_val,
+        "Motion command accepted; physical completion is not confirmed.", "Accepted");
+}
+
+static OPERATE_RET __tool_motion_stop(const MCP_PROPERTY_LIST_T *properties,
+                                      MCP_RETURN_VALUE_T *ret_val,
+                                      void *user_data)
+{
+    (void)user_data;
+    bool emergency = false;
+    if (!__get_bool_prop(properties, "emergency", &emergency)) {
+        return __motion_set_response(DESK_HW_ERR_INVALID_ARG, ret_val, NULL, NULL);
+    }
+
+    char req_id[48];
+    char arguments[48];
+    char response[512];
+    __gen_mcp_req_id("stop", req_id, sizeof(req_id));
+    snprintf(arguments, sizeof(arguments), "{\"emergency\":%s}", emergency ? "true" : "false");
+    int motion_rc = desk_tclaw_execute_tool(req_id, "ctrl.motion.stop",
+                                            arguments, response, sizeof(response));
+    return __motion_set_response(motion_rc, ret_val,
+        "Motion stop accepted; physical stop is not confirmed.", "Stop accepted");
+}
+
 int desk_tclaw_runtime_register_mcp_tools(void)
 {
     OPERATE_RET rt = OPRT_OK;
-    PR_INFO("[TCLAW_RUNTIME] registering DeskAgent native MCP tools (ha, codex, reminder, note)...");
+    const desk_board_driver_ops_t *ops = desk_hardware_get_driver_ops();
+    PR_INFO("[TCLAW_RUNTIME] registering DeskAgent native MCP tools (ha, codex, reminder, note, motion)...");
 
     TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
         "ha_execute",
@@ -604,6 +712,31 @@ int desk_tclaw_runtime_register_mcp_tools(void)
         NULL,
         MCP_PROP_STR_DEF("query", "Search keyword query", "")
     ));
+
+    if (ops && ops->motion_move) {
+        TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+            "motion_move",
+            "Move the Watcher pan/tilt servos to a target. Acknowledgement confirms acceptance only, not physical completion.",
+            __tool_motion_move,
+            NULL,
+            MCP_PROP_INT_RANGE("pan_deg", "Pan target in degrees", (int)DESK_MOTION_PAN_MIN_DEG,
+                               (int)DESK_MOTION_PAN_MAX_DEG),
+            MCP_PROP_INT_RANGE("tilt_deg", "Tilt target in degrees", (int)DESK_MOTION_TILT_MIN_DEG,
+                               (int)DESK_MOTION_TILT_MAX_DEG),
+            MCP_PROP_INT_DEF_RANGE("duration_ms", "Requested move duration in milliseconds.",
+                                   500, 100, 65535)
+        ));
+    }
+
+    if (ops && ops->motion_stop) {
+        TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+            "motion_stop",
+            "Stop the Watcher pan/tilt servos. Acknowledgement confirms command acceptance only.",
+            __tool_motion_stop,
+            NULL,
+            MCP_PROP_BOOL_DEF("emergency", "Use the emergency stop mode.", false)
+        ));
+    }
 
     PR_INFO("[TCLAW_RUNTIME] native MCP tools registered successfully");
     return OPRT_OK;
