@@ -710,6 +710,54 @@ class HAConnector:
                     allowed_list.append(st)
         return allowed_list
 
+    def list_entities(self, domain: Optional[str] = None, query: Optional[str] = None) -> list[dict[str, Any]]:
+        """Return safe, user-facing discovery records from the same filtered state snapshot.
+
+        Discovery is read-only and applies the exact entity policy used by state reads
+        and service execution. The query matches entity IDs and friendly names.
+        """
+        if domain is not None and (not isinstance(domain, str) or not re.fullmatch(r"[a-z0-9_]+", domain)):
+            raise ValueError("domain must be a valid Home Assistant domain")
+        needle = query.strip().casefold() if isinstance(query, str) else ""
+        if query is not None and not isinstance(query, str):
+            raise ValueError("query must be a string")
+        items: list[dict[str, Any]] = []
+        for state in self.get_all_states():
+            entity_id = state.get("entity_id")
+            if not isinstance(entity_id, str) or not self.is_entity_allowed(entity_id):
+                continue
+            entity_domain = entity_id.split(".", 1)[0]
+            if domain is not None and entity_domain != domain:
+                continue
+            attributes = state.get("attributes")
+            attributes = attributes if isinstance(attributes, Mapping) else {}
+            friendly_name = attributes.get("friendly_name")
+            friendly_name = friendly_name if isinstance(friendly_name, str) else entity_id
+            if needle and needle not in entity_id.casefold() and needle not in friendly_name.casefold():
+                continue
+            supported_features = attributes.get("supported_features", 0)
+            if isinstance(supported_features, bool) or not isinstance(supported_features, int):
+                supported_features = 0
+            items.append({
+                "entity_id": entity_id,
+                "friendly_name": friendly_name,
+                "domain": entity_domain,
+                "state": state.get("state"),
+                "supported_features": supported_features,
+            })
+        return items
+
+    def resolve_entity_name(self, name: str) -> dict[str, Any]:
+        """Resolve a spoken name only when it identifies one allowed entity."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("name must be a non-empty string")
+        candidates = [item for item in self.list_entities(query=name) if item["friendly_name"].casefold() == name.strip().casefold()]
+        if len(candidates) == 1:
+            return {"status": "resolved", "entity": candidates[0], "candidates": candidates}
+        if candidates:
+            return {"status": "ambiguous", "entity": None, "candidates": candidates}
+        return {"status": "not_found", "entity": None, "candidates": []}
+
     @staticmethod
     def _is_state_confirmed(
         current_st: Mapping[str, Any],
