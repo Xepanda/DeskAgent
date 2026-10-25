@@ -424,8 +424,8 @@ class TestSafeStartupContract(unittest.TestCase):
         self.assertEqual(rc_evt, 0)
         self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
         self.lib.desk_hardware_display_get_expression(preset_buf, 64, text_buf, 256)
-        self.assertEqual(preset_buf.value.decode("utf-8"), "idle")
-        self.assertEqual(text_buf.value.decode("utf-8"), "Cloud Offline")
+        self.assertEqual(preset_buf.value.decode("utf-8"), "offline")
+        self.assertEqual(text_buf.value.decode("utf-8"), "Offline")
 
     def test_tuya_direct_bridge_hooks(self) -> None:
         """Verifies desk_tclaw_on_tuya_mqtt_connected, desk_tclaw_on_tuya_mqtt_disconnected,
@@ -455,8 +455,8 @@ class TestSafeStartupContract(unittest.TestCase):
         self.assertEqual(rc_disc, 0)
         self.assertEqual(self.lib.desk_tclaw_tuya_session_get_connection_state(), TUYA_CLOUD_DISCONNECTED)
         self.lib.desk_hardware_display_get_expression(preset_buf, 64, text_buf, 256)
-        self.assertEqual(preset_buf.value.decode("utf-8"), "idle")
-        self.assertEqual(text_buf.value.decode("utf-8"), "Cloud Offline")
+        self.assertEqual(preset_buf.value.decode("utf-8"), "offline")
+        self.assertEqual(text_buf.value.decode("utf-8"), "Offline")
 
 
 if __name__ == "__main__":
