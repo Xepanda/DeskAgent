@@ -1795,17 +1795,9 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
 {
     if (payload_len > DESK_WSPK_MAX_PAYLOAD_SIZE) return -2;
 
-    uint8_t stack_buf[DESK_WSPK_HEADER_SIZE + 4096];
-    uint8_t *heap_buf = NULL;
-    uint8_t *target_buf = stack_buf;
-    size_t target_size = sizeof(stack_buf);
-
-    if (DESK_WSPK_HEADER_SIZE + payload_len > sizeof(stack_buf)) {
-        target_size = DESK_WSPK_HEADER_SIZE + payload_len;
-        heap_buf = (uint8_t *)desk_psram_malloc(target_size);
-        if (!heap_buf) return -1;
-        target_buf = heap_buf;
-    }
+    size_t target_size = DESK_WSPK_HEADER_SIZE + payload_len;
+    uint8_t *target_buf = (uint8_t *)desk_psram_malloc(target_size);
+    if (!target_buf) return -1;
 
     size_t packed_len = 0;
     int rc = desk_sdk_bridge_pack_media_frame(frame_type, flags, stream_id, sequence,
@@ -1828,9 +1820,7 @@ int desk_sdk_bridge_send_media_frame(uint8_t frame_type,
         }
     }
 
-    if (heap_buf) {
-        desk_psram_free(heap_buf);
-    }
+    desk_psram_free(target_buf);
     return rc;
 }
 
@@ -4425,26 +4415,32 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
         snprintf(req_id, sizeof(req_id), "req-bridge-%08x-%04x", (unsigned int)now, (unsigned int)(s_event_seq & 0xFFFF));
     }
 
-    /* Record in correlation table */
-    desk_sdk_req_table_add(req_id, operation, 60000);
-
     /* Determine if we should wrap/format into full RequestEnvelope */
-    char formatted_req[4096];
+    char *formatted_req = NULL;
+    char *args_buf = NULL;
     const char *payload_to_send = request_envelope_json;
 
     if (strstr(request_envelope_json, "\"schema_version\"") == NULL ||
         strstr(request_envelope_json, "\"expires_at\"") == NULL) {
+        formatted_req = (char *)desk_psram_malloc(4096U);
+        if (!formatted_req) return -1;
+        args_buf = (char *)desk_psram_malloc(2048U);
+        if (!args_buf) {
+            desk_psram_free(formatted_req);
+            return -1;
+        }
+
         time_t now = time(NULL);
         if (now < 1700000000) now = 1792100000;
         char expires_at[32];
         desk_sdk_format_iso8601(now + 60, expires_at, sizeof(expires_at));
 
-        char args_buf[2048] = "{}";
-        if (!json_extract_subobject(request_envelope_json, "arguments", args_buf, sizeof(args_buf))) {
-            strncpy(args_buf, "{}", sizeof(args_buf) - 1);
+        memcpy(args_buf, "{}", 3U);
+        if (!json_extract_subobject(request_envelope_json, "arguments", args_buf, 2048U)) {
+            memcpy(args_buf, "{}", 3U);
         }
 
-        snprintf(formatted_req, sizeof(formatted_req),
+        snprintf(formatted_req, 4096U,
                  "{\"schema_version\":\"1.0.0\","
                  "\"request_id\":\"%s\","
                  "\"operation\":\"%s\","
@@ -4454,8 +4450,13 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
                  operation[0] != '\0' ? operation : "unknown.tool",
                  args_buf,
                  expires_at);
+        desk_psram_free(args_buf);
+        args_buf = NULL;
         payload_to_send = formatted_req;
     }
+
+    /* Record before outbound dispatch, which may synchronously return a response. */
+    desk_sdk_req_table_add(req_id, operation, 60000);
 
     int ret = 0;
     if (s_outbound_cb) {
@@ -4468,16 +4469,21 @@ int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
         size_t len = strlen(payload_to_send);
         if (desk_sdk_socket_write_all(s_client_fd, payload_to_send, len) != 0) {
             desk_sdk_socket_client_close();
-            return -1;
+            ret = -1;
+            goto cleanup;
         }
         if (len == 0 || payload_to_send[len - 1] != '\n') {
             if (desk_sdk_socket_write_all(s_client_fd, "\n", 1) != 0) {
                 desk_sdk_socket_client_close();
-                return -1;
+                ret = -1;
+                goto cleanup;
             }
         }
     }
 
+cleanup:
+    if (args_buf) desk_psram_free(args_buf);
+    if (formatted_req) desk_psram_free(formatted_req);
     return ret;
 }
 
@@ -5012,8 +5018,8 @@ int desk_firmware_start_background_task(void)
     if (!atomic_compare_exchange_strong(&s_worker_task_running, &expected, true)) {
         return 0;
     }
-    BaseType_t ret = xTaskCreateWithCaps(firmware_worker_task, "desk_poll_worker", 8192, NULL, 5,
-                                         &s_worker_task_handle, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    BaseType_t ret = xTaskCreateWithCaps(firmware_worker_task, "desk_poll_worker", 10240, NULL, 5,
+                                         &s_worker_task_handle, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (ret != pdPASS) {
         atomic_store(&s_worker_task_running, false);
         return -1;

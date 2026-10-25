@@ -267,6 +267,31 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         self.assertEqual(st_buf.value.decode("utf-8"), "completed")
         self.assertFalse(self.lib.desk_sdk_bridge_has_pending_request(req_id.encode("utf-8")))
 
+    def test_dispatch_wraps_request_with_large_arguments(self) -> None:
+        """The dynamically formatted request preserves its full arguments in the outbound envelope."""
+        outbound_requests: list[dict] = []
+
+        @OUTBOUND_CB
+        def on_outbound(data_ptr, length, _user_data):
+            outbound_requests.append(json.loads(ctypes.string_at(data_ptr, length).decode("utf-8")))
+            return 0
+
+        self.lib.desk_sdk_bridge_register_outbound(on_outbound, None)
+        req_id = "req-wrap-large-arguments"
+        arguments = {"entity_ids": [f"sensor.room_{i}" for i in range(32)], "detail": "设备状态" * 80}
+        request = json.dumps({
+            "request_id": req_id,
+            "operation": "ha.list_entities",
+            "arguments": arguments,
+        }, ensure_ascii=False)
+
+        self.assertEqual(self.lib.desk_sdk_bridge_dispatch_tool_request(request.encode("utf-8")), 0)
+        self.assertEqual(len(outbound_requests), 1)
+        self.assertEqual(outbound_requests[0]["schema_version"], "1.0.0")
+        self.assertEqual(outbound_requests[0]["request_id"], req_id)
+        self.assertEqual(outbound_requests[0]["operation"], "ha.list_entities")
+        self.assertEqual(outbound_requests[0]["arguments"], arguments)
+
     def test_large_utf8_result_round_trips_and_small_wait_buffer_is_retryable(self) -> None:
         req_id = "req-large-utf8-result"
         self.assertEqual(self.lib.desk_sdk_bridge_dispatch_tool_request(json.dumps({

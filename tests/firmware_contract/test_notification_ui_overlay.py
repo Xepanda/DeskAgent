@@ -24,13 +24,39 @@ class TestNotificationUiOverlay(unittest.TestCase):
             raise unittest.SkipTest("gcc is required for the native firmware contract harness")
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.lib_path = os.path.join(cls.temp_dir.name, "libdesk_ui_overlay_contract.so")
+        clock_shim = os.path.join(cls.temp_dir.name, "notification_clock_shim.c")
+        with open(clock_shim, "w", encoding="utf-8") as shim:
+            shim.write(r'''
+#include <sys/time.h>
+#include <time.h>
+
+static int s_clock_unavailable;
+
+void desk_notification_test_set_clock_unavailable(int unavailable)
+{
+    s_clock_unavailable = unavailable;
+}
+
+int desk_notification_test_gettimeofday(struct timeval *tv, void *tz)
+{
+    (void)tz;
+    if (s_clock_unavailable) return -1;
+    struct timespec now;
+    if (!tv || clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+    tv->tv_sec = now.tv_sec;
+    tv->tv_usec = (suseconds_t)(now.tv_nsec / 1000);
+    return 0;
+}
+''')
         sources = [
             ROOT / "firmware/components/desk_hardware/src/desk_arbiter.c",
             ROOT / "firmware/components/desk_hardware/src/desk_hardware.c",
             ROOT / "firmware/components/desk_hardware/src/desk_notification.c",
+            Path(clock_shim),
         ]
         command = [compiler, "-shared", "-fPIC", "-O2", "-Wall", "-Wextra",
                    "-D_POSIX_C_SOURCE=200809L",
+                   "-Dgettimeofday=desk_notification_test_gettimeofday",
                    f"-I{ROOT / 'firmware/components/desk_hardware/include'}",
                    *(str(source) for source in sources), "-lm", "-o", cls.lib_path]
         result = subprocess.run(command, capture_output=True, text=True)
@@ -125,6 +151,8 @@ class TestNotificationUiOverlay(unittest.TestCase):
         cls.lib.desk_hardware_notification_deliver.restype = ctypes.c_int
         cls.lib.desk_hardware_notification_process_pending.argtypes = []
         cls.lib.desk_hardware_notification_process_pending.restype = ctypes.c_int
+        cls.lib.desk_notification_test_set_clock_unavailable.argtypes = [ctypes.c_int]
+        cls.lib.desk_notification_test_set_clock_unavailable.restype = None
         cls.lib.desk_hardware_notification_acknowledge.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
         cls.lib.desk_hardware_notification_acknowledge.restype = ctypes.c_int
         cls.lib.desk_hardware_notification_dismiss.argtypes = [ctypes.c_char_p]
@@ -191,6 +219,34 @@ class TestNotificationUiOverlay(unittest.TestCase):
 
     def test_notification_init_is_ram_only_without_storage_provider(self) -> None:
         self.assertEqual(self.lib.desk_hardware_notification_init(None, None), 0)
+
+    def test_empty_pending_queue_does_not_require_clock(self) -> None:
+        self.lib.desk_notification_test_set_clock_unavailable(1)
+        try:
+            self.assertEqual(self.lib.desk_hardware_notification_process_pending(), 0)
+        finally:
+            self.lib.desk_notification_test_set_clock_unavailable(0)
+
+    def test_pending_notification_survives_clock_not_ready(self) -> None:
+        self.assertEqual(self.lib.desk_hardware_set_screen_expression(b"idle", b"Ready"), 0)
+        now = datetime.now(timezone.utc)
+        scheduled = (now - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        expires = (now + timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        item = self.NotificationInput(b"clock-retry", b"reminder", b"clock-retry",
+                                      b"Take a break", scheduled.encode(), expires.encode(), False)
+        status = self.NotificationStatus()
+        self.assertEqual(self.lib.desk_hardware_notification_deliver(
+            ctypes.byref(item), ctypes.byref(status)), 0)
+
+        self.lib.desk_notification_test_set_clock_unavailable(1)
+        try:
+            self.assertEqual(self.lib.desk_hardware_notification_process_pending(), -2)
+            self.assertEqual(self.visible()[0], "idle")
+        finally:
+            self.lib.desk_notification_test_set_clock_unavailable(0)
+
+        self.lib.desk_hardware_notification_process_pending()
+        self.assertEqual(self.visible(), ("alert", "Take a break"))
 
     def test_summary_is_display_only_expiring_and_acknowledged_explicitly(self) -> None:
         self.assertEqual(self.lib.desk_hardware_set_screen_expression(b"idle", b"Ready"), 0)
@@ -428,6 +484,26 @@ class TestNotificationUiOverlay(unittest.TestCase):
                          "display dismiss must not imply delivery or reminder completion")
         self.assertNotIn("acknowledged = 1", dismiss,
                          "display dismiss must not create an ACK")
+
+
+class TestNotificationPendingClockContract(unittest.TestCase):
+    def test_clock_is_checked_only_when_pending_work_exists(self) -> None:
+        source = (ROOT / "firmware/components/desk_hardware/src/desk_notification.c").read_text(
+            encoding="utf-8"
+        )
+        processor = source.split("int desk_hardware_notification_process_pending", 1)[1].split(
+            "int desk_hardware_notification_summary_acknowledge", 1
+        )[0]
+        self.assertIn("has_pending", processor)
+        self.assertLess(processor.index("if (!has_pending)"), processor.index("now_epoch_us()"))
+        self.assertLess(processor.index("if (!now)"), processor.index("entry->pending = 0"))
+        clock = source.split("static uint64_t now_epoch_us", 1)[1].split(
+            "static bool valid_text", 1
+        )[0]
+        self.assertIn("#ifdef ESP_PLATFORM", clock)
+        self.assertIn("tal_time_get_posix_ms()", clock)
+        self.assertIn("1577836800000ull", clock)
+        self.assertIn("(uint64_t)now_ms * 1000u", clock)
 
 
 if __name__ == "__main__":
