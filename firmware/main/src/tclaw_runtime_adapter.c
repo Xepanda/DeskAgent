@@ -108,6 +108,32 @@ static const char *__get_str_prop(const MCP_PROPERTY_LIST_T *props, const char *
     return NULL;
 }
 
+static bool __get_int_prop(const MCP_PROPERTY_LIST_T *props, const char *name, int *out)
+{
+    if (!props || !name || !out) return false;
+    const MCP_PROPERTY_T *p = ai_mcp_property_list_find(props, name);
+    if (!p || p->type != MCP_PROPERTY_TYPE_INTEGER) return false;
+    *out = p->default_val.int_val;
+    return true;
+}
+
+static bool __get_bool_prop(const MCP_PROPERTY_LIST_T *props, const char *name, bool *out)
+{
+    if (!name || !out) return false;
+    if (!props) {
+        *out = false;
+        return true;
+    }
+    const MCP_PROPERTY_T *p = ai_mcp_property_list_find(props, name);
+    if (!p) {
+        *out = false;
+        return true;
+    }
+    if (p->type != MCP_PROPERTY_TYPE_BOOLEAN) return false;
+    *out = p->default_val.bool_val;
+    return true;
+}
+
 static void __gen_mcp_req_id(const char *prefix, char *out_id, size_t out_len)
 {
     static uint32_t s_req_seq = 0;
@@ -115,6 +141,119 @@ static void __gen_mcp_req_id(const char *prefix, char *out_id, size_t out_len)
     uint32_t ts = (uint32_t)tal_time_get_posix();
     snprintf(out_id, out_len, "req-%s-%u-%u", prefix, (unsigned)ts, (unsigned)seq);
 }
+
+#define DESK_NATIVE_RESULT_CAPACITY (16U * 1024U)
+
+static OPERATE_RET __native_host_call(const char *prefix, const char *operation,
+                                     const cJSON *arguments, char *out_result,
+                                     size_t result_capacity)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[48];
+    __gen_mcp_req_id(prefix, req_id, sizeof(req_id));
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", operation);
+    cJSON_AddItemToObject(root, "arguments", arguments ? cJSON_Duplicate(arguments, true) : cJSON_CreateObject());
+    char *envelope = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!envelope) return OPRT_MALLOC_FAILED;
+    int dispatch_rc = desk_sdk_bridge_dispatch_tool_request(envelope);
+    cJSON_free(envelope);
+    if (dispatch_rc != 0) return OPRT_COM_ERROR;
+
+    char status[32] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 4000, status, sizeof(status),
+                                                     out_result, result_capacity);
+    if (wait_rc != 0) return OPRT_COM_ERROR;
+    if (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0) return OPRT_OK;
+    return OPRT_COM_ERROR;
+}
+
+static OPERATE_RET __tool_host_query(const MCP_PROPERTY_LIST_T *properties,
+                                    MCP_RETURN_VALUE_T *ret_val, void *user_data)
+{
+    const char *operation = (const char *)user_data;
+    const char *prefix = "host";
+    cJSON *args = cJSON_CreateObject();
+    if (!args) return OPRT_MALLOC_FAILED;
+    if (strcmp(operation, "ha.list_entities") == 0) {
+        const char *domain = __get_str_prop(properties, "domain");
+        const char *query = __get_str_prop(properties, "query");
+        int limit = 5, offset = 0;
+        if (!__get_int_prop(properties, "limit", &limit) || !__get_int_prop(properties, "offset", &offset) ||
+            limit < 1 || limit > 10 || offset < 0) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: limit must be 1..10 and offset must be non-negative");
+            return OPRT_INVALID_PARM;
+        }
+        if (domain && domain[0]) cJSON_AddStringToObject(args, "domain", domain);
+        if (query && query[0]) cJSON_AddStringToObject(args, "query", query);
+        cJSON_AddNumberToObject(args, "limit", limit);
+        cJSON_AddNumberToObject(args, "offset", offset);
+    } else if (strcmp(operation, "ha.resolve_entity_name") == 0) {
+        const char *name = __get_str_prop(properties, "name");
+        if (!name || !name[0]) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: name is required");
+            return OPRT_INVALID_PARM;
+        }
+        cJSON_AddStringToObject(args, "name", name);
+    } else if (strcmp(operation, "codex.get_task") == 0) {
+        const char *task_id = __get_str_prop(properties, "task_id");
+        if (!task_id || !task_id[0]) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: task_id is required");
+            return OPRT_INVALID_PARM;
+        }
+        cJSON_AddStringToObject(args, "task_id", task_id);
+    } else if (strcmp(operation, "codex.cancel") == 0) {
+        const char *task_id = __get_str_prop(properties, "task_id");
+        const char *reason = __get_str_prop(properties, "reason");
+        if (!task_id || !task_id[0] || (reason && strlen(reason) > 256)) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: task_id is required and reason is limited to 256 characters");
+            return OPRT_INVALID_PARM;
+        }
+        cJSON_AddStringToObject(args, "task_id", task_id);
+        if (reason && reason[0]) cJSON_AddStringToObject(args, "reason", reason);
+    } else if (strcmp(operation, "codex.get_pending_approvals") == 0) {
+        const char *task_id = __get_str_prop(properties, "task_id");
+        if (task_id && task_id[0]) cJSON_AddStringToObject(args, "task_id", task_id);
+    }
+    char *result = (char *)calloc(1, DESK_NATIVE_RESULT_CAPACITY);
+    if (!result) { cJSON_Delete(args); return OPRT_MALLOC_FAILED; }
+    OPERATE_RET rc = __native_host_call(prefix, operation, args, result, DESK_NATIVE_RESULT_CAPACITY);
+    cJSON_Delete(args);
+    cJSON *valid = rc == OPRT_OK ? cJSON_Parse(result) : NULL;
+    if (valid) {
+        ai_mcp_return_value_set_str(ret_val, result);
+        cJSON_Delete(valid);
+    } else {
+        ai_mcp_return_value_set_str(ret_val, rc == OPRT_OK ? "Error: incomplete Host JSON response" :
+                                    "Error: Host request failed or timed out");
+        rc = OPRT_COM_ERROR;
+    }
+    free(result);
+    return rc;
+}
+
+static OPERATE_RET __tool_codex_list_workspaces(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{
+    (void)p;
+    return __tool_host_query(p, r, (void *)"codex.list_workspaces");
+}
+static OPERATE_RET __tool_ha_list_entities(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"ha.list_entities"); }
+static OPERATE_RET __tool_ha_resolve_entity_name(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"ha.resolve_entity_name"); }
+static OPERATE_RET __tool_codex_get_task(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"codex.get_task"); }
+static OPERATE_RET __tool_codex_cancel_task(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"codex.cancel"); }
+static OPERATE_RET __tool_codex_get_pending_approvals(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"codex.get_pending_approvals"); }
 
 static OPERATE_RET __tool_ha_execute(const MCP_PROPERTY_LIST_T *properties,
                                      MCP_RETURN_VALUE_T *ret_val,
@@ -531,10 +670,92 @@ static OPERATE_RET __tool_note_list(const MCP_PROPERTY_LIST_T *properties,
     return OPRT_COM_ERROR;
 }
 
+static OPERATE_RET __motion_set_response(int motion_rc,
+                                         MCP_RETURN_VALUE_T *ret_val,
+                                         const char *accepted_text,
+                                         const char *accepted_status)
+{
+    if (motion_rc == DESK_HW_OK) {
+        ai_mcp_return_value_set_str(ret_val, accepted_text);
+        (void)desk_hardware_display_set_expression("thinking", accepted_status);
+        return OPRT_OK;
+    }
+
+    (void)desk_hardware_display_set_expression("error", "Failed");
+    if (motion_rc == DESK_HW_ERR_INVALID_ARG) {
+        ai_mcp_return_value_set_str(ret_val,
+            "Invalid motion arguments: target or duration is outside supported limits.");
+        return OPRT_INVALID_PARM;
+    }
+    if (motion_rc == DESK_HW_ERR_BUSY) {
+        ai_mcp_return_value_set_str(ret_val, "Motion resource is busy; no motion command was accepted.");
+        return OPRT_COM_ERROR;
+    }
+    if (motion_rc == DESK_HW_ERR_TIMEOUT) {
+        ai_mcp_return_value_set_str(ret_val, "Motion command failed: STM32 acknowledgement timed out.");
+        return OPRT_COM_ERROR;
+    }
+
+    ai_mcp_return_value_set_str(ret_val, "Motion hardware is unavailable or reported a failure.");
+    return OPRT_COM_ERROR;
+}
+
+static OPERATE_RET __tool_motion_move(const MCP_PROPERTY_LIST_T *properties,
+                                      MCP_RETURN_VALUE_T *ret_val,
+                                      void *user_data)
+{
+    (void)user_data;
+    int pan_deg = 0;
+    int tilt_deg = 0;
+    int duration_ms = 0;
+    if (!__get_int_prop(properties, "pan_deg", &pan_deg) ||
+        !__get_int_prop(properties, "tilt_deg", &tilt_deg) ||
+        !__get_int_prop(properties, "duration_ms", &duration_ms) ||
+        pan_deg < DESK_MOTION_PAN_MIN_DEG || pan_deg > DESK_MOTION_PAN_MAX_DEG ||
+        tilt_deg < DESK_MOTION_TILT_MIN_DEG || tilt_deg > DESK_MOTION_TILT_MAX_DEG ||
+        duration_ms < 100 || duration_ms > 65535) {
+        return __motion_set_response(DESK_HW_ERR_INVALID_ARG, ret_val, NULL, NULL);
+    }
+
+    char req_id[48];
+    char arguments[128];
+    char response[1024];
+    __gen_mcp_req_id("motion", req_id, sizeof(req_id));
+    snprintf(arguments, sizeof(arguments),
+             "{\"pan_deg\":%d,\"tilt_deg\":%d,\"duration_ms\":%d}",
+             pan_deg, tilt_deg, duration_ms);
+    int motion_rc = desk_tclaw_execute_tool(req_id, "ctrl.motion.move",
+                                            arguments, response, sizeof(response));
+    return __motion_set_response(motion_rc, ret_val,
+        "Motion command accepted; physical completion is not confirmed.", "Accepted");
+}
+
+static OPERATE_RET __tool_motion_stop(const MCP_PROPERTY_LIST_T *properties,
+                                      MCP_RETURN_VALUE_T *ret_val,
+                                      void *user_data)
+{
+    (void)user_data;
+    bool emergency = false;
+    if (!__get_bool_prop(properties, "emergency", &emergency)) {
+        return __motion_set_response(DESK_HW_ERR_INVALID_ARG, ret_val, NULL, NULL);
+    }
+
+    char req_id[48];
+    char arguments[48];
+    char response[512];
+    __gen_mcp_req_id("stop", req_id, sizeof(req_id));
+    snprintf(arguments, sizeof(arguments), "{\"emergency\":%s}", emergency ? "true" : "false");
+    int motion_rc = desk_tclaw_execute_tool(req_id, "ctrl.motion.stop",
+                                            arguments, response, sizeof(response));
+    return __motion_set_response(motion_rc, ret_val,
+        "Motion stop accepted; physical stop is not confirmed.", "Stop accepted");
+}
+
 int desk_tclaw_runtime_register_mcp_tools(void)
 {
     OPERATE_RET rt = OPRT_OK;
-    PR_INFO("[TCLAW_RUNTIME] registering DeskAgent native MCP tools (ha, codex, reminder, note)...");
+    const desk_board_driver_ops_t *ops = desk_hardware_get_driver_ops();
+    PR_INFO("[TCLAW_RUNTIME] registering DeskAgent native MCP tools (ha, codex, reminder, note, motion)...");
 
     TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
         "ha_execute",
@@ -553,6 +774,25 @@ int desk_tclaw_runtime_register_mcp_tools(void)
         NULL,
         MCP_PROP_STR("entity_id", "Home Assistant entity identifier, e.g. 'light.desk'")
     ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("ha_list_entities", "List allowed Home Assistant entities. Use limit/offset to page results.",
+        __tool_ha_list_entities, NULL,
+        MCP_PROP_STR_DEF("domain", "Optional Home Assistant domain filter", ""),
+        MCP_PROP_STR_DEF("query", "Optional entity name or id search", ""),
+        MCP_PROP_INT_DEF_RANGE("limit", "Page size (1..10)", 5, 1, 10),
+        MCP_PROP_INT_DEF("offset", "Zero-based page offset", 0)));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("ha_resolve_entity_name", "Resolve a friendly Home Assistant entity name; returns candidates when ambiguous.",
+        __tool_ha_resolve_entity_name, NULL, MCP_PROP_STR("name", "Friendly entity name to resolve")));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_get_task", "Get status and summary for a Codex task.",
+        __tool_codex_get_task, NULL, MCP_PROP_STR("task_id", "Codex task id")));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_cancel_task", "Request cancellation of a Codex task.",
+        __tool_codex_cancel_task, NULL, MCP_PROP_STR("task_id", "Codex task id"),
+        MCP_PROP_STR_DEF("reason", "Optional cancellation reason (up to 256 characters)", "")));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_list_workspaces", "List available Codex workspace aliases.",
+        __tool_codex_list_workspaces, NULL));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_get_pending_approvals", "Read pending Codex approvals without deciding them.",
+        __tool_codex_get_pending_approvals, NULL,
+        MCP_PROP_STR_DEF("task_id", "Optional Codex task id filter", "")));
 
     TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
         "codex_submit_turn",
@@ -604,6 +844,31 @@ int desk_tclaw_runtime_register_mcp_tools(void)
         NULL,
         MCP_PROP_STR_DEF("query", "Search keyword query", "")
     ));
+
+    if (ops && ops->motion_move) {
+        TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+            "motion_move",
+            "Move the Watcher pan/tilt servos to a target. Acknowledgement confirms acceptance only, not physical completion.",
+            __tool_motion_move,
+            NULL,
+            MCP_PROP_INT_RANGE("pan_deg", "Pan target in degrees", (int)DESK_MOTION_PAN_MIN_DEG,
+                               (int)DESK_MOTION_PAN_MAX_DEG),
+            MCP_PROP_INT_RANGE("tilt_deg", "Tilt target in degrees", (int)DESK_MOTION_TILT_MIN_DEG,
+                               (int)DESK_MOTION_TILT_MAX_DEG),
+            MCP_PROP_INT_DEF_RANGE("duration_ms", "Requested move duration in milliseconds.",
+                                   500, 100, 65535)
+        ));
+    }
+
+    if (ops && ops->motion_stop) {
+        TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
+            "motion_stop",
+            "Stop the Watcher pan/tilt servos. Acknowledgement confirms command acceptance only.",
+            __tool_motion_stop,
+            NULL,
+            MCP_PROP_BOOL_DEF("emergency", "Use the emergency stop mode.", false)
+        ));
+    }
 
     PR_INFO("[TCLAW_RUNTIME] native MCP tools registered successfully");
     return OPRT_OK;

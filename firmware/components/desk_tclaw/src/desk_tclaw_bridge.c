@@ -554,7 +554,15 @@ int desk_tclaw_execute_tool(const char *request_id,
         float tilt_deg = desk_json_parse_float(args, "tilt_deg", 120.0f);
         uint32_t duration_ms = (uint32_t)desk_json_parse_int(args, "duration_ms", 500);
 
-        if (desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE, 50) != DESK_ARBITER_OK) {
+        if (pan_deg < DESK_MOTION_PAN_MIN_DEG || pan_deg > DESK_MOTION_PAN_MAX_DEG ||
+            tilt_deg < DESK_MOTION_TILT_MIN_DEG || tilt_deg > DESK_MOTION_TILT_MAX_DEG ||
+            duration_ms < 100 || duration_ms > 65535) {
+            status = "failed";
+            strncpy(error_code, "INVALID_ARGUMENT", sizeof(error_code) - 1);
+            strncpy(error_msg, "Motion target or duration is outside supported limits", sizeof(error_msg) - 1);
+            retryable = false;
+            return_code = DESK_HW_ERR_INVALID_ARG;
+        } else if (desk_arbiter_acquire(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE, 50) != DESK_ARBITER_OK) {
             status = "failed";
             strncpy(error_code, "RESOURCE_BUSY", sizeof(error_code) - 1);
             strncpy(error_msg, "Motion gimbal is currently held by higher/equal owner", sizeof(error_msg) - 1);
@@ -608,10 +616,20 @@ int desk_tclaw_execute_tool(const char *request_id,
             return_code = DESK_HW_OK;
         } else {
             status = "failed";
-            strncpy(error_code, "HARDWARE_FAULT", sizeof(error_code) - 1);
-            strncpy(error_msg, "Failed to execute motion stop", sizeof(error_msg) - 1);
-            retryable = false;
-            return_code = DESK_HW_ERR_IO;
+            if (stop_rc == DESK_HW_ERR_TIMEOUT) {
+                strncpy(error_code, "OPERATION_TIMEOUT", sizeof(error_code) - 1);
+                strncpy(error_msg, "STM32 coprocessor motion stop ACK timed out", sizeof(error_msg) - 1);
+                retryable = true;
+            } else if (stop_rc == DESK_HW_ERR_BUSY) {
+                strncpy(error_code, "RESOURCE_BUSY", sizeof(error_code) - 1);
+                strncpy(error_msg, "Motion stop resource is currently busy", sizeof(error_msg) - 1);
+                retryable = true;
+            } else {
+                strncpy(error_code, "HARDWARE_FAULT", sizeof(error_code) - 1);
+                strncpy(error_msg, "Failed to execute motion stop", sizeof(error_msg) - 1);
+                retryable = false;
+            }
+            return_code = stop_rc;
         }
     }
     /* 3. Camera Capture Tool (Strictly real sensor frames only, never fake) */

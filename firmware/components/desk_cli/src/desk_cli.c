@@ -20,7 +20,9 @@
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_input.h"
 #include "desk_watcher_camera.h"
+#if defined(ESP_PLATFORM)
 #include "mbedtls/base64.h"
+#endif
 #include "desk_pairing_window.h"
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_audio.h"
@@ -495,6 +497,7 @@ static void cmd_camera(int argc, char *argv[])
         printf("Camera Capture: rc=%d (%s), valid_frame=%s, out_len=%lu bytes\r\n",
                rc, rc == DESK_HW_OK ? "ok" : cli_camera_capture_error_name(rc),
                rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
+#if defined(ESP_PLATFORM)
         if (rc == DESK_HW_OK && out_len > 0) {
             size_t b64_len = 0;
             mbedtls_base64_encode(NULL, 0, &b64_len, jpeg_buf, out_len);
@@ -507,6 +510,7 @@ static void cmd_camera(int argc, char *argv[])
                 free(b64_str);
             }
         }
+#endif
     } else {
         printf("Camera Subsystem:\r\n");
         printf("  Arbiter Camera Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR));
