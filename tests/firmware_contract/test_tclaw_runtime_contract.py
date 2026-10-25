@@ -132,6 +132,22 @@ class TestTclawRuntimeContract(unittest.TestCase):
         self.assertIn("desk_sdk_bridge_dispatch_tool_request", adapter,
                       "Native tool execution must dispatch request envelope to SDK bridge")
 
+    def test_native_ha_codex_tool_catalog_and_bounded_full_json_response(self) -> None:
+        adapter = (ROOT / "firmware/main/src/tclaw_runtime_adapter.c").read_text(encoding="utf-8")
+        for tool in ("ha_list_entities", "ha_resolve_entity_name", "codex_get_task",
+                     "codex_cancel_task", "codex_list_workspaces", "codex_get_pending_approvals"):
+            self.assertIn(f'"{tool}"', adapter)
+        for operation in ("ha.list_entities", "ha.resolve_entity_name", "codex.get_task",
+                          "codex.cancel", "codex.list_workspaces", "codex.get_pending_approvals"):
+            self.assertIn(f'"{operation}"', adapter)
+        self.assertIn('MCP_PROP_INT_DEF_RANGE("limit"', adapter)
+        self.assertIn('MCP_PROP_INT_DEF("offset"', adapter)
+        self.assertIn('limit < 1 || limit > 10 || offset < 0', adapter)
+        self.assertIn("DESK_NATIVE_RESULT_CAPACITY (16U * 1024U)", adapter)
+        self.assertIn("cJSON_Parse(result)", adapter)
+        self.assertIn("incomplete Host JSON response", adapter)
+        self.assertIn("strlen(reason) > 256", adapter)
+
     def test_native_motion_tools_require_real_board_callbacks_and_use_builtin_dispatch(self) -> None:
         adapter = (ROOT / "firmware/main/src/tclaw_runtime_adapter.c").read_text(encoding="utf-8")
         registration = adapter.split("int desk_tclaw_runtime_register_mcp_tools(void)", 1)[1].split(

@@ -142,6 +142,119 @@ static void __gen_mcp_req_id(const char *prefix, char *out_id, size_t out_len)
     snprintf(out_id, out_len, "req-%s-%u-%u", prefix, (unsigned)ts, (unsigned)seq);
 }
 
+#define DESK_NATIVE_RESULT_CAPACITY (16U * 1024U)
+
+static OPERATE_RET __native_host_call(const char *prefix, const char *operation,
+                                     const cJSON *arguments, char *out_result,
+                                     size_t result_capacity)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return OPRT_MALLOC_FAILED;
+    char req_id[48];
+    __gen_mcp_req_id(prefix, req_id, sizeof(req_id));
+    cJSON_AddStringToObject(root, "request_id", req_id);
+    cJSON_AddStringToObject(root, "source", "tclaw_cloud_llm");
+    cJSON_AddStringToObject(root, "operation", operation);
+    cJSON_AddItemToObject(root, "arguments", arguments ? cJSON_Duplicate(arguments, true) : cJSON_CreateObject());
+    char *envelope = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!envelope) return OPRT_MALLOC_FAILED;
+    int dispatch_rc = desk_sdk_bridge_dispatch_tool_request(envelope);
+    cJSON_free(envelope);
+    if (dispatch_rc != 0) return OPRT_COM_ERROR;
+
+    char status[32] = "";
+    int wait_rc = desk_sdk_bridge_wait_tool_response(req_id, 4000, status, sizeof(status),
+                                                     out_result, result_capacity);
+    if (wait_rc != 0) return OPRT_COM_ERROR;
+    if (strcmp(status, "succeeded") == 0 || strcmp(status, "completed") == 0) return OPRT_OK;
+    return OPRT_COM_ERROR;
+}
+
+static OPERATE_RET __tool_host_query(const MCP_PROPERTY_LIST_T *properties,
+                                    MCP_RETURN_VALUE_T *ret_val, void *user_data)
+{
+    const char *operation = (const char *)user_data;
+    const char *prefix = "host";
+    cJSON *args = cJSON_CreateObject();
+    if (!args) return OPRT_MALLOC_FAILED;
+    if (strcmp(operation, "ha.list_entities") == 0) {
+        const char *domain = __get_str_prop(properties, "domain");
+        const char *query = __get_str_prop(properties, "query");
+        int limit = 5, offset = 0;
+        if (!__get_int_prop(properties, "limit", &limit) || !__get_int_prop(properties, "offset", &offset) ||
+            limit < 1 || limit > 10 || offset < 0) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: limit must be 1..10 and offset must be non-negative");
+            return OPRT_INVALID_PARM;
+        }
+        if (domain && domain[0]) cJSON_AddStringToObject(args, "domain", domain);
+        if (query && query[0]) cJSON_AddStringToObject(args, "query", query);
+        cJSON_AddNumberToObject(args, "limit", limit);
+        cJSON_AddNumberToObject(args, "offset", offset);
+    } else if (strcmp(operation, "ha.resolve_entity_name") == 0) {
+        const char *name = __get_str_prop(properties, "name");
+        if (!name || !name[0]) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: name is required");
+            return OPRT_INVALID_PARM;
+        }
+        cJSON_AddStringToObject(args, "name", name);
+    } else if (strcmp(operation, "codex.get_task") == 0) {
+        const char *task_id = __get_str_prop(properties, "task_id");
+        if (!task_id || !task_id[0]) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: task_id is required");
+            return OPRT_INVALID_PARM;
+        }
+        cJSON_AddStringToObject(args, "task_id", task_id);
+    } else if (strcmp(operation, "codex.cancel") == 0) {
+        const char *task_id = __get_str_prop(properties, "task_id");
+        const char *reason = __get_str_prop(properties, "reason");
+        if (!task_id || !task_id[0] || (reason && strlen(reason) > 256)) {
+            cJSON_Delete(args);
+            ai_mcp_return_value_set_str(ret_val, "Error: task_id is required and reason is limited to 256 characters");
+            return OPRT_INVALID_PARM;
+        }
+        cJSON_AddStringToObject(args, "task_id", task_id);
+        if (reason && reason[0]) cJSON_AddStringToObject(args, "reason", reason);
+    } else if (strcmp(operation, "codex.get_pending_approvals") == 0) {
+        const char *task_id = __get_str_prop(properties, "task_id");
+        if (task_id && task_id[0]) cJSON_AddStringToObject(args, "task_id", task_id);
+    }
+    char *result = (char *)calloc(1, DESK_NATIVE_RESULT_CAPACITY);
+    if (!result) { cJSON_Delete(args); return OPRT_MALLOC_FAILED; }
+    OPERATE_RET rc = __native_host_call(prefix, operation, args, result, DESK_NATIVE_RESULT_CAPACITY);
+    cJSON_Delete(args);
+    cJSON *valid = rc == OPRT_OK ? cJSON_Parse(result) : NULL;
+    if (valid) {
+        ai_mcp_return_value_set_str(ret_val, result);
+        cJSON_Delete(valid);
+    } else {
+        ai_mcp_return_value_set_str(ret_val, rc == OPRT_OK ? "Error: incomplete Host JSON response" :
+                                    "Error: Host request failed or timed out");
+        rc = OPRT_COM_ERROR;
+    }
+    free(result);
+    return rc;
+}
+
+static OPERATE_RET __tool_codex_list_workspaces(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{
+    (void)p;
+    return __tool_host_query(p, r, (void *)"codex.list_workspaces");
+}
+static OPERATE_RET __tool_ha_list_entities(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"ha.list_entities"); }
+static OPERATE_RET __tool_ha_resolve_entity_name(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"ha.resolve_entity_name"); }
+static OPERATE_RET __tool_codex_get_task(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"codex.get_task"); }
+static OPERATE_RET __tool_codex_cancel_task(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"codex.cancel"); }
+static OPERATE_RET __tool_codex_get_pending_approvals(const MCP_PROPERTY_LIST_T *p, MCP_RETURN_VALUE_T *r, void *u)
+{ (void)u; return __tool_host_query(p, r, (void *)"codex.get_pending_approvals"); }
+
 static OPERATE_RET __tool_ha_execute(const MCP_PROPERTY_LIST_T *properties,
                                      MCP_RETURN_VALUE_T *ret_val,
                                      void *user_data)
@@ -661,6 +774,25 @@ int desk_tclaw_runtime_register_mcp_tools(void)
         NULL,
         MCP_PROP_STR("entity_id", "Home Assistant entity identifier, e.g. 'light.desk'")
     ));
+
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("ha_list_entities", "List allowed Home Assistant entities. Use limit/offset to page results.",
+        __tool_ha_list_entities, NULL,
+        MCP_PROP_STR_DEF("domain", "Optional Home Assistant domain filter", ""),
+        MCP_PROP_STR_DEF("query", "Optional entity name or id search", ""),
+        MCP_PROP_INT_DEF_RANGE("limit", "Page size (1..10)", 5, 1, 10),
+        MCP_PROP_INT_DEF("offset", "Zero-based page offset", 0)));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("ha_resolve_entity_name", "Resolve a friendly Home Assistant entity name; returns candidates when ambiguous.",
+        __tool_ha_resolve_entity_name, NULL, MCP_PROP_STR("name", "Friendly entity name to resolve")));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_get_task", "Get status and summary for a Codex task.",
+        __tool_codex_get_task, NULL, MCP_PROP_STR("task_id", "Codex task id")));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_cancel_task", "Request cancellation of a Codex task.",
+        __tool_codex_cancel_task, NULL, MCP_PROP_STR("task_id", "Codex task id"),
+        MCP_PROP_STR_DEF("reason", "Optional cancellation reason (up to 256 characters)", "")));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_list_workspaces", "List available Codex workspace aliases.",
+        __tool_codex_list_workspaces, NULL));
+    TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD("codex_get_pending_approvals", "Read pending Codex approvals without deciding them.",
+        __tool_codex_get_pending_approvals, NULL,
+        MCP_PROP_STR_DEF("task_id", "Optional Codex task id filter", "")));
 
     TUYA_CALL_ERR_RETURN(AI_MCP_TOOL_ADD(
         "codex_submit_turn",
