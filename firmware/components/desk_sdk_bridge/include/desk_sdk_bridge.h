@@ -84,6 +84,14 @@ typedef enum {
 #define DESK_SDK_MAX_FRAME_LEN 8192
 #define DESK_WSPK_MAX_FRAME_SIZE (DESK_WSPK_MAX_PAYLOAD_SIZE + DESK_WSPK_HEADER_SIZE)
 
+/* Bounded host-tool response sizes. The result field is stored separately from
+ * the full incoming envelope and grows only to the bytes actually received. */
+#define DESK_SDK_MAX_TOOL_RESPONSE_ENVELOPE_BYTES (12U * 1024U)
+#define DESK_SDK_MAX_TOOL_RESPONSE_RESULT_BYTES (16U * 1024U)
+#define DESK_SDK_BRIDGE_ERR_BUFFER_TOO_SMALL (-2)
+#define DESK_SDK_BRIDGE_ERR_RESPONSE_TOO_LARGE (-3)
+#define DESK_SDK_BRIDGE_ERR_REQUEST_NOT_FOUND (-4)
+
 /**
  * @brief Return codes for desk_sdk_bridge_process_pairing_udp().
  *
@@ -150,12 +158,19 @@ int desk_sdk_bridge_register_tool_response_cb(desk_sdk_tool_response_cb_t cb, vo
  * @param status_max_len Size of out_status buffer
  * @param out_result Buffer to receive result JSON or error description
  * @param result_max_len Size of out_result buffer
- * @return 0 on success, -1 on timeout or error
+ * @return 0 on success, -1 on timeout/invalid arguments, or
+ *         DESK_SDK_BRIDGE_ERR_BUFFER_TOO_SMALL without consuming the response.
  */
 int desk_sdk_bridge_wait_tool_response(const char *request_id,
                                        uint32_t timeout_ms,
                                        char *out_status, size_t status_max_len,
                                        char *out_result, size_t result_max_len);
+
+/* Handle one Host ResponseEnvelope. Oversize envelopes/results return
+ * DESK_SDK_BRIDGE_ERR_RESPONSE_TOO_LARGE; uncorrelated or stale-generation
+ * responses return DESK_SDK_BRIDGE_ERR_REQUEST_NOT_FOUND and are discarded. */
+int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json);
+size_t desk_sdk_test_pending_result_bytes(void);
 
 /**
  * @brief Pack WSPK binary header (16-byte Little Endian <4sBBHII).
@@ -422,10 +437,6 @@ uint32_t desk_sdk_bridge_get_roller_input_failure_count(void);
  */
 int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json);
 
-/**
- * @brief Handle external tool response envelope returned by Python Application.
- */
-int desk_sdk_bridge_handle_tool_response(const char *response_envelope_json);
 
 /**
  * @brief Start local socket server for SDK and test clients.
