@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "bundle_id": "desk-agent-r1-edge-managed-app",
+  "bundle_status": "candidate_not_release_ready",
+  "sdk": {
+    "distribution": "watcherobot",
+    "version": "0.1.11",
+    "tag": "v0.1.11",
+    "git_commit": "8bc13967a06ef073459be47e930ff43ef37ee8fb",
+    "repository": "https://github.com/orulink-ai/WatcheRobot_python_sdk.git",
+    "wheel_filename": null,
+    "wheel_sha256": null,
+    "wheel_status": "not_built_or_validated_for_linux_arm64"
+  },
+  "target": {
+    "platform": "linux-arm64-rk3566",
+    "official_sdk_support": "not_declared",
+    "device_validation": "not_run"
+  },
+  "runtime_blockers": [
+    "SDK v0.1.11 does not declare Linux as a supported host platform.",
+    "A complete pinned dependency lock and Linux ARM64 wheel/install evidence are required before release.",
+    "Managed Runtime lifecycle and systemd stop/restart behavior require target-device validation."
+  ]
+}

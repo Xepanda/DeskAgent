@@ -6,13 +6,37 @@
       "code": "INVALID_ARGUMENT",
       "category": "CLIENT_ERROR",
       "retryable": false,
-      "description": "The request payload failed schema validation, missing required field, or had out-of-range parameters."
+      "description": "The notification payload failed validation; stable notification wire message: Invalid notification request. Retryable: false."
     },
     "EXPIRED": {
       "code": "EXPIRED",
       "category": "CLIENT_ERROR",
       "retryable": false,
-      "description": "The request expires_at timestamp has already elapsed upon receipt or queue processing."
+      "description": "The notification expires_at timestamp has elapsed; stable notification wire message: Notification has expired. Retryable: false."
+    },
+    "AUTH_REQUIRED": {
+      "code": "AUTH_REQUIRED",
+      "category": "SECURITY_ERROR",
+      "retryable": false,
+      "description": "The WebSocket session is not authenticated for notification delivery; stable notification wire message: Notification delivery requires an authenticated device session."
+    },
+    "STORAGE_FULL": {
+      "code": "STORAGE_FULL",
+      "category": "STORAGE_ERROR",
+      "retryable": false,
+      "description": "The approved notification storage quota has no reclaimable capacity; wire message: Notification storage is full. Retry only after capacity is restored, using the same notification_id."
+    },
+    "STORAGE_ERROR": {
+      "code": "STORAGE_ERROR",
+      "category": "STORAGE_ERROR",
+      "retryable": true,
+      "description": "Notification storage commit or readback failed or is uncertain; wire message: Notification storage operation failed. Keep delivery unknown and retry the same notification_id."
+    },
+    "NOTIFICATION_DELIVERY_FAILED": {
+      "code": "NOTIFICATION_DELIVERY_FAILED",
+      "category": "INTEGRATION_ERROR",
+      "retryable": true,
+      "description": "Notification delivery failed or the A1 return status cannot be classified; wire message: Notification delivery failed. Fail closed and retry only with the same notification_id."
     },
     "UNAUTHORIZED": {
       "code": "UNAUTHORIZED",
@@ -61,6 +85,12 @@
       "category": "INTEGRATION_ERROR",
       "retryable": true,
       "description": "Upstream service (HA Core, Tuya Cloud, or Codex app-server) is disconnected or unreachable."
+    },
+    "STORAGE_UNAVAILABLE": {
+      "code": "STORAGE_UNAVAILABLE",
+      "category": "STORAGE_ERROR",
+      "retryable": true,
+      "description": "A1 returned the dedicated DESK_NOTIFICATION_ERR_STORAGE_UNAVAILABLE (-100), confirming the durable notification provider is unavailable. Stable wire message: Notification storage provider is unavailable. Retry the same notification_id when the provider becomes available."
     },
     "STATE_UNCONFIRMED": {
       "code": "STATE_UNCONFIRMED",

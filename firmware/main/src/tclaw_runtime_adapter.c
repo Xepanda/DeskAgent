@@ -30,6 +30,7 @@
 enum {
     STAGE_SYS_BUS = 0,
     STAGE_TCLAW_CHAT,
+    STAGE_AUDIO_HAL,
     STAGE_APP_IM,
     STAGE_WS_SERVER,
     STAGE_TOOL_REGISTRY,
@@ -41,6 +42,7 @@ enum {
 static desk_tclaw_runtime_stage_t s_stages[STAGE_COUNT] = {
     {"sys_bus", DESK_TCLAW_RUNTIME_BLOCKED, 0},
     {"tclaw_chat", DESK_TCLAW_RUNTIME_BLOCKED, 0},
+    {"audio_hal", DESK_TCLAW_RUNTIME_BLOCKED, 0},
     {"app_im", DESK_TCLAW_RUNTIME_DISABLED, 0},
     {"ws_server", DESK_TCLAW_RUNTIME_DISABLED, 0},
     {"tool_registry", DESK_TCLAW_RUNTIME_BLOCKED, 0},
@@ -620,10 +622,25 @@ const desk_tclaw_runtime_stage_t *desk_tclaw_runtime_stages(unsigned *count)
 }
 
 static const char *s_current_ai_preset = NULL;
+/* UI voice events require both TClaw init and HAL readiness. This gate does
+ * not claim AFE/WakeNet/KWS readiness; the pinned SDK exposes no public hook. */
+static bool s_voice_event_ui_enabled;
+/* MQTT is the authoritative cloud connectivity signal for the home UI. */
+static bool s_cloud_online;
+
+void desk_tclaw_runtime_set_cloud_online(int online)
+{
+    s_cloud_online = online != 0;
+
+    const char *preset = s_cloud_online ? "happy" : "offline";
+    const char *status = s_cloud_online ? "Online" : "Cloud Offline";
+    s_current_ai_preset = s_cloud_online ? NULL : preset;
+    desk_hardware_set_screen_expression(preset, status);
+}
 
 static void __desk_ai_chat_event_handler(AI_NOTIFY_EVENT_T *event)
 {
-    if (!event) return;
+    if (!event || !s_voice_event_ui_enabled || !s_cloud_online) return;
     const char *new_preset = NULL;
     const char *status_text = NULL;
 
@@ -665,6 +682,8 @@ static void __desk_ai_chat_event_handler(AI_NOTIFY_EVENT_T *event)
 
 int desk_tclaw_runtime_init(void)
 {
+    s_voice_event_ui_enabled = false;
+    s_cloud_online = false;
     int first_error = 0;
     int rc = sys_bus_init();
     record_stage(STAGE_SYS_BUS, rc == OPRT_OK ? DESK_TCLAW_RUNTIME_READY : DESK_TCLAW_RUNTIME_FAILED, rc);
@@ -673,10 +692,25 @@ int desk_tclaw_runtime_init(void)
 
     rc = tclaw_chat_init();
     record_stage(STAGE_TCLAW_CHAT, rc == OPRT_OK ? DESK_TCLAW_RUNTIME_SUBSCRIBED : DESK_TCLAW_RUNTIME_FAILED, rc);
-    if (rc == OPRT_OK) {
+    if (rc != OPRT_OK && first_error == 0) first_error = rc;
+
+    /* Keep TClaw initialization errors attributed to tclaw_chat: it can fail
+     * after audio setup. audio_hal is HAL only: it reports the board driver's
+     * own status; neither status proves AFE/WakeNet/KWS readiness. */
+    desk_hardware_audio_status_t audio_status = {0};
+    int audio_hal_rc = desk_hardware_audio_get_status(&audio_status);
+    if (audio_hal_rc == DESK_HW_OK && !audio_status.ready) audio_hal_rc = OPRT_RESOURCE_NOT_READY;
+    bool audio_hal_ready = (audio_hal_rc == DESK_HW_OK && audio_status.ready);
+    record_stage(STAGE_AUDIO_HAL,
+                 audio_hal_ready ? DESK_TCLAW_RUNTIME_READY : DESK_TCLAW_RUNTIME_FAILED,
+                 audio_hal_ready ? OPRT_OK : audio_hal_rc);
+    s_voice_event_ui_enabled = (rc == OPRT_OK && audio_hal_ready);
+    if (s_voice_event_ui_enabled) {
         tclaw_chat_register_event_hook(__desk_ai_chat_event_handler);
     }
-    if (rc != OPRT_OK && first_error == 0) first_error = rc;
+    if (!audio_hal_ready && first_error == 0) {
+        first_error = audio_hal_rc;
+    }
 
     if (!has_im_credentials()) {
         record_stage(STAGE_APP_IM, DESK_TCLAW_RUNTIME_DISABLED, 0);
@@ -717,7 +751,8 @@ int desk_tclaw_runtime_init(void)
 #endif
 
     if (s_stages[STAGE_SYS_BUS].state != DESK_TCLAW_RUNTIME_READY ||
-        s_stages[STAGE_TCLAW_CHAT].state == DESK_TCLAW_RUNTIME_FAILED) {
+        s_stages[STAGE_TCLAW_CHAT].state == DESK_TCLAW_RUNTIME_FAILED ||
+        s_stages[STAGE_AUDIO_HAL].state != DESK_TCLAW_RUNTIME_READY) {
         record_stage(STAGE_AGENT_LOOP, DESK_TCLAW_RUNTIME_BLOCKED,
                      first_error ? first_error : OPRT_RESOURCE_NOT_READY);
         if (first_error == 0) first_error = OPRT_RESOURCE_NOT_READY;

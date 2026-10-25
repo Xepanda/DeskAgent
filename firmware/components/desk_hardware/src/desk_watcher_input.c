@@ -101,9 +101,9 @@ static int watcher_btn_expander_init(void)
     return rc;
 }
 
-static void watcher_input_record_event(desk_watcher_input_channel_status_t *channel,
-                                       desk_touch_target_t target,
-                                       desk_touch_action_t action)
+static void watcher_input_record_event_status(desk_watcher_input_channel_status_t *channel,
+                                              desk_touch_target_t target,
+                                              desk_touch_action_t action)
 {
 #ifdef ESP_PLATFORM
     portENTER_CRITICAL(&s_status_mux);
@@ -115,6 +115,13 @@ static void watcher_input_record_event(desk_watcher_input_channel_status_t *chan
 #ifdef ESP_PLATFORM
     portEXIT_CRITICAL(&s_status_mux);
 #endif
+}
+
+static void watcher_input_record_event(desk_watcher_input_channel_status_t *channel,
+                                       desk_touch_target_t target,
+                                       desk_touch_action_t action)
+{
+    watcher_input_record_event_status(channel, target, action);
     (void)desk_hardware_feed_touch_event(target, action);
 }
 
@@ -186,7 +193,10 @@ static void watcher_input_worker_task(void *arg)
             if (state != last_state) {
                 desk_touch_action_t action;
                 if (watcher_knob_decode_step(last_state, state, &knob_quarter_steps, &action)) {
-                    watcher_input_record_event(&s_status.knob, DESK_TOUCH_TARGET_ROLLER, action);
+                    desk_roller_delta_t delta = action == DESK_TOUCH_ACTION_SCROLL_UP
+                        ? DESK_ROLLER_DELTA_UP : DESK_ROLLER_DELTA_DOWN;
+                    watcher_input_record_event_status(&s_status.knob, DESK_TOUCH_TARGET_ROLLER, action);
+                    (void)desk_hardware_feed_roller_delta(delta);
                 }
                 last_state = state;
             }

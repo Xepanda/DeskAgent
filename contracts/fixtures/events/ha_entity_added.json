@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "evt-ha-state-1004",
+  "sequence": 107,
+  "sequence_scope": "ha:event_bus",
+  "type": "ha.state_changed",
+  "timestamp": "2026-10-11T22:45:05Z",
+  "payload": {
+    "entity_id": "sensor.office_temperature",
+    "old_state": null,
+    "new_state": "21.5",
+    "attributes": {
+      "unit_of_measurement": "°C",
+      "device_class": "temperature"
+    },
+    "timestamp": "2026-10-11T22:45:05Z",
+    "context_id": "ctx-ha-8815"
+  }
+}

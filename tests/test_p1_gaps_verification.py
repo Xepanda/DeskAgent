@@ -155,7 +155,11 @@ class TestP1GapsVerification(unittest.TestCase):
 
         # Test state change notification callback
         observed_events = []
-        stop_sub = ha.subscribe_state_changes(lambda eid, old_st, new_st: observed_events.append((eid, old_st, new_st)))
+        stop_sub = ha.subscribe_state_changes(
+            lambda eid, old_st, new_st, attributes: observed_events.append(
+                (eid, old_st, new_st, attributes)
+            )
+        )
         ha.update_mock_state("light.desk_lamp", "off", {"brightness": 0})
         time.sleep(1.2)
         stop_sub()

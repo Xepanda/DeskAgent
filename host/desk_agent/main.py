@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
+import ipaddress
 import json
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -29,7 +32,10 @@ from host.desk_agent.core.models import RequestEnvelope, ResponseEnvelope, Respo
 from host.desk_agent.core.router import Router
 from host.desk_agent.core.managed_sdk_listener import ManagedSdkMessageListener
 from host.desk_agent.core.managed_sdk_lifecycle import ManagedSdkLifecycleObservers
-from host.desk_agent.core.managed_notification import ManagedNotificationAdapter
+from host.desk_agent.core.managed_notification import (
+    ManagedNotificationAdapter,
+    ManagedNotificationNackError,
+)
 from host.desk_agent.services.life_service import LifeService
 from host.desk_agent.services.network_log_consumer import NetworkLogConsumer
 from host.desk_agent.connectors.ha.ha_connector import HAConnector
@@ -43,6 +49,10 @@ from host.desk_agent.connectors.robot.robot_adapter import RobotAdapter
 from host.desk_agent.connectors.robot.official_camera_adapter import (
     MAX_WSPK_FRAME_BYTES,
     OfficialRobotCameraAdapter,
+)
+from host.desk_agent.connectors.robot.official_camera_stream_ingress import (
+    OfficialCameraStreamIngress,
+    install_raw_device_frame_observer,
 )
 from host.desk_agent.connectors.robot.managed_codex_feedback_adapter import ManagedCodexFeedbackAdapter
 from companion.src.codex_companion import CodexCompanion
@@ -61,6 +71,78 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+def _address_is_loopback(address: Any) -> bool:
+    """Return whether a bound socket address is loopback-only."""
+    host = address[0] if isinstance(address, tuple) else address
+    try:
+        parsed = ipaddress.ip_address(str(host).split("%", 1)[0])
+        if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+            return parsed.ipv4_mapped.is_loopback
+        return parsed.is_loopback
+    except ValueError:
+        return False
+
+
+def _host_is_loopback(host: str) -> bool:
+    """Resolve a configured bind host and require every result to be loopback."""
+    if not host:
+        return False  # HTTPServer treats an empty bind host as a wildcard.
+    try:
+        parsed = ipaddress.ip_address(host.split("%", 1)[0])
+        if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+            return parsed.ipv4_mapped.is_loopback
+        return parsed.is_loopback
+    except ValueError:
+        pass
+    try:
+        results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return bool(results) and all(_address_is_loopback(result[4]) for result in results)
+
+
+def _validate_listener_auth(host: str, auth_token: Any) -> None:
+    if not _host_is_loopback(host) and (not isinstance(auth_token, str) or not auth_token.strip()):
+        raise ValueError("Non-loopback Host listener requires a non-empty auth_token")
+
+
+def _load_host_config(config_path: Optional[str]) -> dict[str, Any]:
+    default_cfg = {
+        "device_id": "desk-agent-r1-host",
+        "server": {"host": "127.0.0.1", "port": 8088},
+        "auth_token": None,
+        "storage": {"db_path": "life_service.db"},
+        "home_assistant": {
+            "base_url": "http://homeassistant.local:8123",
+            "allowed_domains": ["light", "switch", "cover", "climate", "fan", "media_player", "scene", "input_boolean"],
+        },
+        "camera": {"default_lease_ms": 10000},
+        "robot": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "tcp_port": 37020,
+            "udp_port": 37021,
+            "auto_pair": True,
+            "reconnect_interval": 2.0,
+        },
+        "codex": {
+            "workspaces": {
+                "epanda-desk-agent": os.path.realpath("."),
+                "desk-agent-core": os.path.realpath("."),
+            }
+        },
+    }
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                user_cfg = json.load(config_file)
+                default_cfg.update(user_cfg)
+                logger.info("Loaded configuration from %s", config_path)
+        except Exception as exc:
+            logger.error("Failed to parse config file %s: %s; using defaults", config_path, exc)
+    return default_cfg
+
+
 class DeskAgentHostApp:
     def __init__(self, config_path: Optional[str] = None, *, managed_sdk_session: bool = False) -> None:
         self.managed_sdk_session = bool(managed_sdk_session)
@@ -72,6 +154,13 @@ class DeskAgentHostApp:
         # Database and Services
         db_path = Path(self.config.get("storage", {}).get("db_path", "/var/lib/desk-agent/life_service.db"))
         self.life_service = LifeService(db_path)
+        try:
+            # One recovery scan per Host process start. Periodic reminder polling and
+            # SDK reconnects reuse the resulting immutable outbox batch.
+            self._startup_recovery_summary = self.life_service.create_recovery_summary_batch()
+        except Exception as exc:
+            self._startup_recovery_summary = None
+            logger.warning("Startup missed-reminder recovery scan failed (%s)", type(exc).__name__)
         ha_cfg = self.config.get("home_assistant", {})
         self.ha_connector = HAConnector(
             base_url=ha_cfg.get("base_url", "http://homeassistant.local:8123"),
@@ -96,6 +185,13 @@ class DeskAgentHostApp:
         # CR-009 authorization/subscription is not implemented by this lifecycle hook.
         self._network_log_authorized = False
         self.official_camera_adapter: Optional[OfficialRobotCameraAdapter] = None
+        self.official_camera_stream_ingress: Optional[OfficialCameraStreamIngress] = None
+        self._managed_camera_raw_observer_remove: Optional[Callable[[], None]] = None
+        self._camera_stream_metadata_lock = threading.Lock()
+        self._latest_camera_stream_metadata: Optional[dict[str, Any]] = None
+        self._latest_camera_stream_lease_generation: Optional[int] = None
+        self._snapshot_rate_limit_lock = threading.Lock()
+        self._last_snapshot_request_at: dict[str, float] = {}
 
         codex_cfg = self.config.get("codex", {})
         companion_url = codex_cfg.get("companion_url") or self.config.get("codex_companion", {}).get("endpoint")
@@ -147,21 +243,10 @@ class DeskAgentHostApp:
 
         # HA State Subscription
         self._ha_state_changes: list[dict[str, Any]] = []
-        def _on_ha_state_change(entity_id: str, old_state: Optional[str], new_state: Optional[str]) -> None:
-            logger.info("HA entity %s changed: %s -> %s", entity_id, old_state, new_state)
-            self._ha_state_changes.append({
-                "entity_id": entity_id,
-                "old_state": old_state,
-                "new_state": new_state,
-                "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            })
-            if len(self._ha_state_changes) > 100:
-                self._ha_state_changes.pop(0)
-
         ha_cfg = self.config.get("home_assistant", {})
         if ha_cfg.get("subscribe_events", True):
             self._ha_sub_stop: Optional[Callable[[], None]] = self.ha_connector.subscribe_state_changes(
-                _on_ha_state_change,
+                self._on_ha_state_change,
                 interval_sec=float(ha_cfg.get("poll_interval_sec", 2.0)),
             )
         else:
@@ -376,7 +461,8 @@ class DeskAgentHostApp:
                                     continue
                                 result = self.managed_notification_adapter.deliver(notification)
                                 backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
-                                # Transport ACK or application accepted is not durable device acceptance.
+                                # CR-018 is blocked: transport ACK and application accepted do not
+                                # prove durable device acceptance. Keep this same occurrence pending.
                                 self.life_service.record_outbox_failure(
                                     outbox_id,
                                     "Managed notification delivery remains unknown pending approved device persistence",
@@ -388,6 +474,28 @@ class DeskAgentHostApp:
                                     outbox_id,
                                     result.get("delivery_state", "unknown"),
                                 )
+                            except ManagedNotificationNackError as exc:
+                                if exc.retryable:
+                                    backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                                    self.life_service.record_outbox_failure(
+                                        outbox_id,
+                                        f"Managed notification NACK: {exc.error}",
+                                        backoff_seconds=backoff,
+                                        keep_pending=True,
+                                    )
+                                    logger.warning(
+                                        "Managed reminder %s received retryable NACK %s; kept pending",
+                                        outbox_id,
+                                        exc.error,
+                                    )
+                                else:
+                                    terminal = self.life_service.record_terminal_reminder_alert_failure(outbox_id)
+                                    logger.warning(
+                                        "Managed reminder %s received terminal NACK %s (outbox_failed=%s)",
+                                        outbox_id,
+                                        exc.error,
+                                        terminal,
+                                    )
                             except Exception as exc:
                                 backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
                                 self.life_service.record_outbox_failure(
@@ -410,6 +518,43 @@ class DeskAgentHostApp:
                                 self.life_service.record_outbox_failure(
                                     outbox_id, "Delivery channel busy or rejected", backoff_seconds=backoff
                                 )
+                    elif topic == "notification.summary.deliver":
+                        if not self.managed_sdk_session or self.managed_notification_adapter is None:
+                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                            self.life_service.record_outbox_failure(
+                                outbox_id,
+                                "Managed SDK session is not ready for recovery summary",
+                                backoff_seconds=backoff,
+                                keep_pending=True,
+                            )
+                            continue
+                        if not self.life_service.claim_recovery_summary_delivery(
+                            outbox_id, payload.get("summary_id")
+                        ):
+                            continue
+                        try:
+                            result = self.managed_notification_adapter.deliver_summary(payload)
+                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                            # CR-018 is blocked: sys.ack/accepted is transport evidence only.
+                            # Preserve the same summary outbox item as pending/unknown to TTL.
+                            self.life_service.record_outbox_failure(
+                                outbox_id,
+                                "Recovery summary remains pending/unknown pending approved device persistence",
+                                backoff_seconds=backoff,
+                                keep_pending=True,
+                            )
+                            logger.info(
+                                "Recovery summary %s remains pending/unknown after transport attempt (state=%s)",
+                                payload.get("summary_id"), result.get("delivery_state", "unknown"),
+                            )
+                        except Exception as exc:
+                            backoff = min(300, 2 ** (item.get("retry_count", 0) + 1))
+                            self.life_service.record_outbox_failure(
+                                outbox_id,
+                                f"Managed recovery summary delivery unavailable: {type(exc).__name__}",
+                                backoff_seconds=backoff,
+                                keep_pending=True,
+                            )
                     elif topic in ("codex.completed", "codex.failed", "codex.interrupted"):
                         if self.managed_codex_feedback_adapter is not None:
                             try:
@@ -494,14 +639,28 @@ class DeskAgentHostApp:
                     logger.warning("Error in reminder scheduler: %s", e)
             self._scheduler_stop.wait(1.0)
 
+    def _record_managed_notification_event(self, event: Mapping[str, Any]) -> str:
+        """Route CR-028 receipts by summary_id while preserving CR-017 behavior."""
+        if isinstance(event.get("summary_id"), str):
+            return self.life_service.record_recovery_summary_ack(event)
+        return self.life_service.record_managed_notification_event(event)
+
     def close(self) -> None:
         self._scheduler_stop.set()
         if self._scheduler_thread and self._scheduler_thread.is_alive():
             self._scheduler_thread.join(timeout=2.0)
         if hasattr(self, "_delivery_thread") and self._delivery_thread.is_alive():
+            # Managed send_command is bounded by the pinned SDK adapter timeout;
+            # wait for its callback path before closing listeners or SQLite.
             self._delivery_thread.join()
         if self.official_camera_adapter:
             self.official_camera_adapter.close()
+        if self.official_camera_stream_ingress:
+            self.official_camera_stream_ingress.close()
+        self._clear_camera_stream_metadata()
+        if self._managed_camera_raw_observer_remove:
+            self._managed_camera_raw_observer_remove()
+            self._managed_camera_raw_observer_remove = None
         if self._managed_network_log_listener is not None:
             try:
                 self._managed_network_log_listener.remove(self._on_managed_sdk_message)
@@ -532,40 +691,28 @@ class DeskAgentHostApp:
         self.life_service.close()
 
     def _load_config(self, config_path: Optional[str]) -> dict[str, Any]:
-        default_cfg = {
-            "device_id": "desk-agent-r1-host",
-            "server": {"host": "127.0.0.1", "port": 8088},
-            "auth_token": None,
-            "storage": {"db_path": "life_service.db"},
-            "home_assistant": {
-                "base_url": "http://homeassistant.local:8123",
-                "allowed_domains": ["light", "switch", "cover", "climate", "fan", "media_player", "scene", "input_boolean"],
-            },
-            "camera": {"default_lease_ms": 10000},
-            "robot": {
-                "enabled": True,
-                "host": "127.0.0.1",
-                "tcp_port": 37020,
-                "udp_port": 37021,
-                "auto_pair": True,
-                "reconnect_interval": 2.0,
-            },
-            "codex": {
-                "workspaces": {
-                    "epanda-desk-agent": os.path.realpath("."),
-                    "desk-agent-core": os.path.realpath("."),
-                }
-            },
+        return _load_host_config(config_path)
+
+    def _on_ha_state_change(
+        self,
+        entity_id: str,
+        old_state: Optional[str],
+        new_state: Optional[str],
+        attributes: Optional[Mapping[str, Any]],
+    ) -> None:
+        logger.info("HA entity %s changed: %s -> %s", entity_id, old_state, new_state)
+        change: dict[str, Any] = {
+            "entity_id": entity_id,
+            "old_state": old_state,
+            "new_state": new_state,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
-        if config_path and os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    user_cfg = json.load(f)
-                    default_cfg.update(user_cfg)
-                    logger.info("Loaded configuration from %s", config_path)
-            except Exception as e:
-                logger.error("Failed to parse config file %s: %s; using defaults", config_path, e)
-        return default_cfg
+        if new_state is not None:
+            snapshot = dict(attributes) if isinstance(attributes, Mapping) else {}
+            change["attributes"] = copy.deepcopy(snapshot)
+        self._ha_state_changes.append(change)
+        if len(self._ha_state_changes) > 100:
+            self._ha_state_changes.pop(0)
 
     def _register_routes(self) -> None:
         # HA
@@ -776,6 +923,7 @@ class DeskAgentHostApp:
         lease_ms = req.arguments.get("lease_duration_ms")
         target_fps = req.arguments.get("target_fps")
         res = self.camera_service.acquire_lease(client_id, lease_ms, target_fps=target_fps)
+        lease_generation = res.get("lease_generation")
         if not res["granted"]:
             return ResponseEnvelope.create_error(
                 req.request_id,
@@ -783,12 +931,29 @@ class DeskAgentHostApp:
                 message=f"Camera lease is currently held by '{res.get('current_owner')}'",
                 details=res,
             )
-        if self.official_camera_adapter is not None:
-            device_result = self.official_camera_adapter.acquire(
-                client_id, res.get("lease_duration_ms", 10000), target_fps=float(target_fps or res.get("target_fps", 2.0))
+        if self.official_camera_stream_ingress is not None:
+            device_result = self.official_camera_stream_ingress.acquire(
+                client_id,
+                res.get("lease_duration_ms", 10000),
+                target_fps=15.0,
+                lease_generation=lease_generation,
             )
             if not device_result.get("granted"):
-                self.camera_service.release_lease(client_id)
+                self.camera_service.release_lease(client_id, expected_generation=lease_generation)
+                return ResponseEnvelope.create_error(
+                    req.request_id,
+                    code=device_result.get("reason", "DEVICE_ERROR"),
+                    message="Official SDK camera stream lease was not granted",
+                    details=device_result,
+                )
+        elif self.official_camera_adapter is not None:
+            device_result = self.official_camera_adapter.acquire(
+                client_id, res.get("lease_duration_ms", 10000),
+                target_fps=float(target_fps or res.get("target_fps", 2.0)),
+                lease_generation=lease_generation,
+            )
+            if not device_result.get("granted"):
+                self.camera_service.release_lease(client_id, expected_generation=lease_generation)
                 return ResponseEnvelope.create_error(
                     req.request_id,
                     code=device_result.get("reason", "DEVICE_ERROR"),
@@ -804,7 +969,7 @@ class DeskAgentHostApp:
                 }, timeout=1.0)
                 if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
                     logger.warning("Robot rejected camera acquire: %s. Rolling back host lease.", ack)
-                    self.camera_service.release_lease(client_id)
+                    self.camera_service.release_lease(client_id, expected_generation=lease_generation)
                     err_info = ack.get("error", {}) if isinstance(ack, dict) else {}
                     return ResponseEnvelope.create_error(
                         req.request_id,
@@ -817,18 +982,24 @@ class DeskAgentHostApp:
                 }, timeout=1.0)
             except Exception as e:
                 logger.warning("Failed to dispatch camera acquire/capture to robot: %s. Rolling back lease.", e)
-                self.camera_service.release_lease(client_id)
+                self.camera_service.release_lease(client_id, expected_generation=lease_generation)
                 return ResponseEnvelope.create_error(
                     req.request_id,
                     code="DEVICE_ERROR",
                     message=f"Failed to communicate with robot camera: {e}",
                 )
-        return ResponseEnvelope.create_success(req.request_id, res)
+        # lease_generation is Host-internal teardown coordination and must not
+        # change the stable device/client wire contract.
+        return ResponseEnvelope.create_success(
+            req.request_id, {key: value for key, value in res.items() if key != "lease_generation"}
+        )
 
     def _handle_camera_release(self, req: RequestEnvelope) -> ResponseEnvelope:
         client_id = req.client_id or req.arguments.get("client_id", "anonymous")
         released = self.camera_service.release_lease(client_id)
-        if released and self.official_camera_adapter is None and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command"):
+        if (released and self.official_camera_adapter is None
+                and self.official_camera_stream_ingress is None
+                and self.has_robot_hardware_connected() and hasattr(self._robot_client, "send_command")):
             try:
                 self._robot_client.send_command({
                     "type": "ctrl.camera.release",
@@ -847,6 +1018,7 @@ class DeskAgentHostApp:
         robot: Any,
         *,
         command_sender: Callable[[str, dict[str, Any], Optional[float]], dict[str, Any]],
+        communicators: Optional[object] = None,
         on_disconnect: Optional[Callable[[Callable[[], None]], None]] = None,
     ) -> OfficialRobotCameraAdapter:
         """Attach an existing managed-SDK session; this method never starts a Runtime or connection."""
@@ -859,15 +1031,108 @@ class DeskAgentHostApp:
         )
         self.official_camera_adapter = adapter
 
-        def release_device_lease(owner: str, reason: str) -> None:
+        def owner_is_valid(owner: str, generation: int | None = None) -> bool:
+            with self.camera_service._lock:
+                return (
+                    self.camera_service._active_lease_owner == owner
+                    and (generation is None or self.camera_service._active_lease_generation == generation)
+                    and time.time() < self.camera_service._lease_expires_at
+                )
+
+        ingress = OfficialCameraStreamIngress(
+            send_command=command_sender,
+            ingest_frame=self._ingest_official_camera_frame,
+            owner_is_valid=owner_is_valid,
+            capabilities=(getattr(robot, "capabilities", ()) if communicators is not None else ()),
+            clear_frame=self._invalidate_official_camera_owner,
+        )
+        self.official_camera_stream_ingress = ingress
+        if communicators is not None:
+            self._managed_camera_raw_observer_remove = install_raw_device_frame_observer(
+                communicators, ingress.on_application_frame
+            )
+
+        def release_device_lease(owner: str, reason: str, lease_generation: int) -> None:
             if previous_teardown:
-                previous_teardown(owner, reason)
-            adapter.release(owner)
+                previous_teardown(owner, reason, lease_generation)
+            adapter.release(owner, expected_generation=lease_generation)
+            ingress.release(owner, expected_generation=lease_generation)
+            self._clear_camera_stream_metadata(expected_generation=lease_generation)
 
         self.camera_service.on_lease_released = release_device_lease
         if on_disconnect is not None:
             on_disconnect(adapter.on_sdk_disconnect)
+            on_disconnect(self._on_official_camera_session_disconnect)
         return adapter
+
+    @property
+    def latest_camera_stream_metadata(self) -> Optional[dict[str, Any]]:
+        """Return metadata paired with the newest JPEG accepted by A3 ingress."""
+        with self._camera_stream_metadata_lock:
+            return dict(self._latest_camera_stream_metadata) if self._latest_camera_stream_metadata else None
+
+    def _ingest_official_camera_frame(self, jpeg: bytes, metadata: dict[str, Any]) -> None:
+        """Preserve stream metadata at the A3-to-A6 seam while updating A6's JPEG slot."""
+        with self._camera_stream_metadata_lock:
+            self._latest_camera_stream_metadata = dict(metadata)
+            ingress = getattr(self, "official_camera_stream_ingress", None)
+            self._latest_camera_stream_lease_generation = (
+                ingress._lease_generation if ingress is not None else None
+            )
+        self.camera_service.ingest_robot_frame(jpeg, metadata)
+
+    def _clear_camera_stream_metadata(self, *, expected_generation: int | None = None) -> None:
+        lock = getattr(self, "_camera_stream_metadata_lock", None)
+        if lock is not None:
+            with lock:
+                current_generation = getattr(self, "_latest_camera_stream_lease_generation", None)
+                if (expected_generation is not None and current_generation is not None
+                        and current_generation != expected_generation):
+                    return
+                self._latest_camera_stream_metadata = None
+                self._latest_camera_stream_lease_generation = None
+
+    def _invalidate_official_camera_owner(
+        self, owner: str, *, expected_generation: int | None = None,
+    ) -> None:
+        invalidated = self.camera_service.invalidate_owner_on_upstream_disconnect(
+            owner, expected_generation=expected_generation
+        )
+        if invalidated:
+            self._clear_camera_stream_metadata(expected_generation=expected_generation)
+
+    def _on_official_camera_session_disconnect(self) -> None:
+        if self.official_camera_stream_ingress is not None:
+            self.official_camera_stream_ingress.on_session_disconnect()
+        self._clear_camera_stream_metadata()
+        if self._managed_camera_raw_observer_remove is not None:
+            self._managed_camera_raw_observer_remove()
+            self._managed_camera_raw_observer_remove = None
+
+    @staticmethod
+    def _admit_snapshot_request(app: Any, client_id: str) -> tuple[bool, float]:
+        """Enforce one single-frame snapshot request per client every 500 ms."""
+        lock = getattr(app, "_snapshot_rate_limit_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            app._snapshot_rate_limit_lock = lock
+            app._last_snapshot_request_at = {}
+        now = time.monotonic()
+        with lock:
+            recent = app._last_snapshot_request_at
+            previous = recent.get(client_id)
+            if previous is not None and now - previous < 0.5:
+                return False, max(0.0, 0.5 - (now - previous))
+            if len(recent) >= 1024:
+                cutoff = now - 60.0
+                for key, stamp in tuple(recent.items()):
+                    if stamp < cutoff:
+                        recent.pop(key, None)
+            if len(recent) >= 1024 and client_id not in recent:
+                oldest = min(recent, key=recent.get)
+                recent.pop(oldest, None)
+            recent[client_id] = now
+            return True, 0.0
 
     def register_managed_sdk_codex_feedback_session(
         self,
@@ -1078,8 +1343,11 @@ def make_request_handler(app: DeskAgentHostApp):
     class DeskAgentHTTPHandler(BaseHTTPRequestHandler):
         def _check_auth(self) -> bool:
             auth_token = app.config.get("auth_token")
-            if not auth_token:
-                return True
+            if not isinstance(auth_token, str) or not auth_token.strip():
+                # Empty-token local-only mode remains available on loopback;
+                # wildcard or LAN listeners fail closed even if startup checks
+                # were bypassed by an embedding caller.
+                return _address_is_loopback(self.server.server_address)
             auth_hdr = self.headers.get("Authorization", "")
             tok_hdr = self.headers.get("X-Desk-Agent-Token", "")
             if auth_hdr.startswith("Bearer "):
@@ -1159,10 +1427,11 @@ def make_request_handler(app: DeskAgentHostApp):
                 # Extract client_id from query params if present
                 client_id = None
                 if "?" in self.path:
-                    query = self.path.split("?", 1)[1]
-                    for param in query.split("&"):
-                        if param.startswith("client_id="):
-                            client_id = param.split("=", 1)[1]
+                    query_values = parse_qs(
+                        urlsplit(self.path).query, keep_blank_values=True
+                    ).get("client_id", [])
+                    if query_values:
+                        client_id = query_values[0]
 
                 is_snapshot_path = (
                     self.path == "/snapshot"
@@ -1171,6 +1440,7 @@ def make_request_handler(app: DeskAgentHostApp):
                     or self.path.startswith("/snapshot.jpg?")
                     or self.path.startswith("/api/camera/snapshot")
                 )
+                is_single_frame_path = self.path.startswith("/api/camera/frame")
 
                 is_stream_path = (
                     self.path == "/api/camera/stream"
@@ -1264,8 +1534,31 @@ def make_request_handler(app: DeskAgentHostApp):
                             stream.close()
                     return
 
+                if is_snapshot_path or is_single_frame_path:
+                    effective_client = client_id or "snapshot-viewer"
+                    admitted, retry_after = DeskAgentHostApp._admit_snapshot_request(
+                        app, effective_client
+                    )
+                    if not admitted:
+                        self.send_response(429)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Camera-Mode", "snapshot-preview")
+                        self.send_header("X-Camera-Description", "Snapshot preview, maximum 2 FPS")
+                        self.send_header("X-Camera-Max-FPS", "2")
+                        self.send_header("Retry-After", str(max(1, int(retry_after + 0.999))))
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "error": "SNAPSHOT_RATE_LIMITED",
+                            "message": "Snapshot preview is limited to 2 FPS; LIVE stream is available at /api/camera/stream.",
+                            "max_fps": 2,
+                            "retry_after_ms": int(retry_after * 1000 + 0.999),
+                        }).encode())
+                        return
+
                 if is_snapshot_path:
                     ephemeral_lease_acquired = False
+                    ephemeral_lease_generation = None
                     if app.camera_service.is_lease_valid():
                         if not client_id or app.camera_service._active_lease_owner != client_id:
                             self.send_response(403)
@@ -1275,7 +1568,6 @@ def make_request_handler(app: DeskAgentHostApp):
                             return
                         effective_client = client_id
                     else:
-                        effective_client = client_id or "snapshot-viewer"
                         acq = app.camera_service.acquire_lease(effective_client, lease_ms=5000)
                         if not acq.get("granted"):
                             self.send_response(403)
@@ -1284,10 +1576,30 @@ def make_request_handler(app: DeskAgentHostApp):
                             self.wfile.write(json.dumps({"error": "RESOURCE_BUSY"}).encode())
                             return
                         ephemeral_lease_acquired = True
-                        if app.official_camera_adapter is not None:
-                            device_acq = app.official_camera_adapter.acquire(effective_client, 5000, target_fps=10.0)
+                        ephemeral_lease_generation = acq.get("lease_generation")
+                        if app.official_camera_stream_ingress is not None:
+                            device_acq = app.official_camera_stream_ingress.acquire(
+                                effective_client, 5000, target_fps=15.0,
+                                lease_generation=ephemeral_lease_generation,
+                            )
                             if not device_acq.get("granted"):
-                                app.camera_service.release_lease(effective_client)
+                                app.camera_service.release_lease(
+                                    effective_client, expected_generation=ephemeral_lease_generation
+                                )
+                                self.send_response(503)
+                                self.send_header("Content-Type", "application/json")
+                                self.end_headers()
+                                self.wfile.write(json.dumps({"error": device_acq.get("reason", "DEVICE_UNAVAILABLE")}).encode())
+                                return
+                        elif app.official_camera_adapter is not None:
+                            device_acq = app.official_camera_adapter.acquire(
+                                effective_client, 5000, target_fps=10.0,
+                                lease_generation=ephemeral_lease_generation,
+                            )
+                            if not device_acq.get("granted"):
+                                app.camera_service.release_lease(
+                                    effective_client, expected_generation=ephemeral_lease_generation
+                                )
                                 self.send_response(503)
                                 self.send_header("Content-Type", "application/json")
                                 self.end_headers()
@@ -1302,7 +1614,9 @@ def make_request_handler(app: DeskAgentHostApp):
                                 }, timeout=1.0)
                                 if not isinstance(ack, dict) or ack.get("type") != "sys.ack" or ack.get("code") != 0:
                                     logger.warning("Robot rejected snapshot camera acquire: %s", ack)
-                                    app.camera_service.release_lease(effective_client)
+                                    app.camera_service.release_lease(
+                                        effective_client, expected_generation=ephemeral_lease_generation
+                                    )
                                     self.send_response(403)
                                     self.send_header("Content-Type", "application/json")
                                     self.end_headers()
@@ -1310,7 +1624,9 @@ def make_request_handler(app: DeskAgentHostApp):
                                     return
                             except Exception as exc:
                                 logger.warning("Snapshot acquire dispatch error: %s", exc)
-                                app.camera_service.release_lease(effective_client)
+                                app.camera_service.release_lease(
+                                    effective_client, expected_generation=ephemeral_lease_generation
+                                )
                                 self.send_response(503)
                                 self.send_header("Content-Type", "application/json")
                                 self.end_headers()
@@ -1319,7 +1635,8 @@ def make_request_handler(app: DeskAgentHostApp):
 
                     try:
                         initial_seq = getattr(app.camera_service, "_frame_seq", 0)
-                        if app.official_camera_adapter is not None:
+                        if (app.official_camera_adapter is not None
+                                or app.official_camera_stream_ingress is not None):
                             frame_info = None
                             deadline = time.time() + 1.2
                             while time.time() < deadline:
@@ -1395,12 +1712,19 @@ def make_request_handler(app: DeskAgentHostApp):
                         self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
                         self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
                         self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
+                        self.send_header("X-Camera-Mode", "snapshot-preview")
+                        self.send_header("X-Camera-Description", "Snapshot preview, maximum 2 FPS")
+                        self.send_header("X-Camera-Max-FPS", "2")
                         self.end_headers()
                         self.wfile.write(frame_info["jpeg_data"])
                     finally:
                         if ephemeral_lease_acquired:
-                            app.camera_service.release_lease(effective_client)
-                            if app.official_camera_adapter is None and app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command"):
+                            app.camera_service.release_lease(
+                                effective_client, expected_generation=ephemeral_lease_generation
+                            )
+                            if (app.official_camera_adapter is None
+                                    and app.official_camera_stream_ingress is None
+                                    and app.has_robot_hardware_connected() and hasattr(app._robot_client, "send_command")):
                                 try:
                                     app._robot_client.send_command({
                                         "type": "ctrl.camera.release",
@@ -1443,6 +1767,9 @@ def make_request_handler(app: DeskAgentHostApp):
                     self.send_header("X-Frame-Age-Ms", str(frame_info["frame_age_ms"]))
                     self.send_header("X-Frame-Source", str(frame_info.get("source", "unknown")))
                     self.send_header("X-Frame-Hardware", "1" if frame_info.get("is_hardware") else "0")
+                    self.send_header("X-Camera-Mode", "snapshot-preview")
+                    self.send_header("X-Camera-Description", "Snapshot preview, maximum 2 FPS")
+                    self.send_header("X-Camera-Max-FPS", "2")
                     self.end_headers()
                     self.wfile.write(frame_info["jpeg_data"])
             else:
@@ -1483,6 +1810,7 @@ def make_request_handler(app: DeskAgentHostApp):
 
 
 def _serve_host(app: DeskAgentHostApp, host: str, port: int, *, shutdown_check: Optional[Callable[[], bool]] = None) -> None:
+    _validate_listener_auth(host, app.config.get("auth_token"))
     handler_cls = make_request_handler(app)
     httpd = ThreadedHTTPServer((host, port), handler_cls)
 
@@ -1515,6 +1843,8 @@ def _serve_host(app: DeskAgentHostApp, host: str, port: int, *, shutdown_check: 
 
 async def _run_managed_application(config_path: Optional[str], host: str, port: int) -> None:
     """Run the Host inside the one Runtime-authorized SDK managed Application session."""
+    launch_config = _load_host_config(config_path)
+    _validate_listener_auth(host, launch_config.get("auth_token"))
     from watcherobot.application import ApplicationContext
 
     context = ApplicationContext.from_environment()
@@ -1546,15 +1876,26 @@ async def _run_managed_application(config_path: Optional[str], host: str, port: 
             app.register_official_sdk_camera_session(
                 context.robot,
                 command_sender=transport.send_command,
+                communicators=getattr(transport, "_communicators", None),
                 on_disconnect=lifecycle.add,
             )
             app.register_managed_sdk_network_log_session(context)
             lifecycle.add(app.network_log_consumer.on_disconnect)
             app.register_managed_sdk_codex_feedback_session(command_sender=transport.send_command)
+            pending_summaries = app.life_service.get_pending_outbox_messages(limit=1000, include_delayed=True)
+            known_summaries = {
+                item["payload"]["summary_id"]: item["payload"]["expires_at"]
+                for item in pending_summaries
+                if item.get("topic") == "notification.summary.deliver"
+                and isinstance(item.get("payload"), dict)
+                and isinstance(item["payload"].get("summary_id"), str)
+                and isinstance(item["payload"].get("expires_at"), str)
+            }
             notification_adapter = ManagedNotificationAdapter(
                 context,
-                app.life_service.record_managed_notification_event,
+                app._record_managed_notification_event,
                 known_notifications=app.life_service.get_active_notification_contexts(),
+                known_summaries=known_summaries,
             )
             app.managed_notification_adapter = notification_adapter
             host_loop_started = True
@@ -1582,8 +1923,13 @@ def main() -> None:
     parser.add_argument("--check-config", action="store_true", help="Perform pre-flight configuration check and exit")
     args = parser.parse_args()
 
+    launch_config = _load_host_config(args.config)
+    port = args.port or launch_config.get("server", {}).get("port", 8088)
+    host = args.host or launch_config.get("server", {}).get("host", "127.0.0.1")
+
     if args.check_config:
         try:
+            _validate_listener_auth(host, launch_config.get("auth_token"))
             test_app = DeskAgentHostApp(config_path=args.config)
             test_app.close()
             print(json.dumps({"status": "valid", "config": args.config or "default"}))
@@ -1592,10 +1938,7 @@ def main() -> None:
             print(json.dumps({"status": "invalid", "error": str(exc)}), file=sys.stderr)
             sys.exit(1)
 
-    config_loader = DeskAgentHostApp.__new__(DeskAgentHostApp)
-    launch_config = config_loader._load_config(args.config)
-    port = args.port or launch_config.get("server", {}).get("port", 8088)
-    host = args.host or launch_config.get("server", {}).get("host", "127.0.0.1")
+    _validate_listener_auth(host, launch_config.get("auth_token"))
     managed_env_names = (
         "WATCHER_APP_ID",
         "WATCHER_APP_RUN_CREDENTIAL",

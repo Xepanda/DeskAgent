@@ -22,6 +22,12 @@ def camera_empty(sequence: int = 1) -> dict:
     }
 
 
+def diagnostic_event(component: str, event_id: str, fields: dict, sequence: int = 1) -> dict:
+    event = camera_empty(sequence)
+    event["data"].update(component=component, event_id=event_id, fields=fields)
+    return event
+
+
 def queue_full_gap(first: int = 3, last: int = 5, count: int = 3) -> dict:
     return {
         "type": "sys.log.gap",
@@ -43,6 +49,12 @@ class NetworkLogConsumerTests(unittest.TestCase):
         self.assertFalse(consumer.ingest(camera_empty(), authorized=True))
         self.assertEqual(consumer.snapshot()["queued"], 0)
 
+        for enabled_value in (1, "true", object()):
+            with self.subTest(enabled=type(enabled_value).__name__):
+                truthy_but_not_true = NetworkLogConsumer(enabled=enabled_value)
+                self.assertFalse(truthy_but_not_true.snapshot()["enabled"])
+                self.assertFalse(truthy_but_not_true.ingest(camera_empty(), authorized=True))
+
         enabled = NetworkLogConsumer(enabled=True)
         self.assertFalse(enabled.ingest(camera_empty(), authorized=False))
         self.assertFalse(enabled.ingest(camera_empty(), authorized="yes"))
@@ -59,6 +71,47 @@ class NetworkLogConsumerTests(unittest.TestCase):
         stored = consumer.drain()
         self.assertEqual(stored, [camera_empty()])
         self.assertNotIn("private", str(stored))
+
+    def test_accepts_all_cr033_events_with_exact_fields(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        events = [
+            camera_empty(),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY"}, 2),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "NOT_READY"}, 3),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTED"}, 4),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "DISCONNECTED"}, 5),
+            diagnostic_event("stm32", "STM32_ACK_TIMEOUT", {}, 6),
+        ]
+        for event in events:
+            with self.subTest(event=event):
+                self.assertTrue(consumer.ingest(event, authorized=True))
+        self.assertEqual(consumer.drain(), events)
+
+    def test_rejects_cr033_wrong_component_level_fields_and_state(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        invalid = [
+            diagnostic_event("camera", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY"}),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "READY", "extra": 1}),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": "ready"}),
+            diagnostic_event("audio", "AUDIO_DRIVER_STATE_SNAPSHOT", {"state": 1}),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTING"}),
+            diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTED", "ip": "192.0.2.1"}),
+            diagnostic_event("stm32", "STM32_ACK_TIMEOUT", {"command": "move"}),
+        ]
+        for event in invalid:
+            with self.subTest(event=event):
+                self.assertFalse(consumer.ingest(event, authorized=True))
+        self.assertEqual(consumer.snapshot()["rejected"], len(invalid))
+        self.assertEqual(consumer.drain(), [])
+
+    def test_cr033_events_remain_unaccepted_without_enable_and_authorization(self) -> None:
+        event = diagnostic_event("network", "TUYA_MQTT_STATE", {"state": "CONNECTED"})
+        default_off = NetworkLogConsumer()
+        self.assertFalse(default_off.ingest(event, authorized=True))
+        enabled = NetworkLogConsumer(enabled=True)
+        self.assertFalse(enabled.ingest(event, authorized=False))
+        self.assertFalse(enabled.ingest(event, authorized="true"))
+        self.assertEqual(enabled.snapshot()["queued"], 0)
 
     def test_rejects_unknown_event_version_level_component_and_nonempty_fields(self) -> None:
         consumer = NetworkLogConsumer(enabled=True)
@@ -77,10 +130,47 @@ class NetworkLogConsumerTests(unittest.TestCase):
             {"type": "tool.request", "data": {"secret": "x"}},
             {"type": "sys.log.event", "data": {"log_schema_version": "1.0.0"}},
         ])
+        out_of_range = camera_empty()
+        out_of_range["data"]["sequence"] = 1 << 64
+        invalid.append(out_of_range)
         for msg in invalid:
             with self.subTest(message=msg):
                 self.assertFalse(consumer.ingest(msg, authorized=True))
         self.assertEqual(consumer.snapshot()["rejected"], len(invalid))
+
+    def test_timestamp_must_use_rfc3339_date_time_and_timezone_syntax(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        invalid_timestamps = [
+            "2026-10-23 12:34:56+00:00",
+            "2026-W43-5T12:34:56+00:00",
+            "2026-10-23T12:34:56",
+            "2026-10-23x12:34:56+00:00",
+            "2026-10-23T12:34:56+00:00trailing",
+        ]
+        for timestamp in invalid_timestamps:
+            event = camera_empty()
+            event["data"]["timestamp_utc"] = timestamp
+            with self.subTest(timestamp=timestamp):
+                self.assertFalse(consumer.ingest(event, authorized=True))
+        valid = camera_empty()
+        valid["data"]["timestamp_utc"] = "2026-10-23T12:34:56.123Z"
+        self.assertTrue(consumer.ingest(valid, authorized=True))
+
+    def test_session_rejects_a_second_stream_or_boot_identity_until_reset(self) -> None:
+        consumer = NetworkLogConsumer(enabled=True)
+        first = camera_empty()
+        self.assertTrue(consumer.ingest(first, authorized=True))
+
+        other_stream = camera_empty(2)
+        other_stream["data"]["stream_id"] = "logstream_02"
+        other_boot = camera_empty(3)
+        other_boot["data"]["boot_id"] = "boot-second"
+        self.assertFalse(consumer.ingest(other_stream, authorized=True))
+        self.assertFalse(consumer.ingest(other_boot, authorized=True))
+        self.assertEqual(consumer.drain(), [first])
+
+        consumer.reset_session()
+        self.assertTrue(consumer.ingest(other_stream, authorized=True))
 
     def test_accepts_only_queue_full_gap_with_exact_contiguous_range(self) -> None:
         consumer = NetworkLogConsumer(enabled=True)
@@ -101,6 +191,7 @@ class NetworkLogConsumerTests(unittest.TestCase):
             {**base, "data": {**base["data"], "last_dropped_sequence": 2}},
             {**base, "data": {**base["data"], "first_dropped_sequence": 0}},
             {**base, "data": {**base["data"], "dropped_count": True}},
+            {**base, "data": {**base["data"], "last_dropped_sequence": 1 << 64}},
         ]
         for msg in invalid:
             with self.subTest(message=msg):

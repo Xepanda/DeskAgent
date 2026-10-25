@@ -136,9 +136,17 @@ class TestE2EFaultInjection(unittest.TestCase):
 
         received_events = []
         event_received = threading.Event()
+        baseline_received = threading.Event()
 
-        def on_state_change(eid: str, old_st: Optional[str], new_st: Optional[str]) -> None:
-            received_events.append((eid, old_st, new_st))
+        def on_state_change(
+            eid: str,
+            old_st: Optional[str],
+            new_st: Optional[str],
+            attributes: Optional[dict[str, Any]],
+        ) -> None:
+            received_events.append((eid, old_st, new_st, attributes))
+            if eid == "light.desk" and old_st is None and new_st == "off":
+                baseline_received.set()
             if new_st == "on":
                 event_received.set()
 
@@ -151,11 +159,17 @@ class TestE2EFaultInjection(unittest.TestCase):
 
         stop_sub = ha.subscribe_state_changes(on_state_change)
         try:
-            # 1. Verify initial connection
+            # 1. Wait for the initial authoritative REST reconciliation.
+            # is_ws_connected is set before reconcile_states() completes, so
+            # it is not a sufficient synchronization point for the baseline.
             deadline = time.time() + 1.0
             while not ha.is_ws_connected and time.time() < deadline:
                 time.sleep(0.02)
             self.assertTrue(ha.is_ws_connected)
+            self.assertTrue(
+                baseline_received.wait(timeout=1.0),
+                "initial reconciliation must publish light.desk None -> off before state changes",
+            )
 
             # 2. Inject abrupt connection drop
             ha_states[0] = {"entity_id": "light.desk", "state": "on"}
@@ -171,7 +185,7 @@ class TestE2EFaultInjection(unittest.TestCase):
 
             self.assertTrue(ha.is_ws_connected, "WebSocket must reconnect after backoff")
             self.assertGreaterEqual(reconcile_call_count, 1)
-            self.assertIn(("light.desk", "off", "on"), received_events)
+            self.assertIn(("light.desk", "off", "on", {}), received_events)
         finally:
             stop_sub()
             ha.close()

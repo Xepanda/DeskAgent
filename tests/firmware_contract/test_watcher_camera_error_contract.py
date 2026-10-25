@@ -12,9 +12,129 @@ CAMERA_C = ROOT / "firmware/components/desk_hardware/src/desk_watcher_camera.c"
 HARDWARE_C = ROOT / "firmware/components/desk_hardware/src/desk_hardware.c"
 CAMERA_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera.h"
 CAMERA_BUS_H = ROOT / "firmware/components/desk_hardware/include/desk_watcher_camera_bus.h"
+TCLAW_BRIDGE_C = ROOT / "firmware/components/desk_tclaw/src/desk_tclaw_bridge.c"
+CLI_C = ROOT / "firmware/components/desk_cli/src/desk_cli.c"
 
 
 class TestWatcherCameraErrorContract(unittest.TestCase):
+    def test_first_sync_readiness_deadline_has_camera_specific_error(self):
+        header = CAMERA_H.read_text(encoding="utf-8")
+        camera = CAMERA_C.read_text(encoding="utf-8")
+        tclaw = TCLAW_BRIDGE_C.read_text(encoding="utf-8")
+        cli = CLI_C.read_text(encoding="utf-8")
+
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT = -28", header)
+        capture = camera.split("int desk_watcher_camera_capture(", 1)[1]
+        initial_sync_wait = capture.split("/* SYNC is a FIFO readiness hint", 1)[0]
+        self.assertIn("SYNC timeout after capture deadline", initial_sync_wait)
+        self.assertIn(
+            "return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT, (int64_t)camera_capture_overall_deadline_us);",
+            initial_sync_wait,
+        )
+        self.assertNotIn("return camera_capture_release(DESK_HW_ERR_TIMEOUT);", initial_sync_wait)
+
+        # Other deadline and transport cases retain their existing meanings.
+        acquire = camera.split("static int camera_capture_acquire_bus(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("DESK_HW_ERR_TIMEOUT", acquire)
+        retry_sync = capture.split("int retry_sync_rc = camera_sync_is_active(&active);", 1)[1]
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_SYNC_IO", retry_sync.split("if (active)", 1)[0])
+        empty_deadline = capture.split("if (!header_received)", 1)[1].split("int ptl_rc", 1)[0]
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_EMPTY", empty_deadline)
+
+        tclaw_names = tclaw.split("static const char *desk_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'case DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT: return "SYNC stayed low until deadline";',
+            tclaw_names,
+        )
+        retryable = tclaw.split("static bool desk_camera_capture_error_retryable(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("rc == DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT", retryable)
+
+        cli_names = cli.split("static const char *cli_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        self.assertIn(
+            'case DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT: return "SYNC-low timeout";',
+            cli_names,
+        )
+
+    def test_spi_bus_acquire_uses_only_idf_supported_infinite_wait(self):
+        source_text = CAMERA_C.read_text(encoding="utf-8")
+        bus_header = CAMERA_BUS_H.read_text(encoding="utf-8")
+        capture = source_text.split("int desk_watcher_camera_capture(", 1)[1]
+
+        self.assertGreaterEqual(capture.count("camera_capture_acquire_bus(camera_capture_deadline_us)"), 2)
+        self.assertEqual(capture.count("return camera_capture_release(acquire_rc, (int64_t)camera_capture_overall_deadline_us);"), 2)
+        self.assertIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", source_text)
+        self.assertIn("desk_watcher_camera_bus_acquire_error", bus_header)
+        acquire = source_text.split("static int camera_capture_acquire_bus(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("desk_watcher_camera_bus_acquire_error(err, ESP_ERR_TIMEOUT", acquire)
+        self.assertLess(acquire.index("if (err != ESP_OK)"),
+                        acquire.index("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)"))
+        self.assertIn("DESK_HW_ERR_TIMEOUT", acquire)
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_SPI", acquire)
+        self.assertLess(acquire.index("if (esp_timer_get_time() >= deadline_us)"),
+                        acquire.index("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)"))
+        self.assertIn("if (esp_timer_get_time() >= deadline_us)", acquire)
+        self.assertIn("camera_capture_release_bus()", acquire)
+        self.assertNotIn("timeout_ticks", acquire)
+        self.assertNotIn("desk_watcher_camera_bus_deadline_ticks", acquire)
+
+        compiler = shutil.which("gcc")
+        if compiler is None:
+            self.skipTest("native gcc is unavailable; deadline C harness is ready for host CI")
+
+        harness = r'''#include <assert.h>
+#include <stdint.h>
+#include "desk_watcher_camera_bus.h"
+
+int mock_spi_device_acquire_bus(uint32_t wait) { return wait == UINT32_MAX ? 0 : -1; }
+
+int main(void) {
+    uint64_t ticks = 999;
+    uint64_t work_deadline = 0;
+    assert(desk_watcher_camera_work_deadline(50000, 1050000, 750000, &work_deadline));
+    assert(work_deadline == 800000); /* 250 ms stays available for MODE0 cleanup */
+    assert(work_deadline < 1050000);
+    assert(desk_watcher_camera_work_deadline(50000, 5050000, 750000, &work_deadline));
+    assert(work_deadline == 4300000); /* cleanup reserve is capped at 750 ms */
+    assert(!desk_watcher_camera_work_deadline(50000, 50000, 750000, &work_deadline));
+    assert(desk_watcher_camera_bus_deadline_ticks(20500, 10000, 1000, 500, &ticks));
+    assert(ticks == 11); /* ceil 10.5ms to the next scheduler tick */
+    ticks = 999;
+    assert(!desk_watcher_camera_bus_deadline_ticks(10000, 10000, 1000, 500, &ticks));
+    assert(ticks == 0); /* expired deadlines cannot wait */
+    ticks = 0;
+    assert(desk_watcher_camera_bus_deadline_ticks(1000000, 0, 1000, 50, &ticks));
+    assert(ticks == 50); /* always cap at a finite acquire timeout */
+    assert(desk_watcher_camera_bus_deadline_ticks(250000, 50000, 10000, 2, &ticks));
+    assert(ticks == 2); /* 200 ms caller budget cannot become a 3.5 s control wait */
+    assert(desk_watcher_camera_bus_deadline_ticks(55000, 50000, 10000, 2, &ticks));
+    assert(ticks == 1); /* sub-tick remaining budget rounds up by at most one tick */
+    assert(!desk_watcher_camera_bus_deadline_ticks(50000, 50000, 10000, 2, &ticks));
+    assert(ticks == 0); /* expired deadline never starts another control read */
+    assert(desk_watcher_camera_spi_deadline_available(100000, 50000, 1200, 12000000, 20000));
+    assert(!desk_watcher_camera_spi_deadline_available(70000, 50000, 1200, 12000000, 20000));
+    assert(!desk_watcher_camera_spi_deadline_available(50000, 50000, 1200, 12000000, 20000));
+    assert(desk_watcher_camera_bus_acquire_error(-7, -7, -3, -24) == -3);
+    assert(desk_watcher_camera_bus_acquire_error(-8, -7, -3, -24) == -24);
+    /* Pinned ESP-IDF rejects finite waits; only portMAX_DELAY is supported. */
+    const uint32_t portMAX_DELAY = UINT32_MAX;
+    assert(mock_spi_device_acquire_bus(portMAX_DELAY) == 0);
+    assert(mock_spi_device_acquire_bus(1) != 0);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="desk-camera-deadline-") as temp_dir:
+            source = Path(temp_dir) / "camera_deadline_test.c"
+            executable = Path(temp_dir) / "camera_deadline_test.exe"
+            source.write_text(harness, encoding="utf-8")
+            built = subprocess.run(
+                [compiler, "-std=c11", "-Wall", "-Wextra", "-Werror",
+                 f"-I{CAMERA_BUS_H.parent}", str(source), "-o", str(executable)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            run = subprocess.run([str(executable)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
     def test_spi_bus_ownership_releases_once_after_reacquire_deadline(self):
         """Exercise the same ownership transition used by capture cleanup."""
         harness = r'''#include <assert.h>
@@ -25,6 +145,13 @@ static unsigned release_calls;
 static void release_bus(void) { ++release_calls; }
 static void cleanup(bool *owned) {
     if (desk_watcher_camera_bus_take_release(owned)) release_bus();
+}
+static int capture_cleanup(int capture_rc, bool stop_succeeded, bool *needs_recovery,
+                           bool *bus_owned, bool *mutex_owned) {
+    cleanup(bus_owned);
+    int result = desk_watcher_camera_cleanup_result(capture_rc, stop_succeeded, -26, needs_recovery);
+    *mutex_owned = false; /* cleanup releases the capture mutex after recording recovery state */
+    return result;
 }
 
 int main(void) {
@@ -40,19 +167,40 @@ int main(void) {
     desk_watcher_camera_bus_set_acquired(&owned, false); /* failed acquire */
     cleanup(&owned);
     assert(release_calls == 2);
+
+    bool recovery_required = false;
+    bool mutex_owned = true;
+    desk_watcher_camera_bus_set_acquired(&owned, true);
+    int capture_rc = capture_cleanup(0, false, &recovery_required, &owned, &mutex_owned);
+    assert(capture_rc == -26 && recovery_required && !mutex_owned && !owned);
+    assert(release_calls == 3); /* failed MODE0 still releases SPI ownership exactly once */
+    mutex_owned = true; /* next capture holds the same mutex while retrying MODE0 */
+    capture_rc = desk_watcher_camera_cleanup_result(0, true, -26, &recovery_required);
+    assert(capture_rc == 0 && !recovery_required && mutex_owned);
+    mutex_owned = false;
+    assert(!mutex_owned);
     return 0;
 }
 '''
         source_text = CAMERA_C.read_text(encoding="utf-8")
         capture = source_text.split("int desk_watcher_camera_capture(", 1)[1]
-        self.assertIn("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)", capture)
+        self.assertIn("desk_watcher_camera_bus_set_acquired(&s_capture_bus_acquired, true)", source_text)
         self.assertIn("camera_capture_release_bus()", capture)
         empty_deadline = capture.split("if (!header_received)", 1)[1].split("int ptl_rc", 1)[0]
-        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", empty_deadline)
+        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY, (int64_t)camera_capture_overall_deadline_us)", empty_deadline)
         release = source_text.split("static int camera_capture_release(", 1)[1].split("\n}", 1)[0]
         self.assertIn("camera_capture_release_bus()", release)
         bus_release = source_text.split("static void camera_capture_release_bus(", 1)[1].split("\n}", 1)[0]
         self.assertIn("desk_watcher_camera_bus_take_release(&s_capture_bus_acquired)", bus_release)
+        self.assertIn("camera_control_mode_until(0U, 0U, overall_deadline_us)", release)
+        self.assertIn("desk_watcher_camera_cleanup_result", release)
+        self.assertIn("next capture must recover idle", release)
+        self.assertIn("xSemaphoreGive(s_cam_mutex)", release)
+        self.assertLess(release.index("desk_watcher_camera_cleanup_result"), release.index("xSemaphoreGive(s_cam_mutex)"))
+        recovery = capture.split("if (s_camera_needs_idle_recovery)", 1)[1].split("/* MODE request", 1)[0]
+        self.assertIn("camera_control_mode_until(0U, 0U, (int64_t)camera_capture_overall_deadline_us)", recovery)
+        self.assertIn("xSemaphoreGive(s_cam_mutex)", recovery)
+        self.assertIn("s_camera_needs_idle_recovery = false", recovery)
         compiler = shutil.which("gcc")
         if compiler is None:
             self.skipTest("native gcc is unavailable; C harness is ready for host CI")
@@ -72,11 +220,29 @@ int main(void) {
 
     def test_hardware_wrapper_propagates_camera_driver_error(self):
         source = HARDWARE_C.read_text(encoding="utf-8")
-        capture = source.split("int desk_hardware_camera_capture_jpeg(", 1)[1]
+        capture = source.split("static int camera_capture_jpeg_unlocked(", 1)[1]
         capture = capture.split("\n}", 1)[0]
         self.assertIn("return drv_ret;", capture)
         driver_path = capture.split("if (s_board_driver_ops", 1)[1].split("\n    }", 1)[0]
         self.assertNotIn("return DESK_HW_ERR_UNAVAILABLE;", driver_path)
+
+    def test_tclaw_camera_failure_keeps_driver_code_and_actionable_cause(self):
+        source = TCLAW_BRIDGE_C.read_text(encoding="utf-8")
+        names = source.split("static const char *desk_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        for error_name in (
+            "PTL/media protocol validation failed",
+            "media payload CRC mismatch",
+            "camera SYNC input read failed",
+            "SPI transport failed",
+            "camera FIFO remained empty until deadline",
+        ):
+            self.assertIn(error_name, names)
+        camera_tool = source.split('else if (strcmp(operation, "camera.capture")', 1)[1]
+        camera_tool = camera_tool.split("/* 4. Display Expression Tool */", 1)[0]
+        self.assertIn('"Camera capture rc=%d: %s"', camera_tool)
+        self.assertIn("return_code = cam_rc;", camera_tool)
+        self.assertIn("retryable = desk_camera_capture_error_retryable(cam_rc);", camera_tool)
+        self.assertNotIn("return_code = DESK_HW_ERR_UNAVAILABLE;", camera_tool)
 
     def test_driver_names_sync_spi_protocol_and_crc_failures(self):
         header = CAMERA_H.read_text(encoding="utf-8")
@@ -102,6 +268,40 @@ int main(void) {
         ):
             self.assertIn(diagnostic, source)
 
+    def test_resynchronization_preserves_spi_transport_error(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        scan = source.split("static int camera_read_resynchronized_header(", 1)[1].split("\n}", 1)[0]
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        scan_failure = capture.split("if (scan_rc != 0)", 1)[1].split("s_ptl_resynchronizing = false", 1)[0]
+        self.assertIn("SPI PTL resynchronization scan failed", scan)
+        self.assertIn("return DESK_WATCHER_CAMERA_ERR_SPI;", scan)
+        self.assertIn("return esp_timer_get_time() >= capture_deadline_us ? DESK_HW_ERR_TIMEOUT : DESK_WATCHER_CAMERA_ERR_PROTOCOL;", scan)
+        self.assertIn("return camera_capture_release(scan_rc, (int64_t)camera_capture_overall_deadline_us);", scan_failure)
+        self.assertNotIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_PROTOCOL, (int64_t)camera_capture_overall_deadline_us);", scan_failure)
+
+    def test_resynchronization_copies_all_bytes_already_clocked_after_header(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        scan = source.split("static int camera_read_resynchronized_header(", 1)[1].split("\n}", 1)[0]
+
+        # The SPI transfer consumes the complete 16-byte chunk before the
+        # rolling scanner can identify a header. The tail after the header is
+        # already body data and must be prefetched exactly as in the locked
+        # WatcheRobot receiver; omitting it shifts every recovered frame.
+        self.assertIn("*prefetched = sizeof(chunk) - i - 1U;", scan)
+        self.assertIn("memcpy(s_ptl_body, chunk + i + 1U, *prefetched)", scan)
+        self.assertNotIn("i + 1U - *prefetched", scan)
+
+    def test_resynchronization_ends_each_spi_chunk_to_match_locked_ptl_receiver(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        scan = source.split("static int camera_read_resynchronized_header(", 1)[1].split("\n}", 1)[0]
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        normal_header = capture.split("spi_transaction_t hdr_trans", 1)[1].split("};", 1)[0]
+
+        # The official receiver uses spi_read(..., false) for resync scans,
+        # but holds CS across the ordinary header/body pair.
+        self.assertIn(".rx_buffer = chunk, .flags = 0", scan)
+        self.assertIn(".flags = SPI_TRANS_CS_KEEP_ACTIVE", normal_header)
+
     def test_zero_ptl_header_has_distinct_empty_error_and_spi_failures_keep_stage(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
@@ -109,9 +309,9 @@ int main(void) {
         self.assertIn("CAM_PTL_CAPTURE_TIMEOUT_MS", capture)
         self.assertIn("camera_capture_deadline_us", capture)
         self.assertIn("CAM_PTL_EMPTY_BACKOFF_MS", capture)
-        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY)", capture)
-        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI)", capture)
-        self.assertGreaterEqual(capture.count("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI)"), 2)
+        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_EMPTY, (int64_t)camera_capture_overall_deadline_us)", capture)
+        self.assertIn("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI, (int64_t)camera_capture_overall_deadline_us)", capture)
+        self.assertGreaterEqual(capture.count("camera_capture_release(DESK_WATCHER_CAMERA_ERR_SPI, (int64_t)camera_capture_overall_deadline_us)"), 2)
 
     def test_hx_uart_handshake_precedes_ready_and_capture_mode_is_restored(self):
         source = CAMERA_C.read_text(encoding="utf-8")
@@ -123,7 +323,7 @@ int main(void) {
         self.assertIn("WATCHER_CAM_HX_UART_BAUD  921600", source)
         self.assertIn("uart_is_driver_installed(WATCHER_CAM_HX_UART)", source)
         self.assertLess(init.index("camera_control_init()"), init.index("s_camera_initialized = true"))
-        self.assertIn("camera_control_mode(1U, 0U)", capture)
+        self.assertIn("camera_control_mode_until(1U, 0U, camera_capture_deadline_us)", capture)
         self.assertIn("camera_control_mode(0U, 0U)", source)
 
     def test_ptl_resync_is_time_and_work_bounded_and_shared_spi_is_not_freed(self):
@@ -163,6 +363,28 @@ int main(void) {
         self.assertIn("base_header[0]", empty_poll)
         self.assertIn("sync read rc=%d", empty_poll)
 
+    def test_sync_i2c_failure_during_empty_header_retry_is_logged(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1]
+        retry_sync = capture.split("while (esp_timer_get_time() < camera_capture_deadline_us)", 2)[2]
+        retry_sync = retry_sync.split("if (!retry_sync)", 1)[0]
+
+        self.assertIn("int retry_sync_rc = camera_sync_is_active(&active);", retry_sync)
+        self.assertIn("SYNC retry read failed: PCA9535 INPUT0 rc=%d", retry_sync)
+        self.assertIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_SYNC_IO, (int64_t)camera_capture_overall_deadline_us);", retry_sync)
+
+    def test_camera_output_buffer_too_small_has_camera_specific_error_mapping(self):
+        header = CAMERA_H.read_text(encoding="utf-8")
+        camera = CAMERA_C.read_text(encoding="utf-8")
+        tclaw = TCLAW_BRIDGE_C.read_text(encoding="utf-8")
+
+        self.assertIn("DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL = -27", header)
+        capture = camera.split("int desk_watcher_camera_capture(", 1)[1]
+        small_buffer = capture.split("if (jpeg_sz > max_len)", 1)[1].split("memcpy(out_buf", 1)[0]
+        self.assertIn("return camera_capture_release(DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL, (int64_t)camera_capture_overall_deadline_us);", small_buffer)
+        names = tclaw.split("static const char *desk_camera_capture_error_name(", 1)[1].split("\n}", 1)[0]
+        self.assertIn('case DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL: return "JPEG output buffer too small";', names)
+
     def test_empty_headers_retry_until_capture_deadline_and_allow_later_valid_header(self):
         source = CAMERA_C.read_text(encoding="utf-8")
         capture = source.split("int desk_watcher_camera_capture(", 1)[1]
@@ -182,6 +404,60 @@ int main(void) {
         self.assertIn("size_t *out_len, uint32_t timeout_ms);", camera_header)
         self.assertIn("size_t *out_len, uint32_t timeout_ms)", camera)
         self.assertIn("(unsigned)timeout_ms", camera)
+
+    def test_capture_retry_budget_covers_control_mode_and_empty_fifo_warmup(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1].split("int desk_watcher_camera_deinit", 1)[0]
+        self.assertIn("CAM_PTL_CAPTURE_TIMEOUT_MS 5000U", source)
+        self.assertIn("camera_capture_deadline_us", capture)
+        self.assertLess(capture.index("camera_capture_deadline_us ="), capture.index("camera_control_mode_until(1U, 0U, camera_capture_deadline_us)"))
+        self.assertIn("while (esp_timer_get_time() < camera_capture_deadline_us)", capture)
+        self.assertIn("CAM_PTL_EMPTY_BACKOFF_MS", capture)
+        self.assertNotIn("pdMS_TO_TICKS(1000)", capture)
+
+    def test_short_capture_deadline_bounds_mutex_and_hx_control_waits(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        capture = source.split("int desk_watcher_camera_capture(", 1)[1].split("int desk_watcher_camera_deinit", 1)[0]
+        exchange = source.split("static int camera_control_exchange_until(", 1)[1].split("static int camera_control_exchange(", 1)[0]
+        mode = source.split("static int camera_control_mode_until(", 1)[1].split("static int camera_control_mode(", 1)[0]
+        self.assertLess(capture.index("camera_capture_overall_deadline_us ="), capture.index("xSemaphoreTake(s_cam_mutex"))
+        self.assertIn("desk_watcher_camera_work_deadline", capture)
+        self.assertLess(capture.index("camera_capture_work_deadline_us ="), capture.index("xSemaphoreTake(s_cam_mutex"))
+        self.assertIn("desk_watcher_camera_bus_deadline_ticks", capture)
+        self.assertIn("xSemaphoreTake(s_cam_mutex, (TickType_t)mutex_wait_ticks)", capture)
+        self.assertIn("camera_control_mode_until(1U, 0U, camera_capture_deadline_us)", capture)
+        self.assertNotIn("camera_control_mode(1U, 0U)", capture)
+        self.assertIn("camera_control_status_until(&state, deadline_us)", mode)
+        self.assertIn("camera_control_exchange_until(request, id, deadline_us, &state)", mode)
+        self.assertIn("camera_control_status_until(&state, deadline_us)", mode)
+        self.assertNotIn("CAM_CONTROL_MODE_TIMEOUT_MS", mode)
+        self.assertIn("desk_watcher_camera_bus_deadline_ticks", exchange)
+        self.assertIn("pdMS_TO_TICKS(20)", exchange)
+        self.assertIn("camera_capture_release(control_rc, (int64_t)camera_capture_overall_deadline_us)", capture)
+        self.assertIn("camera_read_resynchronized_header(base_header, &body_size, &prefetched,", capture)
+        self.assertIn("camera_capture_spi_budget_available(camera_capture_deadline_us, sizeof(base_header))", capture)
+        self.assertIn("camera_capture_spi_budget_available(camera_capture_deadline_us, body_size - prefetched)", capture)
+        self.assertIn("esp_timer_get_time() >= camera_capture_deadline_us", capture)
+        self.assertIn("camera_capture_spi_budget_available(capture_deadline_us, sizeof(chunk))", source)
+
+    def test_hx_mode_transition_drains_pending_ptl_frame_like_upstream(self):
+        source = CAMERA_C.read_text(encoding="utf-8")
+        mode = source.split("static int camera_control_mode_until(", 1)[1].split("static int camera_control_mode(", 1)[0]
+        drain = source.split("static void camera_control_drain_transition_frame(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("state.mode == 3U", mode)
+        self.assertIn("camera_control_drain_transition_frame(deadline_us)", mode)
+        self.assertIn("s_capture_bus_acquired", drain)
+        self.assertIn("bool ready = resynchronizing", drain)
+        self.assertIn("camera_read_resynchronized_header", drain)
+        self.assertIn("spi_device_acquire_bus(s_spi_dev, portMAX_DELAY)", drain)
+        self.assertIn("CAM_SYNC", source)
+        self.assertIn("desk_watcher_camera_parse_ptl_header", drain)
+        self.assertIn("spi_device_release_bus(s_spi_dev)", drain)
+
+    def test_cli_camera_capture_uses_upstream_five_second_default(self):
+        cli = (ROOT / "firmware/components/desk_cli/src/desk_cli.c").read_text(encoding="utf-8")
+        camera_command = cli.rsplit("static void cmd_camera(int argc, char *argv[])", 1)[1].split("static void cmd_body", 1)[0]
+        self.assertIn("&out_len, 5000)", camera_command)
 
 
 if __name__ == "__main__":

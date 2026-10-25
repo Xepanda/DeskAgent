@@ -93,12 +93,30 @@
       "additionalProperties": false,
       "properties": {
         "entity_id": { "type": "string" },
-        "old_state": { "type": ["string", "null"] },
-        "new_state": { "type": "string" },
-        "attributes": { "type": "object" },
+        "old_state": {
+          "type": ["string", "null"],
+          "description": "Prior entity state; null means no previous cached state was available."
+        },
+        "new_state": {
+          "type": ["string", "null"],
+          "description": "Current entity state. Null only signals that the entity was removed."
+        },
+        "attributes": {
+          "type": "object",
+          "description": "Complete post-change attribute snapshot for a present entity. May be emitted when old_state equals new_state. Omitted when new_state is null (entity removal)."
+        },
         "timestamp": { "type": "string", "format": "date-time" },
         "context_id": { "type": "string" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "new_state": { "type": "null" } },
+            "required": ["new_state"]
+          },
+          "then": { "not": { "required": ["attributes"] } }
+        }
+      ]
     }
   }
 }

@@ -6,6 +6,8 @@
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_log_source.h"
 #include "desk_tclaw_bridge.h"
+#include "desk_notification.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +19,8 @@
 #include <fcntl.h>
 #ifdef ESP_PLATFORM
 #include <sys/poll.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_attr.h"
 #include "tal_api.h"
 #define DESK_PROTOCOL_BSS EXT_RAM_BSS_ATTR
@@ -32,6 +36,94 @@
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#ifdef ESP_PLATFORM
+#include "mbedtls/sha256.h"
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+#include <openssl/evp.h>
+#endif
+
+static pthread_mutex_t s_ws_camera_owner_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char s_ws_camera_owner_id[32];
+
+#define DESK_CAMERA_STREAM_FPS 15.0f
+#define DESK_CAMERA_STREAM_PERIOD_MS 66U
+#define DESK_CAMERA_STREAM_READY_TIMEOUT_MS 1800U
+#define DESK_CAMERA_CAPTURE_TIMEOUT_MS 5000U
+#define DESK_CAMERA_STREAM_MAX_JPEG (DESK_WSPK_MAX_PAYLOAD_SIZE - 20U)
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    bool active;
+    bool starting;
+    bool stop_requested;
+    bool external_join;
+    bool ready;
+    bool ack_sent;
+    bool producer_failed;
+    bool thread_started;
+    bool cleanup_in_progress;
+    pthread_t thread;
+    uint16_t stream_id;
+    uint16_t last_stopped_stream_id;
+    uint32_t sequence;
+    uint32_t last_timestamp_ms;
+    uint64_t next_capture_ms;
+    char client_id[32];
+    char session_id[65];
+    char last_client_id[32];
+    char last_session_id[65];
+    uint8_t *frame_slot;
+    size_t frame_len;
+    uint32_t source_drop_count;
+    uint32_t transport_drop_count;
+} desk_camera_stream_state_t;
+
+static desk_camera_stream_state_t s_camera_stream = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .changed = PTHREAD_COND_INITIALIZER,
+};
+static uint16_t s_camera_stream_id_seed;
+static atomic_int s_camera_exclusive_state = ATOMIC_VAR_INIT(0); /* 0 idle, 1 capture, 2 stream */
+static int desk_sdk_camera_stream_stop_internal(bool from_worker);
+static bool desk_sdk_camera_stream_available(void);
+static bool desk_sdk_log_command_id_valid(const char *id);
+static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed,
+                                         size_t allowed_count);
+static bool desk_sdk_log_pairing_is_complete(void);
+static void desk_sdk_notification_status_callback(
+    const desk_notification_status_event_t *event, void *user_data);
+static void desk_sdk_summary_ack_callback(const char *summary_id, const char *source,
+                                          void *user_data);
+
+static uint64_t desk_sdk_camera_worker_now_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)now.tv_nsec / 1000000ULL;
+}
+
+#ifdef DESK_SDK_TESTING
+static bool s_test_camera_stream_available;
+static int (*s_test_camera_binary_send_hook)(const char *, size_t);
+void desk_sdk_test_camera_stream_set_available(bool available) { s_test_camera_stream_available = available; }
+void desk_sdk_test_camera_binary_send_set_hook(int (*hook)(const char *, size_t)) { s_test_camera_binary_send_hook = hook; }
+uint32_t desk_sdk_test_camera_stream_transport_drop_count(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    uint32_t count = s_camera_stream.transport_drop_count;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    return count;
+}
+uint32_t desk_sdk_test_camera_stream_source_drop_count(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    uint32_t count = s_camera_stream.source_drop_count;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    return count;
+}
+#endif
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -47,6 +139,7 @@ static void desk_sdk_format_iso8601(time_t t, char *out_buf, size_t buf_len)
 
 static bool s_client_connected = false;
 static uint32_t s_event_seq = 0;
+static atomic_uint_least32_t s_roller_input_send_failures = ATOMIC_VAR_INIT(0);
 static desk_sdk_outbound_send_cb_t s_outbound_cb = NULL;
 static void *s_outbound_user_data = NULL;
 static desk_sdk_tool_response_cb_t s_tool_response_cb = NULL;
@@ -70,12 +163,184 @@ static char s_pair_target_mode[32] = "";
 static char s_pair_host[INET_ADDRSTRLEN] = "";
 static uint16_t s_pair_websocket_port = 0;
 static bool desk_sdk_is_lower_hex_64(const char *s);
+static int desk_sdk_audio_stream_begin_command(const char *json_in,
+                                               char *out_buf, size_t max_out_len,
+                                               uint32_t connection_generation);
+static int desk_sdk_audio_stop_command(const char *json_in,
+                                       char *out_buf, size_t max_out_len,
+                                       uint32_t connection_generation);
+static bool desk_sdk_audio_playback_available(void);
+static int desk_sdk_build_capabilities_json(char *out, size_t out_len);
+
+/* The official SDK's `audio.stream` means host-to-device PCM playback only.
+ * The A1 status API reports ready only after the Watcher audio resources,
+ * including the speaker and stream queue, have initialized successfully. */
+static bool desk_sdk_audio_playback_available(void)
+{
+    desk_hardware_audio_status_t status = {0};
+    return desk_hardware_audio_get_status(&status) == DESK_HW_OK && status.ready;
+}
+
+static int desk_sdk_build_capabilities_json(char *out, size_t out_len)
+{
+    if (!out || out_len < 3) return -1;
+    const char *capabilities[8];
+    size_t count = 0;
+    capabilities[count++] = DESK_SDK_CAP_MOTION;
+    capabilities[count++] = DESK_SDK_CAP_CAMERA;
+    capabilities[count++] = DESK_SDK_CAP_EXPRESSION;
+    capabilities[count++] = DESK_SDK_CAP_EXPRESSION_ALT;
+    capabilities[count++] = DESK_SDK_CAP_MCP_TOOLS;
+    capabilities[count++] = DESK_SDK_CAP_INPUTS;
+    if (desk_sdk_camera_stream_available())
+        capabilities[count++] = DESK_SDK_CAP_CAMERA_STREAM;
+    if (desk_sdk_audio_playback_available())
+        capabilities[count++] = DESK_SDK_CAP_AUDIO_STREAM;
+
+    size_t used = 0;
+    int n = snprintf(out, out_len, "[");
+    if (n < 0 || (size_t)n >= out_len) return -1;
+    used = (size_t)n;
+    for (size_t i = 0; i < count; ++i) {
+        n = snprintf(out + used, out_len - used, "%s\"%s\"", i ? "," : "",
+                     capabilities[i]);
+        if (n < 0 || (size_t)n >= out_len - used) return -1;
+        used += (size_t)n;
+    }
+    n = snprintf(out + used, out_len - used, "]");
+    return n >= 0 && (size_t)n < out_len - used ? 0 : -1;
+}
+
+#define DESK_SDK_AUDIO_STOP_TIMEOUT_MS 1500U
+typedef struct {
+    pthread_mutex_t mutex;
+    bool active;
+    bool hash_ready;
+    bool last_seen;
+    bool terminal_sent;
+    bool initial_flow_sent;
+    bool cancel_requested;
+    bool digest_mismatch;
+    uint64_t handle;
+    uint32_t generation;
+    uint32_t stream_id;
+    uint32_t total_bytes;
+    uint32_t received_bytes;
+    uint32_t expected_sequence;
+    uint8_t expected_digest[32];
+    char expected_digest_hex[65];
+    char actual_digest_hex[65];
+    char terminal_reason[32];
+#ifdef ESP_PLATFORM
+    mbedtls_sha256_context hash;
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    EVP_MD_CTX *hash;
+#else
+    void *hash;
+#endif
+} desk_sdk_audio_stream_t;
+static desk_sdk_audio_stream_t s_sdk_audio = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+static atomic_uint_fast64_t s_sdk_audio_handle = ATOMIC_VAR_INIT(1);
+
+static int desk_sdk_audio_hash_begin_locked(void)
+{
+#ifdef ESP_PLATFORM
+    mbedtls_sha256_init(&s_sdk_audio.hash);
+    if (mbedtls_sha256_starts(&s_sdk_audio.hash, 0) != 0) return -1;
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    s_sdk_audio.hash = EVP_MD_CTX_new();
+    if (!s_sdk_audio.hash || EVP_DigestInit_ex(s_sdk_audio.hash, EVP_sha256(), NULL) != 1) return -1;
+#else
+    return -1;
+#endif
+    s_sdk_audio.hash_ready = true;
+    return 0;
+}
+
+static int desk_sdk_audio_hash_update_locked(const uint8_t *data, size_t len)
+{
+    if (!s_sdk_audio.hash_ready || !data || !len) return -1;
+#ifdef ESP_PLATFORM
+    return mbedtls_sha256_update(&s_sdk_audio.hash, data, len) == 0 ? 0 : -1;
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    return EVP_DigestUpdate(s_sdk_audio.hash, data, len) == 1 ? 0 : -1;
+#else
+    return -1;
+#endif
+}
+
+static void desk_sdk_audio_hash_free_locked(void)
+{
+    if (!s_sdk_audio.hash_ready) return;
+#ifdef ESP_PLATFORM
+    mbedtls_sha256_free(&s_sdk_audio.hash);
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    EVP_MD_CTX_free(s_sdk_audio.hash);
+    s_sdk_audio.hash = NULL;
+#endif
+    s_sdk_audio.hash_ready = false;
+}
+
+static int desk_sdk_audio_hash_finish_locked(uint8_t digest[32])
+{
+    if (!s_sdk_audio.hash_ready || !digest) return -1;
+#ifdef ESP_PLATFORM
+    int rc = mbedtls_sha256_finish(&s_sdk_audio.hash, digest);
+#elif defined(DESK_SDK_OPENSSL_TESTING)
+    unsigned int digest_len = 0;
+    int rc = EVP_DigestFinal_ex(s_sdk_audio.hash, digest, &digest_len) == 1 && digest_len == 32 ? 0 : -1;
+#else
+    int rc = -1;
+#endif
+    desk_sdk_audio_hash_free_locked();
+    return rc == 0 ? 0 : -1;
+}
+
+static int desk_sdk_audio_hex_decode(const char *hex, uint8_t out[32])
+{
+    if (!desk_sdk_is_lower_hex_64(hex) || !out) return -1;
+    for (size_t i = 0; i < 32; ++i) {
+        unsigned hi = hex[i * 2] <= '9' ? (unsigned)(hex[i * 2] - '0') : (unsigned)(hex[i * 2] - 'a' + 10);
+        unsigned lo = hex[i * 2 + 1] <= '9' ? (unsigned)(hex[i * 2 + 1] - '0') : (unsigned)(hex[i * 2 + 1] - 'a' + 10);
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+static void desk_sdk_audio_hex_encode(const uint8_t digest[32], char out[65])
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[64] = '\0';
+}
+
+#ifdef DESK_SDK_TESTING
+void desk_sdk_test_prepare_log_pair(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    s_paired = true;
+    strcpy(s_pair_request_id, "11111111111111111111111111111111");
+    strcpy(s_pair_daemon_instance_id, "22222222222222222222222222222222");
+    strcpy(s_active_pairing_token,
+           "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    strcpy(s_pair_target_mode, "python_sdk");
+    strcpy(s_pair_host, "127.0.0.1");
+    s_pair_websocket_port = 8765;
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+}
+#endif
 
 /* CR-009 L2 stream lease. Only structured A1 records are serialized. */
 static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool s_local_log_enabled = false;
 static bool s_log_stream_active = false;
-static bool s_log_camera_only = false;
+static uint8_t s_log_component_mask = 0;
+static bool s_log_audio_snapshot_pending = false;
 static char s_log_stream_id[33] = "";
 static char s_log_min_level[8] = "WARN";
 static char s_log_boot_id[33] = "";
@@ -97,6 +362,8 @@ void desk_sdk_bridge_set_local_log_enabled(bool enabled)
     s_local_log_enabled = enabled;
     if (!enabled) {
         s_log_stream_active = false;
+        s_log_component_mask = 0;
+        s_log_audio_snapshot_pending = false;
         s_log_stream_id[0] = '\0';
         desk_sdk_log_source_reset_locked();
     }
@@ -107,7 +374,8 @@ void desk_sdk_bridge_log_session_closed(void)
 {
     pthread_mutex_lock(&s_log_mutex);
     s_log_stream_active = false;
-    s_log_camera_only = false;
+    s_log_component_mask = 0;
+    s_log_audio_snapshot_pending = false;
     s_log_stream_id[0] = '\0';
     desk_sdk_log_source_reset_locked();
     pthread_mutex_unlock(&s_log_mutex);
@@ -139,20 +407,92 @@ int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len)
             (unsigned long long)s_log_pending_gap.dropped_count);
         s_log_has_pending_gap = false;
     } else if (s_log_has_pending_record) {
-        if (s_log_pending_record.event_id != DESK_WATCHER_LOG_EVENT_CAMERA_CAPTURE_EMPTY) {
+        const char *component = NULL, *event_id = NULL, *state = NULL;
+        const char *level = NULL;
+        uint8_t component_bit = 0;
+        const desk_watcher_log_record_t *record = &s_log_pending_record;
+        switch (record->event_id) {
+        case DESK_WATCHER_LOG_EVENT_CAMERA_CAPTURE_EMPTY:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_CAMERA &&
+                record->level == DESK_WATCHER_LOG_LEVEL_WARN &&
+                record->state == DESK_WATCHER_LOG_STATE_NONE) {
+                component = "camera"; event_id = "CAMERA_CAPTURE_EMPTY";
+                level = "WARN"; component_bit = 1U << 0;
+            }
+            break;
+        case DESK_WATCHER_LOG_EVENT_AUDIO_DRIVER_STATE_SNAPSHOT:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_AUDIO &&
+                record->level == DESK_WATCHER_LOG_LEVEL_WARN &&
+                (record->state == DESK_WATCHER_LOG_STATE_READY ||
+                 record->state == DESK_WATCHER_LOG_STATE_NOT_READY)) {
+                component = "audio"; event_id = "AUDIO_DRIVER_STATE_SNAPSHOT";
+                level = "WARN"; component_bit = 1U << 1;
+                state = record->state == DESK_WATCHER_LOG_STATE_READY ? "READY" : "NOT_READY";
+            }
+            break;
+        case DESK_WATCHER_LOG_EVENT_TUYA_MQTT_STATE:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_NETWORK &&
+                record->level == DESK_WATCHER_LOG_LEVEL_WARN &&
+                (record->state == DESK_WATCHER_LOG_STATE_CONNECTED ||
+                 record->state == DESK_WATCHER_LOG_STATE_DISCONNECTED)) {
+                component = "network"; event_id = "TUYA_MQTT_STATE";
+                level = "WARN"; component_bit = 1U << 2;
+                state = record->state == DESK_WATCHER_LOG_STATE_CONNECTED ? "CONNECTED" : "DISCONNECTED";
+            }
+            break;
+        case DESK_WATCHER_LOG_EVENT_STM32_ACK_TIMEOUT:
+            if (record->component == DESK_WATCHER_LOG_COMPONENT_STM32 &&
+                record->level == DESK_WATCHER_LOG_LEVEL_ERROR &&
+                record->state == DESK_WATCHER_LOG_STATE_NONE) {
+                component = "stm32"; event_id = "STM32_ACK_TIMEOUT";
+                level = "ERROR"; component_bit = 1U << 3;
+            }
+            break;
+        default:
+            break;
+        }
+        if (!event_id || (s_log_component_mask &&
+                          !(s_log_component_mask & component_bit))) {
             s_log_has_pending_record = false;
             pthread_mutex_unlock(&s_log_mutex);
             return 0;
         }
-        n = snprintf(out_json, out_len,
-            "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"WARN\",\"component\":\"camera\",\"event_id\":\"CAMERA_CAPTURE_EMPTY\",\"fields\":{}}}",
-            s_log_stream_id, s_log_boot_id,
-            (unsigned long long)s_log_pending_record.sequence,
-            (unsigned long long)s_log_pending_record.uptime_ms);
+        if (state) {
+            n = snprintf(out_json, out_len,
+                "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"%s\",\"component\":\"%s\",\"event_id\":\"%s\",\"fields\":{\"state\":\"%s\"}}}",
+                s_log_stream_id, s_log_boot_id,
+                (unsigned long long)record->sequence, (unsigned long long)record->uptime_ms,
+                level, component, event_id, state);
+        } else {
+            n = snprintf(out_json, out_len,
+                "{\"type\":\"sys.log.event\",\"data\":{\"log_schema_version\":\"1.0.0\",\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"sequence\":%llu,\"uptime_ms\":%llu,\"level\":\"%s\",\"component\":\"%s\",\"event_id\":\"%s\",\"fields\":{}}}",
+                s_log_stream_id, s_log_boot_id,
+                (unsigned long long)record->sequence, (unsigned long long)record->uptime_ms,
+                level, component, event_id);
+        }
         s_log_has_pending_record = false;
     }
     pthread_mutex_unlock(&s_log_mutex);
     return n > 0 && (size_t)n < out_len ? n : (n < 0 ? -1 : 0);
+}
+
+void desk_sdk_bridge_log_subscribe_ack_sent(void)
+{
+    pthread_mutex_lock(&s_log_mutex);
+    bool publish_snapshot = s_log_audio_snapshot_pending && s_local_log_enabled &&
+        s_log_stream_active && desk_sdk_ws_client_is_authenticated() &&
+        desk_sdk_log_pairing_is_complete() && desk_watcher_log_source_is_enabled();
+    s_log_audio_snapshot_pending = false;
+    pthread_mutex_unlock(&s_log_mutex);
+    if (publish_snapshot) {
+#if defined(DESK_SDK_TESTING) || defined(DESK_SDK_OPENSSL_TESTING)
+        /* Host contract builds have no ESP32 audio source; exercise the same
+         * post-ACK queue transition with the typed readiness producer. */
+        (void)desk_watcher_log_source_publish_audio_driver_state(false);
+#else
+        (void)desk_hardware_publish_audio_driver_state_snapshot();
+#endif
+    }
 }
 
 #define DESK_SDK_PAIRING_CODE_TTL_MS (5ULL * 60ULL * 1000ULL)
@@ -181,6 +521,52 @@ static bool desk_sdk_monotonic_now_ms(uint64_t *now_ms)
     return true;
 }
 #endif
+
+#ifdef DESK_SDK_TESTING
+typedef int (*desk_sdk_test_roller_input_send_hook_t)(desk_sdk_roller_delta_t delta,
+                                                       int64_t timestamp_ms);
+static desk_sdk_test_roller_input_send_hook_t s_test_roller_input_send_hook;
+
+void desk_sdk_test_set_roller_input_send_hook(desk_sdk_test_roller_input_send_hook_t hook)
+{
+    s_test_roller_input_send_hook = hook;
+}
+#endif
+
+static void desk_sdk_roller_input_observer(desk_roller_delta_t delta, void *user_data)
+{
+    (void)user_data;
+    desk_sdk_roller_delta_t sdk_delta;
+    if (delta == DESK_ROLLER_DELTA_UP) {
+        sdk_delta = DESK_SDK_ROLLER_DELTA_POSITIVE;
+    } else if (delta == DESK_ROLLER_DELTA_DOWN) {
+        sdk_delta = DESK_SDK_ROLLER_DELTA_NEGATIVE;
+    } else {
+        atomic_fetch_add(&s_roller_input_send_failures, 1);
+        return;
+    }
+
+    uint64_t monotonic_ms = 0;
+    if (!desk_sdk_monotonic_now_ms(&monotonic_ms) || monotonic_ms > INT64_MAX) {
+        atomic_fetch_add(&s_roller_input_send_failures, 1);
+        return;
+    }
+
+#ifdef DESK_SDK_TESTING
+    int rc = s_test_roller_input_send_hook
+        ? s_test_roller_input_send_hook(sdk_delta, (int64_t)monotonic_ms)
+        : desk_sdk_bridge_send_roller_input(sdk_delta, (int64_t)monotonic_ms);
+#else
+    int rc = desk_sdk_bridge_send_roller_input(sdk_delta, (int64_t)monotonic_ms);
+#endif
+    if (rc != DESK_SDK_ROLLER_OK)
+        atomic_fetch_add(&s_roller_input_send_failures, 1);
+}
+
+uint32_t desk_sdk_bridge_get_roller_input_failure_count(void)
+{
+    return atomic_load(&s_roller_input_send_failures);
+}
 
 static bool desk_sdk_is_lower_hex_32(const char *s)
 {
@@ -1112,6 +1498,7 @@ int desk_sdk_bridge_init(void)
     desk_sdk_bridge_set_local_log_enabled(false);
     s_client_connected = false;
     s_event_seq = 0;
+    atomic_store(&s_roller_input_send_failures, 0);
     s_outbound_cb = NULL;
     s_outbound_user_data = NULL;
     s_tool_response_cb = NULL;
@@ -1127,6 +1514,19 @@ int desk_sdk_bridge_init(void)
     desk_sdk_req_table_init();
     desk_sdk_socket_rx_reset();
     desk_sdk_ws_client_close();
+    if (desk_hardware_register_roller_delta_cb(desk_sdk_roller_input_observer, NULL) != DESK_HW_OK) {
+        printf("[SDK-INPUT] roller observer registration failed\n");
+        return -1;
+    }
+    if (desk_hardware_notification_init(desk_sdk_notification_status_callback, NULL) != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION][ERROR] hardware notification init failed\n");
+        return -1;
+    }
+    if (desk_hardware_notification_register_summary_ack_callback(
+            desk_sdk_summary_ack_callback, NULL) != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION] summary acknowledgement observer registration failed\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -1255,6 +1655,34 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
     return 0;
 }
 
+int desk_sdk_bridge_pack_wjpg_v1(uint32_t sequence,
+                                 uint32_t capture_timestamp_ms,
+                                 const uint8_t *jpeg,
+                                 size_t jpeg_len,
+                                 uint8_t *out_buf,
+                                 size_t max_buf_len,
+                                 size_t *out_len)
+{
+    const size_t header_size = 20;
+    if (out_len) *out_len = 0;
+    if (!jpeg || !out_buf || !out_len || jpeg_len < 4) return -1;
+    if (jpeg_len > DESK_WSPK_MAX_PAYLOAD_SIZE - header_size) return -2;
+    if (jpeg[0] != 0xFF || jpeg[1] != 0xD8 ||
+        jpeg[jpeg_len - 2] != 0xFF || jpeg[jpeg_len - 1] != 0xD9) return -1;
+    if (max_buf_len < header_size + jpeg_len) return -3;
+
+    memcpy(out_buf, "WJPG", 4);
+    out_buf[4] = 1;
+    out_buf[5] = 0;
+    write_u16_le(&out_buf[6], (uint16_t)header_size);
+    write_u32_le(&out_buf[8], sequence);
+    write_u32_le(&out_buf[12], capture_timestamp_ms);
+    write_u32_le(&out_buf[16], (uint32_t)jpeg_len);
+    memcpy(&out_buf[header_size], jpeg, jpeg_len);
+    *out_len = header_size + jpeg_len;
+    return 0;
+}
+
 static uint16_t s_camera_session_id = 100;
 static uint32_t s_camera_seq = 0;
 
@@ -1321,6 +1749,8 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     char daemon_id[64] = "";
     char target_mode[32] = "";
     char pairing_code[16] = "";
+    char proto[64] = "";
+    char version[16] = "";
 
     json_parse_str(udp_in, "request_id", req_id, sizeof(req_id));
     if (strlen(req_id) == 0) {
@@ -1332,7 +1762,22 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
     }
     json_parse_str(udp_in, "target_mode", target_mode, sizeof(target_mode));
     json_parse_str(udp_in, "pairing_code", pairing_code, sizeof(pairing_code));
+    json_parse_str(udp_in, "protocol", proto, sizeof(proto));
+    json_parse_str(udp_in, "version", version, sizeof(version));
     int32_t websocket_port = json_parse_int(udp_in, "websocket_port", -1);
+
+    /* Only accept the pinned official v1.0 contract or the explicitly named
+     * legacy compatibility schema. Unknown/missing protocol fields must never
+     * fall through to the legacy response, and rejected requests must not
+     * consume the one-time pairing window or mint a session token. */
+    bool official_protocol = strcmp(proto, "watcher-lan-pairing") == 0 &&
+                             strcmp(version, "1.0") == 0;
+    bool legacy_protocol = strcmp(proto, "watcher_lan_pairing_v1") == 0 &&
+                           version[0] == '\0';
+    if (!official_protocol && !legacy_protocol) {
+        printf("[SDK-PAIR] pair.request rejected: reason=unsupported_protocol request_id=%s\n", req_id);
+        return DESK_SDK_PAIRING_REJECTED;
+    }
 
     /* interfaces.md 6.4 / CR-001: never grant a pairing before the pairing code
      * has been validated against the explicitly provisioned device-side code.
@@ -1363,17 +1808,13 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
         return DESK_SDK_PAIRING_REJECTED;
     }
 
-    /* Validation passed: only now generate/issue a session token. */
+    /* All protocol and request validation has passed: only now mint a token. */
     if (s_active_pairing_token[0] == '\0') {
         generate_dynamic_token(s_active_pairing_token, sizeof(s_active_pairing_token));
     }
 
-    char proto[64] = "";
-    json_parse_str(udp_in, "protocol", proto, sizeof(proto));
-
-    /* Strict official watcher-lan-pairing protocol check per PairAccept contract */
     int reply_len;
-    if (strcmp(proto, "watcher-lan-pairing") == 0) {
+    if (official_protocol) {
         reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"protocol\":\"watcher-lan-pairing\","
@@ -1386,7 +1827,7 @@ static int desk_sdk_bridge_process_pairing_udp_locked(const char *udp_in, char *
                  daemon_id,
                  strlen(target_mode) > 0 ? target_mode : "python_sdk",
                  s_active_pairing_token);
-    } else {
+    } else { /* explicitly supported legacy watcher_lan_pairing_v1 schema */
         reply_len = snprintf(udp_out, max_out_len,
                  "{\"type\":\"pair.accept\","
                  "\"status\":\"accepted\","
@@ -1469,6 +1910,37 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         }
     }
 
+    /* Live camera controls are intentionally unavailable on the legacy TCP
+     * command path. They require an authenticated, identity-bound WebSocket
+     * session; the current protocol exposes no trusted client/session binding. */
+    if (strcmp(msg_type, "ctrl.camera.stream.start") == 0 ||
+        strcmp(msg_type, "ctrl.camera.stream.stop") == 0 ||
+        strcmp(msg_type, "ctrl.camera.clock.ping") == 0) {
+        char rid_scratch[128];
+        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                 "\"code\":\"WEBSOCKET_SESSION_REQUIRED\","
+                 "\"message\":\"Camera stream controls require the authenticated WebSocket session\"}}",
+                 rid);
+        return 0;
+    }
+
+    /* The legacy TCP line server has no authenticated WebSocket identity or
+     * connection generation. Audio playback can only enter through the
+     * generation-bound WebSocket receive dispatcher below. */
+    if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0 ||
+        strcmp(msg_type, "ctrl.audio.stop") == 0) {
+        char rid_scratch[128];
+        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                 "\"code\":\"WEBSOCKET_SESSION_REQUIRED\","
+                 "\"message\":\"Audio playback commands require the authenticated WebSocket session\"}}",
+                 rid);
+        return 0;
+    }
+
     /* Handshake: sys.client.hello */
     if (strcmp(msg_type, "sys.client.hello") == 0) {
         char provided_token[128] = "";
@@ -1514,18 +1986,15 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
             return 0;
         }
 
-        /* Standard SDK / desktop hello response */
+        /* Standard SDK / desktop hello response. Re-query A1 readiness for
+         * each response so late init or readiness loss is reflected. */
+        char capabilities[256];
+        if (desk_sdk_build_capabilities_json(capabilities, sizeof(capabilities)) != 0)
+            return -1;
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",\"code\":0,\"data\":{"
-                 "\"role\":\"device\","
-                 "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                 DESK_SDK_CAP_INPUTS,
-                 DESK_SDK_CAP_MOTION,
-                 DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_EXPRESSION_ALT,
-                 DESK_SDK_CAP_MCP_TOOLS);
+                 "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":%s}}",
+                 capabilities);
         return 0;
     }
 
@@ -1533,18 +2002,13 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
     else if (strcmp(msg_type, "sys.sdk.ready.get") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        char capabilities[256];
+        if (desk_sdk_build_capabilities_json(capabilities, sizeof(capabilities)) != 0)
+            return -1;
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{"
-                 "\"role\":\"device\","
-                 "\"protocol_version\":\"1.0\","
-                 "\"capabilities\":[\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"]}}",
-                 rid,
-                 DESK_SDK_CAP_INPUTS,
-                 DESK_SDK_CAP_MOTION,
-                 DESK_SDK_CAP_CAMERA,
-                 DESK_SDK_CAP_EXPRESSION,
-                 DESK_SDK_CAP_EXPRESSION_ALT,
-                 DESK_SDK_CAP_MCP_TOOLS);
+                 "\"role\":\"device\",\"protocol_version\":\"1.0\",\"capabilities\":%s}}",
+                 rid, capabilities);
         return 0;
     }
 
@@ -1705,6 +2169,22 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         return 0;
     }
 
+    /* CR-022 streaming remains unavailable until A1 provides a real ESP
+     * producer/readiness hook and the paired-session lease-owner interface is
+     * available here. Never expose the host mock pump as a device stream. */
+    else if (strcmp(msg_type, "ctrl.camera.stream.start") == 0 ||
+             strcmp(msg_type, "ctrl.camera.stream.stop") == 0 ||
+             strcmp(msg_type, "ctrl.camera.clock.ping") == 0) {
+        char rid_scratch[128];
+        const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+        snprintf(out_buf, max_out_len,
+                 "{\"type\":\"sys.nack\",%s\"code\":503,\"error\":{"
+                 "\"code\":\"CAMERA_STREAM_UNAVAILABLE\","
+                 "\"message\":\"A real camera stream producer and paired lease-owner gate are not available\"}}",
+                 rid);
+        return 0;
+    }
+
     /* Camera capture: ctrl.camera.capture / camera.capture / ctrl.camera.capture_with_feedback */
     else if (strcmp(msg_type, "ctrl.camera.capture") == 0 ||
              strcmp(msg_type, "camera.capture") == 0 ||
@@ -1719,9 +2199,18 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
                      rid);
             return 0;
         }
+        int idle = 0;
+        if (!atomic_compare_exchange_strong(&s_camera_exclusive_state, &idle, 1)) {
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
+                     "\"code\":\"RESOURCE_BUSY\",\"message\":\"Camera is owned by an active capture or stream\"}}",
+                     rid);
+            return 0;
+        }
         size_t max_jpeg = 65536;
         uint8_t *jpeg_buf = (uint8_t *)desk_psram_malloc(max_jpeg);
         if (!jpeg_buf) {
+            atomic_store(&s_camera_exclusive_state, 0);
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.nack\",%s\"code\":500,\"error\":{"
                      "\"code\":\"OUT_OF_MEMORY\","
@@ -1731,9 +2220,11 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         }
 
         size_t jpeg_len = 0;
-        int cap_rc = desk_hardware_camera_capture_jpeg(jpeg_buf, max_jpeg, &jpeg_len, 1000);
+        int cap_rc = desk_hardware_camera_capture_jpeg(jpeg_buf, max_jpeg, &jpeg_len,
+                                                       DESK_CAMERA_CAPTURE_TIMEOUT_MS);
         if (cap_rc != DESK_HW_OK || jpeg_len == 0) {
             desk_psram_free(jpeg_buf);
+            atomic_store(&s_camera_exclusive_state, 0);
             snprintf(out_buf, max_out_len,
                      "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
                      "\"code\":\"RESOURCE_BUSY\","
@@ -1754,21 +2245,20 @@ int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t m
         desk_sdk_bridge_send_media_frame(DESK_WSPK_TYPE_IMAGE, 0, s_camera_session_id, s_camera_seq,
                                          jpeg_buf, jpeg_len);
         desk_psram_free(jpeg_buf);
+        atomic_store(&s_camera_exclusive_state, 0);
         return 0;
     }
 
-    /* Audio transport is unsupported until both directions have real media
-     * paths and the capture owner can be negotiated without stopping TClaw. */
-    else if (strcmp(msg_type, "ctrl.audio.stream.begin") == 0 ||
-             strcmp(msg_type, "ctrl.audio.stop") == 0 ||
-             strcmp(msg_type, "ctrl.microphone.open") == 0 ||
+    /* Microphone is a separate unsupported uplink direction until the A1
+     * capture owner, Opus packetizer and WSPK return path are implemented. */
+    else if (strcmp(msg_type, "ctrl.microphone.open") == 0 ||
              strcmp(msg_type, "ctrl.microphone.close") == 0) {
         char rid_scratch[128];
         const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
         snprintf(out_buf, max_out_len,
                  "{\"type\":\"sys.nack\",%s\"code\":501,\"error\":{"
                  "\"code\":\"UNSUPPORTED_OPERATION\","
-                 "\"message\":\"SDK audio transport is not implemented on this device\"}}",
+                 "\"message\":\"SDK microphone uplink is not implemented on this device\"}}",
                  rid);
         return 0;
     }
@@ -1923,6 +2413,465 @@ static bool desk_sdk_log_pairing_is_complete(void)
     return complete;
 }
 
+/* Camera ownership is scoped to the one paired Runtime connection. A valid
+ * pairing token plus the WebSocket HardwareHello ACK latch is the identity
+ * boundary; host/port are connection setup details, not additional auth. */
+static bool desk_sdk_camera_ws_session_is_paired(void)
+{
+    pthread_mutex_lock(&s_pairing_code_mutex);
+    bool paired = s_paired && desk_sdk_is_lower_hex_32(s_pair_request_id) &&
+                  desk_sdk_is_lower_hex_32(s_pair_daemon_instance_id) &&
+                  desk_sdk_is_lower_hex_64(s_active_pairing_token);
+    pthread_mutex_unlock(&s_pairing_code_mutex);
+    return paired && desk_sdk_ws_client_is_authenticated();
+}
+
+void desk_sdk_bridge_camera_session_closed(void)
+{
+    pthread_mutex_lock(&s_ws_camera_owner_mutex);
+    s_ws_camera_owner_id[0] = '\0';
+    pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+    (void)desk_sdk_camera_stream_stop_internal(false);
+}
+
+static bool desk_sdk_camera_stream_available(void)
+{
+#ifdef DESK_SDK_TESTING
+    if (s_test_camera_stream_available) return true;
+#endif
+    return desk_hardware_camera_stream_is_available();
+}
+
+static bool desk_sdk_camera_jpeg_dimensions(const uint8_t *jpeg, size_t len,
+                                            uint16_t *width, uint16_t *height)
+{
+    if (!jpeg || !width || !height || len < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 ||
+        jpeg[len - 2] != 0xFF || jpeg[len - 1] != 0xD9) return false;
+    size_t pos = 2;
+    while (pos + 4 <= len - 2) {
+        if (jpeg[pos++] != 0xFF) return false;
+        while (pos < len && jpeg[pos] == 0xFF) ++pos;
+        if (pos >= len) return false;
+        uint8_t marker = jpeg[pos++];
+        if (marker == 0xD9 || marker == 0xDA) break;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+        if (pos + 2 > len) return false;
+        size_t segment_len = ((size_t)jpeg[pos] << 8) | jpeg[pos + 1];
+        if (segment_len < 2 || segment_len > len - pos) return false;
+        bool sof = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+                   marker != 0xC8 && marker != 0xCC;
+        if (sof) {
+            if (segment_len < 8) return false;
+            *height = (uint16_t)(((uint16_t)jpeg[pos + 3] << 8) | jpeg[pos + 4]);
+            *width = (uint16_t)(((uint16_t)jpeg[pos + 5] << 8) | jpeg[pos + 6]);
+            return *width && *height;
+        }
+        pos += segment_len;
+    }
+    return false;
+}
+
+static void desk_sdk_camera_stream_finalize(void)
+{
+    uint8_t *slot = NULL;
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    slot = s_camera_stream.frame_slot;
+    s_camera_stream.frame_slot = NULL;
+    s_camera_stream.frame_len = 0;
+    s_camera_stream.active = false;
+    s_camera_stream.starting = false;
+    s_camera_stream.stop_requested = false;
+    s_camera_stream.ready = false;
+    s_camera_stream.ack_sent = false;
+    s_camera_stream.producer_failed = false;
+    s_camera_stream.thread_started = false;
+    s_camera_stream.stream_id = 0;
+    s_camera_stream.client_id[0] = '\0';
+    s_camera_stream.session_id[0] = '\0';
+    s_camera_stream.external_join = false;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    if (slot) desk_psram_free(slot);
+    atomic_store(&s_camera_exclusive_state, 0);
+}
+
+static void desk_sdk_camera_stream_frame_cb(const uint8_t *jpeg, size_t jpeg_len,
+                                            uint32_t timestamp_ms, void *user_data)
+{
+    (void)user_data;
+    uint16_t width = 0, height = 0;
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    bool acceptable = (s_camera_stream.active || s_camera_stream.starting) &&
+                      !s_camera_stream.stop_requested && s_camera_stream.frame_slot &&
+                      jpeg_len <= DESK_CAMERA_STREAM_MAX_JPEG &&
+                      desk_sdk_camera_jpeg_dimensions(jpeg, jpeg_len, &width, &height) &&
+                      width == 640 && height == 480 &&
+                      (!s_camera_stream.last_timestamp_ms ||
+                       (int32_t)(timestamp_ms - s_camera_stream.last_timestamp_ms) > 0);
+    if (acceptable) {
+        if (s_camera_stream.ready && !s_camera_stream.ack_sent)
+            ++s_camera_stream.source_drop_count;
+        uint32_t sequence = s_camera_stream.sequence + 1U;
+        size_t wjpg_len = 0;
+        int rc = desk_sdk_bridge_pack_wjpg_v1(sequence, timestamp_ms, jpeg, jpeg_len,
+            s_camera_stream.frame_slot + DESK_WSPK_HEADER_SIZE,
+            DESK_WSPK_MAX_PAYLOAD_SIZE - DESK_WSPK_HEADER_SIZE, &wjpg_len);
+        if (rc == 0) rc = desk_wspk_pack_header(DESK_WSPK_TYPE_IMAGE, 0,
+            s_camera_stream.stream_id, sequence, (uint32_t)wjpg_len,
+            s_camera_stream.frame_slot, DESK_WSPK_HEADER_SIZE);
+        if (rc == 0) {
+            s_camera_stream.sequence = sequence;
+            s_camera_stream.last_timestamp_ms = timestamp_ms;
+            s_camera_stream.frame_len = DESK_WSPK_HEADER_SIZE + wjpg_len;
+            s_camera_stream.ready = true;
+            pthread_cond_broadcast(&s_camera_stream.changed);
+        } else ++s_camera_stream.source_drop_count;
+    } else if (s_camera_stream.active || s_camera_stream.starting) {
+        ++s_camera_stream.source_drop_count;
+    }
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+}
+
+static int desk_sdk_camera_stream_send_binary(const uint8_t *frame, size_t len)
+{
+#ifdef DESK_SDK_TESTING
+    if (s_test_camera_binary_send_hook)
+        return s_test_camera_binary_send_hook((const char *)frame, len);
+#endif
+    return desk_sdk_ws_client_send_binary(frame, len);
+}
+
+static int desk_sdk_camera_stream_stop_internal(bool from_worker)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    while (s_camera_stream.cleanup_in_progress)
+        pthread_cond_wait(&s_camera_stream.changed, &s_camera_stream.mutex);
+    if (!s_camera_stream.frame_slot && !s_camera_stream.thread_started) {
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        return DESK_HW_OK;
+    }
+    s_camera_stream.stop_requested = true;
+    s_camera_stream.active = false;
+    s_camera_stream.starting = false;
+    bool had_thread = s_camera_stream.thread_started;
+    bool self = had_thread && pthread_equal(pthread_self(), s_camera_stream.thread);
+    bool join = s_camera_stream.thread_started && !from_worker && !self;
+    pthread_t thread = s_camera_stream.thread;
+    if (join) s_camera_stream.external_join = true;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+
+    if (join) {
+        (void)pthread_join(thread, NULL);
+        int stop_rc = desk_hardware_camera_stream_stop();
+        desk_sdk_camera_stream_finalize();
+        return stop_rc;
+    }
+    if (self) return DESK_HW_OK;
+    if (!had_thread) {
+        int stop_rc = desk_hardware_camera_stream_stop();
+        desk_sdk_camera_stream_finalize();
+        return stop_rc;
+    }
+    return DESK_HW_OK;
+}
+
+static void *desk_sdk_camera_stream_worker(void *unused)
+{
+    (void)unused;
+    bool failed = false;
+    for (;;) {
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        bool stop = s_camera_stream.stop_requested;
+        char client_id[sizeof(s_camera_stream.client_id)];
+        memcpy(client_id, s_camera_stream.client_id, sizeof(client_id));
+        uint64_t next_ms = s_camera_stream.next_capture_ms;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (stop) break;
+        if (!desk_sdk_camera_ws_session_is_paired() || !desk_arbiter_camera_lease_matches(client_id)) {
+            pthread_mutex_lock(&s_ws_camera_owner_mutex);
+            if (strcmp(s_ws_camera_owner_id, client_id) == 0) s_ws_camera_owner_id[0] = '\0';
+            pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+            failed = true;
+            break;
+        }
+
+        uint64_t now_ms = desk_sdk_camera_worker_now_ms();
+        if (!now_ms) { failed = true; break; }
+        if (!next_ms || now_ms >= next_ms) {
+            int pump_rc = desk_hardware_camera_stream_pump();
+            pthread_mutex_lock(&s_camera_stream.mutex);
+            now_ms = desk_sdk_camera_worker_now_ms();
+            s_camera_stream.next_capture_ms = now_ms + DESK_CAMERA_STREAM_PERIOD_MS;
+            bool may_send = pump_rc == DESK_HW_OK && s_camera_stream.active &&
+                            s_camera_stream.ack_sent && s_camera_stream.ready &&
+                            !s_camera_stream.stop_requested && s_camera_stream.frame_slot;
+            uint8_t *frame = s_camera_stream.frame_slot;
+            size_t frame_len = s_camera_stream.frame_len;
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            if (may_send) {
+                int send_rc = desk_sdk_camera_stream_send_binary(frame, frame_len);
+                if (send_rc == -3) {
+                    pthread_mutex_lock(&s_camera_stream.mutex);
+                    ++s_camera_stream.transport_drop_count;
+                    pthread_mutex_unlock(&s_camera_stream.mutex);
+                } else if (send_rc != 0) { failed = true; break; }
+            }
+            if (pump_rc != DESK_HW_OK && pump_rc != DESK_HW_ERR_BUSY) {
+                failed = true;
+                break;
+            }
+        }
+#ifdef ESP_PLATFORM
+        TickType_t pause_ticks = pdMS_TO_TICKS(5U);
+        vTaskDelay(pause_ticks > 0 ? pause_ticks : 1);
+#else
+        const struct timespec pause = { .tv_sec = 0, .tv_nsec = 5000000L };
+        nanosleep(&pause, NULL);
+#endif
+    }
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    s_camera_stream.stop_requested = true;
+    s_camera_stream.producer_failed = failed;
+    bool external_join = s_camera_stream.external_join;
+    if (!external_join) s_camera_stream.cleanup_in_progress = true;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    if (!external_join) {
+        (void)desk_hardware_camera_stream_stop();
+        (void)pthread_detach(pthread_self());
+        desk_sdk_camera_stream_finalize();
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        s_camera_stream.cleanup_in_progress = false;
+        pthread_cond_broadcast(&s_camera_stream.changed);
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+    }
+    return NULL;
+}
+
+void desk_sdk_bridge_camera_start_ack_sent(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    if (s_camera_stream.active && s_camera_stream.ready)
+        s_camera_stream.ack_sent = true;
+    pthread_cond_broadcast(&s_camera_stream.changed);
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+}
+
+bool desk_sdk_bridge_camera_stream_is_active(void)
+{
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    bool active = s_camera_stream.active || s_camera_stream.starting;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    return active;
+}
+
+static int desk_sdk_camera_stream_reply(char *out, size_t cap, const char *json,
+                                        const char *type, const char *command_id,
+                                        const char *error, int code,
+                                        uint16_t stream_id, uint32_t device_ms,
+                                        bool ack)
+{
+    char rid_scratch[128];
+    const char *rid = desk_sdk_request_id_fragment(json, rid_scratch, sizeof(rid_scratch));
+    int n;
+    if (ack) {
+        n = snprintf(out, cap,
+            "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"type\":\"%s\",\"command_id\":\"%s\","
+            "\"stream_id\":%u,\"device_monotonic_ms\":%u}}",
+            rid, type, command_id, (unsigned)stream_id, (unsigned)device_ms);
+    } else {
+        n = snprintf(out, cap,
+            "{\"type\":\"sys.nack\",%s\"code\":%d,\"error\":{\"code\":\"%s\","
+            "\"message\":\"Camera stream control rejected\"},\"data\":{\"command_id\":\"%s\"}}",
+            rid, code, error, command_id ? command_id : "");
+    }
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int desk_sdk_camera_stream_command(const char *json, char *out, size_t cap,
+                                          const char *type)
+{
+    char command_id[40] = "", client_id[32] = "", session_id[65] = "";
+    char data[512] = "";
+    (void)json_parse_top_level_str(json, "command_id", command_id, sizeof(command_id));
+    (void)json_parse_top_level_str(json, "client_id", client_id, sizeof(client_id));
+    (void)json_parse_top_level_str(json, "session_id", session_id, sizeof(session_id));
+    if (!desk_sdk_log_command_id_valid(command_id) || client_id[0] == '\0' || session_id[0] == '\0' ||
+        !json_extract_subobject(json, "data", data, sizeof(data)))
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "INVALID_ARGUMENT", 400, 0, 0, false);
+
+    if (!desk_sdk_camera_ws_session_is_paired())
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "AUTH_REQUIRED", 403, 0, 0, false);
+    pthread_mutex_lock(&s_ws_camera_owner_mutex);
+    bool bound_owner = strcmp(client_id, s_ws_camera_owner_id) == 0;
+    pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+    if (!bound_owner || !desk_arbiter_camera_lease_matches(client_id))
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "NO_ACTIVE_LEASE", 403, 0, 0, false);
+
+    if (strcmp(type, "ctrl.camera.stream.start") == 0) {
+        static const char *const keys[] = { "width", "height", "target_fps" };
+        if (!desk_log_object_keys_allowed(data, keys, 3) ||
+            json_parse_int(data, "width", -1) != 640 ||
+            json_parse_int(data, "height", -1) != 480 ||
+            json_parse_int(data, "target_fps", -1) != 15)
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "UNSUPPORTED_FORMAT", 400, 0, 0, false);
+        if (!desk_sdk_camera_stream_available())
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_STREAM_UNAVAILABLE", 503, 0, 0, false);
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        if (s_camera_stream.active && strcmp(client_id, s_camera_stream.client_id) == 0 &&
+            strcmp(session_id, s_camera_stream.session_id) == 0) {
+            uint16_t sid = s_camera_stream.stream_id;
+            uint64_t now = 0;
+            (void)desk_sdk_monotonic_now_ms(&now);
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                NULL, 0, sid, (uint32_t)now, true);
+        }
+        if (s_camera_stream.active || s_camera_stream.starting || s_camera_stream.thread_started) {
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "RESOURCE_BUSY", 409, 0, 0, false);
+        }
+        int idle = 0;
+        if (!atomic_compare_exchange_strong(&s_camera_exclusive_state, &idle, 2)) {
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "RESOURCE_BUSY", 409, 0, 0, false);
+        }
+        uint16_t stream_id = ++s_camera_stream_id_seed;
+        if (!stream_id) stream_id = ++s_camera_stream_id_seed;
+        size_t slot_len = DESK_WSPK_HEADER_SIZE + DESK_WSPK_MAX_PAYLOAD_SIZE;
+        uint8_t *slot = (uint8_t *)desk_psram_malloc(slot_len);
+        if (!slot) {
+            atomic_store(&s_camera_exclusive_state, 0);
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "OUT_OF_MEMORY", 500, 0, 0, false);
+        }
+        s_camera_stream.frame_slot = slot;
+        s_camera_stream.frame_len = 0;
+        s_camera_stream.stream_id = stream_id;
+        s_camera_stream.sequence = 0;
+        s_camera_stream.last_timestamp_ms = 0;
+        s_camera_stream.ready = false;
+        s_camera_stream.ack_sent = false;
+        s_camera_stream.producer_failed = false;
+        s_camera_stream.source_drop_count = 0;
+        s_camera_stream.transport_drop_count = 0;
+        s_camera_stream.active = false;
+        s_camera_stream.starting = true;
+        s_camera_stream.stop_requested = false;
+        s_camera_stream.external_join = false;
+        snprintf(s_camera_stream.client_id, sizeof(s_camera_stream.client_id), "%s", client_id);
+        snprintf(s_camera_stream.session_id, sizeof(s_camera_stream.session_id), "%s", session_id);
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+
+        int start_rc = desk_hardware_camera_stream_start(client_id, DESK_CAMERA_STREAM_FPS,
+                                                          desk_sdk_camera_stream_frame_cb, NULL);
+        if (start_rc != DESK_HW_OK) {
+            desk_sdk_camera_stream_finalize();
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_START_FAILED", 503, 0, 0, false);
+        }
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        s_camera_stream.active = true;
+        s_camera_stream.starting = false;
+        s_camera_stream.thread_started = true;
+        if (pthread_create(&s_camera_stream.thread, NULL, desk_sdk_camera_stream_worker, NULL) != 0) {
+            s_camera_stream.thread_started = false;
+            pthread_mutex_unlock(&s_camera_stream.mutex);
+            (void)desk_hardware_camera_stream_stop();
+            desk_sdk_camera_stream_finalize();
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_START_FAILED", 503, 0, 0, false);
+        }
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += (long)DESK_CAMERA_STREAM_READY_TIMEOUT_MS * 1000000L;
+        until.tv_sec += until.tv_nsec / 1000000000L;
+        until.tv_nsec %= 1000000000L;
+        int wait_rc = 0;
+        while (!s_camera_stream.ready && !s_camera_stream.stop_requested &&
+               !s_camera_stream.producer_failed && wait_rc == 0)
+            wait_rc = pthread_cond_timedwait(&s_camera_stream.changed, &s_camera_stream.mutex, &until);
+        bool ready = s_camera_stream.ready && !s_camera_stream.stop_requested &&
+                     !s_camera_stream.producer_failed;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (!ready) {
+            (void)desk_sdk_camera_stream_stop_internal(false);
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_NOT_READY", 503, 0, 0, false);
+        }
+        uint64_t now = 0;
+        (void)desk_sdk_monotonic_now_ms(&now);
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            NULL, 0, stream_id, (uint32_t)now, true);
+    }
+
+    if (strcmp(type, "ctrl.camera.stream.stop") == 0) {
+        int32_t stream_id = json_parse_int(data, "stream_id", -1);
+        /* The wire field is uint16. Reject wider values before any narrowing
+         * conversion so an unknown ID cannot alias and stop a live stream. */
+        if (stream_id <= 0 || stream_id > UINT16_MAX)
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "INVALID_SESSION", 404, 0, 0, false);
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        bool match = stream_id > 0 && s_camera_stream.active &&
+                     (uint16_t)stream_id == s_camera_stream.stream_id &&
+                     strcmp(client_id, s_camera_stream.client_id) == 0 &&
+                     strcmp(session_id, s_camera_stream.session_id) == 0;
+        bool repeated = stream_id > 0 && (uint16_t)stream_id == s_camera_stream.last_stopped_stream_id &&
+                        strcmp(client_id, s_camera_stream.last_client_id) == 0 &&
+                        strcmp(session_id, s_camera_stream.last_session_id) == 0;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (repeated) return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                         NULL, 0, (uint16_t)stream_id, 0, true);
+        if (!match) return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                        "INVALID_SESSION", 404, 0, 0, false);
+        if (desk_sdk_camera_stream_stop_internal(false) != DESK_HW_OK)
+            return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                                "CAMERA_STOP_FAILED", 500, 0, 0, false);
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        s_camera_stream.last_stopped_stream_id = (uint16_t)stream_id;
+        snprintf(s_camera_stream.last_client_id, sizeof(s_camera_stream.last_client_id), "%s", client_id);
+        snprintf(s_camera_stream.last_session_id, sizeof(s_camera_stream.last_session_id), "%s", session_id);
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            NULL, 0, (uint16_t)stream_id, 0, true);
+    }
+
+    static const char *const ping_keys[] = { "ping_id", "host_send_monotonic_ms" };
+    if (!desk_log_object_keys_allowed(data, ping_keys, 2))
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            "INVALID_ARGUMENT", 400, 0, 0, false);
+    pthread_mutex_lock(&s_camera_stream.mutex);
+    bool active = s_camera_stream.active && strcmp(client_id, s_camera_stream.client_id) == 0 &&
+                  strcmp(session_id, s_camera_stream.session_id) == 0;
+    pthread_mutex_unlock(&s_camera_stream.mutex);
+    int32_t ping_id = json_parse_int(data, "ping_id", -1);
+    int32_t host_send = json_parse_int(data, "host_send_monotonic_ms", -1);
+    if (!active || ping_id < 0 || host_send < 0)
+        return desk_sdk_camera_stream_reply(out, cap, json, type, command_id,
+                                            active ? "INVALID_ARGUMENT" : "INVALID_SESSION", 400, 0, 0, false);
+    uint64_t receive_ms = 0, send_ms = 0;
+    (void)desk_sdk_monotonic_now_ms(&receive_ms);
+    (void)desk_sdk_monotonic_now_ms(&send_ms);
+    char rid_scratch[128];
+    const char *rid = desk_sdk_request_id_fragment(json, rid_scratch, sizeof(rid_scratch));
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"type\":\"%s\",\"command_id\":\"%s\","
+        "\"ping_id\":%d,\"host_send_monotonic_ms\":%" PRIu32 ",\"device_receive_monotonic_ms\":%" PRIu32 ",\"device_send_monotonic_ms\":%" PRIu32 "}}",
+        rid, type, command_id, (int)ping_id, (uint32_t)host_send,
+        (uint32_t)receive_ms, (uint32_t)send_ms);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
 static int desk_sdk_log_nack(char *out, size_t cap, const char *type,
                              const char *command_id, const char *error, int code)
 {
@@ -2075,6 +3024,42 @@ static unsigned desk_log_get_member(const char *object, const char *name, char *
     return matches;
 }
 
+static bool desk_log_get_member_span(const char *object, const char *name,
+                                     const char **value_start, size_t *value_len)
+{
+    if (!object || !name || !value_start || !value_len) return false;
+    desk_log_json_parser_t p = { .p = object, .depth = 0 };
+    desk_log_json_ws(&p);
+    if (*p.p++ != '{') return false;
+    desk_log_json_ws(&p);
+    unsigned matches = 0;
+    const char *found_start = NULL, *found_end = NULL;
+    if (*p.p == '}') return false;
+    for (;;) {
+        const char *key_start, *key_end;
+        if (!desk_log_json_string(&p, &key_start, &key_end)) return false;
+        desk_log_json_ws(&p);
+        if (*p.p++ != ':') return false;
+        desk_log_json_ws(&p);
+        const char *start = p.p;
+        if (!desk_log_json_value(&p)) return false;
+        const char *end = p.p;
+        if (desk_log_plain_key(key_start, key_end, name)) {
+            ++matches;
+            found_start = start;
+            found_end = end;
+        }
+        desk_log_json_ws(&p);
+        if (*p.p == '}') break;
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+    if (matches != 1) return false;
+    *value_start = found_start;
+    *value_len = (size_t)(found_end - found_start);
+    return true;
+}
+
 static bool desk_log_object_keys_allowed(const char *object, const char *const *allowed, size_t allowed_count)
 {
     desk_log_json_parser_t p = { .p = object, .depth = 0 };
@@ -2103,33 +3088,996 @@ static bool desk_log_object_keys_allowed(const char *object, const char *const *
     }
 }
 
-static bool desk_log_component_filter_valid(const char *raw, bool *camera_only)
+static bool desk_sdk_notification_append_utf8(uint32_t codepoint, char *out, size_t cap, size_t *used)
 {
+    uint8_t bytes[4];
+    size_t count;
+    if (codepoint == 0 || codepoint < 0x20 || codepoint == 0x7f || codepoint > 0x10ffff ||
+        (codepoint >= 0xd800 && codepoint <= 0xdfff)) return false;
+    if (codepoint < 0x80) { bytes[0] = (uint8_t)codepoint; count = 1; }
+    else if (codepoint < 0x800) {
+        bytes[0] = (uint8_t)(0xc0 | (codepoint >> 6));
+        bytes[1] = (uint8_t)(0x80 | (codepoint & 0x3f)); count = 2;
+    } else if (codepoint < 0x10000) {
+        bytes[0] = (uint8_t)(0xe0 | (codepoint >> 12));
+        bytes[1] = (uint8_t)(0x80 | ((codepoint >> 6) & 0x3f));
+        bytes[2] = (uint8_t)(0x80 | (codepoint & 0x3f)); count = 3;
+    } else {
+        bytes[0] = (uint8_t)(0xf0 | (codepoint >> 18));
+        bytes[1] = (uint8_t)(0x80 | ((codepoint >> 12) & 0x3f));
+        bytes[2] = (uint8_t)(0x80 | ((codepoint >> 6) & 0x3f));
+        bytes[3] = (uint8_t)(0x80 | (codepoint & 0x3f)); count = 4;
+    }
+    if (*used + count >= cap) return false;
+    memcpy(out + *used, bytes, count);
+    *used += count;
+    return true;
+}
+
+static bool desk_sdk_notification_utf8_valid(const char *text)
+{
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        unsigned char lead = *p++;
+        size_t continuation_count;
+        unsigned char second_min = 0x80, second_max = 0xbf;
+        if (lead < 0x80) {
+            if (lead < 0x20 || lead == 0x7f) return false;
+            continue;
+        }
+        if (lead >= 0xc2 && lead <= 0xdf) continuation_count = 1;
+        else if (lead >= 0xe0 && lead <= 0xef) {
+            continuation_count = 2;
+            if (lead == 0xe0) second_min = 0xa0;
+            if (lead == 0xed) second_max = 0x9f;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            continuation_count = 3;
+            if (lead == 0xf0) second_min = 0x90;
+            if (lead == 0xf4) second_max = 0x8f;
+        } else return false;
+        for (size_t i = 0; i < continuation_count; ++i) {
+            unsigned char next = *p++;
+            if (!next || (next & 0xc0) != 0x80 || (i == 0 && (next < second_min || next > second_max))) return false;
+        }
+    }
+    return true;
+}
+
+static int desk_sdk_notification_hex4(const char *s, uint32_t *value)
+{
+    uint32_t result = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        char c = s[i];
+        unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+                         c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10) :
+                         c >= 'A' && c <= 'F' ? (unsigned)(c - 'A' + 10) : 16u;
+        if (digit > 15) return -1;
+        result = (result << 4) | digit;
+    }
+    *value = result;
+    return 0;
+}
+
+/* Decode one top-level JSON string member, including escaped Unicode and
+ * surrogate pairs. Field capacity checks apply to decoded UTF-8 bytes. */
+static bool desk_sdk_notification_get_string(const char *object, const char *key,
+                                             char *out, size_t out_cap)
+{
+    char raw[1024];
+    if (desk_log_get_member(object, key, raw, sizeof(raw)) != 1 || raw[0] != '"') return false;
+    size_t raw_len = strlen(raw);
+    if (raw_len < 2 || raw[raw_len - 1] != '"') return false;
+    size_t used = 0;
+    for (size_t i = 1; i + 1 < raw_len; ++i) {
+        uint32_t cp = (unsigned char)raw[i];
+        if (raw[i] == '\\') {
+            if (++i + 1 >= raw_len) return false;
+            char esc = raw[i];
+            if (esc == '"' || esc == '\\' || esc == '/') cp = (unsigned char)esc;
+            else if (esc == 'b') cp = '\b';
+            else if (esc == 'f') cp = '\f';
+            else if (esc == 'n') cp = '\n';
+            else if (esc == 'r') cp = '\r';
+            else if (esc == 't') cp = '\t';
+            else if (esc == 'u') {
+                if (i + 4 >= raw_len) return false;
+                if (desk_sdk_notification_hex4(raw + i + 1, &cp) != 0) return false;
+                i += 4;
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (i + 6 >= raw_len || raw[i + 1] != '\\' || raw[i + 2] != 'u') return false;
+                    uint32_t low;
+                    if (desk_sdk_notification_hex4(raw + i + 3, &low) != 0 || low < 0xdc00 || low > 0xdfff) return false;
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                    i += 6;
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) return false;
+            } else return false;
+            if (cp < 0x80) {
+                if (cp == 0 || cp < 0x20 || cp == 0x7f || used + 1 >= out_cap) return false;
+                out[used++] = (char)cp;
+            } else if (!desk_sdk_notification_append_utf8(cp, out, out_cap, &used)) return false;
+        } else {
+            if ((unsigned char)raw[i] < 0x20 || used + 1 >= out_cap) return false;
+            out[used++] = raw[i];
+        }
+    }
+    out[used] = '\0';
+    return used > 0 && desk_sdk_notification_utf8_valid(out);
+}
+
+static bool desk_sdk_notification_parse_timestamp(const char *text, uint64_t *out_us)
+{
+    size_t len = strlen(text);
+    if ((len != 20 && (len < 22 || len > 27)) || text[4] != '-' || text[7] != '-' ||
+        text[10] != 'T' || text[13] != ':' || text[16] != ':' || text[len - 1] != 'Z') return false;
+    const unsigned positions[] = {0,1,2,3,5,6,8,9,11,12,14,15,17,18};
+    for (size_t i = 0; i < sizeof(positions) / sizeof(positions[0]); ++i)
+        if (text[positions[i]] < '0' || text[positions[i]] > '9') return false;
+    int year = (text[0]-'0')*1000 + (text[1]-'0')*100 + (text[2]-'0')*10 + text[3]-'0';
+    int month = (text[5]-'0')*10 + text[6]-'0';
+    int day = (text[8]-'0')*10 + text[9]-'0';
+    int hour = (text[11]-'0')*10 + text[12]-'0';
+    int minute = (text[14]-'0')*10 + text[15]-'0';
+    int second = (text[17]-'0')*10 + text[18]-'0';
+    if (year < 1970 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+    static const unsigned month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (day < 1 || (unsigned)day > month_days[month - 1] + (month == 2 && leap ? 1u : 0u)) return false;
+    uint32_t micros = 0;
+    if (len != 20) {
+        if (text[19] != '.') return false;
+        unsigned digits = 0;
+        for (size_t i = 20; i < len - 1; ++i) {
+            if (text[i] < '0' || text[i] > '9' || digits == 6) return false;
+            micros = micros * 10u + (unsigned)(text[i] - '0');
+            ++digits;
+        }
+        if (!digits) return false;
+        while (digits++ < 6) micros *= 10u;
+    }
+    int y = year - (month <= 2);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    int shifted_month = month + (month > 2 ? -3 : 9);
+    unsigned doy = (153u * (unsigned)shifted_month + 2u) / 5u + (unsigned)day - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    int64_t days = (int64_t)era * 146097 + (int64_t)doe - 719468;
+    if (days < 0) return false;
+    *out_us = (((uint64_t)days * 86400u + (uint64_t)hour * 3600u +
+                (uint64_t)minute * 60u + (uint64_t)second) * 1000000u) + micros;
+    return true;
+}
+
+static int desk_sdk_notification_nack(char *out, size_t cap, const char *command_id,
+                                      const char *error, int code)
+{
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.nack\",\"code\":%d,\"data\":{\"type\":\"notification.deliver\",\"command_id\":\"%s\",\"error\":\"%s\"}}",
+        code, command_id, error);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int desk_sdk_notification_result_nack(char *out, size_t cap, const char *command_id, int rc)
+{
+    if (rc == DESK_HW_ERR_BUSY)
+        return desk_sdk_notification_nack(out, cap, command_id, "QUEUE_FULL", 507);
+    if (rc == DESK_HW_ERR_IO)
+        return desk_sdk_notification_nack(out, cap, command_id, "DELIVERY_FAILED", 500);
+    if (rc == DESK_HW_ERR_TIMEOUT)
+        return desk_sdk_notification_nack(out, cap, command_id, "EXPIRED", 410);
+    if (rc == DESK_HW_ERR_INVALID_ARG)
+        return desk_sdk_notification_nack(out, cap, command_id, "INVALID_ARGUMENT", 400);
+    if (rc == DESK_HW_ERR_UNAVAILABLE)
+        return desk_sdk_notification_nack(out, cap, command_id, "NOTIFICATION_DELIVERY_FAILED", 503);
+    return desk_sdk_notification_nack(out, cap, command_id, "NOTIFICATION_DELIVERY_FAILED", 500);
+}
+
+static bool desk_sdk_notification_command_id_valid(const char *id)
+{
+    if (!id || strlen(id) != 32) return false;
+    for (size_t i = 0; i < 32; ++i)
+        if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'))) return false;
+    return true;
+}
+
+static int desk_sdk_notification_dispatch(const char *json_in, char *out_buf, size_t max_out_len,
+                                          const char *data)
+{
+    static const char *const root_keys[] = { "type", "code", "data" };
+    static const char *const data_keys[] = {
+        "notification_id", "reminder_id", "occurrence_id", "title",
+        "scheduled_at", "expires_at", "is_catchup", "command_id"
+    };
+    char root_code[16] = "", command_id[40] = "";
+    unsigned code_count = desk_log_get_member(json_in, "code", root_code, sizeof(root_code));
+    bool outer_valid = desk_log_object_keys_allowed(json_in, root_keys, 3) &&
+                       code_count == 1 && strcmp(root_code, "0") == 0 &&
+                       desk_log_object_keys_allowed(data, data_keys, 8);
+    bool has_command_id = desk_sdk_notification_get_string(data, "command_id", command_id, sizeof(command_id)) &&
+                         desk_sdk_notification_command_id_valid(command_id);
+    if (!has_command_id) return -1;
+    if (!outer_valid)
+        return desk_sdk_notification_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    if (!desk_sdk_ws_client_is_authenticated())
+        return desk_sdk_notification_nack(out_buf, max_out_len, command_id, "AUTH_REQUIRED", 401);
+
+    desk_notification_input_t input = {0};
+    char catchup_raw[8] = "";
+    uint64_t scheduled_us = 0, expires_us = 0;
+    bool fields_valid =
+        desk_sdk_notification_get_string(data, "notification_id", input.notification_id, sizeof(input.notification_id)) &&
+        desk_sdk_notification_get_string(data, "reminder_id", input.reminder_id, sizeof(input.reminder_id)) &&
+        desk_sdk_notification_get_string(data, "occurrence_id", input.occurrence_id, sizeof(input.occurrence_id)) &&
+        desk_sdk_notification_get_string(data, "title", input.title, sizeof(input.title)) &&
+        desk_sdk_notification_get_string(data, "scheduled_at", input.scheduled_at, sizeof(input.scheduled_at)) &&
+        desk_sdk_notification_get_string(data, "expires_at", input.expires_at, sizeof(input.expires_at)) &&
+        desk_log_get_member(data, "is_catchup", catchup_raw, sizeof(catchup_raw)) == 1 &&
+        (strcmp(catchup_raw, "true") == 0 || strcmp(catchup_raw, "false") == 0) &&
+        desk_sdk_notification_parse_timestamp(input.scheduled_at, &scheduled_us) &&
+        desk_sdk_notification_parse_timestamp(input.expires_at, &expires_us) &&
+        expires_us > scheduled_us &&
+        strcmp(input.notification_id, input.occurrence_id) == 0;
+    if (!fields_valid)
+        return desk_sdk_notification_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    input.is_catchup = strcmp(catchup_raw, "true") == 0;
+
+    desk_notification_status_event_t status = {0};
+    int rc = desk_hardware_notification_deliver(&input, &status);
+    if (rc != DESK_HW_OK)
+        return desk_sdk_notification_result_nack(out_buf, max_out_len, command_id, rc);
+    int n = snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"notification.deliver\",\"command_id\":\"%s\"}}",
+        command_id);
+    return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
+}
+
+static bool desk_sdk_summary_identifier_valid(const char *id)
+{
+    size_t len = id ? strlen(id) : 0;
+    if (len == 0 || len > 128) return false;
+    for (size_t i = 0; i < len; ++i) {
+        char c = id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) return false;
+    }
+    return true;
+}
+
+static bool desk_sdk_summary_count_valid(const char *raw)
+{
+    if (!raw || !raw[0]) return false;
+    uint64_t value = 0;
+    for (const char *p = raw; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        unsigned digit = (unsigned)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10u) return false;
+        value = value * 10u + digit;
+    }
+    return true;
+}
+
+static bool desk_sdk_summary_text_nonblank(const char *text)
+{
+    if (!text || !text[0]) return false;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p)
+        if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') return true;
+    return false;
+}
+
+static bool desk_sdk_summary_display_time_valid(const char *text)
+{
+    if (!text || strlen(text) != 26 || text[4] != '-' || text[7] != '-' ||
+        text[10] != ' ' || text[13] != ':' || text[16] != ' ' ||
+        memcmp(text + 17, "UTC", 3) != 0 ||
+        (text[20] != '+' && text[20] != '-')) return false;
+    static const uint8_t digit_positions[] = {
+        0,1,2,3,5,6,8,9,11,12,14,15,21,22,24,25
+    };
+    for (size_t i = 0; i < sizeof(digit_positions); ++i)
+        if (text[digit_positions[i]] < '0' || text[digit_positions[i]] > '9') return false;
+    unsigned hour = (unsigned)(text[11] - '0') * 10u + (unsigned)(text[12] - '0');
+    unsigned minute = (unsigned)(text[14] - '0') * 10u + (unsigned)(text[15] - '0');
+    unsigned offset_hour = (unsigned)(text[21] - '0') * 10u + (unsigned)(text[22] - '0');
+    unsigned offset_minute = (unsigned)(text[24] - '0') * 10u + (unsigned)(text[25] - '0');
+    unsigned month = (unsigned)(text[5] - '0') * 10u + (unsigned)(text[6] - '0');
+    unsigned day = (unsigned)(text[8] - '0') * 10u + (unsigned)(text[9] - '0');
+    unsigned year = (unsigned)(text[0] - '0') * 1000u + (unsigned)(text[1] - '0') * 100u +
+                    (unsigned)(text[2] - '0') * 10u + (unsigned)(text[3] - '0');
+    static const unsigned month_days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (year < 1970 || month < 1 || month > 12 || hour > 23 || minute > 59 ||
+        offset_hour > 14 || offset_minute > 59 || (offset_hour == 14 && offset_minute != 0)) return false;
+    bool leap = (year % 4u == 0u && year % 100u != 0u) || year % 400u == 0u;
+    unsigned max_day = month_days[month - 1] + (month == 2 && leap ? 1u : 0u);
+    return day >= 1 && day <= max_day;
+}
+
+static bool desk_sdk_summary_validate_items(const char *raw_items, size_t items_len)
+{
+    desk_log_json_parser_t p = { .p = raw_items, .depth = 0 };
+    if (*p.p++ != '[') return false;
+    desk_log_json_ws(&p);
+    uint64_t previous_us = 0;
+    unsigned count = 0;
+    if (*p.p == ']') return false;
+    for (;;) {
+        const char *start = p.p;
+        if (!desk_log_json_value(&p)) return false;
+        size_t raw_len = (size_t)(p.p - start);
+        if (raw_len >= 2048 || ++count > 20) return false;
+        char item[2048];
+        memcpy(item, start, raw_len); item[raw_len] = '\0';
+        static const char *const keys[] = {
+            "reminder_id", "occurrence_id", "title", "scheduled_at", "timezone", "display_time"
+        };
+        char reminder_id[129] = "", occurrence_id[129] = "", title[1025] = "";
+        char scheduled_at[32] = "", timezone_name[65] = "";
+        char display_time[DESK_NOTIFICATION_DISPLAY_TIME_MAX + 1] = "";
+        uint64_t scheduled_us = 0;
+        if (!desk_log_object_keys_allowed(item, keys, sizeof(keys) / sizeof(keys[0])) ||
+            !desk_sdk_notification_get_string(item, "reminder_id", reminder_id, sizeof(reminder_id)) ||
+            !desk_sdk_notification_get_string(item, "occurrence_id", occurrence_id, sizeof(occurrence_id)) ||
+            !desk_sdk_notification_get_string(item, "title", title, sizeof(title)) ||
+            !desk_sdk_notification_get_string(item, "scheduled_at", scheduled_at, sizeof(scheduled_at)) ||
+            !desk_sdk_notification_get_string(item, "timezone", timezone_name, sizeof(timezone_name)) ||
+            !desk_sdk_notification_get_string(item, "display_time", display_time, sizeof(display_time)) ||
+            strlen(reminder_id) > 128 || strlen(occurrence_id) > 128 ||
+            !desk_sdk_summary_text_nonblank(title) || strlen(title) > 256 ||
+            strlen(timezone_name) > 64 || !timezone_name[0] ||
+            !desk_sdk_summary_display_time_valid(display_time) ||
+            !desk_sdk_notification_parse_timestamp(scheduled_at, &scheduled_us) ||
+            (count > 1 && scheduled_us < previous_us)) return false;
+        previous_us = scheduled_us;
+        desk_log_json_ws(&p);
+        if (*p.p == ']') { ++p.p; return count >= 1 && (size_t)(p.p - raw_items) == items_len; }
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+}
+
+typedef struct {
+    desk_notification_summary_item_t item;
+    char reminder_id[DESK_NOTIFICATION_REMINDER_ID_MAX + 1];
+    char occurrence_id[DESK_NOTIFICATION_OCCURRENCE_ID_MAX + 1];
+    char title[DESK_NOTIFICATION_SUMMARY_TITLE_MAX + 1];
+    char scheduled_at[DESK_NOTIFICATION_TIMESTAMP_MAX + 1];
+    char timezone[DESK_NOTIFICATION_TIMEZONE_MAX + 1];
+    char display_time[DESK_NOTIFICATION_DISPLAY_TIME_MAX + 1];
+} desk_sdk_summary_item_storage_t;
+
+static bool desk_sdk_summary_parse_items(const char *raw_items, size_t items_len,
+                                         desk_sdk_summary_item_storage_t *storage,
+                                         desk_notification_summary_item_t *items,
+                                         size_t *item_count)
+{
+    desk_log_json_parser_t p = { .p = raw_items, .depth = 0 };
+    if (!storage || !items || !item_count || *p.p++ != '[') return false;
+    desk_log_json_ws(&p);
+    uint64_t previous_us = 0;
+    size_t count = 0;
+    if (*p.p == ']') return false;
+    for (;;) {
+        const char *start = p.p;
+        if (!desk_log_json_value(&p) || count >= DESK_NOTIFICATION_SUMMARY_MAX_ITEMS) return false;
+        size_t raw_len = (size_t)(p.p - start);
+        if (raw_len >= 2048) return false;
+        char raw[2048];
+        memcpy(raw, start, raw_len); raw[raw_len] = '\0';
+        static const char *const keys[] = {
+            "reminder_id", "occurrence_id", "title", "scheduled_at", "timezone", "display_time"
+        };
+        desk_sdk_summary_item_storage_t *dst = &storage[count];
+        uint64_t scheduled_us = 0;
+        if (!desk_log_object_keys_allowed(raw, keys, sizeof(keys) / sizeof(keys[0])) ||
+            !desk_sdk_notification_get_string(raw, "reminder_id", dst->reminder_id, sizeof(dst->reminder_id)) ||
+            !desk_sdk_notification_get_string(raw, "occurrence_id", dst->occurrence_id, sizeof(dst->occurrence_id)) ||
+            !desk_sdk_notification_get_string(raw, "title", dst->title, sizeof(dst->title)) ||
+            !desk_sdk_notification_get_string(raw, "scheduled_at", dst->scheduled_at, sizeof(dst->scheduled_at)) ||
+            !desk_sdk_notification_get_string(raw, "timezone", dst->timezone, sizeof(dst->timezone)) ||
+            !desk_sdk_notification_get_string(raw, "display_time", dst->display_time, sizeof(dst->display_time)) ||
+            !desk_sdk_summary_identifier_valid(dst->reminder_id) ||
+            !desk_sdk_summary_identifier_valid(dst->occurrence_id) ||
+            !desk_sdk_summary_text_nonblank(dst->title) ||
+            strlen(dst->title) > DESK_NOTIFICATION_SUMMARY_TITLE_MAX ||
+            !dst->timezone[0] ||
+            !desk_sdk_summary_display_time_valid(dst->display_time) ||
+            !desk_sdk_notification_parse_timestamp(dst->scheduled_at, &scheduled_us) ||
+            (count > 0 && scheduled_us < previous_us)) return false;
+        previous_us = scheduled_us;
+        dst->item.reminder_id = dst->reminder_id;
+        dst->item.occurrence_id = dst->occurrence_id;
+        dst->item.title = dst->title;
+        dst->item.scheduled_at = dst->scheduled_at;
+        dst->item.timezone = dst->timezone;
+        dst->item.display_time = dst->display_time;
+        items[count] = dst->item;
+        ++count;
+        desk_log_json_ws(&p);
+        if (*p.p == ']') {
+            ++p.p;
+            *item_count = count;
+            return count > 0 && (size_t)(p.p - raw_items) == items_len;
+        }
+        if (*p.p++ != ',') return false;
+        desk_log_json_ws(&p);
+    }
+}
+
+static int desk_sdk_notification_summary_nack(char *out, size_t cap, const char *command_id,
+                                              const char *error, int code)
+{
+    int n = snprintf(out, cap,
+        "{\"type\":\"sys.nack\",\"code\":%d,\"data\":{\"type\":\"notification.summary.deliver\",\"command_id\":\"%s\",\"error\":\"%s\"}}",
+        code, command_id, error);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static void desk_sdk_summary_ack_callback(const char *summary_id, const char *source,
+                                          void *user_data)
+{
+    (void)user_data;
+    (void)desk_sdk_bridge_send_notification_summary_ack(summary_id, source);
+}
+
+static void desk_sdk_notification_status_callback(
+    const desk_notification_status_event_t *event, void *user_data)
+{
+    (void)user_data;
+    if (!event) return;
+    /* User acknowledgement has its own contract event and is never a status. */
+    if (event->status == DESK_NOTIFICATION_ACKNOWLEDGED) {
+        printf("[SDK-NOTIFICATION][WARN] acknowledgement callback has no device event mapping\n");
+        return;
+    }
+    int rc = desk_sdk_bridge_send_notification_status(event->notification_id, event->status);
+    if (rc != 0) {
+        printf("[SDK-NOTIFICATION][WARN] status send failed id=%s status=%d rc=%d\n",
+               event->notification_id, (int)event->status, rc);
+    }
+}
+
+static int desk_sdk_notification_summary_dispatch(const char *json_in, char *out_buf,
+                                                  size_t max_out_len)
+{
+    static const char *const root_keys[] = { "type", "code", "data" };
+    static const char *const data_keys[] = {
+        "summary_id", "batch_id", "created_at", "expires_at", "items", "omitted_count", "command_id"
+    };
+    char command_id[40] = "", command_raw[48] = "", root_code[16] = "";
+    const char *data = NULL;
+    size_t data_len = 0;
+    if (!desk_log_get_member_span(json_in, "data", &data, &data_len) || data_len == 0 ||
+        desk_log_get_member(data, "command_id", command_raw, sizeof(command_raw)) != 1 ||
+        !json_parse_top_level_str(data, "command_id", command_id, sizeof(command_id)) ||
+        !desk_sdk_notification_command_id_valid(command_id)) return -1;
+    if (!desk_log_object_keys_allowed(json_in, root_keys, sizeof(root_keys) / sizeof(root_keys[0])) ||
+        desk_log_get_member(json_in, "code", root_code, sizeof(root_code)) != 1 || strcmp(root_code, "0") != 0 ||
+        !desk_log_object_keys_allowed(data, data_keys, sizeof(data_keys) / sizeof(data_keys[0])))
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    if (!desk_sdk_ws_client_is_authenticated())
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "AUTH_REQUIRED", 401);
+
+    char summary_id[129] = "", batch_id[129] = "", created_at[32] = "", expires_at[32] = "";
+    char omitted_count[32] = "";
+    const char *items_span = NULL;
+    size_t items_len = 0;
+    uint64_t created_us = 0, expires_us = 0;
+    bool valid =
+        desk_sdk_notification_get_string(data, "summary_id", summary_id, sizeof(summary_id)) &&
+        desk_sdk_notification_get_string(data, "batch_id", batch_id, sizeof(batch_id)) &&
+        desk_sdk_summary_identifier_valid(summary_id) && desk_sdk_summary_identifier_valid(batch_id) &&
+        desk_sdk_notification_get_string(data, "created_at", created_at, sizeof(created_at)) &&
+        desk_sdk_notification_get_string(data, "expires_at", expires_at, sizeof(expires_at)) &&
+        desk_sdk_notification_parse_timestamp(created_at, &created_us) &&
+        desk_sdk_notification_parse_timestamp(expires_at, &expires_us) &&
+        expires_us > created_us && expires_us - created_us == 86400000000ULL &&
+        desk_log_get_member_span(data, "items", &items_span, &items_len) &&
+        desk_sdk_summary_validate_items(items_span, items_len) &&
+        desk_log_get_member(data, "omitted_count", omitted_count, sizeof(omitted_count)) == 1 &&
+        desk_sdk_summary_count_valid(omitted_count);
+    uint64_t omitted_value = 0;
+    if (valid) {
+        for (const char *p = omitted_count; *p; ++p)
+            omitted_value = omitted_value * 10u + (unsigned)(*p - '0');
+        if (omitted_value > UINT32_MAX) valid = false;
+    }
+    if (!valid)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+
+    desk_sdk_summary_item_storage_t *storage = calloc(DESK_NOTIFICATION_SUMMARY_MAX_ITEMS, sizeof(*storage));
+    desk_notification_summary_item_t typed_items[DESK_NOTIFICATION_SUMMARY_MAX_ITEMS] = {0};
+    size_t item_count = 0;
+    if (!storage)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "RESOURCE_UNAVAILABLE", 503);
+    if (!desk_sdk_summary_parse_items(items_span, items_len, storage, typed_items, &item_count)) {
+        free(storage);
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "INVALID_ARGUMENT", 400);
+    }
+    desk_notification_summary_input_t input = {
+        .summary_id = summary_id,
+        .batch_id = batch_id,
+        .created_at = created_at,
+        .expires_at = expires_at,
+        .items = typed_items,
+        .item_count = item_count,
+        .omitted_count = (uint32_t)omitted_value,
+    };
+    int deliver_rc = desk_hardware_notification_deliver_summary(&input);
+    free(storage);
+    if (deliver_rc == DESK_HW_ERR_TIMEOUT)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "EXPIRED", 410);
+    if (deliver_rc == DESK_HW_ERR_BUSY)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id, "QUEUE_FULL", 507);
+    if (deliver_rc != DESK_HW_OK)
+        return desk_sdk_notification_summary_nack(out_buf, max_out_len, command_id,
+            deliver_rc == DESK_HW_ERR_INVALID_ARG ? "INVALID_ARGUMENT" : "DELIVERY_UNAVAILABLE",
+            deliver_rc == DESK_HW_ERR_INVALID_ARG ? 400 : 503);
+    int n = snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"notification.summary.deliver\",\"command_id\":\"%s\"}}",
+        command_id);
+    return n >= 0 && (size_t)n < max_out_len ? 0 : -1;
+}
+
+static bool desk_log_component_filter_valid(const char *raw, uint8_t *component_mask)
+{
+    static const char *const names[] = {"camera", "audio", "network", "stm32"};
+    if (!component_mask) return false;
     desk_log_json_parser_t p = { .p = raw, .depth = 0 };
     desk_log_json_ws(&p);
     if (*p.p++ != '[') return false;
     desk_log_json_ws(&p);
-    if (*p.p == ']') { ++p.p; desk_log_json_ws(&p); *camera_only = false; return *p.p == '\0'; }
-    const char *start, *end;
-    if (!desk_log_json_string(&p, &start, &end) || !desk_log_plain_key(start, end, "camera")) return false;
-    desk_log_json_ws(&p);
+    uint8_t mask = 0;
+    if (*p.p != ']') {
+        for (;;) {
+            const char *start, *end;
+            if (!desk_log_json_string(&p, &start, &end)) return false;
+            size_t index;
+            for (index = 0; index < sizeof(names) / sizeof(names[0]); ++index)
+                if (desk_log_plain_key(start, end, names[index])) break;
+            if (index == sizeof(names) / sizeof(names[0]) || (mask & (1U << index))) return false;
+            mask |= (uint8_t)(1U << index);
+            desk_log_json_ws(&p);
+            if (*p.p == ']') break;
+            if (*p.p++ != ',') return false;
+            desk_log_json_ws(&p);
+        }
+    }
     if (*p.p++ != ']') return false;
     desk_log_json_ws(&p);
-    *camera_only = true;
+    *component_mask = mask;
     return *p.p == '\0';
 }
 
 /* This is deliberately called only by the WebSocket receive loop. The legacy
  * TCP line server continues to use desk_sdk_bridge_process_command(). */
+static void desk_sdk_audio_emit(const desk_audio_stream_status_t *status,
+                                const char *reason, const char *digest)
+{
+    if (!status || !reason || !desk_sdk_ws_client_is_connected()) return;
+    char json[512];
+    int n = snprintf(json, sizeof(json),
+        "{\"type\":\"evt.audio.buffer_status\",\"code\":0,\"data\":{"
+        "\"stream_id\":%u,\"reason\":\"%s\",\"free_frames\":%u,"
+        "\"pending_frames\":%u,\"queue_depth\":%u,\"start_buffer_frames\":%u,\"playing\":%s"
+        "%s%s%s}}",
+        (unsigned)status->stream_id, reason, (unsigned)status->free_frames,
+        (unsigned)status->pending_frames, (unsigned)status->queue_depth,
+        (unsigned)status->start_buffer_frames, status->playing ? "true" : "false",
+        digest ? ",\"audio_sha256\":\"" : "", digest ? digest : "", digest ? "\"" : "");
+    if (n > 0 && (size_t)n < sizeof(json)) (void)desk_sdk_ws_client_send_text(json);
+}
+
+static void desk_sdk_audio_mark_cancel_locked(const char *reason)
+{
+    if (!s_sdk_audio.active || s_sdk_audio.cancel_requested) return;
+    snprintf(s_sdk_audio.terminal_reason, sizeof(s_sdk_audio.terminal_reason), "%s",
+             reason ? reason : "playback_write_failed");
+    s_sdk_audio.cancel_requested = true;
+    (void)desk_hardware_audio_stream_stop(s_sdk_audio.handle, DESK_SDK_AUDIO_STOP_TIMEOUT_MS);
+}
+
+static void desk_sdk_audio_poll_locked(uint32_t connection_generation,
+                                       desk_audio_stream_status_t *emit_status,
+                                       char emit_reason[32], char emit_digest[65],
+                                       bool *should_emit)
+{
+    *should_emit = false;
+    if (!s_sdk_audio.active) return;
+    if (s_sdk_audio.generation != connection_generation ||
+        !desk_sdk_ws_client_is_connected()) {
+        desk_sdk_audio_mark_cancel_locked("aborted");
+    }
+
+    desk_audio_stream_status_t status;
+    if (desk_hardware_audio_stream_get_status(s_sdk_audio.handle, &status) != DESK_HW_OK) return;
+    /* The SDK sender waits for its first buffer_status credit before sending
+     * any WSPK payload. Emit the HAL's current free-frame count immediately
+     * after the begin ACK (the WebSocket poller calls us after ACK send). */
+    if (!s_sdk_audio.initial_flow_sent &&
+        s_sdk_audio.generation == connection_generation &&
+        desk_sdk_ws_client_is_connected()) {
+        *emit_status = status;
+        snprintf(emit_reason, 32, "running");
+        emit_digest[0] = '\0';
+        *should_emit = true;
+        s_sdk_audio.initial_flow_sent = true;
+    }
+    if (!status.tx_drained) return;
+
+    const char *reason = s_sdk_audio.terminal_reason;
+    if (!reason[0]) {
+        if (status.state == DESK_AUDIO_STREAM_COMPLETE) reason = "complete";
+        else if (status.state == DESK_AUDIO_STREAM_CANCELED) reason = "aborted";
+        else reason = "playback_write_failed";
+    }
+    if (!s_sdk_audio.terminal_sent && s_sdk_audio.generation == connection_generation &&
+        desk_sdk_ws_client_is_connected()) {
+        *emit_status = status;
+        snprintf(emit_reason, 32, "%s", reason);
+        if (s_sdk_audio.digest_mismatch)
+            snprintf(emit_digest, 65, "%s", s_sdk_audio.actual_digest_hex);
+        else if (strcmp(reason, "complete") == 0)
+            snprintf(emit_digest, 65, "%s", s_sdk_audio.expected_digest_hex);
+        else emit_digest[0] = '\0';
+        *should_emit = true;
+    }
+    s_sdk_audio.terminal_sent = true;
+    desk_sdk_audio_hash_free_locked();
+    s_sdk_audio.active = false;
+}
+
+void desk_sdk_bridge_audio_poll(uint32_t connection_generation)
+{
+    /* Ignore delayed callbacks from a retired session. A current-generation
+     * poll still owns teardown cleanup and may drain an older HAL stream. */
+    if (!desk_sdk_ws_client_audio_generation_acquire(connection_generation)) return;
+    desk_audio_stream_status_t status;
+    char reason[32] = {0}, digest[65] = {0};
+    bool emit = false;
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    desk_sdk_audio_poll_locked(connection_generation, &status, reason, digest, &emit);
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    if (emit) desk_sdk_audio_emit(&status, reason, digest[0] ? digest : NULL);
+    desk_sdk_ws_client_audio_command_release();
+}
+
+void desk_sdk_bridge_audio_session_closed(uint32_t connection_generation)
+{
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (s_sdk_audio.active && s_sdk_audio.generation == connection_generation)
+        desk_sdk_audio_mark_cancel_locked("aborted");
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    desk_sdk_bridge_audio_poll(desk_sdk_ws_client_generation());
+}
+
+int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
+                                           uint32_t connection_generation)
+{
+    desk_wspk_header_t header;
+    if (!frame || len < DESK_WSPK_HEADER_SIZE ||
+        desk_wspk_unpack_header(frame, len, &header) != 0 ||
+        header.frame_type != DESK_WSPK_TYPE_AUDIO ||
+        header.payload_size != len - DESK_WSPK_HEADER_SIZE ||
+        header.payload_size < 2 || header.payload_size > DESK_AUDIO_STREAM_CHUNK_BYTES ||
+        (header.payload_size & 1u) || (header.flags & (uint8_t)~0x03u) != 0) return -1;
+    if (!desk_sdk_ws_client_audio_generation_acquire(connection_generation)) return -1;
+
+    desk_audio_stream_status_t status;
+    bool emit_flow = false;
+    bool cancel = false;
+    bool stale_generation = false;
+    const char *failure_reason = "playback_write_failed";
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (!s_sdk_audio.active) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        desk_sdk_ws_client_audio_command_release();
+        return -1;
+    }
+    if (s_sdk_audio.generation != connection_generation ||
+        s_sdk_audio.stream_id != header.stream_id) {
+        failure_reason = "stale_frame";
+        cancel = true;
+        stale_generation = s_sdk_audio.generation != connection_generation;
+    } else if (s_sdk_audio.last_seen ||
+               header.sequence != s_sdk_audio.expected_sequence ||
+               ((s_sdk_audio.expected_sequence == 0) != ((header.flags & 0x01u) != 0)) ||
+               (s_sdk_audio.expected_sequence != 0 && (header.flags & 0x01u)) ||
+               (s_sdk_audio.received_bytes > s_sdk_audio.total_bytes ||
+                header.payload_size > s_sdk_audio.total_bytes - s_sdk_audio.received_bytes) ||
+               (((s_sdk_audio.received_bytes + header.payload_size) == s_sdk_audio.total_bytes) !=
+                    ((header.flags & 0x02u) != 0))) {
+        failure_reason = "sequence_gap";
+        cancel = true;
+    } else {
+        int rc = desk_hardware_audio_stream_write(s_sdk_audio.handle,
+            s_sdk_audio.generation, s_sdk_audio.stream_id, header.sequence,
+            frame + DESK_WSPK_HEADER_SIZE, header.payload_size, &status);
+        if (rc != DESK_HW_OK) {
+            failure_reason = rc == DESK_HW_ERR_BUSY ? "enqueue_timeout" : "playback_write_failed";
+            cancel = true;
+        } else if (desk_sdk_audio_hash_update_locked(frame + DESK_WSPK_HEADER_SIZE,
+                                                    header.payload_size) != 0) {
+            failure_reason = "playback_write_failed";
+            cancel = true;
+        } else {
+            s_sdk_audio.received_bytes += header.payload_size;
+            ++s_sdk_audio.expected_sequence;
+            emit_flow = true;
+            if (header.flags & 0x02u) {
+                uint8_t actual[32];
+                if (s_sdk_audio.received_bytes != s_sdk_audio.total_bytes ||
+                    desk_sdk_audio_hash_finish_locked(actual) != 0) {
+                    failure_reason = "playback_write_failed";
+                    cancel = true;
+                } else {
+                    desk_sdk_audio_hex_encode(actual, s_sdk_audio.actual_digest_hex);
+                    if (memcmp(actual, s_sdk_audio.expected_digest, sizeof(actual)) != 0) {
+                        s_sdk_audio.digest_mismatch = true;
+                        snprintf(s_sdk_audio.terminal_reason, sizeof(s_sdk_audio.terminal_reason), "complete");
+                        desk_sdk_audio_mark_cancel_locked("complete");
+                    } else if (desk_hardware_audio_stream_finish(s_sdk_audio.handle) != DESK_HW_OK) {
+                        failure_reason = "playback_write_failed";
+                        cancel = true;
+                    } else {
+                        s_sdk_audio.last_seen = true;
+                    }
+                }
+            }
+        }
+    }
+    if (cancel) desk_sdk_audio_mark_cancel_locked(failure_reason);
+    if (emit_flow && desk_hardware_audio_stream_get_status(s_sdk_audio.handle, &status) != DESK_HW_OK)
+        emit_flow = false;
+    uint32_t stream_id = s_sdk_audio.stream_id;
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+
+    if (emit_flow) desk_sdk_audio_emit(&status, "running", NULL);
+    desk_sdk_ws_client_audio_command_release();
+    desk_sdk_bridge_audio_poll(connection_generation);
+    (void)stream_id;
+    return stale_generation ? -1 : 0;
+}
+
+static int desk_sdk_audio_stream_begin_command(const char *json_in,
+                                               char *out_buf, size_t max_out_len,
+                                               uint32_t connection_generation)
+{
+    char rid_scratch[128];
+    const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+    char data[512], digest[65] = {0};
+    if (!json_extract_subobject(json_in, "data", data, sizeof(data))) data[0] = '\0';
+    int32_t stream_id = json_parse_int(data, "stream_id", -1);
+    int32_t total_bytes = json_parse_int(data, "total_bytes", -1);
+    int32_t sample_rate = json_parse_int(data, "sample_rate_hz", -1);
+    int32_t channels = json_parse_int(data, "channels", -1);
+    int32_t sample_width = json_parse_int(data, "sample_width_bytes", -1);
+    if (stream_id < 1 || stream_id > 65535 || total_bytes < 2 ||
+        (uint32_t)total_bytes > DESK_AUDIO_STREAM_MAX_BYTES || (total_bytes & 1) ||
+        sample_rate != 24000 || channels != 1 || sample_width != 2 ||
+        !json_parse_str(data, "audio_sha256", digest, sizeof(digest)) ||
+        !desk_sdk_is_lower_hex_64(digest)) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":400,\"error\":{"
+            "\"code\":\"INVALID_AUDIO_STREAM\",\"message\":\"Invalid PCM stream metadata\"}}", rid);
+        return 0;
+    }
+
+    uint8_t expected_digest[32];
+    if (desk_sdk_audio_hex_decode(digest, expected_digest) != 0) return -1;
+    uint32_t generation = desk_sdk_ws_client_generation();
+    if (!connection_generation || generation != connection_generation ||
+        !desk_sdk_ws_client_is_authenticated()) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
+            "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stream requires an authenticated SDK session\"}}", rid);
+        return 0;
+    }
+
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (s_sdk_audio.active) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":409,\"error\":{"
+            "\"code\":\"RESOURCE_BUSY\",\"message\":\"Another audio stream is active\"}}", rid);
+        return 0;
+    }
+    uint64_t counter = atomic_fetch_add(&s_sdk_audio_handle, 1);
+    uint64_t handle = ((uint64_t)generation << 32) | (counter & 0xffffffffu);
+    if (!handle) handle = atomic_fetch_add(&s_sdk_audio_handle, 1);
+    if (desk_sdk_audio_hash_begin_locked() != 0) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":500,\"error\":{"
+            "\"code\":\"AUDIO_HASH_UNAVAILABLE\",\"message\":\"Cannot initialize audio integrity check\"}}", rid);
+        return 0;
+    }
+    int rc = desk_hardware_audio_stream_begin(handle, generation, (uint32_t)stream_id,
+        (uint32_t)sample_rate, (uint8_t)channels, (uint8_t)sample_width, (uint32_t)total_bytes);
+    if (rc != DESK_HW_OK) {
+        desk_sdk_audio_hash_free_locked();
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        const char *err = rc == DESK_HW_ERR_BUSY ? "RESOURCE_BUSY" :
+                          rc == DESK_HW_ERR_UNAVAILABLE ? "AUDIO_UNAVAILABLE" : "INVALID_AUDIO_STREAM";
+        int code = rc == DESK_HW_ERR_BUSY ? 409 : rc == DESK_HW_ERR_UNAVAILABLE ? 503 : 400;
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":%d,\"error\":{"
+            "\"code\":\"%s\",\"message\":\"Audio HAL rejected stream begin\"}}", rid, code, err);
+        return 0;
+    }
+    s_sdk_audio.active = true;
+    s_sdk_audio.handle = handle;
+    s_sdk_audio.generation = generation;
+    s_sdk_audio.stream_id = (uint32_t)stream_id;
+    s_sdk_audio.total_bytes = (uint32_t)total_bytes;
+    s_sdk_audio.received_bytes = 0;
+    s_sdk_audio.expected_sequence = 0;
+    s_sdk_audio.last_seen = false;
+    s_sdk_audio.terminal_sent = false;
+    s_sdk_audio.initial_flow_sent = false;
+    s_sdk_audio.cancel_requested = false;
+    s_sdk_audio.digest_mismatch = false;
+    s_sdk_audio.terminal_reason[0] = '\0';
+    memcpy(s_sdk_audio.expected_digest, expected_digest, sizeof(expected_digest));
+    memcpy(s_sdk_audio.expected_digest_hex, digest, sizeof(s_sdk_audio.expected_digest_hex));
+    s_sdk_audio.actual_digest_hex[0] = '\0';
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"stream_id\":%u,\"accepted\":true}}",
+        rid, (unsigned)stream_id);
+    return 0;
+}
+
+static int desk_sdk_audio_stop_command(const char *json_in,
+                                       char *out_buf, size_t max_out_len,
+                                       uint32_t connection_generation)
+{
+    char rid_scratch[128], data[256];
+    const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+    if (!json_extract_subobject(json_in, "data", data, sizeof(data))) data[0] = '\0';
+    int32_t requested_id = json_parse_int(data, "stream_id", -1);
+    uint32_t current_generation = desk_sdk_ws_client_generation();
+    if (!connection_generation || current_generation != connection_generation ||
+        !desk_sdk_ws_client_is_authenticated()) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
+            "\"code\":\"AUTH_FAILED\",\"message\":\"Audio stop requires an authenticated SDK session\"}}", rid);
+        return 0;
+    }
+    if (requested_id < 1 || requested_id > UINT16_MAX) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":400,\"error\":{"
+            "\"code\":\"INVALID_ARGUMENTS\",\"message\":\"Audio stop requires the active stream_id\"}}", rid);
+        return 0;
+    }
+    pthread_mutex_lock(&s_sdk_audio.mutex);
+    if (!s_sdk_audio.active || s_sdk_audio.generation != connection_generation ||
+        (uint32_t)requested_id != s_sdk_audio.stream_id) {
+        pthread_mutex_unlock(&s_sdk_audio.mutex);
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":404,\"error\":{"
+            "\"code\":\"AUDIO_STREAM_NOT_FOUND\",\"message\":\"No matching audio stream is active\"}}", rid);
+        return 0;
+    }
+    snprintf(s_sdk_audio.terminal_reason, sizeof(s_sdk_audio.terminal_reason), "aborted");
+    s_sdk_audio.cancel_requested = true;
+    int rc = desk_hardware_audio_stream_stop(s_sdk_audio.handle, DESK_SDK_AUDIO_STOP_TIMEOUT_MS);
+    desk_audio_stream_status_t status;
+    bool drained = desk_hardware_audio_stream_get_status(s_sdk_audio.handle, &status) == DESK_HW_OK && status.tx_drained;
+    pthread_mutex_unlock(&s_sdk_audio.mutex);
+    if (rc != DESK_HW_OK || !drained) {
+        snprintf(out_buf, max_out_len,
+            "{\"type\":\"sys.nack\",%s\"code\":504,\"error\":{"
+            "\"code\":\"AUDIO_DRAIN_TIMEOUT\",\"message\":\"Audio stop did not confirm DMA drain\"}}", rid);
+        return 0;
+    }
+    snprintf(out_buf, max_out_len,
+        "{\"type\":\"sys.ack\",%s\"code\":0,\"data\":{\"stopped\":true}}", rid);
+    return 0;
+}
+
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len)
 {
-    char type_raw[96] = "", data[512] = "", code_raw[16] = "";
+    /* Compatibility entry point for non-audio WebSocket contract helpers.
+     * Audio commands require an explicit receive-loop generation below. */
+    return desk_sdk_bridge_process_ws_command_for_generation(json_in, out_buf,
+                                                               max_out_len, 0);
+}
+
+int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
+                                                       char *out_buf,
+                                                       size_t max_out_len,
+                                                       uint32_t connection_generation)
+{
+    char type_raw[96] = "", code_raw[16] = "";
+    char data[3072] = "";
     if (!json_in || strnlen(json_in, DESK_SDK_MAX_FRAME_LEN + 1U) > DESK_SDK_MAX_FRAME_LEN ||
         !desk_log_json_valid(json_in)) return -1;
-    if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1 ||
-        !desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;
+    if (desk_log_get_member(json_in, "type", type_raw, sizeof(type_raw)) != 1) return -1;
     char type[64] = "";
     if (!json_parse_top_level_str(json_in, "type", type, sizeof(type))) return -1;
+    if (strcmp(type, "ctrl.audio.stream.begin") == 0 ||
+        strcmp(type, "ctrl.audio.stop") == 0) {
+        if (!desk_sdk_camera_ws_session_is_paired() || !desk_sdk_log_pairing_is_complete() ||
+            !desk_sdk_ws_client_audio_command_acquire(connection_generation)) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":401,\"error\":{"
+                     "\"code\":\"AUTH_FAILED\",\"message\":\"Audio command is not bound to the authenticated WebSocket generation\"}}",
+                     rid);
+            return 0;
+        }
+        int audio_rc = strcmp(type, "ctrl.audio.stream.begin") == 0
+            ? desk_sdk_audio_stream_begin_command(json_in, out_buf, max_out_len,
+                                                  connection_generation)
+            : desk_sdk_audio_stop_command(json_in, out_buf, max_out_len,
+                                          connection_generation);
+        desk_sdk_ws_client_audio_command_release();
+        return audio_rc;
+    }
+    if (strcmp(type, "ctrl.camera.stream.start") == 0 ||
+        strcmp(type, "ctrl.camera.stream.stop") == 0 ||
+        strcmp(type, "ctrl.camera.clock.ping") == 0) {
+        return desk_sdk_camera_stream_command(json_in, out_buf, max_out_len, type);
+    }
+    if (strcmp(type, "ctrl.camera.acquire") == 0 || strcmp(type, "camera.acquire") == 0) {
+        if (!desk_sdk_camera_ws_session_is_paired()) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                     "\"code\":\"AUTH_REQUIRED\",\"message\":\"Camera lease requires paired WebSocket\"}}", rid);
+            return 0;
+        }
+        int rc = desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
+        if (rc == 0 && strstr(out_buf, "\"type\":\"sys.ack\"")) {
+            char client_id[32] = "";
+            if (json_parse_top_level_str(json_in, "client_id", client_id, sizeof(client_id)) && client_id[0] &&
+                desk_arbiter_camera_lease_matches(client_id)) {
+                pthread_mutex_lock(&s_ws_camera_owner_mutex);
+                snprintf(s_ws_camera_owner_id, sizeof(s_ws_camera_owner_id), "%s", client_id);
+                pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+            }
+        }
+        return rc;
+    }
+    if (strcmp(type, "ctrl.camera.release") == 0 || strcmp(type, "camera.release") == 0) {
+        char client_id[32] = "";
+        (void)json_parse_top_level_str(json_in, "client_id", client_id, sizeof(client_id));
+        pthread_mutex_lock(&s_ws_camera_owner_mutex);
+        bool owner_matches = client_id[0] && strcmp(client_id, s_ws_camera_owner_id) == 0;
+        pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+        if (!desk_sdk_camera_ws_session_is_paired() || !owner_matches) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":403,\"error\":{"
+                     "\"code\":\"NO_ACTIVE_LEASE\",\"message\":\"Paired WebSocket does not own this lease\"}}", rid);
+            return 0;
+        }
+        pthread_mutex_lock(&s_camera_stream.mutex);
+        bool stream_owned = s_camera_stream.active &&
+                            strcmp(client_id, s_camera_stream.client_id) == 0;
+        pthread_mutex_unlock(&s_camera_stream.mutex);
+        if (stream_owned && desk_sdk_camera_stream_stop_internal(false) != DESK_HW_OK) {
+            char rid_scratch[128];
+            const char *rid = desk_sdk_request_id_fragment(json_in, rid_scratch, sizeof(rid_scratch));
+            snprintf(out_buf, max_out_len,
+                     "{\"type\":\"sys.nack\",%s\"code\":500,\"error\":{"
+                     "\"code\":\"CAMERA_STOP_FAILED\",\"message\":\"Camera stream could not be stopped\"}}", rid);
+            return 0;
+        }
+        int rc = desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
+        if (rc == 0 && strstr(out_buf, "\"type\":\"sys.ack\"")) {
+            pthread_mutex_lock(&s_ws_camera_owner_mutex);
+            s_ws_camera_owner_id[0] = '\0';
+            pthread_mutex_unlock(&s_ws_camera_owner_mutex);
+        }
+        return rc;
+    }
+    if (strcmp(type, "notification.summary.deliver") == 0)
+        return desk_sdk_notification_summary_dispatch(json_in, out_buf, max_out_len);
+    if (!desk_log_get_member(json_in, "data", data, sizeof(data))) return -1;
+    if (strcmp(type, "notification.deliver") == 0)
+        return desk_sdk_notification_dispatch(json_in, out_buf, max_out_len, data);
     if (strcmp(type, "sys.log.subscribe") != 0 && strcmp(type, "sys.log.unsubscribe") != 0)
         return desk_sdk_bridge_process_command(json_in, out_buf, max_out_len);
     static const char *const root_keys[] = { "type", "code", "data" };
@@ -2174,11 +4122,11 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
             pthread_mutex_unlock(&s_log_mutex);
             return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
         }
-        /* v1 currently has only the camera component. Accept omitted/empty or
-         * exactly ["camera"]; reject every other shape rather than widening. */
-        bool camera_only = false;
+        /* CR-033 closes the v1 component filter to these four structured
+         * sources; reject unknown names, duplicates, and non-string shapes. */
+        uint8_t component_mask = 0;
         unsigned component_count = desk_log_get_member(data, "components", field_raw, sizeof(field_raw));
-        if (component_count > 1 || (component_count == 1 && !desk_log_component_filter_valid(field_raw, &camera_only))) {
+        if (component_count > 1 || (component_count == 1 && !desk_log_component_filter_valid(field_raw, &component_mask))) {
                 pthread_mutex_unlock(&s_log_mutex);
                 return desk_sdk_log_nack(out_buf, max_out_len, type, command_id, "INVALID_FILTER", 400);
         }
@@ -2189,7 +4137,8 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
         generate_dynamic_token(s_log_stream_id, sizeof(s_log_stream_id));
         if (!s_log_boot_id[0]) generate_dynamic_token(s_log_boot_id, sizeof(s_log_boot_id));
         s_log_stream_active = true;
-        s_log_camera_only = camera_only;
+        s_log_component_mask = component_mask;
+        s_log_audio_snapshot_pending = true;
         strcpy(s_log_min_level, min_level);
         s_log_has_pending_record = false;
         s_log_has_pending_gap = false;
@@ -2198,10 +4147,12 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
             "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.subscribe\",\"command_id\":\"%s\",\"accepted\":true,\"stream_id\":\"%s\",\"boot_id\":\"%s\",\"next_sequence\":%llu,\"min_level\":\"%s\",\"components\":%s}}",
             command_id, s_log_stream_id, s_log_boot_id,
             (unsigned long long)desk_watcher_log_source_next_sequence(),
-            s_log_min_level, s_log_camera_only ? "[\"camera\"]" : "[]");
+            s_log_min_level, component_mask ? field_raw : "[]");
         if (n < 0 || (size_t)n >= max_out_len) {
             s_log_stream_active = false;
             s_log_stream_id[0] = '\0';
+            s_log_component_mask = 0;
+            s_log_audio_snapshot_pending = false;
             desk_sdk_log_source_reset_locked();
         }
         pthread_mutex_unlock(&s_log_mutex);
@@ -2216,6 +4167,8 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
     }
     s_log_stream_active = false;
     s_log_stream_id[0] = '\0';
+    s_log_component_mask = 0;
+    s_log_audio_snapshot_pending = false;
     desk_sdk_log_source_reset_locked();
     int n = snprintf(out_buf, max_out_len,
         "{\"type\":\"sys.ack\",\"code\":0,\"data\":{\"type\":\"sys.log.unsubscribe\",\"command_id\":\"%s\",\"accepted\":true}}",
@@ -2259,6 +4212,60 @@ int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json)
         desk_sdk_socket_send_line(event_buf);
     }
 
+    return 0;
+}
+
+int desk_sdk_bridge_send_notification_summary_ack(const char *summary_id, const char *source)
+{
+    if (!desk_sdk_summary_identifier_valid(summary_id) || !source) return -1;
+    size_t source_len = strlen(source);
+    if (source_len == 0 || source_len > 64) return -1;
+    for (size_t i = 0; i < source_len; ++i) {
+        char c = source[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) return -1;
+    }
+    char payload[256];
+    int n = snprintf(payload, sizeof(payload),
+                     "{\"summary_id\":\"%s\",\"source\":\"%s\"}", summary_id, source);
+    if (n < 0 || (size_t)n >= sizeof(payload)) return -1;
+    return desk_sdk_bridge_send_event("notification.acknowledged", payload);
+}
+
+static bool desk_sdk_notification_id_valid(const char *notification_id)
+{
+    size_t len = notification_id ? strlen(notification_id) : 0;
+    if (len == 0 || len > DESK_NOTIFICATION_ID_MAX) return false;
+    for (size_t i = 0; i < len; ++i) {
+        char c = notification_id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-')) return false;
+    }
+    return true;
+}
+
+int desk_sdk_bridge_send_notification_status(const char *notification_id,
+                                             desk_notification_status_t status)
+{
+    static const char *const status_names[] = {
+        "accepted", "rendered", "played", "failed", "expired", "unknown",
+    };
+    if (!desk_sdk_notification_id_valid(notification_id) ||
+        status < DESK_NOTIFICATION_ACCEPTED || status > DESK_NOTIFICATION_UNKNOWN) return -1;
+
+    if (!desk_sdk_ws_client_is_authenticated()) return -1;
+
+    char event_json[192];
+    int n = snprintf(event_json, sizeof(event_json),
+                     "{\"type\":\"notification.status\",\"data\":{"
+                     "\"notification_id\":\"%s\",\"status\":\"%s\"}}",
+                     notification_id, status_names[status]);
+    if (n < 0 || (size_t)n >= sizeof(event_json)) return -1;
+    int rc = desk_sdk_ws_client_send_text(event_json);
+    if (rc != 0) return rc;
+    if (s_outbound_cb) {
+        s_outbound_cb(event_json, (size_t)n, s_outbound_user_data);
+    }
     return 0;
 }
 
@@ -2326,6 +4333,43 @@ int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
     }
 
     return 0;
+}
+
+int desk_sdk_bridge_format_roller_input(desk_sdk_roller_delta_t delta,
+                                        int64_t timestamp_ms,
+                                        char *out_json,
+                                        size_t max_len)
+{
+    if ((delta != DESK_SDK_ROLLER_DELTA_POSITIVE &&
+         delta != DESK_SDK_ROLLER_DELTA_NEGATIVE) ||
+        timestamp_ms < 0 || !out_json || max_len == 0) {
+        return DESK_SDK_ROLLER_ERR_INVALID;
+    }
+
+    int written = snprintf(out_json, max_len,
+        "{\"type\":\"evt.sdk.input\",\"data\":{"
+        "\"source\":\"roller\",\"action\":\"rotate\","
+        "\"delta\":%d,\"timestamp_ms\":%lld}}",
+        (int)delta, (long long)timestamp_ms);
+    if (written < 0 || (size_t)written >= max_len) {
+        out_json[0] = '\0';
+        return DESK_SDK_ROLLER_ERR_BUFFER;
+    }
+    return DESK_SDK_ROLLER_OK;
+}
+
+int desk_sdk_bridge_send_roller_input(desk_sdk_roller_delta_t delta,
+                                      int64_t timestamp_ms)
+{
+    char event_json[160];
+    int rc = desk_sdk_bridge_format_roller_input(delta, timestamp_ms,
+                                                  event_json, sizeof(event_json));
+    if (rc != DESK_SDK_ROLLER_OK) return rc;
+    int send_rc = desk_sdk_ws_client_send_text_nonblocking(event_json);
+    if (send_rc == -1) return DESK_SDK_ROLLER_ERR_NOT_CONNECTED;
+    return send_rc == 0
+        ? DESK_SDK_ROLLER_OK
+        : DESK_SDK_ROLLER_ERR_SEND;
 }
 
 int desk_sdk_bridge_dispatch_tool_request(const char *request_envelope_json)
@@ -2850,12 +4894,15 @@ int desk_firmware_poll(int timeout_ms)
     desk_sdk_socket_server_poll(half);
     desk_sdk_pairing_server_poll(half);
     desk_sdk_ws_client_poll(half);
+    int notification_rc = desk_hardware_notification_process_pending();
+    if (notification_rc != DESK_HW_OK) {
+        printf("[SDK-NOTIFICATION][WARN] pending notification processing failed rc=%d\n",
+               notification_rc);
+    }
     return 0;
 }
 
 #ifdef ESP_PLATFORM
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 static TaskHandle_t s_worker_task_handle = NULL;

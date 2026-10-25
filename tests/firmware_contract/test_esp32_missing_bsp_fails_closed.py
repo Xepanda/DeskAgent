@@ -68,13 +68,46 @@ int test_uart_write_count(void);
         )
         (tmp / "include" / "freertos").mkdir(parents=True)
         (tmp / "include" / "freertos" / "FreeRTOS.h").write_text(
-            "#pragma once\n#define pdMS_TO_TICKS(ms) (ms)\n", encoding="utf-8"
+            "#pragma once\n"
+            "#include <freertos/portmacro.h>\n"
+            "#define pdMS_TO_TICKS(ms) (ms)\n", encoding="utf-8"
+        )
+        (tmp / "include" / "freertos" / "portmacro.h").write_text(
+            "#pragma once\n"
+            "typedef int portMUX_TYPE;\n"
+            "#define portMUX_INITIALIZER_UNLOCKED 0\n"
+            "#define portENTER_CRITICAL(mux) ((void)(mux))\n"
+            "#define portEXIT_CRITICAL(mux) ((void)(mux))\n",
+            encoding="utf-8",
         )
         (tmp / "include" / "freertos" / "semphr.h").write_text(
             "#pragma once\n", encoding="utf-8"
         )
+        (tmp / "include" / "freertos" / "task.h").write_text(
+            "#pragma once\n"
+            "#include <freertos/FreeRTOS.h>\n"
+            "static inline void vTaskDelay(unsigned int ticks) { (void)ticks; }\n",
+            encoding="utf-8",
+        )
         (tmp / "include" / "esp_timer.h").write_text(
             "#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n",
+            encoding="utf-8",
+        )
+        (tmp / "include" / "esp_heap_caps.h").write_text(
+            "#pragma once\n"
+            "#include <stddef.h>\n"
+            "#include <stdint.h>\n"
+            "#define MALLOC_CAP_SPIRAM (1U << 0)\n"
+            "#define MALLOC_CAP_8BIT (1U << 1)\n"
+            "static inline size_t heap_caps_get_largest_free_block(uint32_t caps) {\n"
+            "    (void)caps;\n"
+            "    return 0; /* This compile-only fixture has no PSRAM. */\n"
+            "}\n"
+            "static inline void *heap_caps_malloc(size_t size, uint32_t caps) {\n"
+            "    (void)size; (void)caps;\n"
+            "    return NULL; /* Keep the absent-PSRAM fixture fail-closed. */\n"
+            "}\n"
+            "static inline void heap_caps_free(void *ptr) { (void)ptr; }\n",
             encoding="utf-8",
         )
         (tmp / "uart_stub.c").write_text(
@@ -106,6 +139,7 @@ int64_t esp_timer_get_time(void) { static int64_t now; return now += 1000; }
             f"-I{tmp / 'include'}",
             f"-I{repo / 'firmware/components/desk_hardware/include'}",
             str(repo / "firmware/components/desk_hardware/src/desk_arbiter.c"),
+            str(repo / "firmware/components/desk_hardware/src/desk_watcher_log_source.c"),
             str(repo / "firmware/components/desk_hardware/src/desk_hardware.c"),
             str(tmp / "uart_stub.c"), "-o", str(cls.library_path),
         ]

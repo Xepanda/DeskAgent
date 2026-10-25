@@ -49,6 +49,7 @@ class TestMcpToolBridgeContract(unittest.TestCase):
             f"-I{repo_root}/firmware/components/desk_tclaw/include",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_arbiter.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_hardware.c",
+            f"{repo_root}/firmware/components/desk_hardware/src/desk_notification.c",
             f"{repo_root}/firmware/components/desk_tclaw/src/desk_tclaw_bridge.c",
             f"{repo_root}/firmware/components/desk_hardware/src/desk_watcher_log_source.c",
             f"{repo_root}/firmware/components/desk_sdk_bridge/src/desk_sdk_bridge.c",
@@ -173,13 +174,10 @@ class TestMcpToolBridgeContract(unittest.TestCase):
         self.assertEqual(resp.get("code"), 0)
         caps = resp.get("data", {}).get("capabilities", [])
 
-        # Essential capabilities required by contract
-        self.assertIn("inputs", caps)
-        self.assertIn("motion", caps)
-        self.assertIn("camera", caps)
+        # Inputs means SDK roller events only; button and touch inputs are not included.
+        self.assertEqual(caps, ["motion", "camera", "expression.audio_follow.v1", "expression", "mcp_tools", "inputs"])
         self.assertNotIn("audio_stream", caps)
         self.assertNotIn("audio.stream", caps)
-        self.assertTrue("expression" in caps or "expression.audio_follow.v1" in caps)
         self.assertIn("mcp_tools", caps)
 
         # Check sys.sdk.ready.get reports identical capabilities

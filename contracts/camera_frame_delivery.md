@@ -1,6 +1,6 @@
 # Camera Frame Delivery Contract (CR-004 proposal)
 
-**Status:** Lead/A0 approved implementation interface boundary (CR-004). The owning agent may implement within the paths below.
+**Status:** Lead/A0 approved interface boundary (CR-004); the A3 `OfficialRobotCameraAdapter` and managed Application composition-root wiring are present with L2 software evidence. Commit `21d5505` caps managed SDK capture cadence at 2 FPS, matching the current `CameraViewerService.iter_mjpeg()` maximum; requests below 2 FPS are preserved. Combined WSL camera tests passed 53/53 (L2). This does not establish real Runtime deployment, device load behavior, or real-time camera frame delivery; L3/L4 remain open.
 
 This contract adds **no wire protocol**. Device media remains the pinned WatcheRobot WSPK binary frame `<4sBBHII`; this file defines only the in-process Host consumer boundary using the existing `CameraViewerService.ingest_robot_frame(frame_bytes)` method.
 
@@ -33,7 +33,7 @@ ESP32 A2 WSPK FRAME_IMAGE
 ## Lease, cadence and backpressure
 
 - Existing Host `resource.camera.acquire/release` and device `ctrl.camera.acquire/release` commands remain authoritative. A3 forwards them over the official SDK session with the same Host lease owner and duration; it starts capture only after device acquire succeeds.
-- The SDK `camera.capture()` operation correlates `session_id` and returns the image. While a Host lease remains active, A3 may refresh at the requested `target_fps` (bounded by the existing Host resource contract); allow one device capture in flight. Do not enqueue an unbounded set of requests or images.
+- The SDK `camera.capture()` operation correlates `session_id` and returns the image. While a Host lease remains active, A3 may refresh at the requested `target_fps`, capped at 2 FPS to match the current `CameraViewerService.iter_mjpeg()` maximum; requests below 2 FPS are preserved. Allow one device capture in flight. Do not enqueue an unbounded set of requests or images. This software cap does not establish sustained device performance or real-time frame availability.
 - A6 stores one latest JPEG. It does not store frames when there is no active lease. It reports no frame after the existing 2000 ms freshness threshold; it never replays a stale image as current.
 - Host release or expiry stops scheduled capture, sends device release if connected, and clears A6's latest JPEG. Device/Runtime disconnect clears pending waiters and Host frame state; after reconnect a new lease/capture is required.
 
@@ -47,4 +47,4 @@ ESP32 A2 WSPK FRAME_IMAGE
 
 ## Verification boundary
 
-Mocks and constructed JPEG fixtures validate only Level 2. Passing the end-to-end gate requires the unmodified pinned Runtime/SDK and target firmware to produce a real, decodable JPEG from the physical camera, deliver it to `ingest_robot_frame`, return it through `/api/camera/frame` with fresh metadata, and then report unavailable after disconnect or lease expiry.
+The A3 adapter and the 2 FPS cadence cap have L2 evidence; the combined WSL camera suite passed 53/53 using fake transports and fixture frames. Mocks and constructed JPEG fixtures do not establish device-load behavior or real-time frame delivery. Passing the end-to-end gate requires the unmodified pinned Runtime/SDK and target firmware to produce a real, decodable JPEG from the physical camera, deliver it to `ingest_robot_frame`, return it through `/api/camera/frame` with fresh metadata, and then report unavailable after disconnect or lease expiry.

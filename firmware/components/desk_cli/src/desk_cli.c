@@ -19,16 +19,36 @@
 #include "desk_tclaw_bridge.h"
 #include "desk_sdk_bridge.h"
 #include "desk_watcher_input.h"
+#include "desk_watcher_camera.h"
+#include "mbedtls/base64.h"
 #include "desk_pairing_window.h"
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_audio.h"
-#include "desk_watcher_camera.h"
 #include "desk_watcher_motion.h"
+#endif
+
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+static const char *cli_motion_error_name(desk_watcher_motion_error_t error)
+{
+    switch (error) {
+    case DESK_WATCHER_MOTION_ERROR_NONE: return "none";
+    case DESK_WATCHER_MOTION_ERROR_UART_UNAVAILABLE: return "uart-unavailable";
+    case DESK_WATCHER_MOTION_ERROR_UART_BUSY: return "uart-busy";
+    case DESK_WATCHER_MOTION_ERROR_TX_IO: return "tx-io";
+    case DESK_WATCHER_MOTION_ERROR_BAD_CRC: return "bad-crc";
+    case DESK_WATCHER_MOTION_ERROR_WRONG_SEQUENCE: return "wrong-sequence";
+    case DESK_WATCHER_MOTION_ERROR_INVALID_RESPONSE: return "invalid-response";
+    case DESK_WATCHER_MOTION_ERROR_NACK: return "nack";
+    case DESK_WATCHER_MOTION_ERROR_ACK_TIMEOUT: return "ack-timeout";
+    default: return "unknown";
+    }
+}
 #endif
 
 #ifdef ESP_PLATFORM
 #include "netmgr.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -49,6 +69,26 @@ static size_t s_cmd_count = 0;
 static const char *s_provisioning_stage = "idle";
 static const char *s_provisioning_error_stage = "none";
 static int s_provisioning_error_code = 0;
+
+static const char *cli_camera_capture_error_name(int rc)
+{
+    switch (rc) {
+    case DESK_HW_ERR_UNAVAILABLE: return "unavailable";
+    case DESK_HW_ERR_TIMEOUT: return "timeout";
+    case DESK_HW_ERR_BUSY: return "busy";
+    case DESK_HW_ERR_INVALID_ARG: return "invalid-arg";
+    case DESK_WATCHER_CAMERA_ERR_PROTOCOL: return "protocol";
+    case DESK_WATCHER_CAMERA_ERR_CRC: return "CRC";
+    case DESK_WATCHER_CAMERA_ERR_SYNC_IO: return "SYNC I/O";
+    case DESK_WATCHER_CAMERA_ERR_SYNC_TIMEOUT: return "SYNC-low timeout";
+    case DESK_WATCHER_CAMERA_ERR_NOT_READY: return "not-ready";
+    case DESK_WATCHER_CAMERA_ERR_SPI: return "SPI";
+    case DESK_WATCHER_CAMERA_ERR_EMPTY: return "empty FIFO";
+    case DESK_WATCHER_CAMERA_ERR_CONTROL: return "HX6538 control";
+    case DESK_WATCHER_CAMERA_ERR_BUFFER_TOO_SMALL: return "buffer-too-small";
+    default: return "unknown camera error";
+    }
+}
 
 /* Forward declaration */
 static void cmd_help(int argc, char *argv[]);
@@ -206,7 +246,7 @@ static const desk_cli_command_t s_default_cmds[] = {
     {"display", "Display status or set expression: display [preset] [status]", cmd_display},
     {"audio", "Audio diagnostic: audio [status|sample|test|stop]", cmd_audio},
     {"camera", "Camera subsystem diagnostic: camera [status|capture]", cmd_camera},
-    {"body", "STM32 control: body [status|move <pan> <tilt> [duration_ms]|stop]", cmd_body},
+    {"body", "STM32 control: body [status|probe|move <pan> <tilt> [duration_ms]|stop]", cmd_body},
     {"peripherals", "Board peripherals status (RTC, LED, battery)", cmd_peripherals},
     {"input", "Read-only input driver status and event counters", cmd_input},
     {"network", "SDK TCP/UDP server status: network [status]", cmd_network},
@@ -264,10 +304,31 @@ static void cmd_sys_log_enable(int argc, char *argv[])
 static void cmd_sys_version(int argc, char *argv[])
 {
     (void)argc; (void)argv;
-    printf("Desk Agent R1 Firmware v1.0.0 (ESP-IDF v5.4, ESP32-S3 QFN56 v0.2)\r\n");
+#ifdef ESP_PLATFORM
+    const esp_app_desc_t *desc = esp_app_get_description();
+    if (!desc) {
+        printf("Running application identity: UNKNOWN (app descriptor unavailable)\r\n");
+        return;
+    }
+    printf("Running Application: project=%.*s version=%.*s\r\n",
+           (int)sizeof(desc->project_name), desc->project_name,
+           (int)sizeof(desc->version), desc->version);
+    printf("Build: date=%.*s time=%.*s ESP-IDF=%.*s\r\n",
+           (int)sizeof(desc->date), desc->date,
+           (int)sizeof(desc->time), desc->time,
+           (int)sizeof(desc->idf_ver), desc->idf_ver);
+    printf("ELF SHA256 (not source SHA): ");
+    for (size_t i = 0; i < sizeof(desc->app_elf_sha256); ++i) {
+        printf("%02x", (unsigned)desc->app_elf_sha256[i]);
+    }
+    printf("\r\n");
+#else
+    printf("Running application identity: UNKNOWN (host simulation)\r\n");
+#endif
 }
 
 extern uint32_t desk_app_task_stack_hwm(void);
+extern bool desk_app_task_stack_hwm_read(uint32_t *bytes);
 static void cmd_sys_heap(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -281,9 +342,15 @@ static void cmd_sys_heap(int argc, char *argv[])
            (unsigned long)total_free, (unsigned long)free_sram,
            (unsigned long)largest_sram, (unsigned long)min_sram,
            (unsigned long)free_psram);
-    printf("Task Stack Min Remaining: app_task=%lu B, poll_worker=%lu B\r\n",
-           (unsigned long)desk_app_task_stack_hwm(),
-           (unsigned long)desk_firmware_background_task_stack_hwm());
+    uint32_t app_task_hwm = 0U;
+    if (desk_app_task_stack_hwm_read(&app_task_hwm)) {
+        printf("Task Stack Min Remaining: app_task=%lu B (cached self-sample), poll_worker=%lu B\r\n",
+               (unsigned long)app_task_hwm,
+               (unsigned long)desk_firmware_background_task_stack_hwm());
+    } else {
+        printf("Task Stack Min Remaining: app_task=UNKNOWN (no cached self-sample), poll_worker=%lu B\r\n",
+               (unsigned long)desk_firmware_background_task_stack_hwm());
+    }
 #else
     printf("Free Heap: Host Simulation (SRAM: OK, PSRAM: OK)\r\n");
 #endif
@@ -342,9 +409,10 @@ static void cmd_system(int argc, char *argv[])
     printf("SDK UDP Pairing Port: %d (%s)\r\n", udp_port,
            udp_port <= 0 ? "NOT_LISTENING" : "LISTENING");
 
-    /* Arbiter State */
-    printf("Hardware Arbiter    : ACTIVE (Unified Resource Arbiter)\r\n");
-    printf("Display Initialized : %s\r\n", desk_hardware_is_display_initialized() ? "YES" : "NO");
+    /* No public arbiter readiness API exists; resource owners are not a health signal. */
+    printf("Hardware Arbiter Readiness: UNKNOWN (no readiness/status API)\r\n");
+    printf("Display Driver Initialization: %s (software flag only; physical scanout not exposed)\r\n",
+           desk_hardware_is_display_initialized() ? "INITIALIZED" : "NOT_INITIALIZED");
     printf("----------------------------------\r\n");
 }
 
@@ -358,16 +426,21 @@ static void cmd_display(int argc, char *argv[])
     } else {
         char preset[32] = "";
         char status[64] = "";
-        if (!desk_hardware_is_display_initialized()) {
-            printf("Display status: NOT_INITIALIZED\r\n");
+        bool initialized = desk_hardware_is_display_initialized();
+        printf("Display Driver Initialization: %s\r\n",
+               initialized ? "INITIALIZED" : "NOT_INITIALIZED");
+        printf("Display Physical Scanout: UNKNOWN (no physical scanout status API)\r\n");
+        if (!initialized) {
+            printf("Display Software Shadow: UNKNOWN (driver not initialized)\r\n");
             return;
         }
         int rc = desk_hardware_display_get_expression(preset, sizeof(preset), status, sizeof(status));
         if (rc != DESK_HW_OK) {
-            printf("Display status: UNKNOWN (readback rc=%d)\r\n", rc);
+            printf("Display Software Shadow: UNKNOWN (readback rc=%d)\r\n", rc);
             return;
         }
-        printf("Display status: READY; current preset='%s', status='%s'\r\n", preset, status);
+        printf("Display Software Shadow: AVAILABLE (cached expression); preset='%s', status='%s'\r\n",
+               preset, status);
     }
 }
 
@@ -416,11 +489,24 @@ static void cmd_audio(int argc, char *argv[])
 static void cmd_camera(int argc, char *argv[])
 {
     if (argc >= 2 && strcmp(argv[1], "capture") == 0) {
-        static DESK_DIAG_BSS uint8_t jpeg_buf[8192];
+        static DESK_DIAG_BSS uint8_t jpeg_buf[65536];
         size_t out_len = 0;
-        int rc = desk_hardware_camera_capture_jpeg(jpeg_buf, sizeof(jpeg_buf), &out_len, 500);
-        printf("Camera Capture: rc=%d, valid_frame=%s, out_len=%lu bytes\r\n",
-               rc, rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
+        int rc = desk_hardware_camera_capture_jpeg(jpeg_buf, sizeof(jpeg_buf), &out_len, 5000);
+        printf("Camera Capture: rc=%d (%s), valid_frame=%s, out_len=%lu bytes\r\n",
+               rc, rc == DESK_HW_OK ? "ok" : cli_camera_capture_error_name(rc),
+               rc == DESK_HW_OK && out_len > 0 ? "YES" : "NO", (unsigned long)out_len);
+        if (rc == DESK_HW_OK && out_len > 0) {
+            size_t b64_len = 0;
+            mbedtls_base64_encode(NULL, 0, &b64_len, jpeg_buf, out_len);
+            char *b64_str = (char *)malloc(b64_len + 1);
+            if (b64_str) {
+                size_t actual_b64 = 0;
+                mbedtls_base64_encode((unsigned char *)b64_str, b64_len + 1, &actual_b64, jpeg_buf, out_len);
+                b64_str[actual_b64] = '\0';
+                printf("DESK_JPEG_BEGIN %lu\r\n%s\r\nDESK_JPEG_END\r\n", (unsigned long)out_len, b64_str);
+                free(b64_str);
+            }
+        }
     } else {
         printf("Camera Subsystem:\r\n");
         printf("  Arbiter Camera Owner  : %d\r\n", (int)desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR));
@@ -437,6 +523,24 @@ static void cmd_camera(int argc, char *argv[])
 
 static void cmd_body(int argc, char *argv[])
 {
+    if (argc == 2 && strcmp(argv[1], "probe") == 0) {
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        desk_watcher_motion_peer_info_t peer = {0};
+        int rc = desk_watcher_motion_probe(&peer, 1000U);
+        if (rc == DESK_HW_OK) {
+            printf("STM32 HELLO valid: response_seq=%08lx fw=%u.%u.%u hw=%u caps=0x%02x sensors=0x%02x stream_profile=%u\r\n",
+                   (unsigned long)peer.response_seq,
+                   (unsigned)peer.fw_major, (unsigned)peer.fw_minor, (unsigned)peer.fw_patch,
+                   (unsigned)peer.hw_version, (unsigned)peer.capability_bitmap,
+                   (unsigned)peer.sensor_bitmap, (unsigned)peer.default_stream_profile);
+        } else {
+            printf("STM32 HELLO failed: rc=%d (no valid correlated HELLO_RSP)\r\n", rc);
+        }
+#else
+        printf("STM32 HELLO probe unavailable on host simulation.\r\n");
+#endif
+        return;
+    }
     if (argc >= 2 && strcmp(argv[1], "move") == 0) {
         float pan = 0.0f, tilt = 0.0f;
         uint32_t duration_ms = 500;
@@ -468,7 +572,7 @@ static void cmd_body(int argc, char *argv[])
         }
         return;
     }
-    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+    if (argc == 2 && strcmp(argv[1], "stop") == 0) {
         int rc;
 #ifdef ESP_PLATFORM
         rc = desk_hardware_motion_stop(true);
@@ -480,12 +584,18 @@ static void cmd_body(int argc, char *argv[])
         } else {
             printf("Body emergency stop failed: rc=%d\r\n", rc);
         }
-    } else {
+        return;
+    }
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)) {
         float pan = 0.0f, tilt = 0.0f;
         int position_rc = desk_hardware_motion_get_position(&pan, &tilt);
         uint8_t last_frame[64];
         size_t last_len = 0;
         int frame_rc = desk_hardware_get_last_mcu_frame(last_frame, sizeof(last_frame), &last_len);
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        desk_watcher_motion_diagnostics_t motion_diag;
+        desk_watcher_motion_get_diagnostics(&motion_diag);
+#endif
         printf("STM32 Body Coprocessor:\r\n");
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
         printf("  UART Driver State: %s\r\n",
@@ -500,14 +610,31 @@ static void cmd_body(int argc, char *argv[])
             printf("  Setpoint: UNKNOWN (read rc=%d)\r\n", position_rc);
         }
         if (frame_rc == DESK_HW_OK) {
-            printf("  Last formatted TX request length: %lu bytes (not an RX/ACK counter)\r\n",
+            printf("  Last formatted TX request length: %lu bytes (cached formatter data)\r\n",
                    (unsigned long)last_len);
         } else {
             printf("  Last formatted TX request length: UNKNOWN (read rc=%d)\r\n", frame_rc);
         }
-        printf("  STM32 peer/ACK state: UNKNOWN (no independent peer status in CLI)\r\n");
-        printf("  UART Protocol: A5 5A Class=0x02 Motion Frame\r\n");
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        printf("  UART TX bytes (driver reported): %lu; RX bytes: %lu\r\n",
+               (unsigned long)motion_diag.tx_bytes, (unsigned long)motion_diag.rx_bytes);
+        printf("  Valid correlated ACKs: %lu; NACKs: %lu; bad CRC: %lu; wrong sequence: %lu\r\n",
+               (unsigned long)motion_diag.ack_count, (unsigned long)motion_diag.nack_count,
+               (unsigned long)motion_diag.bad_crc_count, (unsigned long)motion_diag.wrong_sequence_count);
+        printf("  Timeouts: %lu; retries: %lu; last motion error: %s\r\n",
+               (unsigned long)motion_diag.timeout_count, (unsigned long)motion_diag.retry_count,
+               cli_motion_error_name(motion_diag.last_error));
+        printf("  Ignored non-HELLO/invalid probe frames: %lu\r\n",
+               (unsigned long)motion_diag.hello_ignored_frame_count);
+        printf("  STM32 peer evidence: %s (since boot; no physical position feedback)\r\n",
+               motion_diag.ack_count > 0 ? "valid ACK observed" : "no valid ACK observed");
+#else
+        printf("  STM32 peer/ACK state: UNKNOWN (no board motion diagnostics API)\r\n");
+#endif
+        printf("  Read-only probe: body probe (official COBS/0 SYS HELLO)\r\n");
+        return;
     }
+    printf("Usage: body [status|probe|move <pan_deg> <tilt_deg> [duration_ms]|stop]\r\n");
 }
 
 static void cmd_peripherals(int argc, char *argv[])

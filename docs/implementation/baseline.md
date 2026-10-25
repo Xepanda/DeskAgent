@@ -75,7 +75,8 @@
 +---------------------------------------------------------------------------------------+
 |  2. 官方 SDK / Runtime 桥接层 (WatcheRobot Runtime):                                 |
 |     - Host 广播 UDP 37021 并监听 LAN WebSocket；设备主动连接并在该连接上重连         |
-|     - 协议兼容与 capabilities 注册: inputs, motion, camera, expression；SDK 音频当前 unsupported |
+|     - capabilities：motion, camera, expression.audio_follow.v1, expression, mcp_tools, |
+|       inputs；按 CR-025 仅表示 roller 旋转，不含按钮或触摸输入；音频 unsupported  |
 |     - 区分单设备所有权: 作为宿主侧唯一的物理机器人连接持有者，严格杜绝两套 daemon 抢占 |
 |     - 严格请求响应与超时管理: 请求未收到设备 ACK 时必须超时报错，绝不伪造成功         |
 +---------------------------------------------------------------------------------------+

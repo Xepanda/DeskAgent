@@ -19,6 +19,7 @@ extern "C" {
 #include <stdint.h>
 #include <stddef.h>
 #include "desk_arbiter.h"
+#include "desk_audio_stream.h"
 
 /* Standard Hardware Error Codes */
 #define DESK_HW_OK                  0
@@ -54,9 +55,16 @@ typedef enum {
     DESK_TOUCH_ACTION_SCROLL_DOWN
 } desk_touch_action_t;
 
+typedef enum {
+    DESK_ROLLER_DELTA_DOWN = -1,
+    DESK_ROLLER_DELTA_UP = 1
+} desk_roller_delta_t;
+
 typedef void (*desk_touch_event_cb_t)(desk_touch_target_t target,
                                       desk_touch_action_t action,
                                       void *user_data);
+typedef void (*desk_roller_delta_cb_t)(desk_roller_delta_t delta,
+                                       void *user_data);
 
 typedef void (*desk_camera_frame_cb_t)(const uint8_t *jpeg_buf,
                                        size_t jpeg_len,
@@ -107,8 +115,24 @@ int desk_hardware_audio_record_read(int16_t *pcm_buf, size_t samples, size_t *re
 int desk_hardware_audio_record_stop(void);
 int desk_hardware_audio_record_inject(const int16_t *pcm_buf, size_t samples);
 int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status);
+/* Publish one allowlisted readiness snapshot only while the structured event
+ * source is enabled. Returns false for disabled/non-Watcher sources. */
+bool desk_hardware_publish_audio_driver_state_snapshot(void);
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz);
 int desk_hardware_audio_play_stop(void);
+/* Host-to-device PCM session. Queue credits reflect the fixed HAL queue. */
+int desk_hardware_audio_stream_begin(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sample_rate_hz,
+                                     uint8_t channels, uint8_t sample_width_bytes,
+                                     uint32_t total_bytes);
+int desk_hardware_audio_stream_write(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sequence,
+                                     const uint8_t *pcm, size_t bytes,
+                                     desk_audio_stream_status_t *out_status);
+int desk_hardware_audio_stream_finish(uint64_t handle);
+int desk_hardware_audio_stream_stop(uint64_t handle, uint32_t timeout_ms);
+int desk_hardware_audio_stream_get_status(uint64_t handle,
+                                          desk_audio_stream_status_t *out_status);
 
 typedef void (*desk_hardware_audio_play_cb_t)(const int16_t *pcm_buf,
                                               size_t samples,
@@ -116,21 +140,30 @@ typedef void (*desk_hardware_audio_play_cb_t)(const int16_t *pcm_buf,
                                               void *user_data);
 int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void *user_data);
 
-/* STM32 Coprocessor MCU Frame Definitions (R3a Ratified) */
+/* STM32 coprocessor frame constants. SYS HELLO IDs follow WatcheRobot mcu_link;
+ * legacy motion constants remain isolated until a valid HELLO peer is observed. */
 #define MCU_FRAME_MAGIC0          0xA5u
 #define MCU_FRAME_MAGIC1          0x5Au
 #define MCU_FRAME_PROTO_VERSION   0x01u
+#define MCU_FRAME_CLASS_SYS       0x01u
 #define MCU_FRAME_CLASS_MOTION    0x02u
+#define MCU_SYS_MSG_HELLO_REQ     0x01u
+#define MCU_SYS_MSG_HELLO_RSP     0x02u
+#define MCU_SYS_MSG_ACK           0x04u
+#define MCU_SYS_MSG_NACK          0x05u
+#define MCU_CAPABILITY_MOTION     0x01u
 
 /* MCU Message IDs */
-#define MCU_MOTION_MSG_ACK        0x00u
 #define MCU_MOTION_MSG_SERVO_MOVE 0x01u
 #define MCU_MOTION_MSG_SERVO_STOP 0x02u
+/* Legacy test-injection IDs; not used by the UART2 official MCU-link driver. */
+#define MCU_MOTION_MSG_ACK        0x00u
 #define MCU_MOTION_MSG_NACK       0xFFu
 
 /* MCU Frame Flags */
 #define MCU_FRAME_FLAG_ACK_REQ    0x01u
 #define MCU_FRAME_FLAG_ACK_RESP   0x02u
+#define MCU_FRAME_FLAG_RESPONSE   0x02u
 #define MCU_FRAME_FLAG_NACK_RESP  0x04u
 
 /* Timing, Retry & Safety Contracts */
@@ -145,6 +178,8 @@ int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void 
 /* Axis Mask Definitions */
 #define MCU_AXIS_MASK_PAN_TILT    0x03u
 #define MCU_AXIS_MASK_CANCEL_ALL  0x01u
+#define MCU_MOTION_PROFILE_EASE_IN_OUT 0x01u
+#define MCU_MOTION_SOURCE_UNKNOWN 0x00u
 
 /* NACK Error Codes */
 #define MCU_NACK_ERR_CRC          0x01u
@@ -161,6 +196,9 @@ int desk_hardware_get_last_mcu_frame(uint8_t *out_buf, size_t max_len, size_t *o
 
 /* Motion / Gimbal API */
 int desk_hardware_motion_move_to(float pan_deg, float tilt_deg, uint32_t duration_ms);
+/* Called only by actual ACK deadline-expiry paths; increments the timeout
+ * counter and offers the CR-033 rate-limited enum event. */
+void desk_hardware_record_mcu_ack_timeout(void);
 int desk_hardware_motion_stop(bool emergency);
 int desk_hardware_motion_get_position(float *out_pan, float *out_tilt);
 int desk_hardware_format_stm32_motion_packet(float pan_deg, float tilt_deg, uint32_t duration_ms,
@@ -201,7 +239,14 @@ void desk_hardware_reset_mcu_stats(void);
 
 /* Camera API */
 int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms);
-int desk_hardware_camera_stream_start(float target_fps, desk_camera_frame_cb_t cb, void *user_data);
+/** Source capability probe; does not claim a resolution, frame rate, or first-frame readiness. */
+bool desk_hardware_camera_stream_is_available(void);
+/** Start explicit-pump streaming bound to an already acquired camera lease owner. */
+int desk_hardware_camera_stream_start(const char *client_id, float target_fps,
+                                      desk_camera_frame_cb_t cb, void *user_data);
+/** True only after this stream has delivered a complete JPEG from the board capture hook. */
+bool desk_hardware_camera_stream_is_ready(void);
+/** Callbacks must not re-enter start/pump/stop. Stop drains the producer but leaves lease release to caller. */
 int desk_hardware_camera_stream_stop(void);
 int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, uint32_t timestamp_ms);
 int desk_hardware_camera_stream_pump(void);
@@ -230,6 +275,16 @@ typedef struct {
 /* Display & Expression API (R2) */
 int desk_hardware_set_screen_expression(const char *preset_name, const char *status_text);
 int desk_hardware_display_set_expression(const char *preset_name, const char *status_text);
+typedef uint32_t desk_hardware_ui_overlay_handle_t;
+/* Base state is retained underneath one volatile notification overlay. */
+int desk_hardware_ui_overlay_present(const char *notification_id,
+                                     const char *preset_name,
+                                     const char *status_text,
+                                     uint64_t expires_epoch_us,
+                                     desk_hardware_ui_overlay_handle_t *out_handle);
+int desk_hardware_ui_overlay_dismiss(desk_hardware_ui_overlay_handle_t handle);
+/* Call from an existing serialized loop; no task/timer is created here. */
+int desk_hardware_ui_overlay_process_expiry(void);
 int desk_hardware_display_get_expression(char *out_preset, size_t max_preset_len, char *out_status, size_t max_status_len);
 int desk_hardware_display_self_test(desk_display_self_test_t *out_result);
 int desk_hardware_screen_self_test(desk_display_self_test_t *out_result);
@@ -240,6 +295,10 @@ bool desk_hardware_is_display_initialized(void);
 int desk_hardware_register_input_cb(desk_touch_event_cb_t cb, void *user_data);
 int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_action_t action);
 int desk_hardware_feed_touch_event(desk_touch_target_t target, desk_touch_action_t action);
+/** Register an optional observer for decoded physical roller detents. Passing NULL unregisters it. */
+int desk_hardware_register_roller_delta_cb(desk_roller_delta_cb_t cb, void *user_data);
+/** Feed one decoded detent to the legacy UI input path and the optional observer. Callback must not block. */
+int desk_hardware_feed_roller_delta(desk_roller_delta_t delta);
 
 /* Strict Hardware Mode & Status Inspection */
 void desk_hardware_set_strict_mode(bool strict);

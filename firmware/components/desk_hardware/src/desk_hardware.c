@@ -4,6 +4,7 @@
  */
 
 #include "desk_hardware.h"
+#include "desk_watcher_log_source.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,14 +13,20 @@
 #include <sys/time.h>
 #include <time.h>
 #include <math.h>
+#include <stdatomic.h>
 
 #ifdef ESP_PLATFORM
 #include "driver/uart.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #endif
 
 #if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
 #include "desk_watcher_board.h"
 #include "desk_watcher_audio.h"
+#include "desk_watcher_camera.h"
 #endif
 
 /* --- Motion & STM32 Link State --- */
@@ -58,6 +65,10 @@ static uint32_t s_mcu_nack_count = 0;
 static uint32_t s_mcu_timeout_count = 0;
 static uint32_t s_mcu_crc_error_count = 0;
 
+#define MCU_ACK_TIMEOUT_RATE_LIMIT_MS 60000U
+_Static_assert(MCU_ACK_TIMEOUT_RATE_LIMIT_MS == DESK_WATCHER_LOG_SOURCE_RATE_WINDOW_MS,
+               "CR-033 STM32 ACK limiter must match structured source window");
+
 static uint64_t mcu_get_time_ms(void)
 {
     struct timeval tv;
@@ -68,10 +79,95 @@ static uint64_t mcu_get_time_ms(void)
 /* --- Touch & Input State --- */
 static desk_touch_event_cb_t s_touch_cb = NULL;
 static void *s_touch_cb_user_data = NULL;
+static desk_roller_delta_cb_t s_roller_delta_cb = NULL;
+static void *s_roller_delta_cb_user_data = NULL;
 
 /* --- Display & Expression State --- */
 static char s_current_preset[32] = "idle";
 static char s_current_status[64] = "Ready";
+
+#define UI_OVERLAY_ID_MAX 128
+typedef struct {
+    bool active;
+    uint32_t generation;
+    uint64_t issued_epoch_us;
+    uint64_t expires_epoch_us;
+    uint64_t deadline_mono_us;
+    char notification_id[UI_OVERLAY_ID_MAX + 1];
+    char preset[32];
+    char status[64];
+} ui_overlay_state_t;
+
+static ui_overlay_state_t s_ui_overlay;
+static uint32_t s_ui_sequence;
+static bool s_ui_render_dirty;
+static char s_ui_base_preset[32] = "idle";
+static char s_ui_base_status[64] = "Ready";
+static char s_ui_expired_notification_id[UI_OVERLAY_ID_MAX + 1];
+#ifdef ESP_PLATFORM
+static portMUX_TYPE s_ui_state_mux = portMUX_INITIALIZER_UNLOCKED;
+#else
+static atomic_flag s_ui_state_lock = ATOMIC_FLAG_INIT;
+#endif
+
+static void ui_state_lock(void)
+{
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&s_ui_state_mux);
+#else
+    while (atomic_flag_test_and_set_explicit(&s_ui_state_lock, memory_order_acquire)) { }
+#endif
+}
+
+static void ui_state_unlock(void)
+{
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&s_ui_state_mux);
+#else
+    atomic_flag_clear_explicit(&s_ui_state_lock, memory_order_release);
+#endif
+}
+
+static uint64_t ui_now_epoch_us(void)
+{
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0 || now.tv_sec < 1577836800) return 0;
+    return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_usec;
+}
+
+#ifdef DESK_HARDWARE_TEST
+static uint64_t s_camera_test_mono_us;
+#endif
+
+static uint64_t ui_now_mono_us(void)
+{
+#ifdef DESK_HARDWARE_TEST
+    if (s_camera_test_mono_us != 0) return s_camera_test_mono_us;
+#endif
+#ifdef ESP_PLATFORM
+    int64_t now = esp_timer_get_time();
+    return now > 0 ? (uint64_t)now : 0;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000u + (uint64_t)now.tv_nsec / 1000u;
+#endif
+}
+
+static uint32_t ui_next_generation(uint32_t value)
+{
+    ++value;
+    return value ? value : 1u;
+}
+
+static void ui_copy_string(char *destination, size_t capacity, const char *source)
+{
+    if (!destination || capacity == 0) return;
+    size_t length = 0;
+    if (source) while (length + 1 < capacity && source[length] != '\0') ++length;
+    if (length) memcpy(destination, source, length);
+    destination[length] = '\0';
+}
 
 /* --- Audio State & Ring Buffer --- */
 #define AUDIO_RING_BUFFER_SAMPLES 16384
@@ -95,9 +191,94 @@ static uint8_t s_cam_frame_buf[CAMERA_MAX_JPEG_LEN];
 static size_t s_cam_frame_len = 0;
 static uint32_t s_cam_timestamp_ms = 1000;
 static bool s_cam_streaming = false;
+static bool s_cam_stream_starting = false;
+static bool s_cam_stream_cancel_start = false;
+static bool s_cam_stream_stopping = false;
+static bool s_cam_stream_inflight = false;
+static bool s_cam_capture_inflight = false;
+static bool s_cam_stream_ready = false;
+static uint32_t s_cam_stream_last_timestamp_ms = 0;
 static float s_cam_target_fps = 0.0f;
 static desk_camera_frame_cb_t s_cam_cb = NULL;
 static void *s_cam_user_data = NULL;
+static char s_cam_client_id[32];
+#ifdef DESK_HARDWARE_TEST
+static void (*s_camera_start_test_gate)(void);
+void desk_hardware_test_set_camera_start_gate(void (*gate)(void))
+{
+    s_camera_start_test_gate = gate;
+}
+void desk_hardware_test_set_camera_monotonic_us(uint64_t now_us)
+{
+    s_camera_test_mono_us = now_us;
+}
+#endif
+#ifdef ESP_PLATFORM
+static uint8_t *s_cam_stream_buf = NULL;
+static portMUX_TYPE s_cam_stream_mux = portMUX_INITIALIZER_UNLOCKED;
+static void camera_stream_state_lock(void) { portENTER_CRITICAL(&s_cam_stream_mux); }
+static void camera_stream_state_unlock(void) { portEXIT_CRITICAL(&s_cam_stream_mux); }
+#else
+static uint8_t s_cam_stream_storage[CAMERA_MAX_JPEG_LEN];
+static uint8_t *s_cam_stream_buf = s_cam_stream_storage;
+static atomic_flag s_cam_stream_mux = ATOMIC_FLAG_INIT;
+static void camera_stream_state_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_cam_stream_mux, memory_order_acquire)) { }
+}
+static void camera_stream_state_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_cam_stream_mux, memory_order_release);
+}
+#endif
+
+static bool camera_is_complete_jpeg(const uint8_t *data, size_t len)
+{
+    if (!data || len < 12 || data[0] != 0xFF || data[1] != 0xD8) return false;
+    bool saw_frame_header = false;
+    bool saw_scan = false;
+    size_t pos = 2;
+    while (pos < len) {
+        if (data[pos] != 0xFF) return false;
+        while (pos < len && data[pos] == 0xFF) ++pos;
+        if (pos >= len) return false;
+        uint8_t marker = data[pos++];
+        if (marker == 0xD9) {
+            return saw_frame_header && saw_scan && pos == len;
+        }
+        if (marker == 0x00 || marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) {
+            return false;
+        }
+        if (pos + 2 > len) return false;
+        size_t segment_len = ((size_t)data[pos] << 8) | data[pos + 1];
+        if (segment_len < 2 || segment_len > len - pos) return false;
+        if ((marker >= 0xC0 && marker <= 0xC3) || (marker >= 0xC5 && marker <= 0xC7) ||
+            (marker >= 0xC9 && marker <= 0xCB) || (marker >= 0xCD && marker <= 0xCF)) {
+            if (segment_len < 8) return false;
+            saw_frame_header = true;
+        }
+        if (marker == 0xDA) {
+            if (segment_len < 6 || !saw_frame_header) return false;
+            saw_scan = true;
+            pos += segment_len;
+            /* Skip entropy-coded bytes, honoring byte stuffing and restart markers. */
+            while (pos < len) {
+                if (data[pos++] != 0xFF) continue;
+                if (pos >= len) return false;
+                uint8_t entropy_marker = data[pos];
+                if (entropy_marker == 0x00 || (entropy_marker >= 0xD0 && entropy_marker <= 0xD7)) {
+                    ++pos;
+                    continue;
+                }
+                --pos; /* The next loop parses this marker (commonly EOI or another scan). */
+                break;
+            }
+            continue;
+        }
+        pos += segment_len;
+    }
+    return false;
+}
 
 /* --- STM32 CRC-16 (CCITT-FALSE: init 0xFFFF, poly 0x1021) --- */
 static uint16_t mcu_crc16_calc(const uint8_t *data, size_t len)
@@ -608,7 +789,7 @@ static int mcu_execute_transaction(const uint8_t *frame_data, size_t frame_len, 
         }
     }
 
-    s_mcu_timeout_count++;
+    desk_hardware_record_mcu_ack_timeout();
     s_pending_state = MCU_TX_TIMEOUT;
     return DESK_HW_ERR_TIMEOUT;
 }
@@ -795,7 +976,16 @@ int desk_hardware_init(void)
     /* Camera sensor starts uninitialized without synthetic dummy picture */
     s_cam_frame_len = 0;
     s_cam_streaming = false;
+    s_cam_stream_starting = false;
+    s_cam_stream_cancel_start = false;
+    s_cam_stream_stopping = false;
+    s_cam_stream_inflight = false;
+    s_cam_capture_inflight = false;
+    s_cam_stream_ready = false;
+    s_cam_stream_last_timestamp_ms = 0;
     s_cam_cb = NULL;
+    s_cam_user_data = NULL;
+    s_cam_client_id[0] = '\0';
 
     /* Reset audio ring buffer */
     s_audio_rec_widx = 0;
@@ -879,13 +1069,14 @@ int desk_hardware_mcu_receive_bytes(const uint8_t *data, size_t len)
     /* Check for ACK */
     if (flags == MCU_FRAME_FLAG_ACK_RESP && payload_len == 4 &&
         (msg_id == MCU_MOTION_MSG_ACK || msg_id == s_pending_msg_id)) {
-        s_mcu_ack_count++;
-        int16_t pan_x10 = (int16_t)(data[12] | ((uint16_t)data[13] << 8));
-        int16_t tilt_x10 = (int16_t)(data[14] | ((uint16_t)data[15] << 8));
-        if (pan_x10 >= 0 && pan_x10 <= 1800 && tilt_x10 >= 1000 && tilt_x10 <= 1400) {
-            s_current_pan = pan_x10 / 10.0f;
-            s_current_tilt = tilt_x10 / 10.0f;
+        uint16_t pan_x10 = (uint16_t)(data[12] | ((uint16_t)data[13] << 8));
+        uint16_t tilt_x10 = (uint16_t)(data[14] | ((uint16_t)data[15] << 8));
+        if (pan_x10 > 1800U || tilt_x10 < 1000U || tilt_x10 > 1400U) {
+            return DESK_HW_ERR_IO;
         }
+        s_mcu_ack_count++;
+        s_current_pan = pan_x10 / 10.0f;
+        s_current_tilt = tilt_x10 / 10.0f;
         s_pending_state = MCU_TX_ACKED;
         return DESK_HW_OK;
     }
@@ -985,6 +1176,26 @@ int desk_hardware_audio_get_status(desk_hardware_audio_status_t *out_status)
 #endif
 }
 
+bool desk_hardware_publish_audio_driver_state_snapshot(void)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    if (!desk_watcher_log_source_is_enabled()) return false;
+    desk_hardware_audio_status_t status = {0};
+    (void)desk_hardware_audio_get_status(&status);
+    return desk_watcher_log_source_publish_audio_driver_state(status.ready);
+#else
+    return false;
+#endif
+}
+
+void desk_hardware_record_mcu_ack_timeout(void)
+{
+    ++s_mcu_timeout_count;
+#ifdef ESP_PLATFORM
+    (void)desk_watcher_log_source_publish_stm32_ack_timeout();
+#endif
+}
+
 int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void *user_data)
 {
     s_audio_play_cb = cb;
@@ -994,6 +1205,10 @@ int desk_hardware_register_audio_play_cb(desk_hardware_audio_play_cb_t cb, void 
 
 int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_t sample_rate_hz)
 {
+    if (!pcm_buf || !samples) return DESK_HW_ERR_INVALID_ARG;
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    if (sample_rate_hz != 16000) return DESK_HW_ERR_INVALID_ARG;
+#endif
 #ifdef ESP_PLATFORM
     if (!s_board_driver_initialized || !s_board_driver_ops ||
         !s_board_driver_ops->audio_play_pcm) {
@@ -1006,21 +1221,91 @@ int desk_hardware_audio_play_pcm(const int16_t *pcm_buf, size_t samples, uint32_
             return -1;
         }
     }
+    if (s_board_driver_ops && s_board_driver_ops->audio_play_pcm && pcm_buf && samples > 0) {
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+        /* Keep owner stable across the payload and its TX EOF fence. */
+        int rc = desk_watcher_audio_play_one_shot(pcm_buf, samples, sample_rate_hz);
+#else
+        int rc = s_board_driver_ops->audio_play_pcm(pcm_buf, samples, sample_rate_hz);
+#endif
+        if (rc != DESK_HW_OK) return rc;
+    }
     if (s_audio_play_cb && pcm_buf && samples > 0) {
         s_audio_play_cb(pcm_buf, samples, sample_rate_hz, s_audio_play_user_data);
-    }
-    if (s_board_driver_ops && s_board_driver_ops->audio_play_pcm && pcm_buf && samples > 0) {
-        int rc = s_board_driver_ops->audio_play_pcm(pcm_buf, samples, sample_rate_hz);
-        if (rc != DESK_HW_OK) return rc;
     }
     return 0;
 }
 
 int desk_hardware_audio_play_stop(void)
 {
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_play_stop();
+#else
     desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE);
     desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE);
     return 0;
+#endif
+}
+
+int desk_hardware_audio_stream_begin(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sample_rate_hz,
+                                     uint8_t channels, uint8_t sample_width_bytes,
+                                     uint32_t total_bytes)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_begin(handle, connection_generation, stream_id,
+        sample_rate_hz, channels, sample_width_bytes, total_bytes);
+#else
+    (void)handle; (void)connection_generation; (void)stream_id;
+    (void)sample_rate_hz; (void)channels; (void)sample_width_bytes; (void)total_bytes;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_write(uint64_t handle, uint32_t connection_generation,
+                                     uint32_t stream_id, uint32_t sequence,
+                                     const uint8_t *pcm, size_t bytes,
+                                     desk_audio_stream_status_t *out_status)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_write(handle, connection_generation, stream_id,
+        sequence, pcm, bytes, out_status);
+#else
+    (void)handle; (void)connection_generation; (void)stream_id;
+    (void)sequence; (void)pcm; (void)bytes; (void)out_status;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_finish(uint64_t handle)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_finish(handle);
+#else
+    (void)handle;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_stop(uint64_t handle, uint32_t timeout_ms)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_stop(handle, timeout_ms);
+#else
+    (void)handle; (void)timeout_ms;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
+}
+
+int desk_hardware_audio_stream_get_status(uint64_t handle,
+                                          desk_audio_stream_status_t *out_status)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    return desk_watcher_audio_stream_get_status(handle, out_status);
+#else
+    (void)handle; (void)out_status;
+    return DESK_HW_ERR_UNAVAILABLE;
+#endif
 }
 
 /* Motion / Gimbal API */
@@ -1132,15 +1417,12 @@ int desk_hardware_camera_inject_frame(const uint8_t *jpeg_buf, size_t jpeg_len, 
     memcpy(s_cam_frame_buf, jpeg_buf, jpeg_len);
     s_cam_frame_len = jpeg_len;
     s_cam_timestamp_ms = timestamp_ms;
-
-    if (s_cam_streaming && s_cam_cb) {
-        s_cam_cb(s_cam_frame_buf, s_cam_frame_len, s_cam_timestamp_ms, s_cam_user_data);
-    }
     return 0;
 #endif
 }
 
-int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len, uint32_t timeout_ms)
+static int camera_capture_jpeg_unlocked(uint8_t *out_buf, size_t max_len, size_t *out_len,
+                                        uint32_t timeout_ms)
 {
     if (out_len) *out_len = 0;
     if (!out_buf || !out_len) return DESK_HW_ERR_INVALID_ARG;
@@ -1186,43 +1468,270 @@ int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *
 #endif
 }
 
-int desk_hardware_camera_stream_start(float target_fps, desk_camera_frame_cb_t cb, void *user_data)
+int desk_hardware_camera_capture_jpeg(uint8_t *out_buf, size_t max_len, size_t *out_len,
+                                       uint32_t timeout_ms)
 {
-#ifdef ESP_PLATFORM
-    /* Only single real JPEG capture is supported on-device at present. */
-    (void)target_fps; (void)cb; (void)user_data;
-    return DESK_HW_ERR_UNAVAILABLE;
+    camera_stream_state_lock();
+    if (s_cam_streaming || s_cam_stream_starting || s_cam_stream_stopping ||
+        s_cam_stream_inflight || s_cam_capture_inflight) {
+        camera_stream_state_unlock();
+        if (out_len) *out_len = 0;
+        return DESK_HW_ERR_BUSY;
+    }
+    s_cam_capture_inflight = true;
+    camera_stream_state_unlock();
+
+    int rc = camera_capture_jpeg_unlocked(out_buf, max_len, out_len, timeout_ms);
+
+    camera_stream_state_lock();
+    s_cam_capture_inflight = false;
+    camera_stream_state_unlock();
+    return rc;
+}
+
+bool desk_hardware_camera_stream_is_available(void)
+{
+#if defined(ESP_PLATFORM) && defined(DESK_BOARD_SENSECAP_WATCHER)
+    const desk_board_driver_ops_t *watcher_ops = desk_watcher_board_get_driver_ops();
+    if (!s_board_driver_initialized || !watcher_ops || s_board_driver_ops != watcher_ops ||
+        watcher_ops->camera_capture != desk_watcher_camera_capture ||
+        !desk_watcher_camera_is_ready()) {
+        return false;
+    }
+    /* This only confirms that one producer buffer can be allocated. It does not
+     * certify image dimensions, capture cadence, or sustained throughput. */
+    return heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) >=
+           CAMERA_MAX_JPEG_LEN;
 #else
-    s_cam_target_fps = target_fps;
+    /* Native injected/mock producers are test fixtures, never device capability. */
+    return false;
+#endif
+}
+
+int desk_hardware_camera_stream_start(const char *client_id, float target_fps,
+                                      desk_camera_frame_cb_t cb, void *user_data)
+{
+    if (!client_id || client_id[0] == '\0' || strlen(client_id) >= sizeof(s_cam_client_id) ||
+        !cb || !isfinite(target_fps) || target_fps <= 0.0f) return DESK_HW_ERR_INVALID_ARG;
+    camera_stream_state_lock();
+    if (s_cam_streaming || s_cam_stream_starting || s_cam_stream_stopping ||
+        s_cam_stream_inflight || s_cam_capture_inflight) {
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_BUSY;
+    }
+    s_cam_stream_starting = true;
+    camera_stream_state_unlock();
+#ifdef DESK_HARDWARE_TEST
+    if (s_camera_start_test_gate) s_camera_start_test_gate();
+#endif
+
+    const desk_board_driver_ops_t *ops = s_board_driver_ops;
+    if (!s_board_driver_initialized || !ops || !ops->camera_capture) {
+        camera_stream_state_lock();
+        s_cam_stream_starting = false;
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#ifdef ESP_PLATFORM
+    if (!desk_hardware_camera_stream_is_available()) {
+        camera_stream_state_lock();
+        s_cam_stream_starting = false;
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#endif
+    if (!desk_arbiter_camera_lease_matches(client_id) ||
+        desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR) != DESK_OWNER_LAN_CAMERA) {
+        camera_stream_state_lock();
+        s_cam_stream_starting = false;
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_BUSY;
+    }
+
+#ifdef ESP_PLATFORM
+    uint8_t *capture_buf = (uint8_t *)heap_caps_malloc(CAMERA_MAX_JPEG_LEN,
+                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!capture_buf) {
+        camera_stream_state_lock();
+        s_cam_stream_starting = false;
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+#else
+    uint8_t *capture_buf = s_cam_stream_storage;
+#endif
+
+    camera_stream_state_lock();
+    if (s_cam_stream_cancel_start || s_cam_stream_stopping) {
+        s_cam_stream_starting = false;
+        camera_stream_state_unlock();
+#ifdef ESP_PLATFORM
+        heap_caps_free(capture_buf);
+#endif
+        return DESK_HW_ERR_BUSY;
+    }
+    s_cam_stream_buf = capture_buf;
+    s_cam_target_fps = target_fps; /* Scheduling cadence belongs to the caller. */
     s_cam_cb = cb;
     s_cam_user_data = user_data;
+    memcpy(s_cam_client_id, client_id, strlen(client_id) + 1);
+    s_cam_stream_ready = false;
+    s_cam_stream_last_timestamp_ms = 0;
     s_cam_streaming = true;
-    return 0;
-#endif
+    s_cam_stream_starting = false;
+    camera_stream_state_unlock();
+    return DESK_HW_OK;
 }
 
 int desk_hardware_camera_stream_pump(void)
 {
-#ifdef ESP_PLATFORM
-    return DESK_HW_ERR_UNAVAILABLE;
-#else
-    if (!s_cam_streaming || !s_cam_cb) return -1;
-    s_cam_timestamp_ms += (uint32_t)(s_cam_target_fps > 0 ? (1000.0f / s_cam_target_fps) : 66);
-    s_cam_cb(s_cam_frame_buf, s_cam_frame_len, s_cam_timestamp_ms, s_cam_user_data);
-    return 0;
-#endif
+    camera_stream_state_lock();
+    if (!s_cam_streaming || !s_cam_cb || !s_cam_stream_buf) {
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    if (s_cam_stream_inflight) {
+        camera_stream_state_unlock();
+        return DESK_HW_ERR_BUSY;
+    }
+    s_cam_stream_inflight = true;
+    s_cam_stream_ready = false;
+    desk_camera_frame_cb_t cb = s_cam_cb;
+    void *user_data = s_cam_user_data;
+    uint8_t *capture_buf = s_cam_stream_buf;
+    char client_id[sizeof(s_cam_client_id)];
+    memcpy(client_id, s_cam_client_id, sizeof(client_id));
+    camera_stream_state_unlock();
+
+    int rc = DESK_HW_ERR_UNAVAILABLE;
+    size_t jpeg_len = 0;
+    const desk_board_driver_ops_t *ops = s_board_driver_ops;
+    if (!desk_arbiter_camera_lease_matches(client_id) ||
+        desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR) != DESK_OWNER_LAN_CAMERA) {
+        rc = DESK_HW_ERR_BUSY;
+    } else if (!s_board_driver_initialized || !ops || !ops->camera_capture) {
+        rc = DESK_HW_ERR_UNAVAILABLE;
+    } else {
+        rc = ops->camera_capture(capture_buf, CAMERA_MAX_JPEG_LEN, &jpeg_len, 1000);
+        if (rc == DESK_HW_OK &&
+            (jpeg_len > CAMERA_MAX_JPEG_LEN || !camera_is_complete_jpeg(capture_buf, jpeg_len))) {
+            rc = DESK_HW_ERR_IO;
+        }
+    }
+
+    if (rc == DESK_HW_OK) {
+        uint64_t mono_ms = ui_now_mono_us() / 1000u;
+        if (mono_ms == 0) {
+            rc = DESK_HW_ERR_IO;
+        } else {
+            camera_stream_state_lock();
+            uint32_t timestamp_ms = (uint32_t)mono_ms;
+            bool stream_current = s_cam_streaming && s_cam_cb == cb && s_cam_stream_buf == capture_buf;
+            bool timestamp_fresh = s_cam_stream_last_timestamp_ms == 0 ||
+                                   (int32_t)(timestamp_ms - s_cam_stream_last_timestamp_ms) > 0;
+            bool dispatch = stream_current && timestamp_fresh;
+            if (dispatch) {
+                s_cam_stream_last_timestamp_ms = timestamp_ms;
+            }
+            camera_stream_state_unlock();
+            if (stream_current && !timestamp_fresh) rc = DESK_HW_ERR_IO;
+            /* A lease may expire or be reassigned while the physical capture is in progress. */
+            dispatch = dispatch && desk_arbiter_camera_lease_matches(client_id) &&
+                       desk_arbiter_get_owner(DESK_RES_CAMERA_SENSOR) == DESK_OWNER_LAN_CAMERA;
+            if (!dispatch) {
+                camera_stream_state_lock();
+                s_cam_stream_ready = false;
+                camera_stream_state_unlock();
+                if (rc == DESK_HW_OK) rc = DESK_HW_ERR_BUSY;
+            }
+            if (dispatch) {
+                cb(capture_buf, jpeg_len, timestamp_ms, user_data);
+                camera_stream_state_lock();
+                if (s_cam_streaming && s_cam_cb == cb && s_cam_stream_buf == capture_buf &&
+                    s_cam_stream_last_timestamp_ms == timestamp_ms) {
+                    s_cam_stream_ready = true;
+                }
+                camera_stream_state_unlock();
+            } else {
+                if (rc == DESK_HW_OK) rc = DESK_HW_ERR_BUSY;
+            }
+        }
+    }
+
+    camera_stream_state_lock();
+    if (rc != DESK_HW_OK) s_cam_stream_ready = false;
+    s_cam_stream_inflight = false;
+    camera_stream_state_unlock();
+    return rc;
+}
+
+bool desk_hardware_camera_stream_is_ready(void)
+{
+    camera_stream_state_lock();
+    bool ready = s_cam_streaming && s_cam_stream_ready;
+    camera_stream_state_unlock();
+    return ready;
 }
 
 int desk_hardware_camera_stream_stop(void)
 {
+    camera_stream_state_lock();
+    if (s_cam_stream_stopping) {
+        camera_stream_state_unlock();
+        for (;;) {
+            camera_stream_state_lock();
+            bool stopping = s_cam_stream_stopping;
+            camera_stream_state_unlock();
+            if (!stopping) return DESK_HW_OK;
+#ifdef ESP_PLATFORM
+            vTaskDelay(pdMS_TO_TICKS(1));
+#else
+            struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+            nanosleep(&pause, NULL);
+#endif
+        }
+    }
+    s_cam_stream_stopping = true;
     s_cam_streaming = false;
+    s_cam_stream_ready = false;
+    if (s_cam_stream_starting) s_cam_stream_cancel_start = true;
     s_cam_cb = NULL;
     s_cam_user_data = NULL;
-    return 0;
+    s_cam_client_id[0] = '\0';
+    camera_stream_state_unlock();
+
+    for (;;) {
+        camera_stream_state_lock();
+        bool inflight = s_cam_stream_inflight || s_cam_stream_starting;
+        camera_stream_state_unlock();
+        if (!inflight) break;
+#ifdef ESP_PLATFORM
+        vTaskDelay(pdMS_TO_TICKS(1));
+#else
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+        nanosleep(&pause, NULL);
+#endif
+    }
+
+#ifdef ESP_PLATFORM
+    camera_stream_state_lock();
+    uint8_t *capture_buf = s_cam_stream_buf;
+    s_cam_stream_buf = NULL;
+    s_cam_stream_stopping = false;
+    s_cam_stream_cancel_start = false;
+    camera_stream_state_unlock();
+    if (capture_buf) heap_caps_free(capture_buf);
+#else
+    camera_stream_state_lock();
+    s_cam_stream_stopping = false;
+    s_cam_stream_cancel_start = false;
+    camera_stream_state_unlock();
+#endif
+    return DESK_HW_OK;
 }
 
 /* Display & Expression API */
-int desk_hardware_display_set_expression(const char *preset_name, const char *status_text)
+static int desk_hardware_display_render_expression(const char *preset_name, const char *status_text)
 {
     if (!preset_name || strlen(preset_name) == 0) {
         return DESK_HW_ERR_INVALID_ARG;
@@ -1272,9 +1781,256 @@ int desk_hardware_display_set_expression(const char *preset_name, const char *st
     return rc;
 }
 
+static int ui_render_current(void)
+{
+    /* A render can race a base/overlay mutation. Retry from the newest snapshot
+     * a small bounded number of times; the board adapter serializes DMA draws. */
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        char preset[sizeof(s_ui_base_preset)];
+        char status[sizeof(s_ui_base_status)];
+        uint32_t sequence;
+        desk_resource_owner_t owner;
+        ui_state_lock();
+        sequence = s_ui_sequence;
+        bool overlay_active = s_ui_overlay.active;
+        const char *current_preset = overlay_active ? s_ui_overlay.preset : s_ui_base_preset;
+        const char *current_status = overlay_active ? s_ui_overlay.status : s_ui_base_status;
+        owner = overlay_active ? DESK_OWNER_SYSTEM_ALERT : DESK_OWNER_TCLAW_VOICE;
+        ui_copy_string(preset, sizeof(preset), current_preset);
+        ui_copy_string(status, sizeof(status), current_status);
+        ui_state_unlock();
+
+        if (desk_arbiter_acquire(DESK_RES_DISPLAY_UI, owner, 50) != DESK_ARBITER_OK) {
+            ui_state_lock();
+            s_ui_render_dirty = true;
+            ui_state_unlock();
+            return DESK_HW_ERR_BUSY;
+        }
+        int rc = desk_hardware_display_render_expression(preset, status);
+        desk_arbiter_release(DESK_RES_DISPLAY_UI, owner);
+        if (rc != DESK_HW_OK) {
+            ui_state_lock();
+            s_ui_render_dirty = true;
+            ui_state_unlock();
+            return rc;
+        }
+
+        ui_state_lock();
+        bool stable = sequence == s_ui_sequence;
+        if (stable) s_ui_render_dirty = false;
+        ui_state_unlock();
+        if (stable) return DESK_HW_OK;
+    }
+    ui_state_lock();
+    s_ui_render_dirty = true;
+    ui_state_unlock();
+    return DESK_HW_ERR_BUSY;
+}
+
+int desk_hardware_ui_overlay_present(const char *notification_id,
+                                     const char *preset_name,
+                                     const char *status_text,
+                                     uint64_t expires_epoch_us,
+                                     desk_hardware_ui_overlay_handle_t *out_handle)
+{
+    if (!notification_id || !memchr(notification_id, '\0', UI_OVERLAY_ID_MAX + 1) ||
+        notification_id[0] == '\0' || !preset_name ||
+        !memchr(preset_name, '\0', sizeof(s_ui_base_preset)) || preset_name[0] == '\0' ||
+        !status_text || !memchr(status_text, '\0', sizeof(s_ui_base_status)) || !out_handle)
+        return DESK_HW_ERR_INVALID_ARG;
+
+    uint64_t now_epoch = ui_now_epoch_us();
+    uint64_t now_mono = ui_now_mono_us();
+    if (!now_epoch || !now_mono) return DESK_HW_ERR_UNAVAILABLE;
+
+    bool expired_previous = false;
+    bool uncertain_previous = false;
+    bool expired_same_notification = false;
+    ui_state_lock();
+    if (strcmp(s_ui_expired_notification_id, notification_id) == 0) {
+        ui_state_unlock();
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    if (s_ui_overlay.active &&
+        (!now_epoch || now_epoch < s_ui_overlay.issued_epoch_us ||
+         now_epoch >= s_ui_overlay.expires_epoch_us || now_mono >= s_ui_overlay.deadline_mono_us)) {
+        expired_same_notification = strcmp(s_ui_overlay.notification_id, notification_id) == 0;
+        uncertain_previous = !now_epoch || now_epoch < s_ui_overlay.issued_epoch_us;
+        ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                       s_ui_overlay.notification_id);
+        s_ui_overlay.active = false;
+        s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+        s_ui_sequence = ui_next_generation(s_ui_sequence);
+        s_ui_render_dirty = true;
+        expired_previous = true;
+    }
+    if (s_ui_overlay.active) {
+        if (strcmp(s_ui_overlay.notification_id, notification_id) != 0) {
+            ui_state_unlock();
+            return DESK_HW_ERR_BUSY;
+        }
+        *out_handle = s_ui_overlay.generation;
+        ui_state_unlock();
+        return DESK_HW_OK; /* Same ID is idempotent; its deadline is immutable. */
+    }
+    if (uncertain_previous) {
+        ui_state_unlock();
+        (void)ui_render_current();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    if (expired_same_notification) {
+        ui_state_unlock();
+        (void)ui_render_current();
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    if (expires_epoch_us <= now_epoch) {
+        ui_state_unlock();
+        if (expired_previous) (void)ui_render_current();
+        return DESK_HW_ERR_TIMEOUT;
+    }
+    uint64_t remaining = expires_epoch_us - now_epoch;
+    if (UINT64_MAX - now_mono < remaining) {
+        ui_state_unlock();
+        if (expired_previous) (void)ui_render_current();
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+
+    s_ui_overlay.active = true;
+    s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+    s_ui_overlay.issued_epoch_us = now_epoch;
+    s_ui_overlay.expires_epoch_us = expires_epoch_us;
+    s_ui_overlay.deadline_mono_us = now_mono + remaining;
+    ui_copy_string(s_ui_overlay.notification_id, sizeof(s_ui_overlay.notification_id), notification_id);
+    ui_copy_string(s_ui_overlay.preset, sizeof(s_ui_overlay.preset), preset_name);
+    ui_copy_string(s_ui_overlay.status, sizeof(s_ui_overlay.status), status_text);
+    s_ui_sequence = ui_next_generation(s_ui_sequence);
+    s_ui_render_dirty = true;
+    uint32_t generation = s_ui_overlay.generation;
+    ui_state_unlock();
+
+    int rc = ui_render_current();
+    if (rc != DESK_HW_OK) {
+        ui_state_lock();
+        if (s_ui_overlay.active && s_ui_overlay.generation == generation) {
+            s_ui_overlay.active = false;
+            s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+            s_ui_sequence = ui_next_generation(s_ui_sequence);
+            s_ui_render_dirty = true;
+            s_ui_render_dirty = true;
+        }
+        ui_state_unlock();
+        (void)ui_render_current();
+        return rc;
+    }
+    *out_handle = generation;
+    return DESK_HW_OK;
+}
+
+int desk_hardware_ui_overlay_dismiss(desk_hardware_ui_overlay_handle_t handle)
+{
+    if (!handle) return DESK_HW_ERR_INVALID_ARG;
+    uint64_t now_mono = ui_now_mono_us();
+    if (!now_mono) return DESK_HW_ERR_UNAVAILABLE;
+    bool was_expired = false;
+    ui_state_lock();
+    if (!s_ui_overlay.active || s_ui_overlay.generation != handle) {
+        ui_state_unlock();
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    uint64_t now_epoch = ui_now_epoch_us();
+    was_expired = now_mono >= s_ui_overlay.deadline_mono_us ||
+                  (now_epoch && now_epoch >= s_ui_overlay.expires_epoch_us);
+    if (was_expired)
+        ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                       s_ui_overlay.notification_id);
+    s_ui_overlay.active = false;
+    s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+    s_ui_sequence = ui_next_generation(s_ui_sequence);
+    s_ui_render_dirty = true;
+    ui_state_unlock();
+    int rc = ui_render_current();
+    return rc != DESK_HW_OK ? rc : (was_expired ? DESK_HW_ERR_TIMEOUT : DESK_HW_OK);
+}
+
+int desk_hardware_ui_overlay_process_expiry(void)
+{
+    uint64_t now_mono = ui_now_mono_us();
+    if (!now_mono) {
+        ui_state_lock();
+        bool had_overlay = s_ui_overlay.active;
+        if (had_overlay) {
+            ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                           s_ui_overlay.notification_id);
+            s_ui_overlay.active = false;
+            s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+            s_ui_sequence = ui_next_generation(s_ui_sequence);
+            s_ui_render_dirty = true;
+        }
+        ui_state_unlock();
+        if (had_overlay) {
+            printf("[UI][WARN] stage=overlay_clock_untrusted; closing volatile overlay\n");
+            int rc = ui_render_current();
+            if (rc != DESK_HW_OK) return rc;
+        } else {
+            ui_state_lock();
+            bool dirty = s_ui_render_dirty;
+            ui_state_unlock();
+            if (dirty) (void)ui_render_current();
+        }
+        return DESK_HW_ERR_UNAVAILABLE;
+    }
+    uint64_t now_epoch = ui_now_epoch_us();
+    ui_state_lock();
+    bool uncertain_clock = s_ui_overlay.active &&
+                           (!now_epoch || now_epoch < s_ui_overlay.issued_epoch_us);
+    bool expired = s_ui_overlay.active &&
+                   (now_mono >= s_ui_overlay.deadline_mono_us ||
+                    (now_epoch && now_epoch >= s_ui_overlay.expires_epoch_us));
+    if (uncertain_clock) expired = true;
+    if (expired) {
+        ui_copy_string(s_ui_expired_notification_id, sizeof(s_ui_expired_notification_id),
+                       s_ui_overlay.notification_id);
+        s_ui_overlay.active = false;
+        s_ui_overlay.generation = ui_next_generation(s_ui_overlay.generation);
+        s_ui_sequence = ui_next_generation(s_ui_sequence);
+        s_ui_render_dirty = true;
+    }
+    ui_state_unlock();
+    if (expired) {
+        if (uncertain_clock)
+            printf("[UI][WARN] stage=overlay_utc_untrusted; closing volatile overlay\n");
+        int rc = ui_render_current();
+        if (rc != DESK_HW_OK) return rc;
+        return uncertain_clock ? DESK_HW_ERR_UNAVAILABLE : DESK_HW_OK;
+    }
+    ui_state_lock();
+    bool dirty = !s_ui_overlay.active && s_ui_render_dirty;
+    ui_state_unlock();
+    if (dirty) return ui_render_current();
+    return DESK_HW_OK;
+}
+
 int desk_hardware_set_screen_expression(const char *preset_name, const char *status_text)
 {
-    return desk_hardware_display_set_expression(preset_name, status_text);
+    if (!preset_name || !preset_name[0] ||
+        !memchr(preset_name, '\0', sizeof(s_ui_base_preset))) return DESK_HW_ERR_INVALID_ARG;
+    if (status_text && !memchr(status_text, '\0', sizeof(s_ui_base_status)))
+        return DESK_HW_ERR_INVALID_ARG;
+
+    ui_state_lock();
+    ui_copy_string(s_ui_base_preset, sizeof(s_ui_base_preset), preset_name);
+    ui_copy_string(s_ui_base_status, sizeof(s_ui_base_status), status_text ? status_text : "");
+    s_ui_sequence = ui_next_generation(s_ui_sequence);
+    bool overlay_active = s_ui_overlay.active;
+    if (!overlay_active) s_ui_render_dirty = true;
+    ui_state_unlock();
+    return overlay_active ? DESK_HW_OK : ui_render_current();
+}
+
+int desk_hardware_display_set_expression(const char *preset_name, const char *status_text)
+{
+    /* All product-facing expression writes go through the UI state owner. */
+    return desk_hardware_set_screen_expression(preset_name, status_text);
 }
 
 int desk_hardware_display_self_test(desk_display_self_test_t *out_result)
@@ -1344,4 +2100,29 @@ int desk_hardware_inject_touch_event(desk_touch_target_t target, desk_touch_acti
 int desk_hardware_feed_touch_event(desk_touch_target_t target, desk_touch_action_t action)
 {
     return desk_hardware_inject_touch_event(target, action);
+}
+
+int desk_hardware_register_roller_delta_cb(desk_roller_delta_cb_t cb, void *user_data)
+{
+    s_roller_delta_cb = cb;
+    s_roller_delta_cb_user_data = user_data;
+    return DESK_HW_OK;
+}
+
+int desk_hardware_feed_roller_delta(desk_roller_delta_t delta)
+{
+    desk_touch_action_t action;
+    if (delta == DESK_ROLLER_DELTA_UP) {
+        action = DESK_TOUCH_ACTION_SCROLL_UP;
+    } else if (delta == DESK_ROLLER_DELTA_DOWN) {
+        action = DESK_TOUCH_ACTION_SCROLL_DOWN;
+    } else {
+        return DESK_HW_ERR_INVALID_ARG;
+    }
+
+    int rc = desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, action);
+    if (s_roller_delta_cb) {
+        s_roller_delta_cb(delta, s_roller_delta_cb_user_data);
+    }
+    return rc;
 }

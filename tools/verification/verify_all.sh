@@ -44,13 +44,45 @@ step_pass "All JSON Schemas, envelopes, positive/negative fixtures, and error ca
 # 2. Level 2: Firmware Native HAL & Protocol Library Compilation
 # ------------------------------------------------------------------------------
 echo "--- Step 2: Firmware Native HAL & SDK Bridge Compilation (firmware/) ---"
-CMAKE_BIN="$(command -v /usr/bin/cmake || which cmake)"
-${CMAKE_BIN} -B firmware/build -S firmware && ${CMAKE_BIN} --build firmware/build --clean-first || step_fail "Firmware native build failed"
+# Allow isolated/tool-managed CMake binaries to be supplied by the caller.
+# This matters in WSL, where a Windows cmake.exe on the interop PATH cannot be
+# executed as a Linux binary. Do not silently cross the host/WSL boundary.
+if [[ -n "${CMAKE_BIN:-}" ]]; then
+  if [[ ! -x "${CMAKE_BIN}" ]]; then
+    step_fail "CMAKE_BIN is set but not executable in this shell: ${CMAKE_BIN}"
+  fi
+else
+  if ! CMAKE_BIN="$(command -v cmake)"; then
+    step_fail "CMake is missing for this shell; install CMake or set CMAKE_BIN to a native executable. In WSL, provide a Linux CMake path with CMAKE_BIN; a Windows cmake.exe cannot run inside WSL."
+  fi
+fi
+
+# This is a standalone host build. Keep the ESP-IDF environment out of CMake's
+# configuration and never reuse firmware/build, which contains IDF artifacts.
+unset IDF_PATH
+HOST_BUILD_DIR="$(mktemp -d "/tmp/desk-agent-host-cmake.XXXXXX")" \
+  || step_fail "Could not create a unique temporary host CMake build directory"
+trap 'rm -rf -- "${HOST_BUILD_DIR}"' EXIT
+
+if ! "${CMAKE_BIN}" -S firmware -B "${HOST_BUILD_DIR}"; then
+  step_fail "Firmware native CMake configure failed"
+fi
+# The native check covers the three portable static libraries. The firmware
+# smoke executable is a separate integration target and its main/app include
+# wiring belongs to the firmware CMake owner; don't make this A7 gate depend on
+# compiling that executable.
+if ! "${CMAKE_BIN}" --build "${HOST_BUILD_DIR}" --target desk_hardware desk_tclaw desk_sdk_bridge; then
+  step_fail "Firmware native build failed"
+fi
 step_pass "Firmware libdesk_hardware.a and libdesk_sdk_bridge.a compiled clean"
 
 # ------------------------------------------------------------------------------
 # 3. Level 2: Complete Python Test Suite (All domains, contract & e2e tests)
 # ------------------------------------------------------------------------------
+# Test environment prerequisite: see tests/requirements-sdk.txt for pinned SDK
+# dependencies needed by discovery. It is test-only; deploy/edge/install.sh
+# intentionally installs requirements.txt. Note the SDK's websockets>=14,<16
+# conflicts with the root requirements.txt websockets>=12,<14 constraint.
 echo ""
 echo "--- Step 3: Complete Python Test Suite (All domains & integration) ---"
 PYTHONPATH=. python3 -m unittest discover -s tests -t . -p "test_*.py" || step_fail "Python test suite failed"
@@ -84,7 +116,7 @@ step_pass "Driver failure/timeout never fake success; ACK correlation, TCP frami
 # ------------------------------------------------------------------------------
 echo ""
 echo "--- Step 6: Edge Deployment Pre-Flight Checks (deploy/edge/) ---"
-bash deploy/edge/verify_edge.sh || step_fail "Edge deployment verification failed"
+sed 's/\r$//' deploy/edge/verify_edge.sh | bash || step_fail "Edge deployment verification failed"
 step_pass "TaishanPi edge environment pre-flight checks passed (directories, permissions, toolchain, Python modules)"
 
 # ------------------------------------------------------------------------------

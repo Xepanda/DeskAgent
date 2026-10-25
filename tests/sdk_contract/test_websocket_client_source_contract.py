@@ -28,8 +28,10 @@ class WebSocketClientSourceContract(unittest.TestCase):
         self.assertIn('"Sec-WebSocket-Accept:"', self.ws)
         self.assertIn("desk_sdk_bridge_build_hardware_hello", self.ws)
         self.assertRegex(self.ws, r"ws_send_frame\(0x1,\s*\(const uint8_t \*\)hello")
-        self.assertIn('"\\\"type\\\":\\\"sys.ack\\\""', self.ws)
+        self.assertIn("ws_hardware_hello_ack_valid((const char *)s_ws_ack)", self.ws)
+        self.assertIn("s_ws_hello_pending_generation = connect_generation", self.ws)
         self.assertIn("s_ws_ready = true", self.ws)
+        self.assertNotIn('strstr((char *)s_ws_ack', self.ws)
 
     def test_client_frames_are_masked_and_server_frames_must_not_be(self) -> None:
         self.assertIn("0x80 | len", self.ws)
@@ -109,7 +111,13 @@ class WebSocketClientSourceContract(unittest.TestCase):
         self.assertIn("else if (frame_opcode == 0x2) frame_limit = DESK_WSPK_MAX_FRAME_SIZE", self.ws)
         self.assertIn("n > frame_limit", self.ws)
         self.assertIn("if (op == 0x2)", self.ws)
-        self.assertIn("desk_wspk_unpack_header", self.ws)
+        # The transport owns WebSocket opcode/size framing; WSPK validation is
+        # intentionally delegated to the bridge's media parser.
+        self.assertIn("desk_sdk_bridge_process_ws_audio_frame(payload, len,", self.ws)
+        audio_parser = self.bridge[self.bridge.index("int desk_sdk_bridge_process_ws_audio_frame"):]
+        self.assertIn("desk_wspk_unpack_header(frame, len, &header)", audio_parser)
+        self.assertIn("header.frame_type != DESK_WSPK_TYPE_AUDIO", audio_parser)
+        self.assertIn("header.payload_size != len - DESK_WSPK_HEADER_SIZE", audio_parser)
         binary_max = 128 * 1024 + 16
         text_max = 8192
         self.assertEqual(binary_max, 131088)

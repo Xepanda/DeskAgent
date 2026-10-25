@@ -31,6 +31,15 @@ class TestWatcherInputEncoderContract(unittest.TestCase):
         self.assertRegex(knob_poll, r"int\s+cur_a\s*=\s*gpio_get_level\(WATCHER_KNOB_PIN_A\)")
         self.assertRegex(knob_poll, r"int\s+cur_b\s*=\s*gpio_get_level\(WATCHER_KNOB_PIN_B\)")
 
+    def test_only_decoded_detents_reach_the_roller_observer(self) -> None:
+        worker = self.input_source.split("static void watcher_input_worker_task", 1)[1]
+        knob_poll = worker.split("/* --- 2. Knob Button", 1)[0]
+        button_poll = worker.split("/* --- 2. Knob Button", 1)[1].split("/* --- 3. SPD2010", 1)[0]
+        self.assertIn("desk_hardware_feed_roller_delta(delta)", knob_poll)
+        self.assertIn("DESK_ROLLER_DELTA_UP", knob_poll)
+        self.assertIn("DESK_ROLLER_DELTA_DOWN", knob_poll)
+        self.assertNotIn("desk_hardware_feed_roller_delta", button_poll)
+
     def test_knob_press_duration_still_selects_existing_short_and_long_actions(self) -> None:
         self.assertRegex(self.input_source, r"duration_ms\s*>=\s*500")
         self.assertIn("DESK_TOUCH_ACTION_LONG_PRESS", self.input_source)

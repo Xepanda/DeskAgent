@@ -5,8 +5,11 @@ Unit test for Host Daemon App and HTTP endpoints.
 from __future__ import annotations
 
 import tempfile
+import asyncio
 import threading
 import time
+import subprocess
+import sys
 import unittest
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -15,7 +18,13 @@ from urllib.error import HTTPError
 import json
 from types import SimpleNamespace
 
-from host.desk_agent.main import DeskAgentHostApp, make_request_handler, ThreadedHTTPServer
+from host.desk_agent.main import (
+    DeskAgentHostApp,
+    _run_managed_application,
+    _serve_host,
+    make_request_handler,
+    ThreadedHTTPServer,
+)
 from host.desk_agent.camera.camera_service import (
     CameraStreamCapacityError,
     CameraStreamFrameUnavailable,
@@ -46,6 +55,12 @@ class TestHostDaemon(unittest.TestCase):
         cls.server_thread.start()
         time.sleep(0.1)
 
+    def setUp(self) -> None:
+        # This class shares one Host across tests; keep the production per-client
+        # limiter while isolating each test's client history.
+        with self.app._snapshot_rate_limit_lock:
+            self.app._last_snapshot_request_at.clear()
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
@@ -58,6 +73,114 @@ class TestHostDaemon(unittest.TestCase):
             self.assertEqual(resp.status, 200)
             data = json.loads(resp.read().decode())
             self.assertEqual(data["status"], "healthy")
+
+    def test_unconfigured_auth_is_rejected_on_non_loopback_routes(self) -> None:
+        """An accidental wildcard bind must not expose RPC or legacy camera routes."""
+        handler = make_request_handler(self.app)
+        server = ThreadedHTTPServer(("0.0.0.0", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            rpc_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "unauthorized-lan-rpc",
+                "operation": "ha.get_state",
+                "arguments": {"entity_id": "light.desk"},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            rpc = Request(
+                f"http://127.0.0.1:{port}/api/rpc",
+                data=json.dumps(rpc_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            for request in (
+                rpc,
+                Request(f"http://127.0.0.1:{port}/api/camera/frame?client_id=unauth"),
+                Request(f"http://127.0.0.1:{port}/api/camera/snapshot"),
+            ):
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request)
+                self.assertEqual(raised.exception.code, 401)
+                raised.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_host_config_check_rejects_non_loopback_without_auth_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({
+                    "server": {"host": "0.0.0.0", "port": 0},
+                    "auth_token": "",
+                    "storage": {"db_path": str(Path(temp_dir) / "life.db")},
+                }),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, "-m", "host.desk_agent.main", "--config", str(config_path), "--check-config"],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("auth_token", proc.stderr)
+
+    def test_host_config_check_allows_loopback_without_auth_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({
+                    "server": {"host": "127.0.0.1", "port": 0},
+                    "storage": {"db_path": str(Path(temp_dir) / "life.db")},
+                }),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, "-m", "host.desk_agent.main", "--config", str(config_path), "--check-config"],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"status": "valid"', proc.stdout)
+
+    def test_normal_startup_rejects_non_loopback_cli_override_without_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({"server": {"host": "127.0.0.1", "port": 0}, "auth_token": ""}),
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, "-m", "host.desk_agent.main", "--config", str(config_path), "--host", "0.0.0.0"],
+                cwd=Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("auth_token", proc.stderr)
+
+    def test_serve_host_rejects_non_loopback_without_token_before_binding(self) -> None:
+        self.app.config["auth_token"] = None
+        with self.assertRaisesRegex(ValueError, "auth_token"):
+            _serve_host(self.app, "0.0.0.0", 0)
+
+    def test_managed_startup_rejects_non_loopback_without_token_before_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "host.json"
+            config_path.write_text(
+                json.dumps({"server": {"host": "0.0.0.0", "port": 0}, "auth_token": ""}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "auth_token"):
+                asyncio.run(_run_managed_application(str(config_path), "0.0.0.0", 0))
 
     def test_rpc_endpoint(self) -> None:
         req_payload = {
@@ -78,6 +201,45 @@ class TestHostDaemon(unittest.TestCase):
             data = json.loads(resp.read().decode())
             self.assertEqual(data["status"], "succeeded")
             self.assertEqual(data["request_id"], "req-daemon-test-01")
+
+    def test_ha_event_query_preserves_attribute_only_snapshot(self) -> None:
+        attributes = {"brightness": 90, "nested": {"mode": "brightness"}}
+        self.app._on_ha_state_change("light.desk", "on", "on", attributes)
+        attributes["brightness"] = 10
+        attributes["nested"]["mode"] = "changed-after-callback"
+        request = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-ha-attribute-event",
+            operation="ha.list_changes",
+            arguments={},
+            expires_at="2030-01-01T00:00:00Z",
+        )
+
+        response = self.app.router.dispatch(request)
+
+        self.assertEqual(response.status.value, "succeeded")
+        event = response.result["changes"][-1]
+        self.assertEqual(event["old_state"], "on")
+        self.assertEqual(event["new_state"], "on")
+        self.assertEqual(event["attributes"], {"brightness": 90, "nested": {"mode": "brightness"}})
+
+    def test_ha_event_query_preserves_removal_without_attributes(self) -> None:
+        self.app._on_ha_state_change("light.removed", "off", None, None)
+        request = RequestEnvelope(
+            schema_version="1.0.0",
+            request_id="req-ha-removal-event",
+            operation="ha.list_changes",
+            arguments={},
+            expires_at="2030-01-01T00:00:00Z",
+        )
+
+        response = self.app.router.dispatch(request)
+
+        self.assertEqual(response.status.value, "succeeded")
+        event = response.result["changes"][-1]
+        self.assertEqual(event["old_state"], "off")
+        self.assertIsNone(event["new_state"])
+        self.assertNotIn("attributes", event)
 
     def test_rpc_reminder_flow(self) -> None:
         create_payload = {
@@ -403,6 +565,70 @@ class TestHostDaemon(unittest.TestCase):
             with urlopen(release_request) as response:
                 self.assertTrue(json.loads(response.read().decode())["result"]["released"])
 
+    def test_camera_frame_endpoint_accepts_valid_bearer_and_rejects_invalid_bearer(self) -> None:
+        """The single-frame route enforces configured Bearer auth before serving a leased JPEG."""
+        auth_token = "camera-frame-test-token"
+        original_auth_token = self.app.config.get("auth_token")
+        client_id = "camera-frame-auth-viewer"
+        jpeg = b"\xff\xd8camera-frame-auth-test\xff\xd9"
+        self.app.config["auth_token"] = auth_token
+        self.app.camera_service.set_hardware_frame_source(lambda: jpeg)
+
+        acquire_payload = {
+            "schema_version": "1.0.0",
+            "request_id": "req-camera-frame-auth-acquire",
+            "operation": "resource.camera.acquire",
+            "client_id": client_id,
+            "arguments": {"client_id": client_id, "lease_duration_ms": 5000},
+            "expires_at": "2030-01-01T00:00:00Z",
+        }
+        acquire_request = Request(
+            f"http://127.0.0.1:{self.port}/api/rpc",
+            data=json.dumps(acquire_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {auth_token}"},
+            method="POST",
+        )
+
+        try:
+            with urlopen(acquire_request) as response:
+                self.assertEqual(json.loads(response.read().decode())["result"]["granted"], True)
+
+            frame_url = f"http://127.0.0.1:{self.port}/api/camera/frame?client_id={client_id}"
+            invalid_request = Request(frame_url, headers={"Authorization": "Bearer invalid-camera-token"})
+            with self.assertRaises(HTTPError) as invalid_response:
+                urlopen(invalid_request)
+            try:
+                self.assertEqual(invalid_response.exception.code, 401)
+            finally:
+                invalid_response.exception.close()
+
+            valid_request = Request(frame_url, headers={"Authorization": f"Bearer {auth_token}"})
+            with urlopen(valid_request, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get("Content-Type"), "image/jpeg")
+                self.assertEqual(response.read(), jpeg)
+        finally:
+            release_payload = {
+                "schema_version": "1.0.0",
+                "request_id": "req-camera-frame-auth-release",
+                "operation": "resource.camera.release",
+                "client_id": client_id,
+                "arguments": {"client_id": client_id},
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            release_request = Request(
+                f"http://127.0.0.1:{self.port}/api/rpc",
+                data=json.dumps(release_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {auth_token}"},
+                method="POST",
+            )
+            try:
+                with urlopen(release_request) as response:
+                    self.assertTrue(json.loads(response.read().decode())["result"]["released"])
+            finally:
+                self.app.camera_service.set_hardware_frame_source(None)
+                self.app.config["auth_token"] = original_auth_token
+
     def test_snapshot_endpoint_unavailable_without_physical_image_source(self) -> None:
         """GET /snapshot reports unavailable when the Host has no physical image source."""
         snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
@@ -414,7 +640,7 @@ class TestHostDaemon(unittest.TestCase):
             error.exception.close()
 
     def test_snapshot_endpoint_retrieval(self) -> None:
-        """Verifies GET /snapshot returns fresh JPEG with anti-caching and frame headers."""
+        """Snapshot responses identify the low-rate preview API explicitly."""
         jpeg = b"\xff\xd8host-test-image\xff\xd9"
         self.app.camera_service.set_hardware_frame_source(lambda: jpeg)
         snap_req = Request(f"http://127.0.0.1:{self.port}/snapshot")
@@ -424,7 +650,47 @@ class TestHostDaemon(unittest.TestCase):
                 self.assertEqual(snap_resp.headers.get("Content-Type"), "image/jpeg")
                 self.assertIn("no-cache", snap_resp.headers.get("Cache-Control", ""))
                 self.assertIsNotNone(snap_resp.headers.get("X-Frame-Seq"))
+                self.assertEqual(snap_resp.headers.get("X-Camera-Mode"), "snapshot-preview")
+                self.assertEqual(snap_resp.headers.get("X-Camera-Max-FPS"), "2")
+                self.assertIn("maximum 2 FPS", snap_resp.headers.get("X-Camera-Description", ""))
                 self.assertEqual(snap_resp.read(), jpeg)
+        finally:
+            self.app.camera_service.set_hardware_frame_source(None)
+
+    def test_snapshot_is_limited_to_2_fps_per_client_and_recovers(self) -> None:
+        jpeg_prefix = b"\xff\xd8snapshot-rate-limit-"
+        frame_id = [0]
+
+        def next_jpeg():
+            frame_id[0] += 1
+            return jpeg_prefix + bytes([frame_id[0] % 255]) + b"\xff\xd9"
+
+        self.app.camera_service.set_hardware_frame_source(next_jpeg)
+        client_id = "snapshot-rate-limit-regression"
+        first_url = f"http://127.0.0.1:{self.port}/snapshot?client_id={client_id}"
+        alias_url = f"http://127.0.0.1:{self.port}/api/camera/snapshot?client_id={client_id}"
+        try:
+            with urlopen(first_url) as first:
+                self.assertEqual(first.status, 200)
+
+            with self.assertRaises(HTTPError) as limited:
+                urlopen(alias_url)
+            self.assertEqual(limited.exception.code, 429)
+            self.assertEqual(limited.exception.headers.get("X-Camera-Mode"), "snapshot-preview")
+            self.assertEqual(limited.exception.headers.get("X-Camera-Max-FPS"), "2")
+            self.assertTrue(limited.exception.headers.get("Retry-After"))
+            body = json.loads(limited.exception.read().decode("utf-8"))
+            self.assertEqual(body["error"], "SNAPSHOT_RATE_LIMITED")
+            self.assertIn("LIVE", body["message"])
+            limited.exception.close()
+
+            admitted, _ = DeskAgentHostApp._admit_snapshot_request(
+                self.app, "snapshot-rate-limit-independent-client"
+            )
+            self.assertTrue(admitted)
+            time.sleep(0.51)
+            with urlopen(first_url) as recovered:
+                self.assertEqual(recovered.status, 200)
         finally:
             self.app.camera_service.set_hardware_frame_source(None)
 
@@ -848,6 +1114,16 @@ class TestCameraStreamRoute(unittest.TestCase):
         self.assertTrue(self.service.iterator_closed)
         self.assertFalse(any(call[0] == "release" for call in self.service.calls))
         self.assertEqual(self.service.active_lease_owner, "viewer-1")
+
+    def test_live_stream_is_not_subject_to_snapshot_rate_limit(self) -> None:
+        self.service.end_after_first = True
+        for _ in range(2):
+            request = Request(self.url, headers={"Authorization": "Bearer stream-test-token"})
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("multipart/x-mixed-replace", response.headers.get("Content-Type", ""))
+                self.assertIn(b"first", response.read())
+        self.assertEqual(len([call for call in self.service.calls if call[0] == "iter"]), 2)
 
     def test_stream_fails_closed_when_no_bearer_token_is_configured(self) -> None:
         self.app.config["auth_token"] = None

@@ -17,7 +17,6 @@ import os
 import socket
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -254,19 +253,37 @@ class TestP1FinalClosure(unittest.TestCase):
         self.assertEqual(frame_info["source"], "hardware_sensor")
 
         # 2. Test hardware frame source callback in pipeline
-        called = [False]
+        called = threading.Event()
+        frame_pushed = threading.Event()
         def mock_sensor() -> bytes:
-            called[0] = True
+            called.set()
             return real_jpeg
 
         cam.set_hardware_frame_source(mock_sensor)
-        cam.pipeline.start(cam.push_frame)
-        time.sleep(0.15)
-        cam.pipeline.stop()
+        initial_seq = frame_info["frame_seq"]
 
-        self.assertTrue(called[0], "Hardware frame source callback must be polled by pipeline")
+        def consume_hardware_frame(frame: bytes, is_hardware: bool) -> None:
+            cam.push_frame(frame, is_hardware=is_hardware)
+            latest = cam.get_latest_frame("test-viewer")
+            if latest is not None and latest["frame_seq"] > initial_seq:
+                frame_pushed.set()
+
+        cam.pipeline.start(consume_hardware_frame)
+        try:
+            self.assertTrue(
+                called.wait(timeout=2.0),
+                "Hardware frame source callback must be polled by pipeline",
+            )
+            self.assertTrue(
+                frame_pushed.wait(timeout=2.0),
+                "Pipeline must push a new hardware frame before the test inspects it",
+            )
+        finally:
+            cam.pipeline.stop()
+
         latest = cam.get_latest_frame("test-viewer")
         self.assertIsNotNone(latest)
+        self.assertGreater(latest["frame_seq"], initial_seq)
         self.assertTrue(latest["is_hardware"])
         self.assertEqual(latest["source"], "hardware_sensor")
 

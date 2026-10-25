@@ -2,7 +2,7 @@
 
 - **提出方：** A0 架构与协议
 - **范围：** A2 WSPK / 官方 Runtime / A3 Host SDK 接入 / A6 相机服务的数据交付边界
-- **状态：** **Lead/A0 已批准实现接口边界**；Transport 语义按现有协议可确定，Host 集成责任按下文分配
+- **状态：** **Lead/A0 已批准接口边界；A3 官方 SDK camera adapter 与 managed Application 接线已有 L2 源码/测试证据；L3/L4 未通过**。commit `21d5505` 将 managed SDK capture cadence 上限限制为 2 FPS，与 `CameraViewerService.iter_mjpeg()` 当前上限一致；低于 2 FPS 的请求仍按请求 cadence 执行。本轮 combined WSL camera tests **53/53 passed**，属于源码/fixture L2；设备负载、真实实时帧和 Runtime 部署未验证。
 - **不在范围：** 修改 WSPK wire format、修改官方 SDK、改变相机硬件驱动或宣布实机 JPEG 已通过
 - **关联：** `contracts/camera_frame_delivery.md`、CR-002、`docs/implementation/p0-3-official-sdk-device-contract.md`
 
@@ -24,19 +24,20 @@
 
 ### Host A6 消费者
 
-- `host/desk_agent/main.py` 当前将 `RobotAdapter.register_camera_frame_callback()` 注册到 `CameraViewerService.ingest_robot_frame()`。该 RobotAdapter 是自有 TCP 37020 链路；当设备走官方 WebSocket 时，这条 TCP callback 不会自动收到 SDK Runtime 路由的 binary media。
+- Legacy TCP 模式下，`host/desk_agent/main.py` 将 `RobotAdapter.register_camera_frame_callback()` 注册到 `CameraViewerService.ingest_robot_frame()`；该 `RobotAdapter` 只对应自有 TCP 37020，不会自动收到官方 SDK Runtime 的 WebSocket binary media。**managed Application 模式已有独立接线：** `_run_managed_application()` 将既有 `ApplicationContext.robot` 与同一 `context._transport.send_command` 注入 `OfficialRobotCameraAdapter`，并把 frame sink 接到 `CameraViewerService.ingest_robot_frame()`；它不创建第二个 Runtime 或连接。
+- `host/desk_agent/connectors/robot/official_camera_adapter.py::OfficialRobotCameraAdapter` 在设备 lease ACK 后启动单 capture worker，使用官方 `robot.camera.capture()` 接收其已关联的 `ImageFrame`，校验 JPEG 标记、content type、正 session ID 和默认 ≤64 KiB 上限后投递完整 JPEG bytes。它按 Host cadence 限制 capture 并发；capture 失败、lease 过期、release 或上游 SDK disconnect 会停止/清理本地 frame state。此为源码事实，实际 Runtime/设备行为仍未验证。
 - `CameraViewerService.ingest_robot_frame(frame_bytes)` 当前接收**已剥掉 WSPK header 的 JPEG bytes**，再由 `push_frame()` 检查 `4..128 KiB` 大小和 JPEG SOI/EOI；仅活动租约内保存单张最新帧，过期帧由默认 2000 ms freshness 检查返回 unavailable，释放租约会清除帧。
 - 现有 Host 资源接口和 firmware 已定义 `resource.camera.acquire/release`、`ctrl.camera.acquire/release`、`ctrl.camera.capture` 命令；Host `main.py` 在获取租约时 acquire 并请求 capture，在释放/临时租约结束时 release。SDK 的高级 `camera.capture()` 管理 capture ACK/图像关联，但没有公开 camera lease 专用方法； pinned SDK 的通用 `send_command()` 可承载仓库已定义的 acquire/release 命令。
 
-## 2. A0 唯一建议接口
+## 2. A0 批准接口与当前接线
 
-**数据路径：A2 只发送原有 WSPK binary → 不修改的 pinned official Runtime → A3 官方 SDK Robot/Camera adapter → A6 `CameraViewerService.ingest_robot_frame(jpeg_bytes)`。**
+**数据路径（已实现 L2 adapter）：A2 发送原有 WSPK binary → 不修改的 pinned official SDK parser/camera API → A3 `OfficialRobotCameraAdapter` → A6 `CameraViewerService.ingest_robot_frame(jpeg_bytes)`。**
 
-A3 应复用本仓已定义的命令及 pinned SDK `send_command()` / `camera.capture()` 语义，不增加新的 wire message、第二套设备 Runtime，也不修改官方 SDK。A6 继续只消费完整 JPEG bytes 和维护 Host viewer lease / freshness；A2 继续只负责设备驱动采集、WSPK 完整帧发送及设备 lease，不直接跨设备调用 Host callback。
+A3 adapter 复用本仓已定义的命令及 pinned SDK `send_command()` / `camera.capture()` 语义，不增加新的 wire message、第二套设备 Runtime，也不修改官方 SDK。A6 继续只消费完整 JPEG bytes 和维护 Host viewer lease / freshness；A2 继续只负责设备驱动采集、WSPK 完整帧发送及设备 lease，不直接跨设备调用 Host callback。
 
 1. Host `resource.camera.acquire` 成功后，A3 adapter 使用 SDK 当前会话向设备发 `ctrl.camera.acquire`（同一 `client_id` 与剩余租期），设备拒绝则回滚 Host lease 并报告现有 `RESOURCE_BUSY` / 设备错误。
 2. 仅在设备 lease 有效期间，A3 使用 pinned SDK `camera.capture()` 请求帧。该 SDK API 负责 ACK 和返回 image 的 `session_id` 关联及其定义的 image fragmentation 重组。A3 只把完成且匹配该 capture session 的 `FRAME_IMAGE` payload 交给 A6；不把 WSPK header 或音频帧传给相机服务。
-3. 预览刷新按当前 Host `target_fps` 运行，单设备只允许一个 capture 在途；每个 lease 至多保留一个等待/最新完整 JPEG，落后帧丢弃，不累积无界队列。定时刷新达到 SDK/device capture 超时则停止本轮并显式报告 unavailable；不得把超时/断连前的旧帧作为新帧。
+3. 预览刷新按 Host `target_fps` 运行，但 SDK camera capture cadence 上限为 **2 FPS**，与 `CameraViewerService.iter_mjpeg()` 的当前最大输出一致；低于 2 FPS 的请求保留。单设备只允许一个 capture 在途；每个 lease 至多保留一个等待/最新完整 JPEG，落后帧丢弃，不累积无界队列。定时刷新达到 SDK/device capture 超时则停止本轮并显式报告 unavailable；不得把超时/断连前的旧帧作为新帧。此上限不证明硬件在持续负载下可稳定提供实时帧。
 4. A6 现有 JPEG 校验、single latest frame、lease owner 和 2000 ms stale 检查继续生效。HTTP viewer 只可在当前 Host lease owner 下读取新鲜帧；无有效租约或没有新鲜帧时返回不可用。
 5. Host lease release、expiry、SDK session disconnect、device reboot 均停止刷新并清空 Host latest frame；有连接时尽力发送现有 `ctrl.camera.release`。连接已断时记录 release 未确认，依赖设备租约超时清理，重连不得复用旧 session_id 或旧帧。
 
@@ -46,12 +47,12 @@ A3 应复用本仓已定义的命令及 pinned SDK `send_command()` / `camera.ca
 
 | 边界 | 建议上限/行为 | 当前证据状态 |
 | --- | --- | --- |
-| WebSocket 完整 WSPK message | ≤ `DESK_WSPK_MAX_FRAME_SIZE` = 131088 bytes（128 KiB payload + 16-byte header），超出在 Host 接收层拒绝 | CR-002 建议；SDK Runtime 现为 `max_size=None`，A3 需在受控读取入口落实 |
+| WebSocket 完整 WSPK message | ≤ `DESK_WSPK_MAX_FRAME_SIZE` = 131088 bytes（128 KiB payload + 16-byte header），超出在 Host 接收层拒绝 | `_run_managed_application()` 包装既有 SDK binary callback，在 SDK camera consumer 处理前拒绝非 bytes/超上限 payload；对应 managed-startup contract test 为 L2。Pinned Runtime 部署后的实际 ingress 仍未测 |
 | 单个相机 JPEG | 当前设备 source **≤65536 bytes**；A6 已接受至 128 KiB。若后续提高设备实际 capture 上限，须先另行核对 SRAM/PSRAM 并保持 WSPK payload ≤128 KiB | firmware `ctrl.camera.capture` 的 64 KiB allocation 是当前有效 source cap；不是 128 KiB |
-| 队列/重组 | 单设备一个 capture 在途、Host 一个最新 JPEG；SDK 定义的 fragmented image assembly 必须限总 JPEG ≤128 KiB，并按官方 stream/sequence/flags 丢弃坏帧 | SDK higher-level camera 支持 reassembly；本仓 A3 adapter 尚未接入 |
-| Camera lease | Host 与设备使用现有 acquire/release 命令；租约 owner 与 duration 保持同一；设备 busy/无租约映射为既有错误，不创建第二种租约 | 现有 Host/firmware TCP path 有命令，WebSocket Host adapter 尚未接入 |
+| 队列/重组与节流 | 单设备一个 capture 在途、Host 一个最新 JPEG；由 pinned SDK camera API 关联 capture 与 image；adapter 再限制完整 JPEG ≤64 KiB；capture cadence ≤2 FPS，低于 2 FPS 的请求保留 | commit `21d5505` 实施 2 FPS 上限；与 `CameraViewerService.iter_mjpeg()` 一致。combined WSL camera tests 53/53 passed，属 L2；设备负载/真实实时帧未测 |
+| Camera lease | Host 与设备使用现有 acquire/release 命令；租约 owner 与 duration 保持同一；设备 busy/无租约映射为既有错误，不创建第二种租约 | managed-mode adapter 已转发 acquire/release 并在 acquire 失败时回滚 Host lease；代码/fixture 测试为 L2 |
 | 无帧/坏帧 | WSPK/header/size/sequence/JPEG 校验失败只丢弃当前帧并保留诊断；capture 超时、无租约、设备 busy 作为失败返回；不能透传前一张图冒充成功 | camera handler 当前把驱动失败映射为 `RESOURCE_BUSY`；`interfaces.md` 已记录需修正为硬件错误，此处不改错误字典 |
-| 断线/释放 | 清理 Host latest frame、capture waiter、fragment assembly 和 lease owner；断线时 release 未确认必须记录；重连需新鲜 capture | 当前 `CameraViewerService` release/expiry 清 buffer；完整 SDK bridge lifecycle 仍待实现验证 |
+| 断线/释放 | 清理 Host latest frame、capture waiter、fragment assembly 和 lease owner；断线时 release 未确认必须记录；重连需新鲜 capture | managed SDK disconnect observer 已接线到非阻塞 camera invalidation，覆盖 L2；真实 Runtime 断线/重连与设备租约回收仍待 L3 验证 |
 
 ## 4. Ownership 与待决事项
 
@@ -63,7 +64,7 @@ A3 应复用本仓已定义的命令及 pinned SDK `send_command()` / `camera.ca
 
 **明确排除：** A4 的 `host/desk_agent/connectors/ha/` 与 HA 状态/服务接入不变；A6 的 viewer、管理页面及 CameraViewerService 所有权不变。A3 只增加 `connectors/robot/` 中的官方 SDK Robot/Camera transport adapter 与对应测试，并执行上述 `main.py` 最小接线；不得改 A4/A6 生产路径。
 
-当前协议足以裁决 image transport、WSPK parsing、session correlation、已有 lease commands 和 Host sink；**没有待新增的 wire protocol 字段**。接口边界已批准，剩余实现/验收项是 A3 Host 侧官方 SDK session 集成、官方 SDK connection 的实际 deployment/configuration，以及真机 camera frame 是否真实可读。A2 `desk_sdk_ws_client_poll()` 的下行 binary 丢弃不能作为 A6 source；旧 TCP `RobotAdapter` callback 也不能被宣称自动接入 WebSocket Runtime。
+当前协议足以裁决 image transport、WSPK parsing、session correlation、已有 lease commands 和 Host sink；**没有待新增的 wire protocol 字段**。A3 adapter、managed Application 接线、相机 callback 与 capture cadence 上限已有 L2 源码/测试证据。commit `21d5505` 的实现由 combined WSL camera tests **53/53 passed** 验证；该结果只证明源码、fake transport 与 fixture 路径。设备负载和真实实时帧仍需 L3/L4；此外仍需验证官方 Runtime 在目标 Host 的实际部署/配置、设备与 Runtime 的真实配对和 WebSocket 媒体收发，以及实体相机真实 JPEG 可读性。此前现场相机空头/无 JPEG 问题仍未关闭。A2 `desk_sdk_ws_client_poll()` 的下行 binary 丢弃不能作为 A6 source；旧 TCP `RobotAdapter` callback 也不能被宣称自动接入 WebSocket Runtime。
 
 ## 5. 验收门槛
 

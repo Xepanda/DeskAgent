@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import sqlite3
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import gc
@@ -239,6 +241,34 @@ class TestLifeService(unittest.TestCase):
         self.service = LifeService(self.db_path)
         self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "cancelled")
 
+    def test_terminal_alert_failure_requires_claimed_ringing_reminder_and_preserves_lifecycle(self) -> None:
+        occurrence_id = self._create_pending_reminder_alert("rem-terminal-outbox")
+        with self.service._get_connection() as conn:
+            outbox_id = conn.execute(
+                "SELECT outbox_id FROM outbox WHERE event_type = 'reminder.alert' "
+                "AND json_extract(payload_json, '$.occurrence_id') = ?",
+                (occurrence_id,),
+            ).fetchone()["outbox_id"]
+
+        self.assertFalse(self.service.record_terminal_reminder_alert_failure(outbox_id))
+        self.assertTrue(self.service.claim_reminder_alert(outbox_id))
+        self.assertTrue(self.service.record_terminal_reminder_alert_failure(outbox_id))
+        self.assertFalse(self.service.record_terminal_reminder_alert_failure(outbox_id))
+        with self.service._get_connection() as conn:
+            row = conn.execute(
+                "SELECT state, retry_count, next_retry_at, dispatched_at FROM outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["retry_count"], 1)
+        self.assertIsNone(row["next_retry_at"])
+        self.assertIsNone(row["dispatched_at"])
+        self.assertEqual(self.service.get_all_occurrences("rem-terminal-outbox")[0]["state"], "ringing")
+        self.assertEqual(self.service.get_reminder("rem-terminal-outbox")["status"], "ringing")
+
+        other_id = self.service.enqueue_outbox("codex.failed", {"task_id": "unrelated"})
+        self.assertFalse(self.service.record_terminal_reminder_alert_failure(other_id))
+
     def test_unconfirmed_claimed_alert_is_retried_after_service_restart(self) -> None:
         occurrence_id = self._create_pending_reminder_alert("rem-claimed-restart")
         with self.service._get_connection() as conn:
@@ -251,6 +281,64 @@ class TestLifeService(unittest.TestCase):
         self.service.close()
         self.service = LifeService(self.db_path)
         self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "pending")
+
+    def test_forced_process_exit_preserves_due_reminder_and_recovers_claim(self) -> None:
+        """A hard process exit must retain a due reminder and reclaim an unacked alert."""
+        self.service.close()
+        due_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+        create_script = r"""
+import os, sys
+from host.desk_agent.services.life_service import LifeService
+service = LifeService(sys.argv[1])
+service.create_reminder("rem-process-crash", "Crash recovery", sys.argv[2])
+os._exit(0)
+"""
+        create = subprocess.run(
+            [sys.executable, "-c", create_script, str(self.db_path), due_at],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(create.returncode, 0, create.stderr)
+
+        self.service = LifeService(self.db_path)
+        reminder = self.service.get_reminder("rem-process-crash")
+        self.assertIsNotNone(reminder)
+        due = self.service.get_due_occurrences()
+        self.assertEqual(len(due), 1)
+        self.assertTrue(due[0]["is_catchup"])
+        occurrence_id = due[0]["occurrence_id"]
+        alert = self.service.trigger_occurrence_to_outbox(occurrence_id)
+        self.assertIsNotNone(alert)
+        self.service.close()
+
+        claim_script = r"""
+import os, sys
+from host.desk_agent.services.life_service import LifeService
+service = LifeService(sys.argv[1])
+items = service.get_pending_outbox()
+alert = next(item for item in items if item["event_type"] == "reminder.alert")
+assert service.claim_reminder_alert(alert["outbox_id"])
+os._exit(0)
+"""
+        claim = subprocess.run(
+            [sys.executable, "-c", claim_script, str(self.db_path)],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(claim.returncode, 0, claim.stderr)
+
+        self.service = LifeService(self.db_path)
+        pending = self.service.get_pending_outbox()
+        recovered = [item for item in pending if item["event_type"] == "reminder.alert"]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["payload"]["occurrence_id"], occurrence_id)
+        self.assertEqual(self._outbox_state_for_occurrence(occurrence_id), "pending")
+        occurrence = self.service.get_all_occurrences("rem-process-crash")[0]
+        self.assertEqual(occurrence["state"], "ringing")
 
     def test_snooze_occurrence_is_idempotent_across_retry_and_restart(self) -> None:
         occurrence_id = self._create_pending_reminder_alert("rem-snooze-outbox")
@@ -666,6 +754,73 @@ class TestLifeService(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(restored["title"], "Backup Item 1")
 
+    def test_corrupt_sqlite_backup_fails_without_closing_or_replacing_live_database(self) -> None:
+        self.service.create_reminder("rem-restore-guard", "Keep me", "2026-10-15T12:00:00Z")
+        outbox_id = self.service.enqueue_outbox("test.restore.guard", {"value": "keep me"})
+        live_connection = self.service._get_connection()
+        corrupt_backup = Path(self.temp_dir.name) / "corrupt_backup.db"
+        corrupt_backup.write_bytes(b"this is not a SQLite database")
+
+        with self.assertRaisesRegex(ValueError, "(?i)(invalid sqlite backup|integrity)"):
+            self.service.restore(corrupt_backup)
+
+        self.assertIs(self.service._conn, live_connection, "failed restore must retain the live connection")
+        self.assertEqual(self.service.get_reminder("rem-restore-guard")["title"], "Keep me")
+        pending = self.service.get_pending_outbox(include_delayed=True)
+        self.assertIn(outbox_id, [item["outbox_id"] for item in pending])
+
+    def test_incomplete_sqlite_backup_fails_without_overwriting_live_data(self) -> None:
+        self.service.create_reminder("rem-schema-guard", "Keep schema data", "2026-10-15T12:00:00Z")
+        outbox_id = self.service.enqueue_outbox("test.restore.schema.guard", {"value": "keep me"})
+        live_connection = self.service._get_connection()
+        incomplete_backup = Path(self.temp_dir.name) / "incomplete_backup.db"
+        backup_conn = sqlite3.connect(incomplete_backup)
+        try:
+            backup_conn.execute("CREATE TABLE unrelated (value TEXT)")
+            backup_conn.commit()
+        finally:
+            backup_conn.close()
+
+        with self.assertRaisesRegex(ValueError, "(?i)(schema|backup)"):
+            self.service.restore(incomplete_backup)
+
+        self.assertIs(self.service._conn, live_connection, "failed restore must retain the live connection")
+        self.assertEqual(self.service.get_reminder("rem-schema-guard")["title"], "Keep schema data")
+        pending = self.service.get_pending_outbox(include_delayed=True)
+        self.assertIn(outbox_id, [item["outbox_id"] for item in pending])
+
+    def test_backup_missing_managed_state_schema_is_rejected_before_live_database_changes(self) -> None:
+        self.service.create_reminder("rem-managed-schema-guard", "Preserve me", "2026-10-15T12:00:00Z")
+        outbox_id = self.service.enqueue_outbox("test.restore.managed.schema.guard", {"value": "preserve me"})
+        live_connection = self.service._get_connection()
+        core_only_backup = Path(self.temp_dir.name) / "core_only_backup.db"
+        backup_conn = sqlite3.connect(core_only_backup)
+        try:
+            backup_conn.executescript("""
+                CREATE TABLE reminders (reminder_id TEXT PRIMARY KEY, title TEXT NOT NULL, due_at TEXT NOT NULL);
+                CREATE TABLE occurrences (
+                    occurrence_id TEXT PRIMARY KEY, reminder_id TEXT NOT NULL,
+                    scheduled_at TEXT NOT NULL, state TEXT NOT NULL
+                );
+                CREATE TABLE notes (note_id TEXT PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL);
+                CREATE TABLE outbox (
+                    outbox_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL, retry_count INTEGER NOT NULL, created_at TEXT NOT NULL
+                );
+            """)
+            integrity = backup_conn.execute("PRAGMA integrity_check").fetchall()
+            self.assertEqual(integrity, [("ok",)])
+        finally:
+            backup_conn.close()
+
+        with self.assertRaisesRegex(ValueError, "(?i)(schema|backup|notification_receipts|recovery_batches)"):
+            self.service.restore(core_only_backup)
+
+        self.assertIs(self.service._conn, live_connection, "failed restore must retain the live connection")
+        self.assertEqual(self.service.get_reminder("rem-managed-schema-guard")["title"], "Preserve me")
+        pending = self.service.get_pending_outbox(include_delayed=True)
+        self.assertIn(outbox_id, [item["outbox_id"] for item in pending])
+
     # -------------------------------------------------------------------------
     # 10. Outbox Exponential Backoff & Dead-Letter State
     # -------------------------------------------------------------------------
@@ -916,6 +1071,16 @@ class TestLifeService(unittest.TestCase):
         # 06:30Z is the second 01:30 (EST). The next daily occurrence is
         # 01:30 EST on Nov 2, which is still 06:30Z.
         self.assertEqual(next_daily, "2026-11-02T06:30:00Z")
+
+    def test_daily_occurrence_skips_nonexistent_spring_forward_wall_time(self) -> None:
+        """A 02:30 daily reminder resumes at 02:30 after the DST gap, without drifting."""
+        next_daily = compute_next_occurrence(
+            "2026-03-07T07:30:00Z", "daily", tz_name="America/New_York"
+        )
+
+        # New York has no 02:30 on Mar 8, 2026. Skip that nonexistent slot so
+        # the stored UTC occurrence still maps to 02:30 local on the next day.
+        self.assertEqual(next_daily, "2026-03-09T06:30:00Z")
 
     # -------------------------------------------------------------------------
     # 13. LifeService Close & Context Manager

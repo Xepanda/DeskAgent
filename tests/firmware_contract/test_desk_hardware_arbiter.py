@@ -11,6 +11,7 @@ import ctypes
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
 
 # Owners matching desk_arbiter.h
@@ -53,6 +54,8 @@ DESK_TOUCH_ACTION_SHORT_PRESS = 0
 DESK_TOUCH_ACTION_LONG_PRESS = 1
 DESK_TOUCH_ACTION_SCROLL_UP = 2
 DESK_TOUCH_ACTION_SCROLL_DOWN = 3
+DESK_ROLLER_DELTA_DOWN = -1
+DESK_ROLLER_DELTA_UP = 1
 
 
 class TestDeskHardwareArbiter(unittest.TestCase):
@@ -93,6 +96,11 @@ class TestDeskHardwareArbiter(unittest.TestCase):
 
         cls.lib.desk_arbiter_get_owner.restype = ctypes.c_int
         cls.lib.desk_arbiter_get_owner.argtypes = [ctypes.c_int]
+
+        PREEMPT_CB = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p)
+        cls.PREEMPT_CB = PREEMPT_CB
+        cls.lib.desk_arbiter_register_preempt_handler.restype = ctypes.c_int
+        cls.lib.desk_arbiter_register_preempt_handler.argtypes = [ctypes.c_int, PREEMPT_CB, ctypes.c_void_p]
 
         cls.lib.desk_arbiter_camera_acquire_lease.restype = ctypes.c_int
         cls.lib.desk_arbiter_camera_acquire_lease.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
@@ -156,7 +164,7 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         CAM_FRAME_CB = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_void_p)
         cls.CAM_FRAME_CB = CAM_FRAME_CB
         cls.lib.desk_hardware_camera_stream_start.restype = ctypes.c_int
-        cls.lib.desk_hardware_camera_stream_start.argtypes = [ctypes.c_float, CAM_FRAME_CB, ctypes.c_void_p]
+        cls.lib.desk_hardware_camera_stream_start.argtypes = [ctypes.c_char_p, ctypes.c_float, CAM_FRAME_CB, ctypes.c_void_p]
 
         cls.lib.desk_hardware_camera_stream_pump.restype = ctypes.c_int
         cls.lib.desk_hardware_camera_stream_pump.argtypes = []
@@ -174,6 +182,13 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         cls.TOUCH_CB = TOUCH_CB
         cls.lib.desk_hardware_register_input_cb.restype = ctypes.c_int
         cls.lib.desk_hardware_register_input_cb.argtypes = [TOUCH_CB, ctypes.c_void_p]
+
+        ROLLER_DELTA_CB = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_void_p)
+        cls.ROLLER_DELTA_CB = ROLLER_DELTA_CB
+        cls.lib.desk_hardware_register_roller_delta_cb.restype = ctypes.c_int
+        cls.lib.desk_hardware_register_roller_delta_cb.argtypes = [ROLLER_DELTA_CB, ctypes.c_void_p]
+        cls.lib.desk_hardware_feed_roller_delta.restype = ctypes.c_int
+        cls.lib.desk_hardware_feed_roller_delta.argtypes = [ctypes.c_int]
 
         cls.lib.desk_hardware_inject_touch_event.restype = ctypes.c_int
         cls.lib.desk_hardware_inject_touch_event.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -248,6 +263,115 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         # Release
         self.lib.desk_arbiter_release(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SYSTEM_ALERT)
         self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_NONE)
+
+    def test_audio_preemption_requires_owner_quiescence_confirmation(self) -> None:
+        """A registered audio backend must confirm stop/drain before an owner changes."""
+        calls = []
+        allow = False
+
+        def on_preempt(resource, owner, requester, timeout_ms, user_data):
+            calls.append((resource, owner, requester, timeout_ms))
+            return allow
+
+        callback = self.PREEMPT_CB(on_preempt)
+        self.assertEqual(self.lib.desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK,
+                                                      DESK_OWNER_SDK_REMOTE, 0), DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, callback, None), DESK_ARBITER_OK)
+
+        denied = self.lib.desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK,
+                                               DESK_OWNER_SYSTEM_ALERT, 37)
+        self.assertEqual(denied, DESK_ARBITER_ERR_BUSY)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_SDK_REMOTE)
+        self.assertEqual(calls, [(DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE,
+                                  DESK_OWNER_SYSTEM_ALERT, 37)])
+
+        allow = True
+        granted = self.lib.desk_arbiter_acquire(DESK_RES_AUDIO_PLAYBACK,
+                                                DESK_OWNER_SYSTEM_ALERT, 41)
+        self.assertEqual(granted, DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK), DESK_OWNER_SYSTEM_ALERT)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, self.PREEMPT_CB(), None), DESK_ARBITER_OK)
+
+    def test_higher_priority_preemption_reservation_blocks_concurrent_lower_request(self) -> None:
+        """A pending SYSTEM_ALERT transition cannot be stolen by a lower owner."""
+        callback_entered = threading.Event()
+        allow_alert_quiesce = threading.Event()
+        alert_result = []
+        callback_observed_owner = []
+
+        def on_preempt(resource, owner, requester, timeout_ms, user_data):
+            if requester == DESK_OWNER_SYSTEM_ALERT:
+                callback_observed_owner.append(self.lib.desk_arbiter_get_owner(resource))
+                callback_entered.set()
+                return allow_alert_quiesce.wait(2)
+            return True
+
+        callback = self.PREEMPT_CB(on_preempt)
+        self.assertEqual(self.lib.desk_arbiter_acquire(
+            DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE, 0), DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, callback, None), DESK_ARBITER_OK)
+
+        alert_thread = threading.Thread(target=lambda: alert_result.append(
+            self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SYSTEM_ALERT, 500)))
+        alert_thread.start()
+        try:
+            self.assertTrue(callback_entered.wait(2), "alert quiesce callback did not start")
+            lower_rc = self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 0)
+            self.assertEqual(lower_rc, DESK_ARBITER_ERR_BUSY)
+            self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                             DESK_OWNER_SDK_REMOTE)
+        finally:
+            allow_alert_quiesce.set()
+            alert_thread.join(2)
+
+        self.assertFalse(alert_thread.is_alive(), "alert acquisition did not finish")
+        self.assertEqual(callback_observed_owner, [DESK_OWNER_SDK_REMOTE])
+        self.assertEqual(alert_result, [DESK_ARBITER_OK])
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                         DESK_OWNER_SYSTEM_ALERT)
+
+    def test_higher_priority_request_supersedes_lower_in_flight_transition(self) -> None:
+        """A late lower callback cannot commit after SYSTEM_ALERT supersedes it."""
+        lower_callback_entered = threading.Event()
+        allow_lower_quiesce = threading.Event()
+        lower_result = []
+
+        def on_preempt(resource, owner, requester, timeout_ms, user_data):
+            if requester == DESK_OWNER_TCLAW_VOICE:
+                lower_callback_entered.set()
+                return allow_lower_quiesce.wait(2)
+            return True
+
+        callback = self.PREEMPT_CB(on_preempt)
+        self.assertEqual(self.lib.desk_arbiter_acquire(
+            DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SDK_REMOTE, 0), DESK_ARBITER_OK)
+        self.assertEqual(self.lib.desk_arbiter_register_preempt_handler(
+            DESK_RES_AUDIO_PLAYBACK, callback, None), DESK_ARBITER_OK)
+
+        lower_thread = threading.Thread(target=lambda: lower_result.append(
+            self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_TCLAW_VOICE, 500)))
+        lower_thread.start()
+        try:
+            self.assertTrue(lower_callback_entered.wait(2), "lower quiesce callback did not start")
+            alert_rc = self.lib.desk_arbiter_acquire(
+                DESK_RES_AUDIO_PLAYBACK, DESK_OWNER_SYSTEM_ALERT, 500)
+            self.assertEqual(alert_rc, DESK_ARBITER_OK)
+            self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                             DESK_OWNER_SYSTEM_ALERT)
+        finally:
+            allow_lower_quiesce.set()
+            lower_thread.join(2)
+
+        self.assertFalse(lower_thread.is_alive(), "lower acquisition did not finish")
+        self.assertEqual(lower_result, [DESK_ARBITER_ERR_BUSY])
+        self.assertEqual(self.lib.desk_arbiter_get_owner(DESK_RES_AUDIO_PLAYBACK),
+                         DESK_OWNER_SYSTEM_ALERT)
 
     def test_camera_lease_locks_tclaw_motion_tracking(self) -> None:
         """Verifies active camera viewing lease locks out automatic TClaw gimbal tracking."""
@@ -387,29 +511,21 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.lib.desk_hardware_audio_play_stop()
 
     def test_camera_frame_injection_and_streaming(self) -> None:
-        """Verifies camera frame injection, stream dispatch callback, and JPEG capture."""
+        """Injected host frames cannot masquerade as a leased board stream producer."""
         stream_frames = []
         def on_frame(jpeg_ptr, jpeg_len, ts_ms, user_data):
             stream_frames.append((bytes(jpeg_ptr[:jpeg_len]), ts_ms))
 
         cb_holder = self.CAM_FRAME_CB(on_frame)
-        self.lib.desk_hardware_camera_stream_start(ctypes.c_float(15.0), cb_holder, None)
+        rc = self.lib.desk_hardware_camera_stream_start(b"viewer-a", ctypes.c_float(15.0), cb_holder, None)
+        self.assertEqual(rc, DESK_HW_ERR_UNAVAILABLE, "Default driver has no initialized real camera producer")
 
-        # Inject custom JPEG frame
+        # Native injection remains useful for single-frame L2 capture tests, but
+        # it must never feed the real board producer callback.
         fake_jpeg = b"\xFF\xD8\xFF\xE0TEST_JPEG_DATA\xFF\xD9"
         rc = self.lib.desk_hardware_camera_inject_frame(fake_jpeg, len(fake_jpeg), 5000)
         self.assertEqual(rc, 0)
-
-        # Stream callback was called on injection
-        self.assertEqual(len(stream_frames), 1)
-        self.assertEqual(stream_frames[0][0], fake_jpeg)
-        self.assertEqual(stream_frames[0][1], 5000)
-
-        # Stream pump advances timestamp and dispatches
-        rc = self.lib.desk_hardware_camera_stream_pump()
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(stream_frames), 2)
-        self.assertGreater(stream_frames[1][1], 5000)
+        self.assertEqual(stream_frames, [])
 
         # Capture JPEG returns latest frame
         cap_buf = ctypes.create_string_buffer(128)
@@ -418,7 +534,7 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(bytes(cap_buf.raw[:cap_len.value]), fake_jpeg)
 
-        self.lib.desk_hardware_camera_stream_stop()
+        self.assertEqual(self.lib.desk_hardware_camera_stream_stop(), DESK_HW_OK)
 
     def test_touch_event_subscription_and_injection(self) -> None:
         """Verifies touch inputs callback registration and dispatch."""
@@ -435,6 +551,36 @@ class TestDeskHardwareArbiter(unittest.TestCase):
         self.assertEqual(len(received_events), 2)
         self.assertEqual(received_events[0], (DESK_TOUCH_TARGET_BACKTOUCH, DESK_TOUCH_ACTION_SHORT_PRESS))
         self.assertEqual(received_events[1], (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP))
+
+    def test_roller_detents_notify_observer_and_preserve_ui_events(self) -> None:
+        """Decoded roller detents reach both SDK observers and the existing UI callback."""
+        ui_events = []
+        roller_deltas = []
+
+        def on_touch(target, action, user_data):
+            ui_events.append((target, action))
+
+        def on_roller_delta(delta, user_data):
+            roller_deltas.append(delta)
+
+        touch_cb = self.TOUCH_CB(on_touch)
+        roller_cb = self.ROLLER_DELTA_CB(on_roller_delta)
+        self.lib.desk_hardware_register_input_cb(touch_cb, None)
+        self.lib.desk_hardware_register_roller_delta_cb(roller_cb, None)
+
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(DESK_ROLLER_DELTA_UP), DESK_HW_OK)
+        self.assertEqual(self.lib.desk_hardware_feed_roller_delta(DESK_ROLLER_DELTA_DOWN), DESK_HW_OK)
+        # Buttons keep their existing TuyaOpen input path and must not become SDK roller events.
+        self.lib.desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SHORT_PRESS)
+        self.lib.desk_hardware_feed_touch_event(DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_LONG_PRESS)
+
+        self.assertEqual(roller_deltas, [DESK_ROLLER_DELTA_UP, DESK_ROLLER_DELTA_DOWN])
+        self.assertEqual(ui_events, [
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_UP),
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SCROLL_DOWN),
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_SHORT_PRESS),
+            (DESK_TOUCH_TARGET_ROLLER, DESK_TOUCH_ACTION_LONG_PRESS),
+        ])
 
     def test_uninitialized_camera_capture_fails_without_synthetic_picture(self) -> None:
         """Verifies camera capture returns DESK_HW_ERR_UNAVAILABLE (-2) when no real sensor/frame is present."""

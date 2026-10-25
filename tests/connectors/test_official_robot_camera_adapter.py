@@ -38,12 +38,64 @@ class Camera:
         return self.frame
 
 
+class TimeoutRecordingCamera(Camera):
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: list[float] = []
+
+    def capture(self, *, timeout: float) -> ImageFrame:
+        self.timeouts.append(timeout)
+        return super().capture(timeout=timeout)
+
+
 class Robot:
     def __init__(self, camera: Camera) -> None:
         self.camera = camera
 
 
 class OfficialRobotCameraAdapterTests(unittest.TestCase):
+    def test_default_capture_wait_exceeds_firmware_five_second_budget(self) -> None:
+        camera = TimeoutRecordingCamera()
+        camera.release.clear()
+        commands: list[tuple[str, float | None]] = []
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda name, _data, timeout: commands.append((name, timeout))
+            or {"type": "sys.ack", "code": 0},
+            ingest_frame=lambda _frame: None,
+        )
+        try:
+            self.assertTrue(adapter.acquire("viewer-timeout", 10000)["granted"])
+            self.assertTrue(camera.entered.wait(1))
+            self.assertEqual(camera.timeouts, [7.0])
+            self.assertEqual(commands, [("ctrl.camera.acquire", 1.0)])
+        finally:
+            camera.release.set()
+            adapter.close()
+
+    def test_capture_cadence_is_capped_to_host_mjpeg_rate_on_acquire_and_renewal(self) -> None:
+        camera = Camera()
+        camera.release.clear()
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda *_a, **_k: {"type": "sys.ack", "code": 0},
+            ingest_frame=lambda _frame: None,
+        )
+        try:
+            self.assertTrue(adapter.acquire("viewer-a", 5000, target_fps=20)["granted"])
+            self.assertEqual(adapter._interval, 0.5, "capture cadence must not exceed Host's 2 FPS MJPEG output cap")
+
+            # Lower consumer rates remain effective when the same lease is renewed.
+            self.assertTrue(adapter.acquire("viewer-a", 5000, target_fps=1)["granted"])
+            self.assertEqual(adapter._interval, 1.0)
+
+            # Renewing with a faster request must restore the consumer cap, not the raw request.
+            self.assertTrue(adapter.acquire("viewer-a", 5000, target_fps=30)["granted"])
+            self.assertEqual(adapter._interval, 0.5)
+        finally:
+            camera.release.set()
+            adapter.close()
+
     def test_sdk_disconnect_invalidates_camera_lease_without_release_command(self) -> None:
         camera = Camera()
         camera.release.clear()
@@ -82,12 +134,12 @@ class OfficialRobotCameraAdapterTests(unittest.TestCase):
     def test_sdk_disconnect_observer_does_not_wait_for_capture_thread(self) -> None:
         camera = Camera()
         camera.release.clear()
-        cleared: list[str] = []
+        cleared: list[tuple[str, int | None]] = []
         adapter = OfficialRobotCameraAdapter(
             Robot(camera),
             send_command=lambda *_a, **_k: {"type": "sys.ack", "code": 0},
             ingest_frame=lambda _frame: None,
-            clear_frame=cleared.append,
+            clear_frame=lambda owner, *, expected_generation=None: cleared.append((owner, expected_generation)),
             capture_timeout=5.0,
         )
         capture_thread = None
@@ -108,7 +160,7 @@ class OfficialRobotCameraAdapterTests(unittest.TestCase):
             self.assertFalse(adapter.is_connected)
             self.assertIsNone(adapter._owner)
             self.assertIsNone(adapter._thread)
-            self.assertEqual(cleared, ["viewer-fast"])
+            self.assertEqual(cleared, [("viewer-fast", 1)])
         finally:
             camera.release.set()
             if capture_thread and capture_thread.is_alive():
@@ -142,6 +194,93 @@ class OfficialRobotCameraAdapterTests(unittest.TestCase):
             self.assertEqual(commands[0][1], {"client_id": "viewer-a", "lease_duration_ms": 3000})
         finally:
             camera.release.set()
+            adapter.close()
+
+    def test_stale_generation_release_and_worker_cleanup_cannot_stop_reacquired_owner(self) -> None:
+        camera = Camera()
+        camera.release.clear()
+        commands: list[str] = []
+        cleared: list[tuple[str, int | None]] = []
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera),
+            send_command=lambda name, *_a, **_k: commands.append(name) or {"type": "sys.ack", "code": 0},
+            ingest_frame=lambda _frame: None,
+            clear_frame=lambda owner, *, expected_generation=None: cleared.append((owner, expected_generation)),
+            capture_timeout=0.01,
+        )
+        try:
+            first = adapter.acquire("same-owner", 5000, lease_generation=11)
+            self.assertTrue(first["granted"])
+            self.assertTrue(camera.entered.wait(1))
+            old_event = adapter._stop_event
+            old_thread = adapter._thread
+
+            self.assertTrue(adapter.release("same-owner", expected_generation=11))
+            self.assertEqual(cleared, [("same-owner", 11)])
+            second = adapter.acquire("same-owner", 5000, lease_generation=12)
+            self.assertTrue(second["granted"])
+            self.assertEqual(adapter._lease_generation, 12)
+            command_count = len(commands)
+
+            adapter._stop_owner("same-owner", old_event, "late old worker", lease_generation=11)
+
+            self.assertEqual(len(commands), command_count, "stale worker must not release the new device lease")
+            self.assertEqual(cleared, [("same-owner", 11)], "stale worker must not clear a newer generation's frame")
+            self.assertEqual(adapter._owner, "same-owner")
+            self.assertIsNot(adapter._stop_event, old_event)
+            self.assertFalse(adapter.release("same-owner", expected_generation=11))
+            self.assertEqual(len(commands), command_count)
+        finally:
+            camera.release.set()
+            if adapter._thread and adapter._thread is not threading.current_thread():
+                adapter._thread.join(timeout=1)
+            adapter.close()
+
+    def test_acquire_waits_for_current_release_device_command(self) -> None:
+        release_entered = threading.Event()
+        allow_release = threading.Event()
+        commands: list[str] = []
+
+        def send_command(name: str, *_args, **_kwargs):
+            commands.append(name)
+            if name == "ctrl.camera.release":
+                release_entered.set()
+                allow_release.wait(1)
+            return {"type": "sys.ack", "code": 0}
+
+        camera = Camera()
+        camera.release.set()
+        adapter = OfficialRobotCameraAdapter(
+            Robot(camera), send_command=send_command, ingest_frame=lambda _frame: None,
+            capture_timeout=0.01,
+        )
+        release_result: list[bool] = []
+        acquire_result: list[dict] = []
+        try:
+            self.assertTrue(adapter.acquire("same-owner", 5000, lease_generation=21)["granted"])
+            releasing = threading.Thread(
+                target=lambda: release_result.append(adapter.release("same-owner", expected_generation=21))
+            )
+            releasing.start()
+            self.assertTrue(release_entered.wait(1))
+
+            acquiring = threading.Thread(
+                target=lambda: acquire_result.append(adapter.acquire("same-owner", 5000, lease_generation=22))
+            )
+            acquiring.start()
+            time.sleep(0.03)
+            self.assertEqual(commands.count("ctrl.camera.acquire"), 1)
+
+            allow_release.set()
+            releasing.join(timeout=1)
+            acquiring.join(timeout=1)
+            self.assertEqual(release_result, [True])
+            self.assertEqual(len(acquire_result), 1)
+            self.assertTrue(acquire_result[0]["granted"])
+            self.assertLess(commands.index("ctrl.camera.release"), len(commands) - 1)
+            self.assertEqual(commands[-1], "ctrl.camera.acquire")
+        finally:
+            allow_release.set()
             adapter.close()
 
     def test_capture_is_single_in_flight_and_rejects_bad_or_oversized_jpeg(self) -> None:

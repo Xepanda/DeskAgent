@@ -4,7 +4,7 @@
  *
  * Implements standard WatcheRobot device protocol endpoints:
  * - sys.client.hello / sys.ack handshake and capabilities negotiation
- * - WSPK binary framing for image media (SDK audio transport is not advertised)
+ * - WSPK binary framing for image media and HAL-ready PCM playback
  * - Inputs event notifications (backtouch, screentouch, roller)
  * - Motion & Camera commands with strict resource arbitration
  * - Bidirectional RequestEnvelope / ResponseEnvelope tool routing
@@ -22,16 +22,19 @@ extern "C" {
 #include <stddef.h>
 #include "desk_hardware.h"
 #include "desk_arbiter.h"
+#include "desk_notification.h"
 
 /**
  * @brief Capabilities declared by Desk Agent firmware to the Python SDK.
  */
-#define DESK_SDK_CAP_INPUTS        "inputs"
 #define DESK_SDK_CAP_MOTION        "motion"
 #define DESK_SDK_CAP_CAMERA        "camera"
+#define DESK_SDK_CAP_CAMERA_STREAM "camera.stream.mjpeg.wspk.v1"
+#define DESK_SDK_CAP_AUDIO_STREAM  "audio.stream"
 #define DESK_SDK_CAP_EXPRESSION    "expression.audio_follow.v1"
 #define DESK_SDK_CAP_EXPRESSION_ALT "expression"
 #define DESK_SDK_CAP_MCP_TOOLS     "mcp_tools"
+#define DESK_SDK_CAP_INPUTS        "inputs"
 
 /**
  * @brief Pending request states in the asynchronous correlation table.
@@ -44,6 +47,18 @@ typedef enum {
     DESK_SDK_REQ_STATE_FAILED,
     DESK_SDK_REQ_STATE_TIMED_OUT
 } desk_sdk_req_state_t;
+
+/** Signed one-detent direction for SDK roller input events. */
+typedef enum {
+    DESK_SDK_ROLLER_DELTA_NEGATIVE = -1,
+    DESK_SDK_ROLLER_DELTA_POSITIVE = 1
+} desk_sdk_roller_delta_t;
+
+#define DESK_SDK_ROLLER_OK                    0
+#define DESK_SDK_ROLLER_ERR_INVALID          (-1)
+#define DESK_SDK_ROLLER_ERR_BUFFER           (-2)
+#define DESK_SDK_ROLLER_ERR_NOT_CONNECTED    (-3)
+#define DESK_SDK_ROLLER_ERR_SEND             (-4)
 
 /**
  * @brief WSPK Binary Framing Constants
@@ -173,6 +188,18 @@ int desk_sdk_bridge_pack_media_frame(uint8_t frame_type,
                                      size_t max_buf_len,
                                      size_t *out_len);
 
+/** Pack one frozen CR-022 WJPG v1 header and complete JPEG payload.
+ * Returns -1 for invalid arguments/JPEG markers, -2 if the JPEG exceeds the
+ * WSPK payload budget, and -3 when the output buffer is too small.
+ */
+int desk_sdk_bridge_pack_wjpg_v1(uint32_t sequence,
+                                 uint32_t capture_timestamp_ms,
+                                 const uint8_t *jpeg,
+                                 size_t jpeg_len,
+                                 uint8_t *out_buf,
+                                 size_t max_buf_len,
+                                 size_t *out_len);
+
 /**
  * @brief Send a complete WSPK binary media frame over active socket connection or outbound cb.
  */
@@ -247,7 +274,19 @@ typedef enum {
 } desk_sdk_ws_state_t;
 int desk_sdk_ws_client_connect_paired(void);
 int desk_sdk_ws_client_poll(int timeout_ms);
+uint32_t desk_sdk_ws_client_generation(void);
+/* Pins a validated audio command to the live paired WebSocket lifecycle until release. */
+bool desk_sdk_ws_client_audio_command_acquire(uint32_t connection_generation);
+/* Pins a PCM callback/poll to the current lifecycle generation, including teardown drain polls. */
+bool desk_sdk_ws_client_audio_generation_acquire(uint32_t connection_generation);
+void desk_sdk_ws_client_audio_command_release(void);
 int desk_sdk_ws_client_send_text(const char *text);
+/* Queues the start ACK with a writer completion callback before live media. */
+int desk_sdk_ws_client_send_camera_start_ack(const char *text);
+/** Best-effort control-queue enqueue for input observer context; fail-fast. */
+int desk_sdk_ws_client_send_text_nonblocking(const char *text);
+/** Enqueue the accepted structured-log subscription ACK with a writer completion hook. */
+int desk_sdk_ws_client_send_log_subscribe_ack(const char *text);
 int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len);
 bool desk_sdk_ws_client_is_connected(void);
 /**
@@ -266,8 +305,15 @@ void desk_sdk_ws_client_close(void);
 void desk_sdk_bridge_set_local_log_enabled(bool enabled);
 /* Internal transport lifecycle seam; clears the current log stream lease. */
 void desk_sdk_bridge_log_session_closed(void);
+/* Clears A2's current WebSocket camera lease-owner binding on teardown. */
+void desk_sdk_bridge_camera_session_closed(void);
+/* Called by the WS writer only after the stream.start ACK has been sent. */
+void desk_sdk_bridge_camera_start_ack_sent(void);
+bool desk_sdk_bridge_camera_stream_is_active(void);
 /* Internal A2 writer seam: returns one serialized v1 event/gap, or 0 if idle. */
 int desk_sdk_bridge_log_next_text(char *out_json, size_t out_len);
+/* Called by the single WS writer only after the subscribe ACK was sent successfully. */
+void desk_sdk_bridge_log_subscribe_ack_sent(void);
 
 /**
  * @brief Parse top-level string field from JSON payload.
@@ -292,12 +338,23 @@ bool json_parse_top_level_str(const char *json, const char *key, char *out_val, 
  * - ctrl.motion.move / ctrl.motion.stop -> sys.ack with CR-002 ACK-only semantics
  *   (status="accepted", accepted=true, state_confirmed=false)
  * - ctrl.camera.acquire / ctrl.camera.release / ctrl.camera.capture
- * - SDK audio transport controls currently return UNSUPPORTED_OPERATION
+ * - Audio playback controls are denied here and only dispatched on the
+ *   authenticated, generation-bound WebSocket receive path
  * - ctrl.expression.play / ctrl.expression.set / ctrl.expression.audio_follow
  */
 int desk_sdk_bridge_process_command(const char *json_in, char *out_buf, size_t max_out_len);
 /* WebSocket-only dispatch. Never use this entry point for the legacy TCP server. */
 int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_t max_out_len);
+/* Receive-loop dispatch binds commands to the lifecycle generation that read the frame. */
+int desk_sdk_bridge_process_ws_command_for_generation(const char *json_in,
+                                                       char *out_buf,
+                                                       size_t max_out_len,
+                                                       uint32_t connection_generation);
+/* Internal A2 media hooks called by the authenticated WebSocket receive loop. */
+int desk_sdk_bridge_process_ws_audio_frame(const uint8_t *frame, size_t len,
+                                           uint32_t connection_generation);
+void desk_sdk_bridge_audio_poll(uint32_t connection_generation);
+void desk_sdk_bridge_audio_session_closed(uint32_t connection_generation);
 #define desk_sdk_bridge_process_line desk_sdk_bridge_process_command
 
 /**
@@ -306,12 +363,59 @@ int desk_sdk_bridge_process_ws_command(const char *json_in, char *out_buf, size_
 int desk_sdk_bridge_send_event(const char *event_type, const char *payload_json);
 
 /**
+ * @brief Emit a CR-028 summary acknowledgement event correlated by stable summary_id.
+ *
+ * This only serializes the bridge event. Durable summary receipt/deduplication
+ * remains unavailable until the CR-018 device storage provider is approved.
+ */
+int desk_sdk_bridge_send_notification_summary_ack(const char *summary_id, const char *source);
+
+/**
+ * @brief Emit one CR-017 notification status event through the SDK event path.
+ *
+ * Serializes only notification_id and the stable status enum name; it never
+ * infers rendered/played from a command ACK or sends notification text.
+ * @return 0 when queued, -1 for invalid ID/status, unauthenticated session,
+ *         or send failure.
+ */
+int desk_sdk_bridge_send_notification_status(const char *notification_id,
+                                             desk_notification_status_t status);
+
+/**
  * @brief Format and dispatch hardware touch input event as contract EventEnvelope.
  */
 int desk_sdk_bridge_send_touch_event(desk_touch_target_t target,
                                      desk_touch_action_t action,
                                      char *out_event_json,
                                      size_t max_len);
+
+/**
+ * @brief Serialize one signed SDK roller detent as the official SDK event.
+ *
+ * This emits the WebSocket message (not the legacy EventEnvelope):
+ * {"type":"evt.sdk.input","data":{"source":"roller",
+ * "action":"rotate","delta":+1|-1,"timestamp_ms":T}}.
+ * `timestamp_ms` must be a nonnegative monotonic millisecond value.
+ * @return DESK_SDK_ROLLER_OK, ERR_INVALID for invalid direction/time, or
+ *         ERR_BUFFER when the output buffer is too small.
+ */
+int desk_sdk_bridge_format_roller_input(desk_sdk_roller_delta_t delta,
+                                        int64_t timestamp_ms,
+                                        char *out_json,
+                                        size_t max_len);
+
+/**
+ * @brief Queue one roller event on the active SDK WebSocket after Hello ACK.
+ *
+ * This is best effort: it does not wait for Runtime consumption. A missing
+ * Runtime WebSocket returns ERR_NOT_CONNECTED; a full/busy/failed writer queue
+ * returns ERR_SEND. It never falls back to the legacy TCP/control event path.
+ */
+int desk_sdk_bridge_send_roller_input(desk_sdk_roller_delta_t delta,
+                                      int64_t timestamp_ms);
+
+/** @brief Number of roller observer events dropped by the SDK bridge. */
+uint32_t desk_sdk_bridge_get_roller_input_failure_count(void);
 
 /**
  * @brief Forward external tool request from TClaw to Python Application.

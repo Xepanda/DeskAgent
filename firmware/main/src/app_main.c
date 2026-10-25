@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "desk_hardware.h"
+#include "desk_watcher_log_source.h"
 #include "desk_tclaw_bridge.h"
 #include "desk_sdk_bridge.h"
 #include "tuya_config.h"
@@ -26,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
+#include "desk_app_stack_hwm_cache.h"
 #else
 #include <stdbool.h>
 
@@ -155,6 +157,7 @@ static void desk_tuya_log_output(const char *line)
     /* This SDK's ESP32 tkl_log_output ignores its varargs. Use a literal
      * string sink so '%' in an already formatted SDK line stays inert. */
     fputs(line, stdout);
+    desk_watcher_log_source_observe_tal_line(line);
 }
 #endif
 
@@ -199,6 +202,9 @@ static void tuya_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *e
         break;
 
     case TUYA_EVENT_MQTT_CONNECTED:
+#ifdef ESP_PLATFORM
+        (void)desk_watcher_log_source_publish_tuya_mqtt_state(true);
+#endif
         desk_provisioning_apply_event(desk_provisioning_current_state(), DESK_PROVISIONING_EVENT_MQTT_ONLINE);
         desk_cli_update_provisioning_status(desk_provisioning_stage_name(desk_provisioning_current_state()->stage),
                                             desk_provisioning_current_state()->error_stage,
@@ -207,20 +213,23 @@ static void tuya_event_handler_on(tuya_iot_client_t *client, tuya_event_msg_t *e
 #ifdef ESP_PLATFORM
         /* This is an observed network event. The native ai_chat/ai_agent event
          * subscribers own cloud audio; do not start the host dialogue shim. */
-        desk_hardware_set_screen_expression("happy", "Online");
+        desk_tclaw_runtime_set_cloud_online(1);
 #else
         desk_tclaw_on_tuya_mqtt_connected();
 #endif
         break;
 
     case TUYA_EVENT_MQTT_DISCONNECT:
+#ifdef ESP_PLATFORM
+        (void)desk_watcher_log_source_publish_tuya_mqtt_state(false);
+#endif
         desk_provisioning_apply_event(desk_provisioning_current_state(), DESK_PROVISIONING_EVENT_MQTT_OFFLINE);
         desk_cli_update_provisioning_status(desk_provisioning_stage_name(desk_provisioning_current_state()->stage),
                                             desk_provisioning_current_state()->error_stage,
                                             desk_provisioning_current_state()->error_code);
         printf("[TUYA][EVENT] stage=%s\n", desk_provisioning_stage_name(desk_provisioning_current_state()->stage));
 #ifdef ESP_PLATFORM
-        desk_hardware_set_screen_expression("idle", "Cloud Offline");
+        desk_tclaw_runtime_set_cloud_online(0);
 #else
         desk_tclaw_on_tuya_mqtt_disconnected();
 #endif
@@ -286,6 +295,10 @@ static int on_sdk_tool_response(const char *response_envelope_json, void *user_d
     (void)user_data;
     return desk_tclaw_runtime_handle_bridge_response(response_envelope_json);
 }
+
+#ifdef ESP_PLATFORM
+static void desk_app_task_stack_hwm_publish_self(void);
+#endif
 
 static int desk_agent_main_worker(void)
 {
@@ -516,6 +529,8 @@ static int desk_agent_main_worker(void)
             printf("[TUYA][WARN] stage=yield rc=%d retry_in_ms=%u consecutive=%u\n",
                    yield_rc, delay_ms, s_yield_retry_state.consecutive_errors);
         }
+        (void)desk_hardware_ui_overlay_process_expiry();
+        desk_app_task_stack_hwm_publish_self();
         vTaskDelay(pdMS_TO_TICKS(delay_ms ? delay_ms : 50));
     }
 #endif
@@ -523,26 +538,46 @@ static int desk_agent_main_worker(void)
 }
 
 #ifdef ESP_PLATFORM
-static TaskHandle_t s_app_task_handle = NULL;
+static desk_app_stack_hwm_cache_t s_app_task_hwm_cache = DESK_APP_STACK_HWM_CACHE_INITIALIZER;
+static bool s_app_task_hwm_sampling_enabled;
+
+static void desk_app_task_stack_hwm_publish_self(void)
+{
+    if (!s_app_task_hwm_sampling_enabled) return;
+    uint32_t bytes = (uint32_t)uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
+    desk_app_stack_hwm_cache_publish(&s_app_task_hwm_cache, bytes);
+}
+
+bool desk_app_task_stack_hwm_read(uint32_t *bytes)
+{
+    return desk_app_stack_hwm_cache_read(&s_app_task_hwm_cache, bytes);
+}
 
 uint32_t desk_app_task_stack_hwm(void)
 {
-    if (s_app_task_handle != NULL) {
-        return (uint32_t)uxTaskGetStackHighWaterMark(s_app_task_handle) * sizeof(StackType_t);
-    }
-    return 0;
+    uint32_t bytes = 0;
+    (void)desk_app_task_stack_hwm_read(&bytes);
+    return bytes;
 }
 
 static void desk_app_task(void *pvParameters)
 {
     (void)pvParameters;
+    s_app_task_hwm_sampling_enabled = true;
+    desk_app_task_stack_hwm_publish_self();
     int rc = desk_agent_main_worker();
+    desk_app_task_stack_hwm_publish_self();
     if (rc != 0) {
         printf("[ERROR] desk_agent_main_worker exited with code %d\n", rc);
     }
     vTaskDelete(NULL);
 }
 #else
+bool desk_app_task_stack_hwm_read(uint32_t *bytes)
+{
+    *bytes = 0U;
+    return false;
+}
 uint32_t desk_app_task_stack_hwm(void) { return 0; }
 #endif
 
@@ -555,7 +590,7 @@ int app_main(void)
      * Sized at 8KB (down from 16KB) while allowing main_task (CONFIG_ESP_MAIN_TASK_STACK_SIZE = 3584 B)
      * to exit and return its stack memory to the internal heap upon app_main() return. */
     BaseType_t task_rc = xTaskCreateWithCaps(desk_app_task, "desk_app_task", 8192, NULL, 5,
-                                            &s_app_task_handle, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                                            NULL, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (task_rc != pdPASS) {
         printf("[ERROR] Failed to spawn desk_app_task in internal SRAM (rc=%d), falling back to synchronous execution\n", (int)task_rc);
         return desk_agent_main_worker();

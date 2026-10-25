@@ -14,11 +14,20 @@ from typing import Any, Mapping, Optional
 
 
 _TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
-_LEVELS = frozenset({"ERROR", "WARN", "INFO", "DEBUG"})
-_EVENT_ID = "CAMERA_CAPTURE_EMPTY"
+_RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+_EVENTS = {
+    ("camera", "CAMERA_CAPTURE_EMPTY"): {},
+    ("audio", "AUDIO_DRIVER_STATE_SNAPSHOT"): {"state": frozenset({"READY", "NOT_READY"})},
+    ("network", "TUYA_MQTT_STATE"): {"state": frozenset({"CONNECTED", "DISCONNECTED"})},
+    ("stm32", "STM32_ACK_TIMEOUT"): {},
+}
+_LEVELS = frozenset({"ERROR", "WARN"})
 _GAP_REASON = "QUEUE_FULL"
 _SCHEMA_VERSION = "1.0.0"
 _QUEUE_CAPACITY = 16
+_UINT64_MAX = (1 << 64) - 1
 
 
 class NetworkLogConsumer:
@@ -29,7 +38,7 @@ class NetworkLogConsumer:
         *,
         enabled: bool = False,
     ) -> None:
-        self.enabled = bool(enabled)
+        self.enabled = enabled is True
         self._queue: deque[dict[str, Any]] = deque()
         self._lock = threading.Lock()
         self._closed = False
@@ -57,14 +66,25 @@ class NetworkLogConsumer:
             if safe_message is None:
                 self._rejected += 1
                 return False
+            data = safe_message["data"]
+            stream_id = data["stream_id"]
+            boot_id = data["boot_id"]
+            if (
+                self._active_stream_id is not None
+                and stream_id != self._active_stream_id
+            ) or (
+                self._active_boot_id is not None
+                and boot_id != self._active_boot_id
+            ):
+                self._rejected += 1
+                return False
             if len(self._queue) >= _QUEUE_CAPACITY:
                 # CR-009 uses drop-new to preserve the earliest queued evidence.
                 self._dropped += 1
                 return False
             self._queue.append(safe_message)
-            data = safe_message["data"]
-            self._active_stream_id = data.get("stream_id")
-            self._active_boot_id = data.get("boot_id")
+            self._active_stream_id = stream_id
+            self._active_boot_id = boot_id
             self._accepted += 1
             return True
 
@@ -155,10 +175,23 @@ class NetworkLogConsumer:
             return None
         if not _is_nonnegative_int(data.get("uptime_ms")):
             return None
-        if data.get("level") not in _LEVELS or data.get("component") != "camera":
+        level = data.get("level")
+        component = data.get("component")
+        event_id = data.get("event_id")
+        if not isinstance(level, str) or level not in _LEVELS:
             return None
-        if data.get("event_id") != _EVENT_ID or data.get("fields") != {}:
+        if not isinstance(component, str) or not isinstance(event_id, str):
             return None
+        field_schema = _EVENTS.get((component, event_id))
+        fields = data.get("fields")
+        if field_schema is None or not isinstance(fields, Mapping) or set(fields) != set(field_schema):
+            return None
+        safe_fields: dict[str, str] = {}
+        for key, allowed_values in field_schema.items():
+            value = fields.get(key)
+            if not isinstance(value, str) or value not in allowed_values:
+                return None
+            safe_fields[key] = value
 
         event = {
             "type": "sys.log.event",
@@ -169,14 +202,18 @@ class NetworkLogConsumer:
                 "sequence": data["sequence"],
                 "uptime_ms": data["uptime_ms"],
                 "level": data["level"],
-                "component": "camera",
-                "event_id": _EVENT_ID,
-                "fields": {},
+                "component": component,
+                "event_id": event_id,
+                "fields": safe_fields,
             },
         }
         if "timestamp_utc" in data:
             timestamp = data["timestamp_utc"]
-            if not isinstance(timestamp, str) or len(timestamp) > 40:
+            if (
+                not isinstance(timestamp, str)
+                or len(timestamp) > 40
+                or _RFC3339_TIMESTAMP.fullmatch(timestamp) is None
+            ):
                 return None
             try:
                 parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -225,4 +262,9 @@ def _valid_token(value: object) -> bool:
 
 
 def _is_nonnegative_int(value: object, *, allow_zero: bool = True) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and (value >= 0 if allow_zero else value > 0)
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (value >= 0 if allow_zero else value > 0)
+        and value <= _UINT64_MAX
+    )

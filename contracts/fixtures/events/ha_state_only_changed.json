@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0.0",
+  "event_id": "evt-ha-state-1003",
+  "sequence": 106,
+  "sequence_scope": "ha:event_bus",
+  "type": "ha.state_changed",
+  "timestamp": "2026-10-11T22:45:04Z",
+  "payload": {
+    "entity_id": "switch.office_lamp",
+    "old_state": "off",
+    "new_state": "on",
+    "timestamp": "2026-10-11T22:45:04Z",
+    "context_id": "ctx-ha-8814"
+  }
+}

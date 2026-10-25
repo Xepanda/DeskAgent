@@ -39,6 +39,32 @@ class TestTclawRuntimeContract(unittest.TestCase):
             "raw PCM delivery is not a wakeup or voice activity event",
         )
 
+    def test_cloud_disconnect_uses_offline_preset_and_gates_late_voice_events(self) -> None:
+        adapter = (ROOT / "firmware/main/src/tclaw_runtime_adapter.c").read_text(encoding="utf-8")
+        app = (ROOT / "firmware/main/src/app_main.c").read_text(encoding="utf-8")
+        setter = adapter.split("void desk_tclaw_runtime_set_cloud_online", 1)[1].split(
+            "static void __desk_ai_chat_event_handler", 1
+        )[0]
+        handler = adapter.split("static void __desk_ai_chat_event_handler", 1)[1].split(
+            "int desk_tclaw_runtime_init", 1
+        )[0]
+
+        self.assertIn('"offline"', setter)
+        self.assertIn('"Cloud Offline"', setter)
+        self.assertIn("!s_cloud_online", handler,
+                      "late TClaw events must not overwrite an authoritative offline state")
+        self.assertIn("desk_tclaw_runtime_set_cloud_online(1)", app)
+        self.assertIn("desk_tclaw_runtime_set_cloud_online(0)", app)
+
+    def test_notification_alert_is_a_supported_board_expression(self) -> None:
+        board = (ROOT / "firmware/components/desk_hardware/src/desk_watcher_board.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('{ "alert",', board,
+                      "notification delivery already requests alert; board adapter must accept it")
+        self.assertIn('strcmp(preset_name, "alert") == 0', board,
+                      "notification state must have an explicit renderer")
+
     def test_native_runtime_uses_official_modules_in_dependency_order(self) -> None:
         source = ROOT / "firmware/main/src/tclaw_runtime_adapter.c"
         adapter = source.read_text(encoding="utf-8")

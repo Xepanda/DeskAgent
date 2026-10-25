@@ -58,9 +58,12 @@ MCU_FRAME_MAGIC1 = 0x5A
 MCU_FRAME_PROTO_VERSION = 0x01
 MCU_FRAME_CLASS_MOTION = 0x02
 
-MCU_MOTION_MSG_ACK = 0x00
 MCU_MOTION_MSG_SERVO_MOVE = 0x01
 MCU_MOTION_MSG_SERVO_STOP = 0x02
+MCU_SYS_MSG_ACK = 0x04
+MCU_SYS_MSG_NACK = 0x05
+# Legacy desk_hardware.c injection path only; not the UART2 peer protocol.
+MCU_MOTION_MSG_ACK = 0x00
 MCU_MOTION_MSG_NACK = 0xFF
 
 MCU_FRAME_FLAG_ACK_REQ = 0x01
@@ -135,6 +138,27 @@ class TestSTM32BodyProtocol(unittest.TestCase):
 
         cls.lib = ctypes.CDLL(cls.so_path)
 
+        class MCUHelloPeerInfo(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint8) for name in (
+                "fw_major", "fw_minor", "fw_patch", "hw_version",
+                "capability_bitmap", "sensor_bitmap", "default_stream_profile")] + [
+                    ("response_seq", ctypes.c_uint32)]
+        cls.MCUHelloPeerInfo = MCUHelloPeerInfo
+        class MCUHelloRx(ctypes.Structure):
+            _fields_ = [("wire", ctypes.c_uint8 * 160), ("length", ctypes.c_size_t),
+                        ("discarding_oversize_frame", ctypes.c_bool)]
+        cls.MCUHelloRx = MCUHelloRx
+        cls.lib.desk_watcher_motion_pack_hello_req.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_pack_hello_req.argtypes = [
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t)]
+        cls.lib.desk_watcher_motion_parse_hello_rsp.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_parse_hello_rsp.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(MCUHelloPeerInfo)]
+        cls.lib.desk_watcher_motion_hello_rx_feed.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_hello_rx_feed.argtypes = [
+            ctypes.POINTER(MCUHelloRx), ctypes.c_uint8, ctypes.POINTER(MCUHelloPeerInfo)]
+
         # Function bindings
         cls.lib.desk_hardware_init.restype = ctypes.c_int
         cls.lib.desk_hardware_init.argtypes = []
@@ -168,6 +192,15 @@ class TestSTM32BodyProtocol(unittest.TestCase):
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_uint8),
+        ]
+        cls.lib.desk_watcher_motion_parse_ack.restype = ctypes.c_int
+        cls.lib.desk_watcher_motion_parse_ack.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_uint8,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.POINTER(ctypes.c_bool),
         ]
 
         cls.lib.desk_hardware_motion_get_position.restype = ctypes.c_int
@@ -361,6 +394,101 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         # Wire serialization check: Little-Endian [0xB1, 0x29]
         le_bytes = [c_crc & 0xFF, (c_crc >> 8) & 0xFF]
         self.assertEqual(le_bytes, [0xB1, 0x29])
+
+    def test_official_hello_wire_and_response(self) -> None:
+        seq = 0x12345678
+        tx = (ctypes.c_uint8 * 32)()
+        tx_len = ctypes.c_size_t()
+        self.assertEqual(self.lib.desk_watcher_motion_pack_hello_req(
+            seq, tx, len(tx), ctypes.byref(tx_len)), DESK_HW_OK)
+        wire = bytes(tx[:tx_len.value])
+        self.assertEqual(wire[-1], 0)
+        raw = self._cobs_decode(wire[:-1])
+        self.assertEqual(raw[:6], bytes([0xA5, 0x5A, 1, 1, 1, 1]))
+        self.assertEqual(struct.unpack_from("<I", raw, 6)[0], seq)
+        self.assertEqual(struct.unpack_from("<H", raw, 10)[0], 0)
+        self.assertEqual(len(raw), 14)
+        self.assertEqual(struct.unpack_from("<H", raw, 12)[0], python_crc16_ccitt(raw[:12]))
+
+        response_seq = 0xAABBCCDD
+        payload = bytes([0, 2, 7, 9, 3, 0x21, 0x05, 0, 7])
+        rsp_raw = bytearray([0xA5, 0x5A, 1, 1, 2, 0]) + bytearray(struct.pack("<I", response_seq))
+        rsp_raw.extend(struct.pack("<H", len(payload)))
+        rsp_raw.extend(payload)
+        rsp_raw.extend(struct.pack("<H", python_crc16_ccitt(rsp_raw)))
+        rsp_wire = self._cobs_encode(bytes(rsp_raw)) + b"\x00"
+        frame = (ctypes.c_uint8 * len(rsp_wire)).from_buffer_copy(rsp_wire)
+        info = self.MCUHelloPeerInfo()
+        parse = self.lib.desk_watcher_motion_parse_hello_rsp
+        self.assertEqual(parse(frame, len(rsp_wire), ctypes.byref(info)), DESK_HW_OK)
+        self.assertEqual((info.fw_major, info.fw_minor, info.fw_patch, info.hw_version), (2, 7, 9, 3))
+        self.assertEqual((info.capability_bitmap, info.sensor_bitmap, info.default_stream_profile), (0x21, 0x05, 7))
+        self.assertEqual(info.response_seq, response_seq)
+        corrupt_wire = bytearray(rsp_wire)
+        corrupt_wire[-3] ^= 1
+        corrupt = (ctypes.c_uint8 * len(corrupt_wire)).from_buffer_copy(corrupt_wire)
+        self.assertNotEqual(parse(corrupt, len(corrupt_wire), ctypes.byref(info)), DESK_HW_OK)
+
+        ack_payload = bytes([0, 0, 0, 0, 0, 0])
+        ack_raw = bytearray([0xA5, 0x5A, 1, 1, 4, 2]) + bytearray(struct.pack("<I", 55))
+        ack_raw.extend(struct.pack("<H", len(ack_payload)))
+        ack_raw.extend(ack_payload)
+        ack_raw.extend(struct.pack("<H", python_crc16_ccitt(ack_raw)))
+        ack_wire = self._cobs_encode(bytes(ack_raw)) + b"\x00"
+        rx = self.MCUHelloRx()
+        feed = self.lib.desk_watcher_motion_hello_rx_feed
+        for byte in ack_wire:
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_ERR_BUSY)
+        for byte in rsp_wire:
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_OK)
+        self.assertEqual(info.response_seq, response_seq)
+
+        rx = self.MCUHelloRx()
+        for byte in bytes([0x55] * 200 + [0]):
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_ERR_BUSY)
+        self.assertFalse(rx.discarding_oversize_frame)
+        for byte in rsp_wire:
+            result = feed(ctypes.byref(rx), byte, ctypes.byref(info))
+        self.assertEqual(result, DESK_HW_OK)
+
+    @staticmethod
+    def _cobs_encode(raw: bytes) -> bytes:
+        out = bytearray([0])
+        code_index, code = 0, 1
+        for byte in raw:
+            if byte == 0:
+                out[code_index] = code
+                code_index = len(out)
+                out.append(0)
+                code = 1
+            else:
+                out.append(byte)
+                code += 1
+                if code == 0xFF:
+                    out[code_index] = code
+                    code_index = len(out)
+                    out.append(0)
+                    code = 1
+        out[code_index] = code
+        return bytes(out)
+
+    @staticmethod
+    def _cobs_decode(encoded: bytes) -> bytes:
+        out = bytearray()
+        i = 0
+        while i < len(encoded):
+            code = encoded[i]
+            i += 1
+            if code == 0 or i + code - 1 > len(encoded):
+                raise ValueError("invalid COBS")
+            out.extend(encoded[i:i + code - 1])
+            i += code - 1
+            if code != 0xFF and i < len(encoded):
+                out.append(0)
+        return bytes(out)
 
     # ------------------------------------------------------------------
     # Test 2: SERVO_MOVE Golden Test Vector
@@ -690,6 +818,9 @@ class TestSTM32BodyProtocol(unittest.TestCase):
             wrong_payload[10:12] = struct.pack("<H", 5)
             wrong_payload = wrong_payload[:16] + b"\x00" + wrong_payload[16:]
             send(wrong_payload)
+            invalid_angles = bytearray(valid)
+            invalid_angles[12:16] = struct.pack("<hh", 1801, 1200)
+            send(invalid_angles)
             trailing = bytearray(valid + b"\x00")
             outcomes.append(self.lib.desk_hardware_mcu_receive_bytes(
                 (ctypes.c_uint8 * len(trailing))(*trailing), len(trailing)
@@ -710,10 +841,42 @@ class TestSTM32BodyProtocol(unittest.TestCase):
         self.lib.desk_hardware_set_mcu_max_retries(0)
         self.assertEqual(self.lib.desk_hardware_motion_move_to(90.0, 120.0, 300), DESK_HW_OK)
         self.assertEqual(outcomes, [DESK_HW_ERR_BUSY, DESK_HW_ERR_IO, DESK_HW_ERR_IO,
-                                    DESK_HW_ERR_IO, -3, DESK_HW_ERR_IO, DESK_HW_OK])
+                                    DESK_HW_ERR_IO, DESK_HW_ERR_IO, -3,
+                                    DESK_HW_ERR_IO, DESK_HW_OK])
         self.assertEqual(self.lib.desk_hardware_get_mcu_nack_count(), 0)
         self.lib.desk_hardware_set_mcu_max_retries(MCU_MAX_RETRIES)
         self.lib.desk_hardware_set_mcu_timeout_ms(MCU_ACK_TIMEOUT_MS)
+
+    def test_06d_official_sys_ack_and_nack_use_payload_ref_seq(self) -> None:
+        def official_sys(msg_id: int, header_seq: int, payload: bytes) -> bytes:
+            raw = bytearray([0xA5, 0x5A, 1, 1, msg_id, 2])
+            raw.extend(struct.pack("<I", header_seq))
+            raw.extend(struct.pack("<H", len(payload)))
+            raw.extend(payload)
+            raw.extend(struct.pack("<H", python_crc16_ccitt(raw)))
+            return bytes(raw)
+
+        def parse(raw: bytes, expected_seq: int = 123) -> tuple[int, int, bool]:
+            frame = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
+            nack_code = ctypes.c_uint8()
+            is_nack = ctypes.c_bool()
+            result = self.lib.desk_watcher_motion_parse_ack(
+                frame, len(raw), expected_seq, MCU_MOTION_MSG_SERVO_MOVE,
+                ctypes.byref(nack_code), ctypes.byref(is_nack),
+            )
+            return result, nack_code.value, is_nack.value
+
+        # The peer response header sequence is independent from the command's ref_seq.
+        ack = official_sys(MCU_SYS_MSG_ACK, 0xDEADBEEF, struct.pack("<IH", 123, 0))
+        self.assertEqual(parse(ack), (DESK_HW_OK, 0, False))
+        wrong_ref = official_sys(MCU_SYS_MSG_ACK, 123, struct.pack("<IH", 124, 0))
+        self.assertEqual(parse(wrong_ref)[0], DESK_HW_ERR_BUSY)
+
+        nack = official_sys(MCU_SYS_MSG_NACK, 0xAABBCCDD, struct.pack("<IHH", 123, 0, 0x1234))
+        self.assertEqual(parse(nack), (DESK_HW_ERR_IO, 0x34, True))
+        corrupted = bytearray(ack)
+        corrupted[-1] ^= 1
+        self.assertEqual(parse(bytes(corrupted))[0], DESK_HW_ERR_IO)
 
     def test_06c_motion_rejects_non_finite_angles(self) -> None:
         for pan, tilt in ((float("nan"), 120.0), (90.0, float("nan")),

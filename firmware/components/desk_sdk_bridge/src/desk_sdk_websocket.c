@@ -68,9 +68,16 @@ static bool s_ws_ready = false;
 /* A successful HardwareHello ACK observed on this socket, not cryptographic
  * peer authentication (the current transport is plaintext WebSocket). */
 static bool s_ws_authenticated = false;
+/* Exactly one first HardwareHello may be pending on a socket generation. */
+static bool s_ws_hello_pending = false;
+static uint32_t s_ws_hello_pending_generation = 0;
 /* Serializes only the ACK latch and its generation. It is never held while
  * taking the pairing mutex or doing network I/O. */
 static pthread_mutex_t s_ws_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_ws_lifecycle_cond = PTHREAD_COND_INITIALIZER;
+static bool s_ws_lifecycle_closing = false;
+static unsigned s_ws_audio_commands_inflight = 0;
+static pthread_mutex_t s_ws_connect_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t s_ws_generation = 0;
 static desk_sdk_ws_state_t s_ws_state = DESK_SDK_WS_OFFLINE;
 #ifndef ESP_PLATFORM
@@ -91,6 +98,8 @@ typedef struct {
     uint8_t opcode;
     uint32_t generation;
     bool close_after_send;
+    bool camera_start_ack;
+    bool log_subscribe_ack;
     size_t len;
     uint8_t payload[WS_CONTROL_FRAME_MAX];
 } ws_outbound_frame_t;
@@ -177,6 +186,10 @@ static void *ws_writer_main(void *unused)
             } else if (!stale && frame->close_after_send) {
                 ws_disconnect_generation_and_schedule(frame->generation);
             }
+            if (!stale && send_rc == 0 && frame->camera_start_ack)
+                desk_sdk_bridge_camera_start_ack_sent();
+            if (!stale && send_rc == 0 && frame->log_subscribe_ack)
+                desk_sdk_bridge_log_subscribe_ack_sent();
             pthread_mutex_lock(&s_ws_writer_mutex);
             memset(&s_ws_writer_current, 0, sizeof(s_ws_writer_current));
             pthread_mutex_unlock(&s_ws_writer_mutex);
@@ -242,7 +255,8 @@ static int ws_writer_start(void)
     return 0;
 }
 
-static int ws_enqueue_frame(uint8_t opcode, const uint8_t *payload, size_t len)
+static int ws_enqueue_frame_with_camera_ack(uint8_t opcode, const uint8_t *payload,
+                                            size_t len, bool camera_start_ack)
 {
     if (!payload || len > WS_CONTROL_FRAME_MAX || ws_writer_start() != 0) {
         if (len > WS_CONTROL_FRAME_MAX) ws_disconnect_and_schedule();
@@ -258,11 +272,80 @@ static int ws_enqueue_frame(uint8_t opcode, const uint8_t *payload, size_t len)
     s_ws_control_queue[tail].opcode = opcode;
     s_ws_control_queue[tail].generation = ws_lifecycle_generation();
     s_ws_control_queue[tail].close_after_send = opcode == 0x8;
+    s_ws_control_queue[tail].camera_start_ack = camera_start_ack;
     s_ws_control_queue[tail].len = len;
     memcpy(s_ws_control_queue[tail].payload, payload, len);
     ++s_ws_control_count;
     pthread_cond_signal(&s_ws_writer_cond);
     pthread_mutex_unlock(&s_ws_writer_mutex);
+    return 0;
+}
+
+static int ws_enqueue_log_subscribe_ack(uint8_t opcode, const uint8_t *payload, size_t len)
+{
+    if (!payload || len > WS_CONTROL_FRAME_MAX || ws_writer_start() != 0) {
+        if (len > WS_CONTROL_FRAME_MAX) ws_disconnect_and_schedule();
+        return -1;
+    }
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    if (s_ws_control_count == WS_CONTROL_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&s_ws_writer_mutex);
+        ws_disconnect_and_schedule();
+        return -1;
+    }
+    size_t tail = (s_ws_control_head + s_ws_control_count) % WS_CONTROL_QUEUE_CAPACITY;
+    s_ws_control_queue[tail].opcode = opcode;
+    s_ws_control_queue[tail].generation = ws_lifecycle_generation();
+    s_ws_control_queue[tail].close_after_send = opcode == 0x8;
+    s_ws_control_queue[tail].log_subscribe_ack = true;
+    s_ws_control_queue[tail].len = len;
+    memcpy(s_ws_control_queue[tail].payload, payload, len);
+    ++s_ws_control_count;
+    pthread_cond_signal(&s_ws_writer_cond);
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+    return 0;
+}
+
+static int ws_enqueue_frame(uint8_t opcode, const uint8_t *payload, size_t len)
+{
+    return ws_enqueue_frame_with_camera_ack(opcode, payload, len, false);
+}
+
+/* Roller input is delivered synchronously from the hardware input worker.
+ * This path never starts the writer and never waits on lifecycle/queue locks.
+ * The connection path prepares the writer before marking the session ready. */
+static int ws_enqueue_frame_nonblocking(uint8_t opcode,
+                                        const uint8_t *payload,
+                                        size_t len)
+{
+    if (!payload || len > WS_CONTROL_FRAME_MAX) return -1;
+    if (pthread_mutex_trylock(&s_ws_lifecycle_mutex) != 0) return -2;
+    bool ready = s_ws_ready;
+    uint32_t generation = s_ws_generation;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    if (!ready) return -1;
+
+    if (pthread_mutex_trylock(&s_ws_writer_mutex) != 0) return -2;
+    if (!s_ws_writer_started) {
+        pthread_mutex_unlock(&s_ws_writer_mutex);
+        return -3;
+    }
+    if (s_ws_control_count == WS_CONTROL_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&s_ws_writer_mutex);
+        return -4;
+    }
+
+    size_t tail = (s_ws_control_head + s_ws_control_count) % WS_CONTROL_QUEUE_CAPACITY;
+    s_ws_control_queue[tail].opcode = opcode;
+    s_ws_control_queue[tail].generation = generation;
+    s_ws_control_queue[tail].close_after_send = opcode == 0x8;
+    s_ws_control_queue[tail].len = len;
+    memcpy(s_ws_control_queue[tail].payload, payload, len);
+    ++s_ws_control_count;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+    /* The writer polls on its 20ms timed-wait interval; this is a nominal
+     * queue-observation interval, with additional scheduler latency possible.
+     * Avoid condition-variable work in the synchronous hardware callback. */
     return 0;
 }
 
@@ -335,13 +418,23 @@ static void ws_schedule_reconnect(void)
 static bool ws_transport_close_for_generation(uint32_t expected_generation, bool check_generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    while (s_ws_lifecycle_closing)
+        pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex);
     if (check_generation && expected_generation != s_ws_generation) {
         pthread_mutex_unlock(&s_ws_lifecycle_mutex);
         return false;
     }
+    /* Block new audio commands and wait for the bounded HAL operation that
+     * already owns this generation before invalidating its identity. */
+    s_ws_lifecycle_closing = true;
+    while (s_ws_audio_commands_inflight != 0)
+        pthread_cond_wait(&s_ws_lifecycle_cond, &s_ws_lifecycle_mutex);
+    uint32_t closed_generation = s_ws_generation;
     ++s_ws_generation;
     s_ws_ready = false;
     s_ws_authenticated = false;
+    s_ws_hello_pending = false;
+    s_ws_hello_pending_generation = 0;
     int fd = s_ws_fd;
     s_ws_fd = -1;
     if (fd >= 0) {
@@ -350,6 +443,8 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     }
     s_ws_state = DESK_SDK_WS_OFFLINE;
     s_ws_rx_len = 0;
+    s_ws_lifecycle_closing = false;
+    pthread_cond_broadcast(&s_ws_lifecycle_cond);
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
     if (fd >= 0 && pthread_mutex_trylock(&s_ws_socket_write_mutex) == 0) {
         pthread_mutex_lock(&s_ws_lifecycle_mutex);
@@ -360,6 +455,8 @@ static bool ws_transport_close_for_generation(uint32_t expected_generation, bool
     }
     ws_clear_outbound_queue();
     desk_sdk_bridge_log_session_closed();
+    desk_sdk_bridge_camera_session_closed();
+    desk_sdk_bridge_audio_session_closed(closed_generation);
     return true;
 }
 
@@ -384,14 +481,200 @@ static int ws_socket_fd_for_generation(uint32_t generation)
     return fd;
 }
 
+typedef struct { const char *p; unsigned depth; } ws_json_parser_t;
+typedef struct { const char *start; const char *end; } ws_json_span_t;
+
+static void ws_json_ws(ws_json_parser_t *p)
+{
+    while (*p->p == ' ' || *p->p == '\t' || *p->p == '\r' || *p->p == '\n') ++p->p;
+}
+
+static bool ws_json_string(ws_json_parser_t *p, ws_json_span_t *span)
+{
+    if (*p->p != '"') return false;
+    const char *start = p->p++;
+    while (*p->p) {
+        unsigned char c = (unsigned char)*p->p++;
+        if (c == '"') { if (span) { span->start = start; span->end = p->p; } return true; }
+        if (c < 0x20) return false;
+        if (c == '\\') {
+            c = (unsigned char)*p->p++;
+            if (c == 'u') {
+                for (int i = 0; i < 4; ++i) {
+                    char h = *p->p++;
+                    if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) return false;
+                }
+            } else if (c != '"' && c != '\\' && c != '/' && c != 'b' && c != 'f' &&
+                       c != 'n' && c != 'r' && c != 't') return false;
+        }
+    }
+    return false;
+}
+
+static bool ws_json_key_equal(ws_json_span_t key, const char *expected)
+{
+    /* Schema keys are ASCII. Refuse escaped aliases so duplicate spellings
+     * cannot bypass this fail-closed, exact-key contract. */
+    size_t n = strlen(expected);
+    return key.end - key.start == (ptrdiff_t)(n + 2) && key.start[0] == '"' &&
+           memchr(key.start + 1, '\\', n) == NULL &&
+           memcmp(key.start + 1, expected, n) == 0;
+}
+
+static bool ws_json_value(ws_json_parser_t *p);
+
+static bool ws_json_object(ws_json_parser_t *p)
+{
+    ws_json_span_t keys[16]; size_t count = 0;
+    if (*p->p++ != '{') return false;
+    ws_json_ws(p);
+    if (*p->p == '}') { ++p->p; return true; }
+    for (;;) {
+        ws_json_span_t key;
+        if (count == sizeof(keys)/sizeof(keys[0]) || !ws_json_string(p, &key)) return false;
+        for (size_t i = 0; i < count; ++i) {
+            size_t a = (size_t)(key.end-key.start), b = (size_t)(keys[i].end-keys[i].start);
+            if (a == b && memcmp(key.start, keys[i].start, a) == 0) return false;
+        }
+        keys[count++] = key;
+        ws_json_ws(p);
+        if (*p->p++ != ':') return false;
+        if (!ws_json_value(p)) return false;
+        ws_json_ws(p);
+        if (*p->p == '}') { ++p->p; return true; }
+        if (*p->p++ != ',') return false;
+        ws_json_ws(p);
+    }
+}
+
+static bool ws_json_value(ws_json_parser_t *p)
+{
+    ws_json_ws(p);
+    if (++p->depth > 16) return false;
+    bool ok = false;
+    if (*p->p == '"') ok = ws_json_string(p, NULL);
+    else if (*p->p == '{') ok = ws_json_object(p);
+    else if (*p->p == '[') {
+        ++p->p; ws_json_ws(p);
+        if (*p->p == ']') { ++p->p; ok = true; }
+        else for (;;) {
+            if (!ws_json_value(p)) break;
+            ws_json_ws(p);
+            if (*p->p == ']') { ++p->p; ok = true; break; }
+            if (*p->p++ != ',') break;
+            ws_json_ws(p);
+        }
+    } else if (strncmp(p->p, "true", 4) == 0) { p->p += 4; ok = true; }
+    else if (strncmp(p->p, "false", 5) == 0) { p->p += 5; ok = true; }
+    else if (strncmp(p->p, "null", 4) == 0) { p->p += 4; ok = true; }
+    else {
+        const char *n = p->p;
+        if (*n == '-') ++n;
+        if (*n == '0') ++n;
+        else if (*n >= '1' && *n <= '9') { do { ++n; } while (*n >= '0' && *n <= '9'); }
+        else n = p->p;
+        if (n != p->p) {
+            if (*n == '.') { ++n; if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9'); }
+            if (n != p->p && (*n == 'e' || *n == 'E')) {
+                ++n; if (*n == '+' || *n == '-') ++n;
+                if (*n < '0' || *n > '9') n = p->p; else do { ++n; } while (*n >= '0' && *n <= '9');
+            }
+            if (n != p->p) { p->p = n; ok = true; }
+        }
+    }
+    --p->depth;
+    return ok;
+}
+
+static bool ws_json_span_string(ws_json_span_t span, const char *expected)
+{
+    size_t n = strlen(expected);
+    return span.end - span.start == (ptrdiff_t)(n + 2) && span.start[0] == '"' &&
+           memchr(span.start + 1, '\\', n) == NULL && memcmp(span.start + 1, expected, n) == 0;
+}
+
+static bool ws_json_span_object(ws_json_span_t span, const char *const *names,
+                                const char *const *strings, size_t count)
+{
+    ws_json_parser_t p = { .p = span.start, .depth = 0 };
+    if (*p.p++ != '{') return false;
+    bool seen[8] = {false};
+    if (count > sizeof(seen)/sizeof(seen[0])) return false;
+    ws_json_ws(&p);
+    for (;;) {
+        ws_json_span_t key, value;
+        if (!ws_json_string(&p, &key)) return false;
+        size_t field;
+        for (field = 0; field < count; ++field) if (ws_json_key_equal(key, names[field])) break;
+        if (field == count || seen[field]) return false;
+        seen[field] = true;
+        ws_json_ws(&p);
+        if (*p.p++ != ':') return false;
+        ws_json_ws(&p); value.start = p.p;
+        if (!ws_json_value(&p)) return false;
+        value.end = p.p;
+        if (strings[field] && !ws_json_span_string(value, strings[field])) return false;
+        if (count == 3 && field == 1) {
+            size_t number_len = (size_t)(value.end-value.start);
+            if (!((number_len == 1 && value.start[0] == '0') ||
+                  (number_len == 2 && value.start[0] == '-' && value.start[1] == '0'))) return false;
+        }
+        if (!strings[field] && ((count == 3 && field == 2) ||
+                                (count == 4 && field == 3) ||
+                                (count == 1 && field == 0))) {
+            if (*value.start != '{' || !ws_json_span_object(value,
+                field == 2 ? (const char *const[]){"type","role","session_state","negotiated"} :
+                field == 3 ? (const char *const[]){"audio_uplink"} :
+                             (const char *const[]){"codec","sample_rate","channels","frame_duration_ms","packetization","version"},
+                field == 2 ? (const char *const[]){"sys.client.hello","hardware","connected",NULL} :
+                field == 3 ? (const char *const[]){NULL} :
+                             (const char *const[]){"opus",NULL,NULL,NULL,"one_opus_packet_per_wspk",NULL},
+                field == 2 ? 4 : field == 3 ? 1 : 6)) return false;
+        }
+        if (count == 6 && field != 0 && field != 4) {
+            const char *expected_number = field == 1 ? "16000" : field == 2 ? "1" :
+                                          field == 3 ? "60" : "1";
+            if ((size_t)(value.end-value.start) != strlen(expected_number) ||
+                memcmp(value.start, expected_number, strlen(expected_number)) != 0) return false;
+        }
+        ws_json_ws(&p);
+        if (*p.p == '}') { ++p.p; break; }
+        if (*p.p++ != ',') return false;
+        ws_json_ws(&p);
+    }
+    ws_json_ws(&p);
+    if (p.p != span.end) return false;
+    for (size_t i = 0; i < count; ++i) if (!seen[i]) return false;
+    return true;
+}
+
+static bool ws_hardware_hello_ack_valid(const char *json)
+{
+    static const char *const fields[] = {"type", "code", "data"};
+    static const char *const values[] = {"sys.ack", NULL, NULL};
+    if (!json) return false;
+    ws_json_parser_t p = { .p = json, .depth = 0 };
+    ws_json_span_t whole = { .start = NULL, .end = NULL };
+    ws_json_ws(&p);
+    whole.start = p.p;
+    if (!ws_json_value(&p)) return false;
+    whole.end = p.p; ws_json_ws(&p);
+    if (*p.p || *whole.start != '{') return false;
+    return ws_json_span_object(whole, fields, values, 3);
+}
+
 static bool ws_commit_hardware_hello_ack(uint32_t generation)
 {
     pthread_mutex_lock(&s_ws_lifecycle_mutex);
-    bool current = generation == s_ws_generation;
+    bool current = !s_ws_lifecycle_closing && generation == s_ws_generation && s_ws_hello_pending &&
+                   s_ws_hello_pending_generation == generation && !s_ws_ready &&
+                   s_ws_state == DESK_SDK_WS_HELLO_SENT;
     if (current) {
         /* This records protocol ACK observation, not cryptographic peer auth. */
         s_ws_authenticated = true;
         s_ws_ready = true;
+        s_ws_hello_pending = false;
+        s_ws_hello_pending_generation = 0;
         s_ws_state = DESK_SDK_WS_CONNECTED;
     }
     pthread_mutex_unlock(&s_ws_lifecycle_mutex);
@@ -599,11 +882,59 @@ bool desk_sdk_ws_client_is_authenticated(void)
     return authenticated;
 }
 desk_sdk_ws_state_t desk_sdk_ws_client_get_state(void) { return s_ws_state; }
+uint32_t desk_sdk_ws_client_generation(void) { return ws_lifecycle_generation(); }
+
+bool desk_sdk_ws_client_audio_command_acquire(uint32_t connection_generation)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool valid = !s_ws_lifecycle_closing && connection_generation != 0 &&
+                 connection_generation == s_ws_generation && s_ws_ready && s_ws_authenticated;
+    if (valid) ++s_ws_audio_commands_inflight;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return valid;
+}
+
+bool desk_sdk_ws_client_audio_generation_acquire(uint32_t connection_generation)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    bool valid = !s_ws_lifecycle_closing && connection_generation != 0 &&
+                 connection_generation == s_ws_generation;
+    if (valid) ++s_ws_audio_commands_inflight;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    return valid;
+}
+
+void desk_sdk_ws_client_audio_command_release(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    if (s_ws_audio_commands_inflight > 0) --s_ws_audio_commands_inflight;
+    if (s_ws_audio_commands_inflight == 0)
+        pthread_cond_broadcast(&s_ws_lifecycle_cond);
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+}
 
 int desk_sdk_ws_client_send_text(const char *text)
 {
     if (!s_ws_ready || !text) return -1;
     return ws_enqueue_frame(0x1, (const uint8_t *)text, strlen(text));
+}
+
+int desk_sdk_ws_client_send_camera_start_ack(const char *text)
+{
+    if (!s_ws_ready || !text) return -1;
+    return ws_enqueue_frame_with_camera_ack(0x1, (const uint8_t *)text, strlen(text), true);
+}
+
+int desk_sdk_ws_client_send_log_subscribe_ack(const char *text)
+{
+    if (!s_ws_ready || !text) return -1;
+    return ws_enqueue_log_subscribe_ack(0x1, (const uint8_t *)text, strlen(text));
+}
+
+int desk_sdk_ws_client_send_text_nonblocking(const char *text)
+{
+    if (!text) return -1;
+    return ws_enqueue_frame_nonblocking(0x1, (const uint8_t *)text, strlen(text));
 }
 
 int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len)
@@ -622,6 +953,7 @@ int desk_sdk_ws_client_send_binary(const uint8_t *data, size_t len)
 
 int desk_sdk_ws_client_connect_paired(void)
 {
+    pthread_mutex_lock(&s_ws_connect_mutex);
     char host[INET_ADDRSTRLEN], hello[512], key[32], expected[48];
     uint8_t key_raw[16];
     uint16_t port;
@@ -673,27 +1005,39 @@ int desk_sdk_ws_client_connect_paired(void)
     if (tail_len) { memcpy(s_ws_rx, tail, tail_len); s_ws_rx_len = tail_len; }
     /* Before HardwareHello succeeds, the writer cannot enqueue frames and
      * the connection path is the only possible socket writer. */
-    if (ws_send_frame(0x1, (const uint8_t *)hello, strlen(hello)) != 0) goto fail;
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    if (connect_generation != s_ws_generation || s_ws_fd < 0) {
+        pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+        goto fail;
+    }
     s_ws_state = DESK_SDK_WS_HELLO_SENT;
+    s_ws_hello_pending = true;
+    s_ws_hello_pending_generation = connect_generation;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    if (ws_send_frame(0x1, (const uint8_t *)hello, strlen(hello)) != 0) goto fail;
     uint8_t opcode; size_t ack_len;
     if (ws_read_frame(3000, &opcode, s_ws_ack, sizeof(s_ws_ack)-1, &ack_len) != 0 || opcode != 0x1) goto fail;
     s_ws_ack[ack_len] = 0;
-    if (!strstr((char *)s_ws_ack, "\"type\":\"sys.ack\"") || !strstr((char *)s_ws_ack, "\"sys.client.hello\"") || !strstr((char *)s_ws_ack, "\"code\":0")) goto fail;
+    if (!ws_hardware_hello_ack_valid((const char *)s_ws_ack)) goto fail;
+    if (ws_writer_start() != 0) goto fail;
     /* Commit only if no close/credential/policy/identity invalidation happened
      * while this connection was in flight. This remains protocol ACK evidence,
      * not cryptographic Runtime peer authentication. */
     if (!ws_commit_hardware_hello_ack(connect_generation)) goto fail;
     s_reconnect_failures = 0;
     s_ws_retry_at = 0;
+    pthread_mutex_unlock(&s_ws_connect_mutex);
     return 0;
 fail:
     ws_transport_close();
     if (s_pairing_target_valid) ws_schedule_reconnect();
+    pthread_mutex_unlock(&s_ws_connect_mutex);
     return -1;
 }
 
 int desk_sdk_ws_client_poll(int timeout_ms)
 {
+    desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
     if (!s_ws_ready) {
         if (s_pairing_target_valid && s_ws_retry_at != 0 && time(NULL) >= s_ws_retry_at) {
             s_reconnect_attempt = true;
@@ -702,21 +1046,25 @@ int desk_sdk_ws_client_poll(int timeout_ms)
         }
         return 0;
     }
+    uint32_t frame_generation = ws_lifecycle_generation();
     uint8_t op; uint8_t *payload = s_ws_payload; size_t len = 0;
     int rc = ws_read_frame(timeout_ms, &op, payload, WS_FRAME_CAP-1, &len);
     if (rc == 1) return 0;
     if (rc != 0) { ws_disconnect_and_schedule(); return -1; }
+    if (frame_generation != ws_lifecycle_generation()) {
+        ws_disconnect_generation_and_schedule(frame_generation);
+        return -1;
+    }
     if (op == 0x8) { return ws_enqueue_frame(0x8, payload, len); }
     if (op == 0x9) { return ws_enqueue_frame(0xA, payload, len); }
     if (op == 0xA) return 0;
     if (op == 0x2) {
-        desk_wspk_header_t media_header;
-        if (len < DESK_WSPK_HEADER_SIZE || desk_wspk_unpack_header(payload, len, &media_header) != 0 ||
-            media_header.payload_size != len - DESK_WSPK_HEADER_SIZE) {
-            ws_disconnect_and_schedule();
+        if (desk_sdk_bridge_process_ws_audio_frame(payload, len,
+                                                  frame_generation) != 0) {
+            ws_disconnect_generation_and_schedule(frame_generation);
             return -1;
         }
-        /* Binary media ingress is validated here; no application ingress callback exists yet. */
+        desk_sdk_bridge_audio_poll(ws_lifecycle_generation());
         return 0;
     }
     if (op != 0x1) { ws_disconnect_and_schedule(); return -1; }
@@ -725,7 +1073,75 @@ int desk_sdk_ws_client_poll(int timeout_ms)
     char message_type[64] = "";
     if (json_parse_top_level_str((const char *)payload, "type", message_type, sizeof(message_type)) &&
         strcmp(message_type, "sys.client.hello") == 0) { ws_disconnect_and_schedule(); return -1; }
-    if (desk_sdk_bridge_process_ws_command((const char *)payload, s_ws_response, sizeof(s_ws_response)) == 0)
-        return desk_sdk_ws_client_send_text(s_ws_response);
+    if (desk_sdk_bridge_process_ws_command_for_generation((const char *)payload,
+            s_ws_response, sizeof(s_ws_response), frame_generation) == 0) {
+        if (strcmp(message_type, "ctrl.camera.stream.start") == 0 &&
+            strstr(s_ws_response, "\"type\":\"sys.ack\""))
+            return desk_sdk_ws_client_send_camera_start_ack(s_ws_response);
+        if (strcmp(message_type, "sys.log.subscribe") == 0 &&
+            strstr(s_ws_response, "\"type\":\"sys.ack\""))
+            return desk_sdk_ws_client_send_log_subscribe_ack(s_ws_response);
+        int send_rc = desk_sdk_ws_client_send_text(s_ws_response);
+        desk_sdk_bridge_audio_poll(frame_generation);
+        return send_rc;
+    }
     return 0;
 }
+
+#ifdef DESK_SDK_TESTING
+void desk_sdk_test_ws_seed_ready(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    ++s_ws_generation;
+    s_ws_ready = true;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_writer_started = true;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_seed_authenticated(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    ++s_ws_generation;
+    s_ws_ready = true;
+    s_ws_authenticated = true;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_writer_started = true;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_lock_control_queue(void)
+{
+    pthread_mutex_lock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_unlock_control_queue(void)
+{
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_fill_control_queue(void)
+{
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_control_count = WS_CONTROL_QUEUE_CAPACITY;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+}
+
+void desk_sdk_test_ws_clear_control_queue(void)
+{
+    ws_clear_outbound_queue();
+}
+
+void desk_sdk_test_ws_reset(void)
+{
+    pthread_mutex_lock(&s_ws_lifecycle_mutex);
+    s_ws_ready = false;
+    pthread_mutex_unlock(&s_ws_lifecycle_mutex);
+    pthread_mutex_lock(&s_ws_writer_mutex);
+    s_ws_writer_started = false;
+    pthread_mutex_unlock(&s_ws_writer_mutex);
+    ws_clear_outbound_queue();
+}
+#endif
