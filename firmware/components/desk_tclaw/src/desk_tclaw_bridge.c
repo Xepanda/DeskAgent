@@ -120,7 +120,7 @@ static char s_last_tool_result[1024] = "";
 typedef enum {
     WATCHER_UI_PAGE_HOME = 0,
     WATCHER_UI_PAGE_AUDIO,
-    WATCHER_UI_PAGE_CONNECTION,
+    WATCHER_UI_PAGE_VOICE,
     WATCHER_UI_PAGE_DEVICE,
     WATCHER_UI_PAGE_COUNT
 } watcher_ui_page_t;
@@ -138,7 +138,7 @@ static const char *watcher_ui_page_name(watcher_ui_page_t page)
     switch (page) {
     case WATCHER_UI_PAGE_HOME: return "HOME";
     case WATCHER_UI_PAGE_AUDIO: return "AUDIO";
-    case WATCHER_UI_PAGE_CONNECTION: return "CONNECTION";
+    case WATCHER_UI_PAGE_VOICE: return "VOICE";
     case WATCHER_UI_PAGE_DEVICE: return "DEVICE";
     default: return "HOME";
     }
@@ -153,38 +153,38 @@ static int watcher_ui_render(void)
     }
     if (!s_ui_overlay_active) return DESK_HW_OK;
     if (!s_ui_page_open) {
-        snprintf(status, sizeof(status), "MENU %s", watcher_ui_page_name(s_ui_focus));
+        snprintf(status, sizeof(status), "%s", watcher_ui_page_name(s_ui_focus));
     } else {
         switch (s_ui_focus) {
         case WATCHER_UI_PAGE_HOME:
-            snprintf(status, sizeof(status), "HOME %.16s", s_ui_home_status);
+            snprintf(status, sizeof(status), "%.20s", s_ui_home_status);
             break;
         case WATCHER_UI_PAGE_AUDIO: {
             desk_hardware_audio_status_t audio = {0};
             if (desk_hardware_audio_get_status(&audio) != DESK_HW_OK) {
-                snprintf(status, sizeof(status), "AUDIO UNAVAILABLE");
+                snprintf(status, sizeof(status), "Mic unavailable");
+            } else if (audio.errors > 0) {
+                snprintf(status, sizeof(status), "Mic check");
             } else {
-                snprintf(status, sizeof(status), "MIC %s F%lu E%lu",
-                         audio.running ? "RUN" : "READY",
-                         (unsigned long)audio.frames, (unsigned long)audio.errors);
+                snprintf(status, sizeof(status), "%s", audio.running ? "Mic active" : "Mic ready");
             }
             break;
         }
-        case WATCHER_UI_PAGE_CONNECTION:
+        case WATCHER_UI_PAGE_VOICE:
             switch (desk_tclaw_get_state()) {
-            case TCLAW_STATE_LISTENING: snprintf(status, sizeof(status), "TCLAW SHIM LISTENING"); break;
-            case TCLAW_STATE_THINKING: snprintf(status, sizeof(status), "TCLAW SHIM THINKING"); break;
-            case TCLAW_STATE_SPEAKING: snprintf(status, sizeof(status), "TCLAW SHIM SPEAKING"); break;
-            case TCLAW_STATE_TOOL_CALLING: snprintf(status, sizeof(status), "TCLAW SHIM TOOL CALL"); break;
+            case TCLAW_STATE_LISTENING: snprintf(status, sizeof(status), "Listening"); break;
+            case TCLAW_STATE_THINKING: snprintf(status, sizeof(status), "Thinking"); break;
+            case TCLAW_STATE_SPEAKING: snprintf(status, sizeof(status), "Speaking"); break;
+            case TCLAW_STATE_TOOL_CALLING: snprintf(status, sizeof(status), "Working"); break;
             case TCLAW_STATE_IDLE:
-            default: snprintf(status, sizeof(status), "TCLAW SHIM IDLE"); break;
+            default: snprintf(status, sizeof(status), "Ready"); break;
             }
             break;
         case WATCHER_UI_PAGE_DEVICE:
-            snprintf(status, sizeof(status), "WATCHER S3 412X412");
+            snprintf(status, sizeof(status), "Desk Agent");
             break;
         default:
-            snprintf(status, sizeof(status), "PAGE UNAVAILABLE");
+            snprintf(status, sizeof(status), "Unavailable");
             break;
         }
     }
@@ -413,7 +413,9 @@ uint32_t desk_tclaw_get_tool_timeout_ms(void)
 /* --------------------------------------------------------------------------
  * Speech & Interruption Execution
  * -------------------------------------------------------------------------- */
-int desk_tclaw_start_speaking(const char *speech_text)
+static int desk_tclaw_start_speaking_with_feedback(const char *speech_text,
+                                                   const char *preset,
+                                                   const char *label)
 {
     if (!speech_text) return -1;
 
@@ -425,7 +427,7 @@ int desk_tclaw_start_speaking(const char *speech_text)
     strncpy(s_last_response, speech_text, sizeof(s_last_response) - 1);
     s_last_response[sizeof(s_last_response) - 1] = '\0';
 
-    desk_tclaw_update_ui_screen("speaking", s_last_response);
+    desk_tclaw_update_ui_screen(preset, label);
 
     /* Stream speech tokens to registered listener if active */
     if (s_speech_stream_cb) {
@@ -442,6 +444,11 @@ int desk_tclaw_start_speaking(const char *speech_text)
     }
 
     return 0;
+}
+
+int desk_tclaw_start_speaking(const char *speech_text)
+{
+    return desk_tclaw_start_speaking_with_feedback(speech_text, "speaking", "Speaking");
 }
 
 int desk_tclaw_interrupt(void)
@@ -784,12 +791,18 @@ int desk_tclaw_handle_tool_response(const char *request_id,
 
     s_turn_count++;
     char spoken[1024];
+    const char *feedback_preset = "error";
+    const char *feedback_label = "Failed";
     if (strcmp(eff_status, "accepted") == 0) {
         snprintf(spoken, sizeof(spoken), "Action accepted successfully: %s",
                  (eff_result && strlen(eff_result) > 0) ? eff_result : "OK");
+        feedback_preset = "thinking";
+        feedback_label = "Accepted";
     } else if (strcmp(eff_status, "succeeded") == 0) {
         snprintf(spoken, sizeof(spoken), "Action completed successfully: %s",
                  (eff_result && strlen(eff_result) > 0) ? eff_result : "OK");
+        feedback_preset = "happy";
+        feedback_label = "Done";
     } else {
         snprintf(spoken, sizeof(spoken), "Action encountered an error: %s",
                  (eff_error && strlen(eff_error) > 0) ? eff_error : "Error");
@@ -799,7 +812,7 @@ int desk_tclaw_handle_tool_response(const char *request_id,
     s_pending_request_id[0] = '\0';
     s_pending_tool_start_ms = 0;
 
-    return desk_tclaw_start_speaking(spoken);
+    return desk_tclaw_start_speaking_with_feedback(spoken, feedback_preset, feedback_label);
 }
 
 int desk_tclaw_handle_tool_timeout(const char *request_id)
@@ -891,7 +904,7 @@ int desk_tclaw_tuya_session_start(const char *session_id)
     }
 
     s_state = TCLAW_STATE_LISTENING;
-    desk_tclaw_update_ui_screen("listening", "Tuya Cloud Voice Active");
+    desk_tclaw_update_ui_screen("listening", "Listening");
     return 0;
 }
 
@@ -914,7 +927,7 @@ int desk_tclaw_tuya_session_feed_audio(const uint8_t *pcm_data, size_t len)
 
     if (s_state == TCLAW_STATE_IDLE) {
         s_state = TCLAW_STATE_LISTENING;
-        desk_tclaw_update_ui_screen("listening", "Listening...");
+        desk_tclaw_update_ui_screen("listening", "Listening");
     }
 
     return 0;
@@ -931,7 +944,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
                 s_tuya_session_id[sizeof(s_tuya_session_id) - 1] = '\0';
             }
             s_state = TCLAW_STATE_LISTENING;
-            desk_tclaw_update_ui_screen("listening", "Tuya Cloud Listening");
+            desk_tclaw_update_ui_screen("listening", "Listening");
             break;
 
         case TUYA_DIALOGUE_EVT_STREAM_TOKEN:
@@ -948,7 +961,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
                 if (cur_len + strlen(event->token) < sizeof(s_last_response) - 1) {
                     strcat(s_last_response, event->token);
                 }
-                desk_tclaw_update_ui_screen("speaking", s_last_response);
+                desk_tclaw_update_ui_screen("speaking", "Speaking");
 
                 if (s_speech_stream_cb) {
                     s_speech_stream_cb(event->token, event->is_final_token, s_stream_user_data);
@@ -958,7 +971,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
 
         case TUYA_DIALOGUE_EVT_TOOL_CALL:
             s_state = TCLAW_STATE_TOOL_CALLING;
-            desk_tclaw_update_ui_screen("thinking", "Calling tool...");
+            desk_tclaw_update_ui_screen("thinking", "Working");
             if (event->tool_name) {
                 strncpy(s_current_pending_tool, event->tool_name, sizeof(s_current_pending_tool) - 1);
                 s_current_pending_tool[sizeof(s_current_pending_tool) - 1] = '\0';
@@ -999,7 +1012,7 @@ int desk_tclaw_tuya_handle_cloud_event(const tuya_dialogue_event_t *event)
             desk_arbiter_release(DESK_RES_MOTION_GIMBAL, DESK_OWNER_TCLAW_VOICE);
             desk_arbiter_release(DESK_RES_CAMERA_SENSOR, DESK_OWNER_TCLAW_VOICE);
             s_state = TCLAW_STATE_IDLE;
-            desk_tclaw_update_ui_screen("idle", event->error_msg ? event->error_msg : "Error");
+            desk_tclaw_update_ui_screen("error", "Try again");
             break;
 
         default:
@@ -1079,7 +1092,7 @@ int desk_tclaw_on_tuya_mqtt_disconnected(void)
     if (s_tuya_session_id[0] != '\0') {
         desk_tclaw_tuya_session_stop();
     }
-    return desk_tclaw_update_ui_screen("idle", "Cloud Offline");
+    return desk_tclaw_update_ui_screen("offline", "Offline");
 }
 
 int desk_tclaw_inject_text(const char *user_prompt)
@@ -1091,10 +1104,10 @@ int desk_tclaw_inject_text(const char *user_prompt)
     }
 
     s_state = TCLAW_STATE_LISTENING;
-    desk_tclaw_update_ui_screen("listening", user_prompt);
+    desk_tclaw_update_ui_screen("listening", "Listening");
 
     s_state = TCLAW_STATE_THINKING;
-    desk_tclaw_update_ui_screen("thinking", "Thinking...");
+    desk_tclaw_update_ui_screen("thinking", "Thinking");
 
     /* Detect intent for tool dispatching through Tuya dialogue engine */
     char req_id[64];
