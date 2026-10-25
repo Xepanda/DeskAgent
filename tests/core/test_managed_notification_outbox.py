@@ -175,6 +175,79 @@ class ManagedNotificationOutboxTests(unittest.TestCase):
             finally:
                 app.close()
 
+    def test_user_acknowledgement_blocks_reminder_replay_after_restart(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "host.desk_agent.main.CodexCompanion", _FakeCompanion
+        ):
+            config_path = Path(directory) / "host.json"
+            db_path = Path(directory) / "life.db"
+            config_path.write_text(
+                '{"storage":{"db_path":"' + str(db_path).replace("\\", "\\\\")
+                + '"},"home_assistant":{"subscribe_events":false}}',
+                encoding="utf-8",
+            )
+            app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+            app._scheduler_stop.set()
+            app._delivery_thread.join(timeout=2)
+            self.assertFalse(app._delivery_thread.is_alive())
+            adapter = _FakeNotificationAdapter()
+            app.managed_notification_adapter = adapter
+            try:
+                app.life_service.create_reminder(
+                    reminder_id="rem-managed-ack-replay",
+                    title="Ack replay test",
+                    due_at="2099-02-03T04:05:00Z",
+                )
+                occurrence_id = app.life_service.get_all_occurrences(
+                    "rem-managed-ack-replay"
+                )[0]["occurrence_id"]
+                created = app.life_service.trigger_occurrence_to_outbox(occurrence_id)
+                outbox_id = created["outbox_id"]
+
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+                self.assertEqual(len(adapter.notifications), 1)
+                self.assertEqual(
+                    app.life_service.get_notification_receipt(occurrence_id)["delivery_status"],
+                    "unknown",
+                )
+
+                acknowledgement = {
+                    "type": "notification.acknowledged",
+                    "notification_id": occurrence_id,
+                    "source": "button",
+                }
+                self.assertEqual(
+                    app.life_service.record_managed_notification_event(acknowledgement), "recorded"
+                )
+                app.close()
+
+                app = DeskAgentHostApp(str(config_path), managed_sdk_session=True)
+                app._scheduler_stop.set()
+                app._delivery_thread.join(timeout=2)
+                self.assertFalse(app._delivery_thread.is_alive())
+                app.managed_notification_adapter = adapter
+                app.life_service._get_connection().execute(
+                    "UPDATE outbox SET next_retry_at = NULL WHERE outbox_id = ?", (outbox_id,)
+                )
+                app._scheduler_stop = _OneIterationStop()
+                app._delivery_loop()
+
+                self.assertEqual(
+                    len(adapter.notifications), 1,
+                    "durably acknowledged reminder must not be presented again after restart",
+                )
+                receipt = app.life_service.get_notification_receipt(occurrence_id)
+                self.assertEqual(receipt["user_acknowledged"], 1)
+                row = app.life_service._get_connection().execute(
+                    "SELECT state FROM outbox WHERE outbox_id = ?", (outbox_id,)
+                ).fetchone()
+                self.assertEqual(row["state"], "pending")
+            finally:
+                app.close()
+
 
 if __name__ == "__main__":
     unittest.main()
